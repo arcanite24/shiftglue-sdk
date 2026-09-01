@@ -18,5 +18,6 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID) {
   uint sample_index = output_position.x & 1;
   frame_accumulator[uint2(output_position.x,
                           destination_row + output_position.y)] =
-      source_tile.Load(uint2(source_x, output_position.y), sample_index);
+      source_tile.Load(uint2(source_x, destination_row + output_position.y),
+                       sample_index);
 }
