@@ -546,6 +546,10 @@ struct GraphicsIsolatedDrawResult {
       GraphicsIsolatedDrawStatus::kUnsupportedState;
   uint64_t frame_sequence = 0;
   bool frame_accumulator_source = false;
+  uint32_t logical_width = 0;
+  uint32_t logical_height = 0;
+  uint32_t draw_resolution_scale_x = 0;
+  uint32_t draw_resolution_scale_y = 0;
   uint32_t target_width = 0;
   uint32_t target_height = 0;
   GraphicsIsolatedDrawTargetFailure target_failure =

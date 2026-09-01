@@ -3808,6 +3808,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       isolated_result.frame_sequence = isolated_draw_request.frame_sequence;
       isolated_result.frame_accumulator_source =
           isolated_draw_request.frame_accumulator_source;
+      isolated_result.logical_width = isolated_replay_logical_width;
+      isolated_result.logical_height = isolated_replay_logical_height;
+      isolated_result.draw_resolution_scale_x = draw_resolution_scale_x;
+      isolated_result.draw_resolution_scale_y = draw_resolution_scale_y;
       if (memexport_used || !host_render_targets_used ||
           !is_rasterization_done) {
         isolated_result.status =
@@ -4067,6 +4071,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       isolated_result.frame_sequence = isolated_draw_request.frame_sequence;
       isolated_result.frame_accumulator_source =
           isolated_draw_request.frame_accumulator_source;
+      isolated_result.logical_width = isolated_replay_logical_width;
+      isolated_result.logical_height = isolated_replay_logical_height;
+      isolated_result.draw_resolution_scale_x = draw_resolution_scale_x;
+      isolated_result.draw_resolution_scale_y = draw_resolution_scale_y;
       const bool isolated_index_buffer_supported =
           primitive_processing_result.index_buffer_type ==
               PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA ||
