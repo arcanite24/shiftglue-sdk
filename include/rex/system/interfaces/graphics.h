@@ -508,6 +508,10 @@ struct GraphicsIsolatedDrawRequest {
   // Duplicate a draw that has only a depth/stencil attachment. The backend
   // must reject this mode if any guest color target is bound.
   bool depth_only_target = false;
+  // Duplicate a draw that has only the first color attachment. The backend
+  // must reject this mode if a guest depth/stencil or later color target is
+  // bound. Mutually exclusive with depth_only_target.
+  bool color_only_target = false;
   bool readback_requested = false;
   // Capture the authoritative guest color target after the original draw.
   // This is independent of the private replay readback and never suppresses

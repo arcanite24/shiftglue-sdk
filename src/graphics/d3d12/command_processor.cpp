@@ -3816,14 +3816,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                       isolated_replay_logical_width,
                       isolated_replay_logical_height,
                       isolated_draw_request.stencil_seed_probe_requested,
-                      isolated_draw_request.depth_only_target)) ||
+                      isolated_draw_request.depth_only_target,
+                      isolated_draw_request.color_only_target)) ||
                  (isolated_draw_request.reuse_target &&
                   render_target_cache_->ResumeIsolatedReplayTarget(
                       isolated_result.target_width,
                       isolated_result.target_height,
                       isolated_replay_logical_width,
                       isolated_replay_logical_height,
-                      isolated_draw_request.depth_only_target))) {
+                      isolated_draw_request.depth_only_target,
+                      isolated_draw_request.color_only_target))) {
         if (isolated_draw_request.reference_seed_depth_readback_requested &&
             isolated_draw_request.reference_seed_depth_readback_completion) {
           uint32_t readback_detail = 0;
@@ -4072,14 +4074,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                       isolated_replay_logical_width,
                       isolated_replay_logical_height,
                       isolated_draw_request.stencil_seed_probe_requested,
-                      isolated_draw_request.depth_only_target)) ||
+                      isolated_draw_request.depth_only_target,
+                      isolated_draw_request.color_only_target)) ||
                  (isolated_draw_request.reuse_target &&
                   render_target_cache_->ResumeIsolatedReplayTarget(
                       isolated_result.target_width,
                       isolated_result.target_height,
                       isolated_replay_logical_width,
                       isolated_replay_logical_height,
-                      isolated_draw_request.depth_only_target))) {
+                      isolated_draw_request.depth_only_target,
+                      isolated_draw_request.color_only_target))) {
         if (isolated_draw_request.reference_seed_depth_readback_requested &&
             isolated_draw_request.reference_seed_depth_readback_completion) {
           uint32_t readback_detail = 0;
