@@ -1055,6 +1055,9 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
   isolated_replay_frame_accumulator_target_.Reset();
   isolated_replay_frame_accumulator_target_state_ =
       D3D12_RESOURCE_STATE_COPY_DEST;
+  isolated_replay_frame_accumulator_resolved_source_.Reset();
+  isolated_replay_frame_accumulator_resolved_source_state_ =
+      D3D12_RESOURCE_STATE_RESOLVE_DEST;
   isolated_replay_frame_accumulator_frame_sequence_ = 0;
   isolated_replay_frame_accumulator_committed_frame_sequence_ = 0;
   isolated_replay_frame_accumulator_width_ = 0;
@@ -2820,6 +2823,90 @@ D3D12RenderTargetCache::ApplyIsolatedReplayFrameAccumulator(
     command_processor_.PushTransitionBarrier(
         source_resource, D3D12_RESOURCE_STATE_COPY_SOURCE,
         source_previous_state);
+    isolated_replay_frame_accumulator_target_state_ =
+        D3D12_RESOURCE_STATE_COPY_DEST;
+  } else if (source_desc.SampleDesc.Count == 4 &&
+             request.sample_select == 6) {
+    bool recreate_resolved_source =
+        !isolated_replay_frame_accumulator_resolved_source_;
+    if (!recreate_resolved_source) {
+      const D3D12_RESOURCE_DESC current =
+          isolated_replay_frame_accumulator_resolved_source_->GetDesc();
+      recreate_resolved_source = current.Width != source_desc.Width ||
+                                 current.Height != source_desc.Height ||
+                                 current.Format != source_desc.Format;
+    }
+    if (recreate_resolved_source) {
+      D3D12_RESOURCE_DESC resolved_desc = source_desc;
+      resolved_desc.Alignment = 0;
+      resolved_desc.SampleDesc.Count = 1;
+      resolved_desc.SampleDesc.Quality = 0;
+      resolved_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+      Microsoft::WRL::ComPtr<ID3D12Resource> resolved_source;
+      HRESULT create_result = device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesDefault,
+          command_processor_.GetD3D12Provider()
+              .GetHeapFlagCreateNotZeroed(),
+          &resolved_desc, D3D12_RESOURCE_STATE_RESOLVE_DEST, nullptr,
+          IID_PPV_ARGS(&resolved_source));
+      if (FAILED(create_result)) {
+        clear_active();
+        result.status =
+            system::GraphicsNativeFrameAccumulatorStatus::kAllocationFailed;
+        return result;
+      }
+      resolved_source->SetName(
+          L"Pinyon Shift private procedural frame accumulator resolved source");
+      isolated_replay_frame_accumulator_resolved_source_ =
+          std::move(resolved_source);
+      isolated_replay_frame_accumulator_resolved_source_state_ =
+          D3D12_RESOURCE_STATE_RESOLVE_DEST;
+    }
+
+    source_previous_state = isolated_color->SetResourceState(
+        D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+    command_processor_.PushTransitionBarrier(
+        source_resource, source_previous_state,
+        D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+    command_processor_.PushTransitionBarrier(
+        isolated_replay_frame_accumulator_resolved_source_.Get(),
+        isolated_replay_frame_accumulator_resolved_source_state_,
+        D3D12_RESOURCE_STATE_RESOLVE_DEST);
+    command_processor_.SubmitBarriers();
+    command_processor_.GetDeferredCommandList().D3DResolveSubresource(
+        isolated_replay_frame_accumulator_resolved_source_.Get(), 0,
+        source_resource, 0, source_desc.Format);
+    command_processor_.PushTransitionBarrier(
+        isolated_replay_frame_accumulator_resolved_source_.Get(),
+        D3D12_RESOURCE_STATE_RESOLVE_DEST,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    command_processor_.PushTransitionBarrier(
+        isolated_replay_frame_accumulator_target_.Get(),
+        isolated_replay_frame_accumulator_target_state_,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    command_processor_.SubmitBarriers();
+
+    D3D12_TEXTURE_COPY_LOCATION destination{};
+    destination.pResource = isolated_replay_frame_accumulator_target_.Get();
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION source{};
+    source.pResource =
+        isolated_replay_frame_accumulator_resolved_source_.Get();
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_BOX source_box{request.source_x,
+                         request.source_y,
+                         0,
+                         request.source_x + request.source_width,
+                         request.source_y + request.source_height,
+                         1};
+    command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(
+        &destination, 0, request.destination_row, 0, &source, &source_box);
+    isolated_color->SetResourceState(source_previous_state);
+    command_processor_.PushTransitionBarrier(
+        source_resource, D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
+        source_previous_state);
+    isolated_replay_frame_accumulator_resolved_source_state_ =
+        D3D12_RESOURCE_STATE_COPY_SOURCE;
     isolated_replay_frame_accumulator_target_state_ =
         D3D12_RESOURCE_STATE_COPY_DEST;
   } else {
