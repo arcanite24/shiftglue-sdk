@@ -58,6 +58,7 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/host_depth_store_4xmsaa_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/isolated_depth_readback_msaa_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/procedural_frame_accumulator_2xmsaa_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/procedural_frame_accumulator_4xmsaa_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/passthrough_position_xy_vs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_clear_32bpp_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_clear_32bpp_scaled_cs.h"
@@ -1026,6 +1027,8 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
   ui::d3d12::util::ReleaseAndNull(isolated_depth_readback_root_signature_);
   ui::d3d12::util::ReleaseAndNull(
       isolated_replay_frame_accumulator_2xmsaa_pipeline_);
+  ui::d3d12::util::ReleaseAndNull(
+      isolated_replay_frame_accumulator_4xmsaa_pipeline_);
   ui::d3d12::util::ReleaseAndNull(
       isolated_replay_frame_accumulator_2xmsaa_root_signature_);
 
@@ -2639,6 +2642,12 @@ D3D12RenderTargetCache::ApplyIsolatedReplayFrameAccumulator(
       request.storage_height < request.logical_height ||
       request.storage_height >= request.logical_height + 64 ||
       !request.storage_row_count ||
+      !request.source_width || !request.source_height ||
+      !request.copy_row_count || request.sample_select > 6 ||
+      request.source_height != request.copy_row_count ||
+      request.copy_row_count > request.storage_row_count ||
+      request.padding_row_count !=
+          request.storage_row_count - request.copy_row_count ||
       request.destination_row > request.storage_height ||
       request.storage_row_count >
           request.storage_height - request.destination_row ||
@@ -2683,14 +2692,20 @@ D3D12RenderTargetCache::ApplyIsolatedReplayFrameAccumulator(
   result.native_2x_msaa = msaa_2x_supported();
   const bool source_topology_supported =
       (source_desc.SampleDesc.Count == 1 &&
-       source_desc.Width >= request.logical_width) ||
+       request.source_width == request.logical_width) ||
       (source_desc.SampleDesc.Count == 2 &&
-       source_desc.Width * 2 >= request.logical_width);
+       (request.source_width == request.logical_width ||
+        uint64_t(request.source_width) * 2 == request.logical_width)) ||
+      (source_desc.SampleDesc.Count == 4 &&
+       request.source_width == request.logical_width);
+  const bool source_region_supported =
+      uint64_t(request.source_x) + request.source_width <= source_desc.Width &&
+      uint64_t(request.source_y) + request.source_height <=
+          source_desc.Height;
   if (source_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
       source_desc.DepthOrArraySize != 1 || source_desc.MipLevels != 1 ||
       source_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT ||
-      !source_topology_supported ||
-      source_desc.Height < request.storage_row_count) {
+      !source_topology_supported || !source_region_supported) {
     static bool logged_unsupported_frame_accumulator_target = false;
     if (!logged_unsupported_frame_accumulator_target) {
       logged_unsupported_frame_accumulator_target = true;
@@ -2734,10 +2749,9 @@ D3D12RenderTargetCache::ApplyIsolatedReplayFrameAccumulator(
       target_desc.Height = request.storage_height;
       target_desc.SampleDesc.Count = 1;
       target_desc.SampleDesc.Quality = 0;
-      target_desc.Flags =
-          source_desc.SampleDesc.Count == 2
-              ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
-              : D3D12_RESOURCE_FLAG_NONE;
+      target_desc.Flags = source_desc.SampleDesc.Count > 1
+                              ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                              : D3D12_RESOURCE_FLAG_NONE;
       Microsoft::WRL::ComPtr<ID3D12Resource> target;
       HRESULT create_result = device->CreateCommittedResource(
           &ui::d3d12::util::kHeapPropertiesDefault,
@@ -2794,8 +2808,12 @@ D3D12RenderTargetCache::ApplyIsolatedReplayFrameAccumulator(
     D3D12_TEXTURE_COPY_LOCATION source{};
     source.pResource = source_resource;
     source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    D3D12_BOX source_box{0, 0, 0, request.logical_width,
-                         request.storage_row_count, 1};
+    D3D12_BOX source_box{request.source_x,
+                         request.source_y,
+                         0,
+                         request.source_x + request.source_width,
+                         request.source_y + request.source_height,
+                         1};
     command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(
         &destination, 0, request.destination_row, 0, &source, &source_box);
     isolated_color->SetResourceState(source_previous_state);
@@ -2810,7 +2828,7 @@ D3D12RenderTargetCache::ApplyIsolatedReplayFrameAccumulator(
       root_parameters[0].ParameterType =
           D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
       root_parameters[0].Constants.ShaderRegister = 0;
-      root_parameters[0].Constants.Num32BitValues = 4;
+      root_parameters[0].Constants.Num32BitValues = 8;
       root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
       D3D12_DESCRIPTOR_RANGE source_range{};
       source_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -2843,13 +2861,28 @@ D3D12RenderTargetCache::ApplyIsolatedReplayFrameAccumulator(
         return result;
       }
     }
-    if (!isolated_replay_frame_accumulator_2xmsaa_pipeline_) {
+    if (source_desc.SampleDesc.Count == 2 &&
+        !isolated_replay_frame_accumulator_2xmsaa_pipeline_) {
       isolated_replay_frame_accumulator_2xmsaa_pipeline_ =
           ui::d3d12::util::CreateComputePipeline(
               device, shaders::procedural_frame_accumulator_2xmsaa_cs,
               sizeof(shaders::procedural_frame_accumulator_2xmsaa_cs),
               isolated_replay_frame_accumulator_2xmsaa_root_signature_);
       if (!isolated_replay_frame_accumulator_2xmsaa_pipeline_) {
+        clear_active();
+        result.status =
+            system::GraphicsNativeFrameAccumulatorStatus::kAllocationFailed;
+        return result;
+      }
+    }
+    if (source_desc.SampleDesc.Count == 4 &&
+        !isolated_replay_frame_accumulator_4xmsaa_pipeline_) {
+      isolated_replay_frame_accumulator_4xmsaa_pipeline_ =
+          ui::d3d12::util::CreateComputePipeline(
+              device, shaders::procedural_frame_accumulator_4xmsaa_cs,
+              sizeof(shaders::procedural_frame_accumulator_4xmsaa_cs),
+              isolated_replay_frame_accumulator_2xmsaa_root_signature_);
+      if (!isolated_replay_frame_accumulator_4xmsaa_pipeline_) {
         clear_active();
         result.status =
             system::GraphicsNativeFrameAccumulatorStatus::kAllocationFailed;
@@ -2892,17 +2925,21 @@ D3D12RenderTargetCache::ApplyIsolatedReplayFrameAccumulator(
         command_processor_.GetDeferredCommandList();
     command_list.D3DSetComputeRootSignature(
         isolated_replay_frame_accumulator_2xmsaa_root_signature_);
-    const uint32_t constants[4] = {
-        uint32_t(source_desc.Width), source_desc.Height,
-        request.destination_row, request.storage_row_count};
+    const uint32_t constants[8] = {
+        request.source_x,      request.source_y,
+        request.source_width,  request.source_height,
+        request.logical_width, request.destination_row,
+        request.copy_row_count, request.sample_select};
     command_list.D3DSetComputeRoot32BitConstants(
         0, uint32_t(rex::countof(constants)), constants, 0);
     command_list.D3DSetComputeRootDescriptorTable(1, descriptors[0].second);
     command_list.D3DSetComputeRootDescriptorTable(2, descriptors[1].second);
     command_processor_.SetExternalPipeline(
-        isolated_replay_frame_accumulator_2xmsaa_pipeline_);
+        source_desc.SampleDesc.Count == 4
+            ? isolated_replay_frame_accumulator_4xmsaa_pipeline_
+            : isolated_replay_frame_accumulator_2xmsaa_pipeline_);
     command_list.D3DDispatch((request.logical_width + 7) / 8,
-                             (request.storage_row_count + 7) / 8, 1);
+                             (request.copy_row_count + 7) / 8, 1);
     isolated_color->SetResourceState(source_previous_state);
     command_processor_.PushTransitionBarrier(
         source_resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
