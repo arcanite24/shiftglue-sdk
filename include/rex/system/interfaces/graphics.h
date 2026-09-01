@@ -238,6 +238,8 @@ struct GraphicsDrawObservation {
   uint32_t command_buffer_parent_packet_physical_address = UINT32_MAX;
   uint32_t command_buffer_root_physical_address = UINT32_MAX;
   uint32_t command_buffer_depth = 0;
+  uint64_t bin_select = 0;
+  uint64_t bin_mask = 0;
   uint32_t packet = 0;
   uint32_t initiator = 0;
   uint32_t primitive_type = 0;

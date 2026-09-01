@@ -1599,6 +1599,8 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
         observation.command_buffer_root_physical_address =
             observation_command_buffer_.root_physical_address;
         observation.command_buffer_depth = observation_command_buffer_.depth;
+        observation.bin_select = bin_select_;
+        observation.bin_mask = bin_mask_;
         observation.packet = packet;
         observation.initiator = vgt_draw_initiator.value;
         observation.primitive_type = uint32_t(vgt_draw_initiator.prim_type);
