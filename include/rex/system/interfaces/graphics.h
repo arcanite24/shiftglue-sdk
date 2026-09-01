@@ -201,6 +201,10 @@ constexpr uint32_t kGraphicsVertexAttributeObservationLimit = 32;
 struct GraphicsFloatConstantObservation {
   uint32_t index = 0;
   uint32_t values[4] = {};
+  uint32_t write_maximum_age_frames = 0;
+  uint32_t write_provenance_valid = 0;
+  uint32_t write_provenance_split = 0;
+  uint32_t write_value_mismatch_mask = 0;
 };
 
 constexpr uint32_t kGraphicsFloatConstantObservationLimit = 64;

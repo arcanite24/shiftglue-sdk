@@ -288,6 +288,20 @@ class CommandProcessor {
     uint32_t depth = 0;
   };
   ObservationCommandBufferContext observation_command_buffer_{};
+  struct ShaderConstantWriteState {
+    uint64_t frame_sequence = 0;
+    uint32_t packet_physical_address = UINT32_MAX;
+    uint32_t command_buffer_physical_address = UINT32_MAX;
+    uint32_t command_buffer_length_dwords = 0;
+    uint32_t command_buffer_parent_packet_physical_address = UINT32_MAX;
+    uint32_t command_buffer_root_physical_address = UINT32_MAX;
+    uint32_t command_buffer_depth = 0;
+    uint32_t packet = 0;
+    uint32_t value = 0;
+    bool valid = false;
+  };
+  std::array<ShaderConstantWriteState, 512 * 4>
+      shader_constant_write_state_{};
 
   bool paused_ = false;
 

@@ -377,6 +377,24 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
       index < XE_GPU_REG_SHADER_CONSTANT_000_X + 512 * 4) {
+    ShaderConstantWriteState& write_state =
+        shader_constant_write_state_[index -
+                                     XE_GPU_REG_SHADER_CONSTANT_000_X];
+    write_state.frame_sequence = observation_frame_sequence_;
+    write_state.packet_physical_address =
+        observation_packet_physical_address_;
+    write_state.command_buffer_physical_address =
+        observation_command_buffer_.physical_address;
+    write_state.command_buffer_length_dwords =
+        observation_command_buffer_.length_dwords;
+    write_state.command_buffer_parent_packet_physical_address =
+        observation_command_buffer_.parent_packet_physical_address;
+    write_state.command_buffer_root_physical_address =
+        observation_command_buffer_.root_physical_address;
+    write_state.command_buffer_depth = observation_command_buffer_.depth;
+    write_state.packet = observation_packet_;
+    write_state.value = value;
+    write_state.valid = true;
     auto observer = graphics_system_->shader_constant_write_observer();
     if (observer) {
       system::GraphicsShaderConstantWriteObservation observation;
@@ -1734,6 +1752,63 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
               std::memcpy(output[output_index].values,
                           &(*register_file_)[register_base + constant_index * 4],
                           sizeof(output[output_index].values));
+              const uint32_t write_state_base =
+                  register_base - XE_GPU_REG_SHADER_CONSTANT_000_X +
+                  constant_index * 4;
+              const ShaderConstantWriteState& first_write_state =
+                  shader_constant_write_state_[write_state_base];
+              bool write_provenance_valid = first_write_state.valid;
+              bool write_provenance_split = false;
+              uint32_t write_value_mismatch_mask = 0;
+              uint64_t oldest_write_frame = first_write_state.frame_sequence;
+              const auto same_write_source = [](const auto& left,
+                                                const auto& right) {
+                return left.packet_physical_address ==
+                           right.packet_physical_address &&
+                       left.command_buffer_physical_address ==
+                           right.command_buffer_physical_address &&
+                       left.command_buffer_length_dwords ==
+                           right.command_buffer_length_dwords &&
+                       left.command_buffer_parent_packet_physical_address ==
+                           right.command_buffer_parent_packet_physical_address &&
+                       left.command_buffer_root_physical_address ==
+                           right.command_buffer_root_physical_address &&
+                       left.command_buffer_depth == right.command_buffer_depth &&
+                       left.packet == right.packet;
+              };
+              for (uint32_t component = 0; component < 4; ++component) {
+                const ShaderConstantWriteState& component_write_state =
+                    shader_constant_write_state_[write_state_base + component];
+                write_provenance_valid &= component_write_state.valid;
+                write_provenance_split |=
+                    component != 0 &&
+                    !same_write_source(first_write_state,
+                                       component_write_state);
+                if (component_write_state.valid) {
+                  oldest_write_frame =
+                      std::min(oldest_write_frame,
+                               component_write_state.frame_sequence);
+                  if (component_write_state.value !=
+                      output[output_index].values[component]) {
+                    write_value_mismatch_mask |= uint32_t(1) << component;
+                  }
+                }
+              }
+              auto& constant_output = output[output_index];
+              constant_output.write_provenance_valid =
+                  write_provenance_valid ? 1u : 0u;
+              constant_output.write_provenance_split =
+                  write_provenance_split ? 1u : 0u;
+              constant_output.write_value_mismatch_mask =
+                  write_value_mismatch_mask;
+              if (write_provenance_valid) {
+                constant_output.write_maximum_age_frames =
+                    observation_frame_sequence_ >= oldest_write_frame
+                        ? uint32_t(std::min<uint64_t>(
+                              observation_frame_sequence_ - oldest_write_frame,
+                              UINT32_MAX))
+                        : UINT32_MAX;
+              }
               ++output_index;
             }
           }
