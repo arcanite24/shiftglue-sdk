@@ -3917,7 +3917,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         render_target_cache_->EndIsolatedReplayTarget(
             isolated_draw_request.frame_sequence,
             isolated_draw_request.defer_preview_publication_until_swap,
-            isolated_draw_request.depth_only_target);
+            isolated_draw_request.depth_only_target,
+            isolated_draw_request.frame_accumulator_source);
         isolated_replay_recorded = true;
         isolated_result.status =
             system::GraphicsIsolatedDrawStatus::kRecorded;
@@ -4177,7 +4178,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         render_target_cache_->EndIsolatedReplayTarget(
             isolated_draw_request.frame_sequence,
             isolated_draw_request.defer_preview_publication_until_swap,
-            isolated_draw_request.depth_only_target);
+            isolated_draw_request.depth_only_target,
+            isolated_draw_request.frame_accumulator_source);
         isolated_replay_recorded = true;
         isolated_result.status =
             system::GraphicsIsolatedDrawStatus::kRecorded;

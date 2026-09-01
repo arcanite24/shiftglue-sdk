@@ -1797,6 +1797,7 @@ bool D3D12RenderTargetCache::BeginIsolatedReplayTarget(
   width_out = 0;
   height_out = 0;
   failure_out = system::GraphicsIsolatedDrawTargetFailure::kNone;
+  isolated_replay_frame_accumulator_source_frame_sequence_ = 0;
   isolated_replay_active_depth_target_ = nullptr;
   if ((depth_only_target && color_only_target) ||
       (stencil_seed_probe_requested && color_only_target)) {
@@ -2613,6 +2614,7 @@ D3D12RenderTargetCache::ApplyIsolatedReplayFrameAccumulator(
     isolated_replay_frame_accumulator_logical_height_ = 0;
     isolated_replay_frame_accumulator_appended_row_end_ = 0;
     isolated_replay_frame_accumulator_reseed_required_ = false;
+    isolated_replay_frame_accumulator_source_frame_sequence_ = 0;
   };
   if (request.cancel && !request.begin && !request.append &&
       !request.commit) {
@@ -2646,6 +2648,13 @@ D3D12RenderTargetCache::ApplyIsolatedReplayFrameAccumulator(
     clear_active();
     result.status =
         system::GraphicsNativeFrameAccumulatorStatus::kUnavailable;
+    return result;
+  }
+  if (isolated_replay_frame_accumulator_source_frame_sequence_ !=
+          frame_sequence) {
+    clear_active();
+    result.status =
+        system::GraphicsNativeFrameAccumulatorStatus::kUnqualifiedSource;
     return result;
   }
 
@@ -2907,12 +2916,13 @@ D3D12RenderTargetCache::ApplyIsolatedReplayFrameAccumulator(
   result.appended_row_end =
       isolated_replay_frame_accumulator_appended_row_end_;
   result.committed = request.commit;
+  isolated_replay_frame_accumulator_source_frame_sequence_ = 0;
   return result;
 }
 
 void D3D12RenderTargetCache::EndIsolatedReplayTarget(
     uint64_t frame_sequence, bool defer_preview_publication_until_swap,
-    bool depth_only_target) {
+    bool depth_only_target, bool frame_accumulator_source) {
   if (GetPath() != Path::kHostRenderTargets) {
     return;
   }
@@ -2922,6 +2932,8 @@ void D3D12RenderTargetCache::EndIsolatedReplayTarget(
   if (depth_only_target) {
     return;
   }
+  isolated_replay_frame_accumulator_source_frame_sequence_ =
+      frame_accumulator_source ? frame_sequence : 0;
   if (defer_preview_publication_until_swap) {
     isolated_replay_deferred_preview_frame_sequence_ = frame_sequence;
     isolated_replay_deferred_preview_width_ =
@@ -2971,6 +2983,10 @@ void D3D12RenderTargetCache::CancelDeferredIsolatedReplayPreview(
     isolated_replay_frame_accumulator_committed_frame_sequence_ = 0;
     isolated_replay_frame_accumulator_appended_row_end_ = 0;
     isolated_replay_frame_accumulator_reseed_required_ = false;
+  }
+  if (isolated_replay_frame_accumulator_source_frame_sequence_ ==
+      frame_sequence) {
+    isolated_replay_frame_accumulator_source_frame_sequence_ = 0;
   }
 }
 

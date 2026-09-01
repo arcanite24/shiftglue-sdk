@@ -366,6 +366,7 @@ enum class GraphicsNativeFrameAccumulatorStatus : uint32_t {
   kUnavailable = 4,
   kUnsupportedTarget = 5,
   kAllocationFailed = 6,
+  kUnqualifiedSource = 7,
 };
 
 struct GraphicsNativeFrameAccumulatorResult {
@@ -618,6 +619,10 @@ struct GraphicsIsolatedDrawRequest {
   // complete frame. Any failed draw in the accumulation cancels the pending
   // preview and leaves the previous Xenos frame authoritative.
   bool defer_preview_publication_until_swap = false;
+  // Make the completed private color replay eligible as the source of one
+  // same-frame native accumulator append. The accumulator consumes this tag;
+  // unrelated isolated replays can never become procedural input implicitly.
+  bool frame_accumulator_source = false;
   // After the original authoritative guest draw, publish the completed private
   // pass into the same guest color and depth/stencil resources. The backend
   // must validate the entire pair before recording either copy. This never

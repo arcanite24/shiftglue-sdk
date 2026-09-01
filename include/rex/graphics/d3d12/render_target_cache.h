@@ -144,7 +144,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   void EndIsolatedReplayTarget(
       uint64_t frame_sequence,
       bool defer_preview_publication_until_swap = false,
-      bool depth_only_target = false);
+      bool depth_only_target = false,
+      bool frame_accumulator_source = false);
   void CommitDeferredIsolatedReplayPreview(uint64_t frame_sequence);
   void CancelDeferredIsolatedReplayPreview(uint64_t frame_sequence);
   system::GraphicsIsolatedDrawPublicationResult PublishIsolatedReplayTarget(
@@ -761,6 +762,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   ID3D12PipelineState*
       isolated_replay_frame_accumulator_2xmsaa_pipeline_ = nullptr;
   uint64_t isolated_replay_frame_accumulator_frame_sequence_ = 0;
+  uint64_t isolated_replay_frame_accumulator_source_frame_sequence_ = 0;
   uint64_t isolated_replay_frame_accumulator_committed_frame_sequence_ = 0;
   uint32_t isolated_replay_frame_accumulator_width_ = 0;
   uint32_t isolated_replay_frame_accumulator_height_ = 0;
