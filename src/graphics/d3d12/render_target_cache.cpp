@@ -57,6 +57,7 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/host_depth_store_2xmsaa_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/host_depth_store_4xmsaa_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/isolated_depth_readback_msaa_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/procedural_frame_accumulator_2xmsaa_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/passthrough_position_xy_vs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_clear_32bpp_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_clear_32bpp_scaled_cs.h"
@@ -1023,6 +1024,10 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
 
   ui::d3d12::util::ReleaseAndNull(isolated_depth_readback_pipeline_);
   ui::d3d12::util::ReleaseAndNull(isolated_depth_readback_root_signature_);
+  ui::d3d12::util::ReleaseAndNull(
+      isolated_replay_frame_accumulator_2xmsaa_pipeline_);
+  ui::d3d12::util::ReleaseAndNull(
+      isolated_replay_frame_accumulator_2xmsaa_root_signature_);
 
   const auto release_isolated_readback = [](IsolatedReplayReadback& readback) {
     if (readback.buffer && readback.mapping) {
@@ -1047,9 +1052,6 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
   isolated_replay_frame_accumulator_target_.Reset();
   isolated_replay_frame_accumulator_target_state_ =
       D3D12_RESOURCE_STATE_COPY_DEST;
-  isolated_replay_frame_accumulator_tile_.Reset();
-  isolated_replay_frame_accumulator_tile_state_ =
-      D3D12_RESOURCE_STATE_RESOLVE_DEST;
   isolated_replay_frame_accumulator_frame_sequence_ = 0;
   isolated_replay_frame_accumulator_committed_frame_sequence_ = 0;
   isolated_replay_frame_accumulator_width_ = 0;
@@ -2598,14 +2600,30 @@ D3D12RenderTargetCache::ApplyIsolatedReplayFrameAccumulator(
       isolated_replay_color_target_.get());
   ID3D12Resource* source_resource = isolated_color->resource();
   const D3D12_RESOURCE_DESC source_desc = source_resource->GetDesc();
-  const bool source_format_supported =
-      source_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
-      source_desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM;
+  const bool source_topology_supported =
+      (source_desc.SampleDesc.Count == 1 &&
+       source_desc.Width >= request.logical_width) ||
+      (source_desc.SampleDesc.Count == 2 &&
+       source_desc.Width * 2 >= request.logical_width);
   if (source_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
       source_desc.DepthOrArraySize != 1 || source_desc.MipLevels != 1 ||
-      !source_desc.SampleDesc.Count || !source_format_supported ||
-      source_desc.Width < request.logical_width ||
+      source_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT ||
+      !source_topology_supported ||
       source_desc.Height < request.storage_row_count) {
+    static bool logged_unsupported_frame_accumulator_target = false;
+    if (!logged_unsupported_frame_accumulator_target) {
+      logged_unsupported_frame_accumulator_target = true;
+      REXGPU_WARN(
+          "Native procedural frame accumulator target unsupported: "
+          "dimension {}, {}x{}, array {}, mips {}, format {}, samples {}, "
+          "quality {}, requested {}x{} rows {}",
+          uint32_t(source_desc.Dimension), source_desc.Width,
+          source_desc.Height, source_desc.DepthOrArraySize,
+          source_desc.MipLevels, uint32_t(source_desc.Format),
+          source_desc.SampleDesc.Count, source_desc.SampleDesc.Quality,
+          request.logical_width, request.storage_height,
+          request.storage_row_count);
+    }
     clear_active();
     result.status =
         system::GraphicsNativeFrameAccumulatorStatus::kUnsupportedTarget;
@@ -2635,7 +2653,10 @@ D3D12RenderTargetCache::ApplyIsolatedReplayFrameAccumulator(
       target_desc.Height = request.storage_height;
       target_desc.SampleDesc.Count = 1;
       target_desc.SampleDesc.Quality = 0;
-      target_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+      target_desc.Flags =
+          source_desc.SampleDesc.Count == 2
+              ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+              : D3D12_RESOURCE_FLAG_NONE;
       Microsoft::WRL::ComPtr<ID3D12Resource> target;
       HRESULT create_result = device->CreateCommittedResource(
           &ui::d3d12::util::kHeapPropertiesDefault,
@@ -2673,96 +2694,140 @@ D3D12RenderTargetCache::ApplyIsolatedReplayFrameAccumulator(
     return result;
   }
 
-  ID3D12Resource* copy_source = source_resource;
   D3D12_RESOURCE_STATES source_previous_state =
       D3D12_RESOURCE_STATE_COMMON;
-  bool source_is_resolved_tile = false;
-  if (source_desc.SampleDesc.Count > 1) {
-    bool recreate_tile = !isolated_replay_frame_accumulator_tile_;
-    if (!recreate_tile) {
-      const D3D12_RESOURCE_DESC current =
-          isolated_replay_frame_accumulator_tile_->GetDesc();
-      recreate_tile = current.Width != source_desc.Width ||
-                      current.Height != source_desc.Height ||
-                      current.Format != source_desc.Format;
-    }
-    if (recreate_tile) {
-      D3D12_RESOURCE_DESC tile_desc = source_desc;
-      tile_desc.Alignment = 0;
-      tile_desc.SampleDesc.Count = 1;
-      tile_desc.SampleDesc.Quality = 0;
-      tile_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-      Microsoft::WRL::ComPtr<ID3D12Resource> tile;
-      HRESULT create_result = device->CreateCommittedResource(
-          &ui::d3d12::util::kHeapPropertiesDefault,
-          command_processor_.GetD3D12Provider()
-              .GetHeapFlagCreateNotZeroed(),
-          &tile_desc, D3D12_RESOURCE_STATE_RESOLVE_DEST, nullptr,
-          IID_PPV_ARGS(&tile));
-      if (FAILED(create_result)) {
-        clear_active();
-        result.status =
-            system::GraphicsNativeFrameAccumulatorStatus::kAllocationFailed;
-        return result;
-      }
-      tile->SetName(L"Pinyon Shift private procedural resolved tile");
-      isolated_replay_frame_accumulator_tile_ = std::move(tile);
-      isolated_replay_frame_accumulator_tile_state_ =
-          D3D12_RESOURCE_STATE_RESOLVE_DEST;
-    }
-    source_previous_state =
-        isolated_color->SetResourceState(D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
-    command_processor_.PushTransitionBarrier(
-        source_resource, source_previous_state,
-        D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
-    command_processor_.PushTransitionBarrier(
-        isolated_replay_frame_accumulator_tile_.Get(),
-        isolated_replay_frame_accumulator_tile_state_,
-        D3D12_RESOURCE_STATE_RESOLVE_DEST);
-    command_processor_.SubmitBarriers();
-    command_processor_.GetDeferredCommandList().D3DResolveSubresource(
-        isolated_replay_frame_accumulator_tile_.Get(), 0, source_resource, 0,
-        source_desc.Format);
-    isolated_color->SetResourceState(source_previous_state);
-    command_processor_.PushTransitionBarrier(
-        source_resource, D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
-        source_previous_state);
-    command_processor_.PushTransitionBarrier(
-        isolated_replay_frame_accumulator_tile_.Get(),
-        D3D12_RESOURCE_STATE_RESOLVE_DEST,
-        D3D12_RESOURCE_STATE_COPY_SOURCE);
-    isolated_replay_frame_accumulator_tile_state_ =
-        D3D12_RESOURCE_STATE_COPY_SOURCE;
-    copy_source = isolated_replay_frame_accumulator_tile_.Get();
-    source_is_resolved_tile = true;
-  } else {
+  if (source_desc.SampleDesc.Count == 1) {
     source_previous_state =
         isolated_color->SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE);
     command_processor_.PushTransitionBarrier(
         source_resource, source_previous_state,
         D3D12_RESOURCE_STATE_COPY_SOURCE);
-  }
-  command_processor_.PushTransitionBarrier(
-      isolated_replay_frame_accumulator_target_.Get(),
-      isolated_replay_frame_accumulator_target_state_,
-      D3D12_RESOURCE_STATE_COPY_DEST);
-  command_processor_.SubmitBarriers();
-
-  D3D12_TEXTURE_COPY_LOCATION destination{};
-  destination.pResource = isolated_replay_frame_accumulator_target_.Get();
-  destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  D3D12_TEXTURE_COPY_LOCATION source{};
-  source.pResource = copy_source;
-  source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  D3D12_BOX source_box{0, 0, 0, request.logical_width,
-                       request.storage_row_count, 1};
-  command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(
-      &destination, 0, request.destination_row, 0, &source, &source_box);
-  if (!source_is_resolved_tile) {
+    command_processor_.PushTransitionBarrier(
+        isolated_replay_frame_accumulator_target_.Get(),
+        isolated_replay_frame_accumulator_target_state_,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    command_processor_.SubmitBarriers();
+    D3D12_TEXTURE_COPY_LOCATION destination{};
+    destination.pResource = isolated_replay_frame_accumulator_target_.Get();
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION source{};
+    source.pResource = source_resource;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_BOX source_box{0, 0, 0, request.logical_width,
+                         request.storage_row_count, 1};
+    command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(
+        &destination, 0, request.destination_row, 0, &source, &source_box);
     isolated_color->SetResourceState(source_previous_state);
     command_processor_.PushTransitionBarrier(
         source_resource, D3D12_RESOURCE_STATE_COPY_SOURCE,
         source_previous_state);
+    isolated_replay_frame_accumulator_target_state_ =
+        D3D12_RESOURCE_STATE_COPY_DEST;
+  } else {
+    if (!isolated_replay_frame_accumulator_2xmsaa_root_signature_) {
+      D3D12_ROOT_PARAMETER root_parameters[3]{};
+      root_parameters[0].ParameterType =
+          D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+      root_parameters[0].Constants.ShaderRegister = 0;
+      root_parameters[0].Constants.Num32BitValues = 4;
+      root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+      D3D12_DESCRIPTOR_RANGE source_range{};
+      source_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+      source_range.NumDescriptors = 1;
+      source_range.BaseShaderRegister = 0;
+      root_parameters[1].ParameterType =
+          D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+      root_parameters[1].DescriptorTable.NumDescriptorRanges = 1;
+      root_parameters[1].DescriptorTable.pDescriptorRanges = &source_range;
+      root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+      D3D12_DESCRIPTOR_RANGE output_range{};
+      output_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+      output_range.NumDescriptors = 1;
+      output_range.BaseShaderRegister = 0;
+      root_parameters[2].ParameterType =
+          D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+      root_parameters[2].DescriptorTable.NumDescriptorRanges = 1;
+      root_parameters[2].DescriptorTable.pDescriptorRanges = &output_range;
+      root_parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+      D3D12_ROOT_SIGNATURE_DESC root_signature_desc{};
+      root_signature_desc.NumParameters = uint32_t(rex::countof(root_parameters));
+      root_signature_desc.pParameters = root_parameters;
+      isolated_replay_frame_accumulator_2xmsaa_root_signature_ =
+          ui::d3d12::util::CreateRootSignature(
+              command_processor_.GetD3D12Provider(), root_signature_desc);
+      if (!isolated_replay_frame_accumulator_2xmsaa_root_signature_) {
+        clear_active();
+        result.status =
+            system::GraphicsNativeFrameAccumulatorStatus::kAllocationFailed;
+        return result;
+      }
+    }
+    if (!isolated_replay_frame_accumulator_2xmsaa_pipeline_) {
+      isolated_replay_frame_accumulator_2xmsaa_pipeline_ =
+          ui::d3d12::util::CreateComputePipeline(
+              device, shaders::procedural_frame_accumulator_2xmsaa_cs,
+              sizeof(shaders::procedural_frame_accumulator_2xmsaa_cs),
+              isolated_replay_frame_accumulator_2xmsaa_root_signature_);
+      if (!isolated_replay_frame_accumulator_2xmsaa_pipeline_) {
+        clear_active();
+        result.status =
+            system::GraphicsNativeFrameAccumulatorStatus::kAllocationFailed;
+        return result;
+      }
+    }
+    ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[2];
+    if (!command_processor_.RequestOneUseSingleViewDescriptors(2,
+                                                                descriptors)) {
+      clear_active();
+      result.status =
+          system::GraphicsNativeFrameAccumulatorStatus::kAllocationFailed;
+      return result;
+    }
+    device->CopyDescriptorsSimple(1, descriptors[0].first,
+                                  isolated_color->descriptor_srv().GetHandle(),
+                                  D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC output_view{};
+    output_view.Format = source_desc.Format;
+    output_view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    device->CreateUnorderedAccessView(
+        isolated_replay_frame_accumulator_target_.Get(), nullptr,
+        &output_view, descriptors[1].first);
+    source_previous_state = isolated_color->SetResourceState(
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    command_processor_.PushTransitionBarrier(
+        source_resource, source_previous_state,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (isolated_replay_frame_accumulator_target_state_ ==
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+      command_processor_.PushUAVBarrier(
+          isolated_replay_frame_accumulator_target_.Get());
+    }
+    command_processor_.PushTransitionBarrier(
+        isolated_replay_frame_accumulator_target_.Get(),
+        isolated_replay_frame_accumulator_target_state_,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    command_processor_.SubmitBarriers();
+    DeferredCommandList& command_list =
+        command_processor_.GetDeferredCommandList();
+    command_list.D3DSetComputeRootSignature(
+        isolated_replay_frame_accumulator_2xmsaa_root_signature_);
+    const uint32_t constants[4] = {
+        uint32_t(source_desc.Width), source_desc.Height,
+        request.destination_row, request.storage_row_count};
+    command_list.D3DSetComputeRoot32BitConstants(
+        0, uint32_t(rex::countof(constants)), constants, 0);
+    command_list.D3DSetComputeRootDescriptorTable(1, descriptors[0].second);
+    command_list.D3DSetComputeRootDescriptorTable(2, descriptors[1].second);
+    command_processor_.SetExternalPipeline(
+        isolated_replay_frame_accumulator_2xmsaa_pipeline_);
+    command_list.D3DDispatch((request.logical_width + 7) / 8,
+                             (request.storage_row_count + 7) / 8, 1);
+    isolated_color->SetResourceState(source_previous_state);
+    command_processor_.PushTransitionBarrier(
+        source_resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        source_previous_state);
+    isolated_replay_frame_accumulator_target_state_ =
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
   }
 
   isolated_replay_frame_accumulator_appended_row_end_ =

@@ -752,10 +752,10 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       isolated_replay_frame_accumulator_target_;
   D3D12_RESOURCE_STATES isolated_replay_frame_accumulator_target_state_ =
       D3D12_RESOURCE_STATE_COPY_DEST;
-  Microsoft::WRL::ComPtr<ID3D12Resource>
-      isolated_replay_frame_accumulator_tile_;
-  D3D12_RESOURCE_STATES isolated_replay_frame_accumulator_tile_state_ =
-      D3D12_RESOURCE_STATE_RESOLVE_DEST;
+  ID3D12RootSignature*
+      isolated_replay_frame_accumulator_2xmsaa_root_signature_ = nullptr;
+  ID3D12PipelineState*
+      isolated_replay_frame_accumulator_2xmsaa_pipeline_ = nullptr;
   uint64_t isolated_replay_frame_accumulator_frame_sequence_ = 0;
   uint64_t isolated_replay_frame_accumulator_committed_frame_sequence_ = 0;
   uint32_t isolated_replay_frame_accumulator_width_ = 0;
