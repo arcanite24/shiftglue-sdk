@@ -2662,6 +2662,15 @@ D3D12RenderTargetCache::ApplyIsolatedReplayFrameAccumulator(
       isolated_replay_color_target_.get());
   ID3D12Resource* source_resource = isolated_color->resource();
   const D3D12_RESOURCE_DESC source_desc = source_resource->GetDesc();
+  result.source_resource_width = uint32_t(source_desc.Width);
+  result.source_resource_height = source_desc.Height;
+  result.source_sample_count = source_desc.SampleDesc.Count;
+  result.source_sample_quality = source_desc.SampleDesc.Quality;
+  result.source_guest_msaa_samples =
+      uint32_t(1) << uint32_t(isolated_color->key().msaa_samples);
+  result.draw_resolution_scale_x = draw_resolution_scale_x();
+  result.draw_resolution_scale_y = draw_resolution_scale_y();
+  result.native_2x_msaa = msaa_2x_supported();
   const bool source_topology_supported =
       (source_desc.SampleDesc.Count == 1 &&
        source_desc.Width >= request.logical_width) ||

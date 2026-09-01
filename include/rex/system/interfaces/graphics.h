@@ -378,6 +378,14 @@ struct GraphicsNativeFrameAccumulatorResult {
   uint32_t logical_width = 0;
   uint32_t logical_height = 0;
   uint32_t appended_row_end = 0;
+  uint32_t source_resource_width = 0;
+  uint32_t source_resource_height = 0;
+  uint32_t source_sample_count = 0;
+  uint32_t source_sample_quality = 0;
+  uint32_t source_guest_msaa_samples = 0;
+  uint32_t draw_resolution_scale_x = 0;
+  uint32_t draw_resolution_scale_y = 0;
+  bool native_2x_msaa = false;
   bool committed = false;
 };
 
