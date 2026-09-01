@@ -232,6 +232,17 @@ struct BuilderContext {
   void emit_function_call(uint32_t address);
 
   /**
+   * @brief Emit C++ code for a guest tail branch to a function.
+   * @param address Target function address
+   * @param indent Whitespace prepended to the emitted statement
+   *
+   * Direct targets use REX_TAIL_CALL so supported host compilers are required
+   * to reuse the current stack frame. Special helpers retain their existing
+   * semantics and then return from the caller.
+   */
+  void emit_tail_function_call(uint32_t address, std::string_view indent = "\t");
+
+  /**
    * @brief Emit C++ code for a conditional branch.
    * @param not_ If true, invert the condition
    * @param cond Condition field name ("eq", "lt", "gt")

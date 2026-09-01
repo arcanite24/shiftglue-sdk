@@ -1956,6 +1956,7 @@ const DxbcShaderTranslator::SystemConstantRdef DxbcShaderTranslator::system_cons
     {"xe_texture_swizzled_signs", ShaderRdefTypeIndex::kUint4Array2, sizeof(uint32_t) * 4 * 2},
 
     {"xe_textures_resolution_scaled", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
+    {"xe_textures_normalized_fixed_point", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
     {"xe_sample_count_log2", ShaderRdefTypeIndex::kUint2, sizeof(uint32_t) * 2},
     {"xe_alpha_test_reference", ShaderRdefTypeIndex::kFloat, sizeof(float)},
 

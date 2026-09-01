@@ -31,6 +31,7 @@
 #include <rex/platform.h>
 #include <rex/types.h>
 #include <rex/ui/flags.h>
+#include <rex/ui/presentation_pacer.h>
 #include <rex/ui/surface.h>
 #include <rex/ui/ui_drawer.h>
 
@@ -951,6 +952,7 @@ class Presenter {
   // These two images can be accessed by painting in parallel, in an unordered
   // way, with guest output refreshing.
   std::atomic<uint32_t> guest_output_mailbox_acquired_and_ready_{0};
+  std::atomic<uint64_t> guest_output_refresh_sequence_{0};
   // The "writable" image is different than both "acquired" and "ready" and is
   // accessible only by the guest output refreshing - it's the image that the
   // refresher may write to.
@@ -971,6 +973,13 @@ class Presenter {
   // with paint_mode_mutex_ held in this case, and guest output consumption
   // happens as part of painting.
   std::mutex guest_output_mailbox_consumer_mutex_;
+
+  // Presentation can originate on the UI or guest-output thread. Serialize
+  // host pacing state without coupling it to guest vblank or mailbox timing.
+  std::mutex presentation_pacing_mutex_;
+  PresentationDeadlineScheduler presentation_deadline_scheduler_;
+  uint64_t last_presented_refresh_sequence_ = UINT64_MAX;
+  int64_t last_present_time_ns_ = 0;
 
   std::array<GuestOutputProperties, kGuestOutputMailboxSize> guest_output_properties_;
   // Accessible only by refreshing, whether the last refresh contained an image

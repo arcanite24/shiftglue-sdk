@@ -25,6 +25,7 @@
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/xenos.h>
+#include <rex/system/interfaces/graphics.h>
 #include <rex/ui/d3d12/d3d12_api.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 
@@ -95,6 +96,12 @@ class D3D12TextureCache final : public TextureCache {
   // (notifying the command processor about that), so this must be called before
   // binding the actual drawing pipeline.
   void RequestTextures(uint32_t used_texture_mask) override;
+
+  // Exports borrowed GPU-ready resources after RequestTextures has completed.
+  // Callers retaining a resource must use the supplied lifetime callbacks.
+  void ObserveNativeTextures(
+      uint32_t used_texture_mask,
+      system::GraphicsNativeTextureSetObservation& observation) const;
 
   // Returns whether texture SRV keys stored externally are still valid for the
   // current bindings and host shader binding layout. Both keys and

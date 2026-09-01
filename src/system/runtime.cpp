@@ -336,6 +336,27 @@ bool Runtime::SetupVfs() {
     }
   }
 
+  // Mount cache_root as a writable cache:\ device when provided. Some titles
+  // use this for required transient streams (for example, race replays), and
+  // don't tolerate a device-not-found result even though the data itself is
+  // disposable.
+  if (!cache_root_.empty()) {
+    auto abs_cache_root = std::filesystem::absolute(cache_root_);
+    auto cache_mount = "\\Device\\Harddisk0\\Cache";
+    auto cache_device =
+        std::make_unique<rex::filesystem::HostPathDevice>(cache_mount, abs_cache_root, false);
+    if (!cache_device->Initialize()) {
+      REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize cache host path device");
+      return false;
+    }
+    if (!file_system_->RegisterDevice(std::move(cache_device))) {
+      REXSYS_ERROR("Runtime::SetupVfs: Failed to register cache host path device");
+      return false;
+    }
+    file_system_->RegisterSymbolicLink("cache:", cache_mount);
+    REXSYS_INFO("  Mounted {} at cache:", abs_cache_root.string());
+  }
+
   // Setup NullDevice for raw HDD partition accesses
   // Cache/STFC code baked into games tries reading/writing to these
   // Using a NullDevice returns success to all IO requests, allowing games
@@ -349,10 +370,6 @@ bool Runtime::SetupVfs() {
     file_system_->RegisterDevice(std::move(null_device));
     REXSYS_DEBUG("  Registered NullDevice for \\Device\\Harddisk0\\{{Partition0,Cache0,Cache1}}");
   }
-
-  // NOTE: Do NOT register a device for cache: paths
-  // Games handle "device not found" gracefully but don't handle actual device
-  // errors (like NAME_COLLISION) well. Let cache: fail cleanly.
 
   return true;
 }

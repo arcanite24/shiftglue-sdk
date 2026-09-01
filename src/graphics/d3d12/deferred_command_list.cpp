@@ -60,6 +60,14 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
             args.values_uint, args.num_rects,
             args.num_rects ? reinterpret_cast<const D3D12_RECT*>(&args + 1) : nullptr);
       } break;
+      case Command::kD3DClearUnorderedAccessViewFloat: {
+        auto& args = *reinterpret_cast<const ClearUnorderedAccessViewHeader*>(stream);
+        command_list->ClearUnorderedAccessViewFloat(
+            args.view_gpu_handle_in_current_heap, args.view_cpu_handle,
+            args.resource, args.values_float, args.num_rects,
+            args.num_rects ? reinterpret_cast<const D3D12_RECT*>(&args + 1)
+                           : nullptr);
+      } break;
       case Command::kD3DCopyBufferRegion: {
         auto& args = *reinterpret_cast<const D3DCopyBufferRegionArguments*>(stream);
         command_list->CopyBufferRegion(args.dst_buffer, args.dst_offset, args.src_buffer,
@@ -77,6 +85,13 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
         auto& args = *reinterpret_cast<const D3DCopyTextureRegionArguments*>(stream);
         command_list->CopyTextureRegion(&args.dst, args.dst_x, args.dst_y, args.dst_z, &args.src,
                                         args.has_src_box ? &args.src_box : nullptr);
+      } break;
+      case Command::kD3DResolveSubresource: {
+        auto& args =
+            *reinterpret_cast<const D3DResolveSubresourceArguments*>(stream);
+        command_list->ResolveSubresource(
+            args.dst_resource, args.dst_subresource, args.src_resource,
+            args.src_subresource, args.format);
       } break;
       case Command::kD3DDispatch: {
         if (current_pipeline_state != nullptr) {

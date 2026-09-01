@@ -84,10 +84,10 @@ target_link_libraries(rexruntime
         spdlog::spdlog
         tomlplusplus
         SDL3::SDL3
+        xxHash::xxhash
     PRIVATE
         aes128
         mspack
-        xxHash::xxhash
 )
 
 if(REXGLUE_ENABLE_TRACY)
@@ -106,7 +106,10 @@ if(REXGLUE_ENABLE_PERF_COUNTERS)
 endif()
 
 if(WIN32)
-    target_link_libraries(rexruntime PRIVATE ws2_32)
+    # FFmpeg and SDL still reference the pre-UCRT spellings of a few CRT
+    # helpers when built with clang's GNU-style driver. oldnames provides the
+    # canonical aliases and keeps clean Windows links reproducible.
+    target_link_libraries(rexruntime PRIVATE ws2_32 oldnames)
     target_link_libraries(rexruntime PUBLIC dxgi dxguid)
     target_compile_definitions(rexruntime PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()

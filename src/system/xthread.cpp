@@ -10,7 +10,9 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 
 #include <fmt/format.h>
@@ -45,6 +47,21 @@ REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
 
 namespace rex::system {
 
+bool IsReentryTraceEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("PINYON_SHIFT_REENTRY_TRACE");
+    return value && std::strcmp(value, "1") == 0;
+  }();
+  if (enabled) {
+    static const bool activation_logged = [] {
+      REXSYS_INFO("M4_TRACE reentry.tracing enabled=1");
+      return true;
+    }();
+    (void)activation_logged;
+  }
+  return enabled;
+}
+
 const uint32_t XAPC::kSize;
 const uint32_t XAPC::kDummyKernelRoutine;
 const uint32_t XAPC::kDummyRundownRoutine;
@@ -52,6 +69,105 @@ const uint32_t XAPC::kDummyRundownRoutine;
 using namespace rex::literals;
 
 uint32_t next_xthread_id_ = 0;
+
+namespace {
+
+std::atomic<uint64_t> g_m4_reentry_dispatch_sequence{0};
+
+const char* DiscoveryEnvironment(const char* name, const char* fallback) {
+  const char* value = std::getenv(name);
+  return value && value[0] ? value : fallback;
+}
+
+bool IsSpeculativeDiscoveryEntry(uint32_t address) {
+  const char* cursor = std::getenv("PINYON_SHIFT_DISCOVERY_CANDIDATES");
+  if (!cursor) {
+    return false;
+  }
+  while (*cursor) {
+    char* end = nullptr;
+    const unsigned long value = std::strtoul(cursor, &end, 16);
+    if (end != cursor && static_cast<uint32_t>(value) == address) {
+      return true;
+    }
+    if (!end || !*end) {
+      break;
+    }
+    cursor = end + 1;
+  }
+  return false;
+}
+
+struct ReentryStackFrame {
+  uint32_t stack_pointer;
+  uint32_t caller_stack_pointer;
+  uint32_t saved_lr;
+  bool registered;
+};
+
+void LogMissingReentryStackContinuations(memory::Memory* memory,
+                                         runtime::FunctionDispatcher* dispatcher,
+                                         PPCContext* context, const X_KTHREAD* kthread) {
+  constexpr size_t kMaxFrames = 128;
+  std::array<ReentryStackFrame, kMaxFrames> frames{};
+  size_t frame_count = 0;
+  bool has_unregistered_continuation = false;
+  const uint32_t stack_limit = kthread->stack_limit;
+  const uint32_t stack_base = kthread->stack_base;
+  uint32_t stack_pointer = context->r1.u32;
+  const char* stop_reason = "frame-limit";
+
+  while (frame_count < frames.size()) {
+    if ((stack_pointer & 0xF) || stack_pointer < stack_limit ||
+        stack_pointer > stack_base - sizeof(uint32_t)) {
+      stop_reason = "invalid-stack-pointer";
+      break;
+    }
+
+    const uint32_t caller_stack_pointer = memory::load_and_swap<uint32_t>(
+        memory->TranslateVirtual(stack_pointer));
+    if ((caller_stack_pointer & 0xF) || caller_stack_pointer <= stack_pointer ||
+        caller_stack_pointer > stack_base ||
+        caller_stack_pointer - 8 < stack_limit) {
+      stop_reason = "end-of-back-chain";
+      break;
+    }
+
+    const uint32_t saved_lr = memory::load_and_swap<uint32_t>(
+        memory->TranslateVirtual(caller_stack_pointer - 8));
+    const bool registered = dispatcher->GetFunction(saved_lr) != nullptr;
+    frames[frame_count++] = {
+        stack_pointer,
+        caller_stack_pointer,
+        saved_lr,
+        registered,
+    };
+    has_unregistered_continuation |= !registered;
+    stack_pointer = caller_stack_pointer;
+  }
+
+  if (!has_unregistered_continuation) {
+    return;
+  }
+
+  REXSYS_INFO(
+      "M5_TRACE stack.reentry.snapshot.begin entry={:08X} sp={:08X} limit={:08X} "
+      "base={:08X} frames={} stop={}",
+      static_cast<uint32_t>(context->lr), context->r1.u32, stack_limit, stack_base,
+      frame_count, stop_reason);
+  for (size_t depth = 0; depth < frame_count; ++depth) {
+    const auto& frame = frames[depth];
+    REXSYS_INFO(
+        "M5_TRACE stack.reentry.snapshot.frame depth={} sp={:08X} caller_sp={:08X} "
+        "saved_lr={:08X} registered={}",
+        depth, frame.stack_pointer, frame.caller_stack_pointer, frame.saved_lr,
+        frame.registered ? 1 : 0);
+  }
+  REXSYS_INFO("M5_TRACE stack.reentry.snapshot.end entry={:08X}",
+              static_cast<uint32_t>(context->lr));
+}
+
+}  // namespace
 
 XThread::XThread(KernelState* kernel_state)
     : XObject(kernel_state, kObjectType), guest_thread_(true) {}
@@ -572,6 +688,9 @@ void XThread::Execute() {
   REXSYS_NOISY_DEBUG("Execute thid {} (handle={:08X}, '{}', native={:08X})", thread_id_, handle(),
                      thread_name_, thread_->system_id());
 
+  // Emit the opt-in activation marker even before the first restored continuation.
+  (void)IsReentryTraceEnabled();
+
   // Let the kernel know we are starting.
   kernel_state_->OnThreadExecute(this);
 
@@ -609,11 +728,6 @@ void XThread::Execute() {
 
   auto* dispatcher = runtime->function_dispatcher();
   auto* memory = runtime->memory();
-  PPCFunc* func = dispatcher->GetFunction(address);
-  if (!func) {
-    REXSYS_ERROR("XThread::Execute - No function registered at {:08X}", address);
-    return;
-  }
 
   auto* ctx = thread_state_->context();
   uint8_t* base = memory->virtual_membase();
@@ -643,15 +757,70 @@ void XThread::Execute() {
   // when another fiber switches back to the main execution context.
   main_fiber_ = rex::thread::Fiber::ConvertCurrentThread();
 
-  // Execute the function
-  REXSYS_NOISY_DEBUG("XThread::Execute - Calling function at {:08X}", address);
-  func(*ctx, base);
+  // A guest context restore changes the full PPC register set and LR. It must
+  // not return through the static C++ callers compiled for the abandoned
+  // context. Reenter() jumps back here, where the restored LR is resolved and
+  // called through the same ordinary AOT function dispatcher as thread entry.
+  volatile uint32_t next_address = address;
+  volatile bool continue_reentry = false;
+  if (setjmp(reentry_jmp_buf_) != 0) {
+    continue_reentry = true;
+    next_address = reentry_address_;
+    if (IsReentryTraceEnabled()) {
+      LogMissingReentryStackContinuations(memory, dispatcher, ctx, guest_object<X_KTHREAD>());
+    }
+  }
 
-  exit_code = static_cast<int>(ctx->r3.u32);
+  while (next_address != 0) {
+    const uint32_t dispatch_address = next_address;
+    next_address = 0;
+
+    PPCFunc* func = dispatcher->GetFunction(dispatch_address);
+    if (!func) {
+      REXSYS_ERROR("XThread::Execute - No function registered at {:08X}", dispatch_address);
+      return;
+    }
+
+    // Emit before entering AOT code: a later context restore may abandon this
+    // host call chain, in which case the post-call event is never reached.
+    if (continue_reentry && IsReentryTraceEnabled()) {
+      const uint64_t sequence =
+          g_m4_reentry_dispatch_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+      REXSYS_INFO(
+          "M4_TRACE reentry.dispatch sequence={} entry={:08X} thread={} restored_lr={:08X} "
+          "classification={} build={} candidate_report={}",
+          sequence, dispatch_address, thread_id_, static_cast<uint32_t>(ctx->lr),
+          IsSpeculativeDiscoveryEntry(dispatch_address) ? "speculative" : "accepted",
+          DiscoveryEnvironment("PINYON_SHIFT_DISCOVERY_BUILD_ID", "unidentified"),
+          DiscoveryEnvironment("PINYON_SHIFT_CANDIDATE_REPORT_SHA256", "none"));
+    }
+
+    REXSYS_NOISY_DEBUG("XThread::Execute - Calling function at {:08X}", dispatch_address);
+      ctx->dispatch_address = dispatch_address;
+      func(*ctx, base);
+      ctx->dispatch_address = 0;
+    exit_code = static_cast<int>(ctx->r3.u32);
+
+    if (continue_reentry) {
+      if (IsReentryTraceEnabled()) {
+        REXSYS_INFO("M3_TRACE stack.reentry.return entry={:08X} lr={:08X}", dispatch_address,
+                    static_cast<uint32_t>(ctx->lr));
+      }
+      next_address = static_cast<uint32_t>(ctx->lr);
+    }
+  }
 
   // If we got here it means the execute completed without an exit being called.
   // Treat the return code as an implicit exit code (if desired).
   Exit(!want_exit_code ? 0 : exit_code);
+}
+
+void XThread::Reenter(uint32_t address) {
+  if (IsReentryTraceEnabled()) {
+    REXSYS_INFO("M3_TRACE stack.reentry.transfer address={:08X}", address);
+  }
+  reentry_address_ = address;
+  std::longjmp(reentry_jmp_buf_, 1);
 }
 
 void XThread::EnterCriticalRegion() {

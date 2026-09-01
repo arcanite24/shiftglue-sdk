@@ -34,5 +34,7 @@
       ctx.last_indirect_target = rex_indirect_target_;                                     \
       rex_indirect_func_ = rex::runtime::ResolveIndirectFunction(rex_indirect_target_);    \
     }                                                                                      \
+    ctx.dispatch_address = rex_indirect_target_;                                           \
     rex_indirect_func_(ctx, base);                                                         \
+    ctx.dispatch_address = 0;                                                              \
   } while (0)

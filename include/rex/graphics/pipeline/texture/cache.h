@@ -121,6 +121,13 @@ class TextureCache {
     const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
     return binding ? binding->swizzled_signs : kSwizzledSignsUnsigned;
   }
+  bool IsActiveTextureNormalizedFixedPoint(uint32_t fetch_constant_index) const {
+    const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+    if (!binding || !binding->normalized_fixed_point) {
+      return false;
+    }
+    return true;
+  }
   bool IsActiveTextureResolutionScaled(uint32_t fetch_constant_index) const {
     const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
     if (!binding) {
@@ -457,6 +464,9 @@ class TextureCache {
     // Packed TextureSign values, 2 bit per each component, with guest-side
     // destination swizzle from the fetch constant applied to them.
     uint8_t swizzled_signs;
+    // Whether the fetch requests normalized fixed-point output. Float texture
+    // formats are excluded even though their num_format bit is normally zero.
+    bool normalized_fixed_point;
     // Unsigned version of the texture (or signed if they have the same data).
     Texture* texture;
     // Signed version of the texture if the data in the signed version is

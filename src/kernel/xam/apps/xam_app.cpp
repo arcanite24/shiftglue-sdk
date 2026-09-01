@@ -27,6 +27,8 @@ XamApp::XamApp(KernelState* kernel_state) : App(kernel_state, 0xFE) {}
 
 X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                       uint32_t buffer_length) {
+  REXKRNL_INFO("M2_TRACE xam.dispatch message={:08X} buffer={:08X} length={}", message,
+               buffer_ptr, buffer_length);
   // NOTE: buffer_length may be zero or valid.
   auto buffer = memory_->TranslateVirtual(buffer_ptr);
   switch (message) {
@@ -97,6 +99,22 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       auto adr = *unk;
       REXKRNL_DEBUG("XamApp(0x00022005)(%.8X, %.8X)", (uint32_t)data->unk_00,
                     (uint32_t)data->unk_04);
+      return X_E_SUCCESS;
+    }
+    case 0x0002B003: {
+      // Used by Forza Horizon during the controller-card transition. The title
+      // passes a three-qword input payload while reporting a zero buffer length.
+      struct message_data {
+        rex::be<uint64_t> unk_00;
+        rex::be<uint64_t> unk_08;
+        rex::be<uint64_t> unk_10;
+      }* data = reinterpret_cast<message_data*>(buffer);
+      if (!data) {
+        return X_E_INVALIDARG;
+      }
+      REXKRNL_DEBUG("XamApp(0x0002B003)({:016X}, {:016X}, {:016X})",
+                    (uint64_t)data->unk_00, (uint64_t)data->unk_08,
+                    (uint64_t)data->unk_10);
       return X_E_SUCCESS;
     }
   }

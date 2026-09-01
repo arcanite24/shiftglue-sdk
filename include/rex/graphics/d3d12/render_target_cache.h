@@ -30,6 +30,7 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
 #include <rex/memory.h>
+#include <rex/system/interfaces/graphics.h>
 #include <rex/ui/d3d12/d3d12_cpu_descriptor_pool.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
@@ -93,6 +94,73 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   bool depth_float24_round() const { return depth_float24_round_; }
   bool depth_float24_convert_in_pixel_shader() const {
     return depth_float24_convert_in_pixel_shader_;
+  }
+
+  // Seeds and binds private clones of the current depth and first color target.
+  // EndIsolatedReplayTarget restores the guest bindings without changing the
+  // guest attachments or ownership.
+  bool BeginIsolatedReplayTarget(uint32_t& width_out, uint32_t& height_out,
+                                 uint32_t logical_width,
+                                 uint32_t logical_height,
+                                 bool stencil_seed_probe_requested,
+                                 bool depth_only_target = false);
+  bool ResumeIsolatedReplayTarget(uint32_t& width_out, uint32_t& height_out,
+                                  uint32_t logical_width,
+                                  uint32_t logical_height,
+                                  bool depth_only_target = false);
+  system::GraphicsIsolatedDrawReadbackStatus QueueIsolatedReplayReadback(
+      system::GraphicsIsolatedDrawReadbackCompletion completion,
+      uint32_t* failure_detail_out);
+  system::GraphicsIsolatedDrawReadbackStatus QueueGuestColorReadback(
+      system::GraphicsIsolatedDrawReadbackCompletion completion,
+      uint32_t* failure_detail_out);
+  system::GraphicsIsolatedDrawReadbackStatus QueueGuestConsumerColorReadback(
+      bool before_draw,
+      system::GraphicsIsolatedDrawReadbackCompletion completion,
+      uint32_t* failure_detail_out);
+  system::GraphicsIsolatedDrawReadbackStatus QueueGuestConsumerDepthReadback(
+      bool before_draw,
+      system::GraphicsIsolatedDrawReadbackCompletion completion,
+      uint32_t* failure_detail_out);
+  system::GraphicsIsolatedDrawReadbackStatus QueueIsolatedReplayDepthReadback(
+      system::GraphicsIsolatedDrawReadbackCompletion completion,
+      uint32_t* failure_detail_out);
+  system::GraphicsIsolatedDrawReadbackStatus
+  QueueIsolatedReplaySeedDepthReadback(
+      system::GraphicsIsolatedDrawReadbackCompletion completion,
+      uint32_t* failure_detail_out);
+  system::GraphicsIsolatedDrawReadbackStatus QueueGuestSeedDepthReadback(
+      system::GraphicsIsolatedDrawReadbackCompletion completion,
+      uint32_t* failure_detail_out);
+  system::GraphicsIsolatedDrawReadbackStatus QueueGuestDepthReadback(
+      system::GraphicsIsolatedDrawReadbackCompletion completion,
+      uint32_t* failure_detail_out);
+  void EndIsolatedReplayTarget(
+      uint64_t frame_sequence,
+      bool defer_preview_publication_until_swap = false,
+      bool depth_only_target = false);
+  void CommitDeferredIsolatedReplayPreview(uint64_t frame_sequence);
+  void CancelDeferredIsolatedReplayPreview(uint64_t frame_sequence);
+  system::GraphicsIsolatedDrawPublicationResult PublishIsolatedReplayTarget(
+      bool depth_only_target = false);
+
+  struct IsolatedReplayPreviewSource {
+    ID3D12Resource* resource = nullptr;
+    D3D12_RESOURCE_STATES previous_state = D3D12_RESOURCE_STATE_COMMON;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t logical_width = 0;
+    uint32_t logical_height = 0;
+    uint64_t frame_sequence = 0;
+    bool resolved = false;
+  };
+  bool BeginIsolatedReplayPreview(uint64_t required_frame_sequence,
+                                  IsolatedReplayPreviewSource& source_out);
+  void EndIsolatedReplayPreview(
+      const IsolatedReplayPreviewSource& source);
+  uint64_t GetIsolatedReplayPreviewFrameSequence() const {
+    return isolated_replay_preview_frame_sequence_;
   }
 
   DXGI_FORMAT GetColorResourceDXGIFormat(xenos::ColorRenderTargetFormat format) const;
@@ -665,6 +733,60 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
 
   std::shared_ptr<ui::d3d12::D3D12CpuDescriptorPool> descriptor_pool_color_;
   std::shared_ptr<ui::d3d12::D3D12CpuDescriptorPool> descriptor_pool_depth_;
+  std::unique_ptr<RenderTarget> isolated_replay_color_target_;
+  std::unique_ptr<RenderTarget> isolated_replay_depth_target_;
+  std::unique_ptr<RenderTarget> isolated_replay_depth_only_target_;
+  RenderTarget* isolated_replay_active_depth_target_ = nullptr;
+  Microsoft::WRL::ComPtr<ID3D12Resource>
+      isolated_replay_preview_resolved_target_;
+  D3D12_RESOURCE_STATES isolated_replay_preview_resolved_target_state_ =
+      D3D12_RESOURCE_STATE_RESOLVE_DEST;
+  uint64_t isolated_replay_preview_frame_sequence_ = 0;
+  uint64_t isolated_replay_deferred_preview_frame_sequence_ = 0;
+  uint32_t isolated_replay_active_preview_width_ = 0;
+  uint32_t isolated_replay_active_preview_height_ = 0;
+  uint32_t isolated_replay_preview_width_ = 0;
+  uint32_t isolated_replay_preview_height_ = 0;
+  uint32_t isolated_replay_deferred_preview_width_ = 0;
+  uint32_t isolated_replay_deferred_preview_height_ = 0;
+  struct IsolatedReplayReadback {
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    Microsoft::WRL::ComPtr<ID3D12Resource> resolved_target;
+    uint8_t* mapping = nullptr;
+    uint64_t submission = 0;
+    uint64_t data_size = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t row_pitch = 0;
+    uint32_t format = 0;
+    uint32_t sample_count = 1;
+    uint32_t plane_count = 0;
+    uint64_t plane_offsets[system::GraphicsIsolatedDrawReadback::kMaxPlanes] =
+        {};
+    uint32_t
+        plane_row_pitches[system::GraphicsIsolatedDrawReadback::kMaxPlanes] =
+            {};
+    uint32_t
+        plane_row_sizes[system::GraphicsIsolatedDrawReadback::kMaxPlanes] = {};
+    uint32_t
+        plane_row_counts[system::GraphicsIsolatedDrawReadback::kMaxPlanes] = {};
+    system::GraphicsIsolatedDrawReadbackCompletion completion = nullptr;
+  } isolated_replay_readback_;
+  IsolatedReplayReadback guest_reference_readback_;
+  IsolatedReplayReadback guest_consumer_before_readback_;
+  IsolatedReplayReadback guest_consumer_after_readback_;
+  IsolatedReplayReadback guest_consumer_before_depth_readback_;
+  IsolatedReplayReadback guest_consumer_after_depth_readback_;
+  IsolatedReplayReadback isolated_replay_depth_readback_;
+  IsolatedReplayReadback guest_depth_reference_readback_;
+  IsolatedReplayReadback isolated_replay_seed_depth_readback_;
+  IsolatedReplayReadback guest_seed_depth_readback_;
+  system::GraphicsIsolatedDrawReadbackStatus QueueRenderTargetReadback(
+      D3D12RenderTarget* target, IsolatedReplayReadback& pending_readback,
+      system::GraphicsIsolatedDrawReadbackCompletion completion,
+      uint32_t* failure_detail_out);
+  ID3D12RootSignature* isolated_depth_readback_root_signature_ = nullptr;
+  ID3D12PipelineState* isolated_depth_readback_pipeline_ = nullptr;
   std::shared_ptr<ui::d3d12::D3D12CpuDescriptorPool> descriptor_pool_srv_;
   ui::d3d12::D3D12CpuDescriptorPool::Descriptor null_rtv_descriptor_ss_;
   ui::d3d12::D3D12CpuDescriptorPool::Descriptor null_rtv_descriptor_ms_;

@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -24,6 +25,7 @@
 #include <rex/graphics/flags.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
+#include <rex/perf/counter.h>
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
@@ -319,6 +321,17 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
 void GraphicsSystem::MarkVblank() {
   // TODO: Enable profiling once ported
   // SCOPE_profile_cpu_f("gpu");
+
+  using VblankClock = std::chrono::steady_clock;
+  static std::atomic<int64_t> last_vblank_ns{0};
+  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             VblankClock::now().time_since_epoch())
+                             .count();
+  const int64_t previous_ns = last_vblank_ns.exchange(now_ns, std::memory_order_relaxed);
+  PROFILE_GUEST_VBLANK();
+  if (previous_ns) {
+    PROFILE_GUEST_VBLANK_DELTA_NS(now_ns - previous_ns);
+  }
 
   // Increment vblank counter (so the game sees us making progress).
   if (command_processor_) {

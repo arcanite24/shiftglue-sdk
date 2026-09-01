@@ -432,6 +432,15 @@ bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::strin
       testJson["inputs"]["memory"] = SerializeMemory(spec.mem_inputs);
       testJson["outputs"]["registers"] = SerializeRegisters(spec.outputs);
       testJson["outputs"]["memory"] = SerializeMemory(spec.mem_outputs);
+      if (spec.name == "test_stvlx_differential") {
+        testJson["partial_store_differential"] = true;
+        testJson["partial_store_kind"] = "left";
+      } else if (spec.name == "test_stvrx_differential") {
+        testJson["partial_store_differential"] = true;
+        testJson["partial_store_kind"] = "right";
+      } else {
+        testJson["partial_store_differential"] = false;
+      }
       templateData["tests"].push_back(testJson);
       ++totalTests;
     }

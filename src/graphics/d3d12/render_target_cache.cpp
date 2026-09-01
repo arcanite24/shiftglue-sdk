@@ -56,6 +56,7 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/host_depth_store_1xmsaa_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/host_depth_store_2xmsaa_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/host_depth_store_4xmsaa_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/isolated_depth_readback_msaa_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/passthrough_position_xy_vs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_clear_32bpp_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_clear_32bpp_scaled_cs.h"
@@ -1020,6 +1021,35 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
   }
   ui::d3d12::util::ReleaseAndNull(host_depth_store_root_signature_);
 
+  ui::d3d12::util::ReleaseAndNull(isolated_depth_readback_pipeline_);
+  ui::d3d12::util::ReleaseAndNull(isolated_depth_readback_root_signature_);
+
+  const auto release_isolated_readback = [](IsolatedReplayReadback& readback) {
+    if (readback.buffer && readback.mapping) {
+      D3D12_RANGE write_range = {};
+      readback.buffer->Unmap(0, &write_range);
+    }
+    readback = {};
+  };
+  release_isolated_readback(isolated_replay_readback_);
+  release_isolated_readback(guest_reference_readback_);
+  release_isolated_readback(guest_consumer_before_readback_);
+  release_isolated_readback(guest_consumer_after_readback_);
+  release_isolated_readback(guest_consumer_before_depth_readback_);
+  release_isolated_readback(guest_consumer_after_depth_readback_);
+  release_isolated_readback(isolated_replay_depth_readback_);
+  release_isolated_readback(guest_depth_reference_readback_);
+  release_isolated_readback(isolated_replay_seed_depth_readback_);
+  release_isolated_readback(guest_seed_depth_readback_);
+  isolated_replay_preview_resolved_target_.Reset();
+  isolated_replay_preview_resolved_target_state_ =
+      D3D12_RESOURCE_STATE_RESOLVE_DEST;
+  isolated_replay_preview_frame_sequence_ = 0;
+  isolated_replay_deferred_preview_frame_sequence_ = 0;
+  isolated_replay_active_depth_target_ = nullptr;
+  isolated_replay_depth_only_target_.reset();
+  isolated_replay_depth_target_.reset();
+  isolated_replay_color_target_.reset();
   null_rtv_descriptor_ms_.Free();
   null_rtv_descriptor_ss_.Free();
   descriptor_pool_srv_.reset();
@@ -1043,6 +1073,48 @@ void D3D12RenderTargetCache::CompletedSubmissionUpdated() {
   if (transfer_vertex_buffer_pool_) {
     transfer_vertex_buffer_pool_->Reclaim(command_processor_.GetCompletedSubmission());
   }
+  const auto complete_isolated_readback = [this](
+                                              IsolatedReplayReadback& readback) {
+    if (!readback.buffer ||
+        readback.submission > command_processor_.GetCompletedSubmission()) {
+      return;
+    }
+    system::GraphicsIsolatedDrawReadback result;
+    result.status = system::GraphicsIsolatedDrawReadbackStatus::kReady;
+    result.data = readback.mapping;
+    result.data_size = readback.data_size;
+    result.width = readback.width;
+    result.height = readback.height;
+    result.row_pitch = readback.row_pitch;
+    result.format = readback.format;
+    result.sample_count = readback.sample_count;
+    result.plane_count = readback.plane_count;
+    std::copy_n(readback.plane_offsets, readback.plane_count,
+                result.plane_offsets);
+    std::copy_n(readback.plane_row_pitches, readback.plane_count,
+                result.plane_row_pitches);
+    std::copy_n(readback.plane_row_sizes, readback.plane_count,
+                result.plane_row_sizes);
+    std::copy_n(readback.plane_row_counts, readback.plane_count,
+                result.plane_row_counts);
+    auto completion = readback.completion;
+    if (completion) {
+      completion(result);
+    }
+    D3D12_RANGE write_range = {};
+    readback.buffer->Unmap(0, &write_range);
+    readback = {};
+  };
+  complete_isolated_readback(isolated_replay_readback_);
+  complete_isolated_readback(guest_reference_readback_);
+  complete_isolated_readback(guest_consumer_before_readback_);
+  complete_isolated_readback(guest_consumer_after_readback_);
+  complete_isolated_readback(guest_consumer_before_depth_readback_);
+  complete_isolated_readback(guest_consumer_after_depth_readback_);
+  complete_isolated_readback(isolated_replay_depth_readback_);
+  complete_isolated_readback(guest_depth_reference_readback_);
+  complete_isolated_readback(isolated_replay_seed_depth_readback_);
+  complete_isolated_readback(guest_seed_depth_readback_);
 }
 
 void D3D12RenderTargetCache::BeginSubmission() {
@@ -1172,6 +1244,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
   if (!draw_util::GetResolveInfo(register_file(), memory, draw_resolution_scale_x(),
                                  draw_resolution_scale_y(), fixed_16_truncated_to_minus_1_to_1,
                                  fixed_16_truncated_to_minus_1_to_1, resolve_info)) {
+    draw_util::LogResolveFailureState(register_file(), memory);
     return false;
   }
 
@@ -1698,6 +1771,1080 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(Rend
   return new D3D12RenderTarget(key, resource.Get(), std::move(descriptor_draw),
                                std::move(descriptor_load_separate), std::move(descriptor_srv),
                                std::move(descriptor_srv_stencil), resource_state);
+}
+
+bool D3D12RenderTargetCache::BeginIsolatedReplayTarget(
+    uint32_t& width_out, uint32_t& height_out,
+    uint32_t logical_width, uint32_t logical_height,
+    bool stencil_seed_probe_requested, bool depth_only_target) {
+  width_out = 0;
+  height_out = 0;
+  isolated_replay_active_depth_target_ = nullptr;
+  if (!depth_only_target) {
+    isolated_replay_deferred_preview_frame_sequence_ = 0;
+    isolated_replay_deferred_preview_width_ = 0;
+    isolated_replay_deferred_preview_height_ = 0;
+    isolated_replay_active_preview_width_ = 0;
+    isolated_replay_active_preview_height_ = 0;
+  }
+  if (GetPath() != Path::kHostRenderTargets) {
+    return false;
+  }
+  RenderTarget* const* guest_targets =
+      last_update_accumulated_render_targets();
+  if (!guest_targets[0] || (!depth_only_target && !guest_targets[1])) {
+    return false;
+  }
+  for (uint32_t i = depth_only_target ? 1 : 2;
+       i <= xenos::kMaxColorRenderTargets; ++i) {
+    if (guest_targets[i]) {
+      return false;
+    }
+  }
+
+  auto& isolated_replay_depth_target =
+      depth_only_target ? isolated_replay_depth_only_target_
+                        : isolated_replay_depth_target_;
+  const RenderTargetKey depth_key = guest_targets[0]->key();
+  if (!isolated_replay_depth_target ||
+      isolated_replay_depth_target->key() != depth_key) {
+    isolated_replay_depth_target.reset(CreateRenderTarget(depth_key));
+  }
+  if (!depth_only_target) {
+    const RenderTargetKey color_key = guest_targets[1]->key();
+    if (!isolated_replay_color_target_ ||
+        isolated_replay_color_target_->key() != color_key) {
+      isolated_replay_color_target_.reset(CreateRenderTarget(color_key));
+    }
+  }
+  if (!isolated_replay_depth_target ||
+      (!depth_only_target && !isolated_replay_color_target_)) {
+    isolated_replay_depth_target.reset();
+    if (!depth_only_target) {
+      isolated_replay_color_target_.reset();
+    }
+    isolated_replay_active_depth_target_ = nullptr;
+    return false;
+  }
+
+  auto* isolated_depth = static_cast<D3D12RenderTarget*>(
+      isolated_replay_depth_target.get());
+  auto* guest_depth = static_cast<D3D12RenderTarget*>(guest_targets[0]);
+  auto* isolated_color = depth_only_target
+                             ? nullptr
+                             : static_cast<D3D12RenderTarget*>(
+                                   isolated_replay_color_target_.get());
+  auto* guest_color = depth_only_target
+                          ? nullptr
+                          : static_cast<D3D12RenderTarget*>(guest_targets[1]);
+  const D3D12_RESOURCE_DESC target_desc =
+      (depth_only_target ? isolated_depth : isolated_color)
+          ->resource()
+          ->GetDesc();
+  width_out = uint32_t(target_desc.Width);
+  height_out = target_desc.Height;
+  if (!depth_only_target) {
+    isolated_replay_active_preview_width_ =
+        std::min(logical_width, width_out);
+    isolated_replay_active_preview_height_ =
+        std::min(logical_height, height_out);
+    if (!isolated_replay_active_preview_width_ ||
+        !isolated_replay_active_preview_height_) {
+      return false;
+    }
+  }
+
+  if (stencil_seed_probe_requested) {
+    constexpr uint8_t kStencilSeedProbeValue = 0xA5;
+    const D3D12_RESOURCE_STATES isolated_probe_state =
+        isolated_depth->SetResourceState(D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    command_processor_.PushTransitionBarrier(
+        isolated_depth->resource(), isolated_probe_state,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    command_processor_.SubmitBarriers();
+    command_processor_.GetDeferredCommandList().D3DClearDepthStencilView(
+        isolated_depth->descriptor_draw().GetHandle(),
+        D3D12_CLEAR_FLAG_STENCIL, 0.0f, kStencilSeedProbeValue, 0, nullptr);
+  }
+
+  const D3D12_RESOURCE_STATES guest_depth_state =
+      guest_depth->SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE);
+  const D3D12_RESOURCE_STATES guest_color_state =
+      guest_color ? guest_color->SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE)
+                  : D3D12_RESOURCE_STATE_COMMON;
+  const D3D12_RESOURCE_STATES isolated_depth_state =
+      isolated_depth->SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST);
+  const D3D12_RESOURCE_STATES isolated_color_state =
+      isolated_color
+          ? isolated_color->SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST)
+          : D3D12_RESOURCE_STATE_COMMON;
+  command_processor_.PushTransitionBarrier(
+      guest_depth->resource(), guest_depth_state,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  if (guest_color) {
+    command_processor_.PushTransitionBarrier(
+        guest_color->resource(), guest_color_state,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+  }
+  command_processor_.PushTransitionBarrier(
+      isolated_depth->resource(), isolated_depth_state,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  if (isolated_color) {
+    command_processor_.PushTransitionBarrier(
+        isolated_color->resource(), isolated_color_state,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+  }
+  command_processor_.SubmitBarriers();
+
+  DeferredCommandList& command_list =
+      command_processor_.GetDeferredCommandList();
+  // Copy depth/stencil plane-by-plane so the diagnostic replay contract
+  // explicitly covers every plane of the typeless MSAA target. This also
+  // makes plane coverage independently reviewable from the readback path.
+  const D3D12_RESOURCE_DESC depth_desc =
+      isolated_depth->resource()->GetDesc();
+  D3D12_FEATURE_DATA_FORMAT_INFO depth_format_info = {depth_desc.Format, 0};
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  if (!device ||
+      FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO,
+                                         &depth_format_info,
+                                         sizeof(depth_format_info))) ||
+      !depth_format_info.PlaneCount) {
+    return false;
+  }
+  for (uint32_t plane = 0; plane < depth_format_info.PlaneCount; ++plane) {
+    D3D12_TEXTURE_COPY_LOCATION destination = {};
+    destination.pResource = isolated_depth->resource();
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destination.SubresourceIndex =
+        plane * uint32_t(depth_desc.MipLevels) *
+        uint32_t(depth_desc.DepthOrArraySize);
+    D3D12_TEXTURE_COPY_LOCATION source = {};
+    source.pResource = guest_depth->resource();
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    source.SubresourceIndex = destination.SubresourceIndex;
+    command_list.D3DCopyTextureRegion(&destination, 0, 0, 0, &source,
+                                       nullptr);
+  }
+  if (isolated_color) {
+    command_list.D3DCopyResource(isolated_color->resource(),
+                                 guest_color->resource());
+  }
+
+  guest_depth->SetResourceState(guest_depth_state);
+  if (guest_color) {
+    guest_color->SetResourceState(guest_color_state);
+  }
+  command_processor_.PushTransitionBarrier(
+      guest_depth->resource(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+      guest_depth_state);
+  if (guest_color) {
+    command_processor_.PushTransitionBarrier(
+        guest_color->resource(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+        guest_color_state);
+  }
+
+  RenderTarget* isolated_targets[1 + xenos::kMaxColorRenderTargets] = {};
+  isolated_targets[0] = isolated_depth;
+  if (isolated_color) {
+    isolated_targets[1] = isolated_color;
+  }
+  SetCommandListRenderTargets(isolated_targets);
+  command_processor_.SubmitBarriers();
+
+  isolated_replay_active_depth_target_ = isolated_depth;
+  return true;
+}
+
+bool D3D12RenderTargetCache::ResumeIsolatedReplayTarget(
+    uint32_t& width_out, uint32_t& height_out, uint32_t logical_width,
+    uint32_t logical_height, bool depth_only_target) {
+  width_out = 0;
+  height_out = 0;
+  isolated_replay_active_depth_target_ = nullptr;
+  auto& isolated_replay_depth_target =
+      depth_only_target ? isolated_replay_depth_only_target_
+                        : isolated_replay_depth_target_;
+  if (GetPath() != Path::kHostRenderTargets ||
+      !isolated_replay_depth_target ||
+      (!depth_only_target && !isolated_replay_color_target_)) {
+    isolated_replay_active_depth_target_ = nullptr;
+    return false;
+  }
+  RenderTarget* const* guest_targets =
+      last_update_accumulated_render_targets();
+  if (!guest_targets[0] || (!depth_only_target && !guest_targets[1]) ||
+      guest_targets[0]->key() != isolated_replay_depth_target->key()) {
+    isolated_replay_active_depth_target_ = nullptr;
+    return false;
+  }
+  if (!depth_only_target &&
+      guest_targets[1]->key() != isolated_replay_color_target_->key()) {
+    return false;
+  }
+  for (uint32_t i = depth_only_target ? 1 : 2;
+       i <= xenos::kMaxColorRenderTargets; ++i) {
+    if (guest_targets[i]) {
+      return false;
+    }
+  }
+
+  auto* isolated_depth = static_cast<D3D12RenderTarget*>(
+      isolated_replay_depth_target.get());
+  auto* isolated_color = depth_only_target
+                             ? nullptr
+                             : static_cast<D3D12RenderTarget*>(
+                                   isolated_replay_color_target_.get());
+  const D3D12_RESOURCE_DESC target_desc =
+      (depth_only_target ? isolated_depth : isolated_color)
+          ->resource()
+          ->GetDesc();
+  width_out = uint32_t(target_desc.Width);
+  height_out = target_desc.Height;
+  if (!depth_only_target) {
+    isolated_replay_active_preview_width_ = std::max(
+        isolated_replay_active_preview_width_,
+        std::min(logical_width, width_out));
+    isolated_replay_active_preview_height_ = std::max(
+        isolated_replay_active_preview_height_,
+        std::min(logical_height, height_out));
+    if (!isolated_replay_active_preview_width_ ||
+        !isolated_replay_active_preview_height_) {
+      return false;
+    }
+  }
+  RenderTarget* isolated_targets[1 + xenos::kMaxColorRenderTargets] = {};
+  isolated_targets[0] = isolated_depth;
+  if (isolated_color) {
+    isolated_targets[1] = isolated_color;
+  }
+  SetCommandListRenderTargets(isolated_targets);
+  command_processor_.SubmitBarriers();
+  isolated_replay_active_depth_target_ = isolated_depth;
+  return true;
+}
+
+system::GraphicsIsolatedDrawReadbackStatus
+D3D12RenderTargetCache::QueueIsolatedReplayReadback(
+    system::GraphicsIsolatedDrawReadbackCompletion completion,
+    uint32_t* failure_detail_out) {
+  if (!isolated_replay_color_target_) {
+    return system::GraphicsIsolatedDrawReadbackStatus::kUnsupportedTarget;
+  }
+  return QueueRenderTargetReadback(
+      static_cast<D3D12RenderTarget*>(isolated_replay_color_target_.get()),
+      isolated_replay_readback_, completion, failure_detail_out);
+}
+
+system::GraphicsIsolatedDrawReadbackStatus
+D3D12RenderTargetCache::QueueGuestColorReadback(
+    system::GraphicsIsolatedDrawReadbackCompletion completion,
+    uint32_t* failure_detail_out) {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return system::GraphicsIsolatedDrawReadbackStatus::kUnsupportedTarget;
+  }
+  RenderTarget* const* guest_targets =
+      last_update_accumulated_render_targets();
+  if (!guest_targets[1]) {
+    return system::GraphicsIsolatedDrawReadbackStatus::kUnsupportedTarget;
+  }
+  return QueueRenderTargetReadback(
+      static_cast<D3D12RenderTarget*>(guest_targets[1]),
+      guest_reference_readback_, completion, failure_detail_out);
+}
+
+system::GraphicsIsolatedDrawReadbackStatus
+D3D12RenderTargetCache::QueueGuestConsumerColorReadback(
+    bool before_draw,
+    system::GraphicsIsolatedDrawReadbackCompletion completion,
+    uint32_t* failure_detail_out) {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return system::GraphicsIsolatedDrawReadbackStatus::kUnsupportedTarget;
+  }
+  RenderTarget* const* guest_targets =
+      last_update_accumulated_render_targets();
+  if (!guest_targets[1]) {
+    return system::GraphicsIsolatedDrawReadbackStatus::kUnsupportedTarget;
+  }
+  auto status = QueueRenderTargetReadback(
+      static_cast<D3D12RenderTarget*>(guest_targets[1]),
+      before_draw ? guest_consumer_before_readback_
+                  : guest_consumer_after_readback_,
+      completion, failure_detail_out);
+  if (before_draw &&
+      status == system::GraphicsIsolatedDrawReadbackStatus::kReady) {
+    // The generic readback queues restoration of a single-sample target for
+    // later submission. This diagnostic copy runs before the authoritative
+    // draw, so make the restoration barrier visible before recording it.
+    command_processor_.SubmitBarriers();
+  }
+  return status;
+}
+
+system::GraphicsIsolatedDrawReadbackStatus
+D3D12RenderTargetCache::QueueGuestConsumerDepthReadback(
+    bool before_draw,
+    system::GraphicsIsolatedDrawReadbackCompletion completion,
+    uint32_t* failure_detail_out) {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return system::GraphicsIsolatedDrawReadbackStatus::kUnsupportedTarget;
+  }
+  RenderTarget* const* guest_targets =
+      last_update_accumulated_render_targets();
+  if (!guest_targets[0]) {
+    return system::GraphicsIsolatedDrawReadbackStatus::kUnsupportedTarget;
+  }
+  auto status = QueueRenderTargetReadback(
+      static_cast<D3D12RenderTarget*>(guest_targets[0]),
+      before_draw ? guest_consumer_before_depth_readback_
+                  : guest_consumer_after_depth_readback_,
+      completion, failure_detail_out);
+  if (before_draw &&
+      status == system::GraphicsIsolatedDrawReadbackStatus::kReady) {
+    // Restore the depth target before the authoritative draw is recorded.
+    command_processor_.SubmitBarriers();
+  }
+  return status;
+}
+
+system::GraphicsIsolatedDrawReadbackStatus
+D3D12RenderTargetCache::QueueIsolatedReplayDepthReadback(
+    system::GraphicsIsolatedDrawReadbackCompletion completion,
+    uint32_t* failure_detail_out) {
+  if (!isolated_replay_active_depth_target_) {
+    return system::GraphicsIsolatedDrawReadbackStatus::kUnsupportedTarget;
+  }
+  return QueueRenderTargetReadback(
+      static_cast<D3D12RenderTarget*>(isolated_replay_active_depth_target_),
+      isolated_replay_depth_readback_, completion, failure_detail_out);
+}
+
+system::GraphicsIsolatedDrawReadbackStatus
+D3D12RenderTargetCache::QueueIsolatedReplaySeedDepthReadback(
+    system::GraphicsIsolatedDrawReadbackCompletion completion,
+    uint32_t* failure_detail_out) {
+  if (!isolated_replay_active_depth_target_) {
+    return system::GraphicsIsolatedDrawReadbackStatus::kUnsupportedTarget;
+  }
+  return QueueRenderTargetReadback(
+      static_cast<D3D12RenderTarget*>(isolated_replay_active_depth_target_),
+      isolated_replay_seed_depth_readback_, completion, failure_detail_out);
+}
+
+system::GraphicsIsolatedDrawReadbackStatus
+D3D12RenderTargetCache::QueueGuestSeedDepthReadback(
+    system::GraphicsIsolatedDrawReadbackCompletion completion,
+    uint32_t* failure_detail_out) {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return system::GraphicsIsolatedDrawReadbackStatus::kUnsupportedTarget;
+  }
+  RenderTarget* const* guest_targets =
+      last_update_accumulated_render_targets();
+  if (!guest_targets[0]) {
+    return system::GraphicsIsolatedDrawReadbackStatus::kUnsupportedTarget;
+  }
+  return QueueRenderTargetReadback(
+      static_cast<D3D12RenderTarget*>(guest_targets[0]),
+      guest_seed_depth_readback_, completion, failure_detail_out);
+}
+
+system::GraphicsIsolatedDrawReadbackStatus
+D3D12RenderTargetCache::QueueGuestDepthReadback(
+    system::GraphicsIsolatedDrawReadbackCompletion completion,
+    uint32_t* failure_detail_out) {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return system::GraphicsIsolatedDrawReadbackStatus::kUnsupportedTarget;
+  }
+  RenderTarget* const* guest_targets =
+      last_update_accumulated_render_targets();
+  if (!guest_targets[0]) {
+    return system::GraphicsIsolatedDrawReadbackStatus::kUnsupportedTarget;
+  }
+  return QueueRenderTargetReadback(static_cast<D3D12RenderTarget*>(guest_targets[0]),
+                                   guest_depth_reference_readback_, completion, failure_detail_out);
+}
+
+system::GraphicsIsolatedDrawReadbackStatus D3D12RenderTargetCache::QueueRenderTargetReadback(
+    D3D12RenderTarget* target, IsolatedReplayReadback& pending_readback,
+    system::GraphicsIsolatedDrawReadbackCompletion completion, uint32_t* failure_detail_out) {
+  if (failure_detail_out) {
+    *failure_detail_out = 0;
+  }
+  if (!completion || pending_readback.buffer || !target) {
+    return system::GraphicsIsolatedDrawReadbackStatus::kUnsupportedTarget;
+  }
+  ID3D12Resource* source = target->resource();
+  const D3D12_RESOURCE_DESC source_desc = source->GetDesc();
+  if (source_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+      source_desc.DepthOrArraySize != 1 || source_desc.MipLevels != 1) {
+    return system::GraphicsIsolatedDrawReadbackStatus::kUnsupportedTarget;
+  }
+  const bool is_depth = target->key().is_depth != 0;
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  if (!device) {
+    return system::GraphicsIsolatedDrawReadbackStatus::kUnsupportedTarget;
+  }
+  if (is_depth && source_desc.SampleDesc.Count > 1) {
+    const uint64_t row_pitch = source_desc.Width * source_desc.SampleDesc.Count * 8;
+    const uint64_t total_size = row_pitch * source_desc.Height;
+    if (!source_desc.Width || !source_desc.Height || source_desc.Width > UINT32_MAX ||
+        row_pitch > UINT32_MAX || !total_size || total_size > UINT32_MAX) {
+      return system::GraphicsIsolatedDrawReadbackStatus::kUnsupportedTarget;
+    }
+
+    if (!isolated_depth_readback_root_signature_) {
+      D3D12_ROOT_PARAMETER root_parameters[3] = {};
+      root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+      root_parameters[0].Constants.ShaderRegister = 0;
+      root_parameters[0].Constants.RegisterSpace = 0;
+      root_parameters[0].Constants.Num32BitValues = 3;
+      root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+      D3D12_DESCRIPTOR_RANGE source_range = {};
+      source_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+      source_range.NumDescriptors = 2;
+      source_range.BaseShaderRegister = 0;
+      source_range.RegisterSpace = 0;
+      source_range.OffsetInDescriptorsFromTableStart = 0;
+      root_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+      root_parameters[1].DescriptorTable.NumDescriptorRanges = 1;
+      root_parameters[1].DescriptorTable.pDescriptorRanges = &source_range;
+      root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+      D3D12_DESCRIPTOR_RANGE output_range = {};
+      output_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+      output_range.NumDescriptors = 1;
+      output_range.BaseShaderRegister = 0;
+      output_range.RegisterSpace = 0;
+      output_range.OffsetInDescriptorsFromTableStart = 0;
+      root_parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+      root_parameters[2].DescriptorTable.NumDescriptorRanges = 1;
+      root_parameters[2].DescriptorTable.pDescriptorRanges = &output_range;
+      root_parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+      D3D12_ROOT_SIGNATURE_DESC root_signature_desc = {};
+      root_signature_desc.NumParameters = uint32_t(rex::countof(root_parameters));
+      root_signature_desc.pParameters = root_parameters;
+      isolated_depth_readback_root_signature_ = ui::d3d12::util::CreateRootSignature(
+          command_processor_.GetD3D12Provider(), root_signature_desc);
+      if (!isolated_depth_readback_root_signature_) {
+        return system::GraphicsIsolatedDrawReadbackStatus::kAllocationFailed;
+      }
+      isolated_depth_readback_root_signature_->SetName(
+          L"Isolated MSAA depth readback root signature");
+    }
+    if (!isolated_depth_readback_pipeline_) {
+      isolated_depth_readback_pipeline_ =
+          ui::d3d12::util::CreateComputePipeline(device, shaders::isolated_depth_readback_msaa_cs,
+                                                 sizeof(shaders::isolated_depth_readback_msaa_cs),
+                                                 isolated_depth_readback_root_signature_);
+      if (!isolated_depth_readback_pipeline_) {
+        return system::GraphicsIsolatedDrawReadbackStatus::kAllocationFailed;
+      }
+      isolated_depth_readback_pipeline_->SetName(L"Isolated MSAA depth readback pipeline");
+    }
+
+    D3D12_RESOURCE_DESC extraction_desc;
+    ui::d3d12::util::FillBufferResourceDesc(extraction_desc, total_size,
+                                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    Microsoft::WRL::ComPtr<ID3D12Resource> extraction_buffer;
+    HRESULT create_result = device->CreateCommittedResource(
+        &ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &extraction_desc,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&extraction_buffer));
+    if (FAILED(create_result)) {
+      if (failure_detail_out) {
+        *failure_detail_out = uint32_t(create_result);
+      }
+      return system::GraphicsIsolatedDrawReadbackStatus::kAllocationFailed;
+    }
+    extraction_buffer->SetName(L"Isolated MSAA depth extraction buffer");
+
+    D3D12_RESOURCE_DESC readback_desc;
+    ui::d3d12::util::FillBufferResourceDesc(readback_desc, total_size, D3D12_RESOURCE_FLAG_NONE);
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    const auto& provider = command_processor_.GetD3D12Provider();
+    create_result = device->CreateCommittedResource(
+        &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
+        &readback_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer));
+    if (FAILED(create_result)) {
+      if (failure_detail_out) {
+        *failure_detail_out = uint32_t(create_result);
+      }
+      return system::GraphicsIsolatedDrawReadbackStatus::kAllocationFailed;
+    }
+    D3D12_RANGE read_range = {0, SIZE_T(total_size)};
+    void* mapping = nullptr;
+    if (FAILED(buffer->Map(0, &read_range, &mapping))) {
+      return system::GraphicsIsolatedDrawReadbackStatus::kMapFailed;
+    }
+
+    ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[3];
+    if (!command_processor_.RequestOneUseSingleViewDescriptors(uint32_t(rex::countof(descriptors)),
+                                                               descriptors)) {
+      D3D12_RANGE write_range = {};
+      buffer->Unmap(0, &write_range);
+      return system::GraphicsIsolatedDrawReadbackStatus::kAllocationFailed;
+    }
+    device->CopyDescriptorsSimple(1, descriptors[0].first, target->descriptor_srv().GetHandle(),
+                                  D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    device->CopyDescriptorsSimple(1, descriptors[1].first,
+                                  target->descriptor_srv_stencil().GetHandle(),
+                                  D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC output_view = {};
+    output_view.Format = DXGI_FORMAT_R32_TYPELESS;
+    output_view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    output_view.Buffer.NumElements = uint32_t(total_size / sizeof(uint32_t));
+    output_view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    device->CreateUnorderedAccessView(extraction_buffer.Get(), nullptr, &output_view,
+                                      descriptors[2].first);
+
+    const D3D12_RESOURCE_STATES old_state =
+        target->SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    command_processor_.PushTransitionBarrier(source, old_state,
+                                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    command_processor_.SubmitBarriers();
+    DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+    command_list.D3DSetComputeRootSignature(isolated_depth_readback_root_signature_);
+    const uint32_t constants[3] = {uint32_t(source_desc.Width), source_desc.Height,
+                                   source_desc.SampleDesc.Count};
+    command_list.D3DSetComputeRoot32BitConstants(0, uint32_t(rex::countof(constants)), constants,
+                                                 0);
+    command_list.D3DSetComputeRootDescriptorTable(1, descriptors[0].second);
+    command_list.D3DSetComputeRootDescriptorTable(2, descriptors[2].second);
+    command_processor_.SetExternalPipeline(isolated_depth_readback_pipeline_);
+    command_list.D3DDispatch((uint32_t(source_desc.Width) + 7) / 8, (source_desc.Height + 7) / 8,
+                             1);
+    target->SetResourceState(old_state);
+    command_processor_.PushTransitionBarrier(source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                             old_state);
+    command_processor_.PushTransitionBarrier(extraction_buffer.Get(),
+                                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                             D3D12_RESOURCE_STATE_COPY_SOURCE);
+    command_processor_.SubmitBarriers();
+    command_list.D3DCopyBufferRegion(buffer.Get(), 0, extraction_buffer.Get(), 0, total_size);
+
+    pending_readback.buffer = std::move(buffer);
+    pending_readback.resolved_target = std::move(extraction_buffer);
+    pending_readback.mapping = static_cast<uint8_t*>(mapping);
+    pending_readback.submission = command_processor_.GetCurrentSubmission();
+    pending_readback.data_size = total_size;
+    pending_readback.width = uint32_t(source_desc.Width);
+    pending_readback.height = source_desc.Height;
+    pending_readback.row_pitch = uint32_t(row_pitch);
+    pending_readback.format = uint32_t(source_desc.Format);
+    pending_readback.sample_count = source_desc.SampleDesc.Count;
+    pending_readback.plane_count = 1;
+    pending_readback.plane_offsets[0] = 0;
+    pending_readback.plane_row_pitches[0] = uint32_t(row_pitch);
+    pending_readback.plane_row_sizes[0] = uint32_t(row_pitch);
+    pending_readback.plane_row_counts[0] = source_desc.Height;
+    pending_readback.completion = completion;
+    return system::GraphicsIsolatedDrawReadbackStatus::kReady;
+  }
+
+  Microsoft::WRL::ComPtr<ID3D12Resource> resolved_target;
+  D3D12_RESOURCE_DESC copy_desc = source_desc;
+  copy_desc.Alignment = 0;
+  copy_desc.SampleDesc.Count = 1;
+  copy_desc.SampleDesc.Quality = 0;
+  D3D12_CLEAR_VALUE resolved_clear = {};
+  resolved_clear.Format = source_desc.Format;
+  ID3D12Resource* copy_source = source;
+  if (source_desc.SampleDesc.Count > 1) {
+    copy_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    HRESULT resolve_result = device->CreateCommittedResource(
+        &ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE,
+        &copy_desc, D3D12_RESOURCE_STATE_RESOLVE_DEST, &resolved_clear,
+        IID_PPV_ARGS(&resolved_target));
+    if (FAILED(resolve_result)) {
+      if (failure_detail_out) {
+        *failure_detail_out = uint32_t(resolve_result);
+      }
+      REXGPU_ERROR(
+          "D3D12RenderTargetCache: Isolated resolve allocation failed "
+          "(HRESULT 0x{:08X}, {}x{}, format {}, samples {}, alignment {}, "
+          "layout {}, flags 0x{:X})",
+          uint32_t(resolve_result), source_desc.Width, source_desc.Height,
+          uint32_t(source_desc.Format), source_desc.SampleDesc.Count,
+          copy_desc.Alignment, uint32_t(copy_desc.Layout),
+          uint32_t(copy_desc.Flags));
+      return system::GraphicsIsolatedDrawReadbackStatus::
+          kResolveAllocationFailed;
+    }
+    copy_source = resolved_target.Get();
+  }
+
+  uint32_t plane_count = 1;
+  if (is_depth) {
+    D3D12_FEATURE_DATA_FORMAT_INFO format_info = {source_desc.Format, 0};
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO,
+                                           &format_info,
+                                           sizeof(format_info))) ||
+        !format_info.PlaneCount ||
+        format_info.PlaneCount >
+            system::GraphicsIsolatedDrawReadback::kMaxPlanes) {
+      return system::GraphicsIsolatedDrawReadbackStatus::kUnsupportedTarget;
+    }
+    plane_count = format_info.PlaneCount;
+  }
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints
+      [system::GraphicsIsolatedDrawReadback::kMaxPlanes] = {};
+  UINT row_counts[system::GraphicsIsolatedDrawReadback::kMaxPlanes] = {};
+  UINT64 row_sizes[system::GraphicsIsolatedDrawReadback::kMaxPlanes] = {};
+  UINT64 total_size = 0;
+  device->GetCopyableFootprints(&copy_desc, 0, plane_count, 0, footprints,
+                                row_counts, row_sizes, &total_size);
+  if (!total_size || total_size > UINT32_MAX ||
+      source_desc.Width > UINT32_MAX) {
+    return system::GraphicsIsolatedDrawReadbackStatus::kUnsupportedTarget;
+  }
+  for (uint32_t plane = 0; plane < plane_count; ++plane) {
+    if (!row_counts[plane] || !row_sizes[plane] ||
+        row_sizes[plane] > UINT32_MAX) {
+      return system::GraphicsIsolatedDrawReadbackStatus::kUnsupportedTarget;
+    }
+  }
+
+  D3D12_RESOURCE_DESC buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(
+      buffer_desc, total_size, D3D12_RESOURCE_FLAG_NONE);
+  Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+  const auto& provider = command_processor_.GetD3D12Provider();
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback,
+          provider.GetHeapFlagCreateNotZeroed(), &buffer_desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)))) {
+    return system::GraphicsIsolatedDrawReadbackStatus::kAllocationFailed;
+  }
+  D3D12_RANGE read_range = {0, SIZE_T(total_size)};
+  void* mapping = nullptr;
+  if (FAILED(buffer->Map(0, &read_range, &mapping))) {
+    return system::GraphicsIsolatedDrawReadbackStatus::kMapFailed;
+  }
+
+  D3D12_RESOURCE_STATES old_state =
+      target->SetResourceState(
+          source_desc.SampleDesc.Count > 1
+              ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE
+              : D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.PushTransitionBarrier(
+      source, old_state,
+      source_desc.SampleDesc.Count > 1
+          ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE
+          : D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.SubmitBarriers();
+  if (source_desc.SampleDesc.Count > 1) {
+    command_processor_.GetDeferredCommandList().D3DResolveSubresource(
+        copy_source, 0, source, 0, source_desc.Format);
+    command_processor_.PushTransitionBarrier(
+        copy_source, D3D12_RESOURCE_STATE_RESOLVE_DEST,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    target->SetResourceState(old_state);
+    command_processor_.PushTransitionBarrier(
+        source, D3D12_RESOURCE_STATE_RESOLVE_SOURCE, old_state);
+    command_processor_.SubmitBarriers();
+  }
+  for (uint32_t plane = 0; plane < plane_count; ++plane) {
+    D3D12_TEXTURE_COPY_LOCATION destination = {};
+    destination.pResource = buffer.Get();
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    destination.PlacedFootprint = footprints[plane];
+    D3D12_TEXTURE_COPY_LOCATION source_location = {};
+    source_location.pResource = copy_source;
+    source_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    source_location.SubresourceIndex = plane;
+    command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(
+        &destination, 0, 0, 0, &source_location, nullptr);
+  }
+  if (source_desc.SampleDesc.Count == 1) {
+    target->SetResourceState(old_state);
+    command_processor_.PushTransitionBarrier(
+        source, D3D12_RESOURCE_STATE_COPY_SOURCE, old_state);
+  }
+
+  pending_readback.buffer = std::move(buffer);
+  pending_readback.resolved_target = std::move(resolved_target);
+  pending_readback.mapping = static_cast<uint8_t*>(mapping);
+  pending_readback.submission =
+      command_processor_.GetCurrentSubmission();
+  pending_readback.data_size = total_size;
+  pending_readback.width = uint32_t(source_desc.Width);
+  pending_readback.height = source_desc.Height;
+  pending_readback.row_pitch = footprints[0].Footprint.RowPitch;
+  pending_readback.format = uint32_t(source_desc.Format);
+  pending_readback.sample_count = source_desc.SampleDesc.Count;
+  pending_readback.plane_count = plane_count;
+  for (uint32_t plane = 0; plane < plane_count; ++plane) {
+    pending_readback.plane_offsets[plane] = footprints[plane].Offset;
+    pending_readback.plane_row_pitches[plane] =
+        footprints[plane].Footprint.RowPitch;
+    pending_readback.plane_row_sizes[plane] = uint32_t(row_sizes[plane]);
+    pending_readback.plane_row_counts[plane] = row_counts[plane];
+  }
+  pending_readback.completion = completion;
+  return system::GraphicsIsolatedDrawReadbackStatus::kReady;
+}
+
+void D3D12RenderTargetCache::EndIsolatedReplayTarget(
+    uint64_t frame_sequence, bool defer_preview_publication_until_swap,
+    bool depth_only_target) {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return;
+  }
+  SetCommandListRenderTargets(last_update_accumulated_render_targets());
+  command_processor_.SubmitBarriers();
+  isolated_replay_active_depth_target_ = nullptr;
+  if (depth_only_target) {
+    return;
+  }
+  if (defer_preview_publication_until_swap) {
+    isolated_replay_deferred_preview_frame_sequence_ = frame_sequence;
+    isolated_replay_deferred_preview_width_ =
+        isolated_replay_active_preview_width_;
+    isolated_replay_deferred_preview_height_ =
+        isolated_replay_active_preview_height_;
+  } else {
+    isolated_replay_deferred_preview_frame_sequence_ = 0;
+    isolated_replay_deferred_preview_width_ = 0;
+    isolated_replay_deferred_preview_height_ = 0;
+    isolated_replay_preview_frame_sequence_ = frame_sequence;
+    isolated_replay_preview_width_ = isolated_replay_active_preview_width_;
+    isolated_replay_preview_height_ = isolated_replay_active_preview_height_;
+  }
+}
+
+void D3D12RenderTargetCache::CommitDeferredIsolatedReplayPreview(
+    uint64_t frame_sequence) {
+  if (isolated_replay_deferred_preview_frame_sequence_ == frame_sequence) {
+    isolated_replay_preview_frame_sequence_ = frame_sequence;
+    isolated_replay_preview_width_ = isolated_replay_deferred_preview_width_;
+    isolated_replay_preview_height_ = isolated_replay_deferred_preview_height_;
+  }
+  isolated_replay_deferred_preview_frame_sequence_ = 0;
+  isolated_replay_deferred_preview_width_ = 0;
+  isolated_replay_deferred_preview_height_ = 0;
+}
+
+void D3D12RenderTargetCache::CancelDeferredIsolatedReplayPreview(
+    uint64_t frame_sequence) {
+  if (isolated_replay_deferred_preview_frame_sequence_ == frame_sequence) {
+    isolated_replay_deferred_preview_frame_sequence_ = 0;
+    isolated_replay_deferred_preview_width_ = 0;
+    isolated_replay_deferred_preview_height_ = 0;
+  }
+}
+
+system::GraphicsIsolatedDrawPublicationResult
+D3D12RenderTargetCache::PublishIsolatedReplayTarget(bool depth_only_target) {
+  system::GraphicsIsolatedDrawPublicationResult result;
+  if (GetPath() != Path::kHostRenderTargets) {
+    result.status = system::GraphicsIsolatedDrawPublicationStatus::kUnsupportedPath;
+    return result;
+  }
+  auto& isolated_replay_depth_target =
+      depth_only_target ? isolated_replay_depth_only_target_
+                        : isolated_replay_depth_target_;
+  if (!isolated_replay_depth_target ||
+      (!depth_only_target && !isolated_replay_color_target_)) {
+    result.status = system::GraphicsIsolatedDrawPublicationStatus::kUnavailable;
+    return result;
+  }
+
+  RenderTarget* const* guest_targets =
+      last_update_accumulated_render_targets();
+  if (!guest_targets[0] || (!depth_only_target && !guest_targets[1])) {
+    result.status = system::GraphicsIsolatedDrawPublicationStatus::kUnavailable;
+    return result;
+  }
+  for (uint32_t i = depth_only_target ? 1 : 2;
+       i <= xenos::kMaxColorRenderTargets; ++i) {
+    if (guest_targets[i]) {
+      result.status = system::GraphicsIsolatedDrawPublicationStatus::kTargetMismatch;
+      return result;
+    }
+  }
+  if (guest_targets[0]->key() != isolated_replay_depth_target->key() ||
+      (!depth_only_target &&
+       guest_targets[1]->key() != isolated_replay_color_target_->key())) {
+    result.status = system::GraphicsIsolatedDrawPublicationStatus::kTargetMismatch;
+    return result;
+  }
+
+  auto* guest_depth = static_cast<D3D12RenderTarget*>(guest_targets[0]);
+  auto* guest_color = depth_only_target
+                          ? nullptr
+                          : static_cast<D3D12RenderTarget*>(guest_targets[1]);
+  auto* isolated_depth = static_cast<D3D12RenderTarget*>(
+      isolated_replay_depth_target.get());
+  auto* isolated_color =
+      depth_only_target
+          ? nullptr
+          : static_cast<D3D12RenderTarget*>(
+                isolated_replay_color_target_.get());
+  const D3D12_RESOURCE_DESC guest_depth_desc =
+      guest_depth->resource()->GetDesc();
+  const D3D12_RESOURCE_DESC guest_color_desc =
+      guest_color ? guest_color->resource()->GetDesc() : D3D12_RESOURCE_DESC{};
+  const D3D12_RESOURCE_DESC isolated_depth_desc =
+      isolated_depth->resource()->GetDesc();
+  const D3D12_RESOURCE_DESC isolated_color_desc =
+      isolated_color ? isolated_color->resource()->GetDesc()
+                     : D3D12_RESOURCE_DESC{};
+  const auto matching_desc = [](const D3D12_RESOURCE_DESC& left,
+                                const D3D12_RESOURCE_DESC& right) {
+    return left.Dimension == right.Dimension &&
+           left.Alignment == right.Alignment && left.Width == right.Width &&
+           left.Height == right.Height &&
+           left.DepthOrArraySize == right.DepthOrArraySize &&
+           left.MipLevels == right.MipLevels && left.Format == right.Format &&
+           left.SampleDesc.Count == right.SampleDesc.Count &&
+           left.SampleDesc.Quality == right.SampleDesc.Quality &&
+           left.Layout == right.Layout && left.Flags == right.Flags;
+  };
+  if (!matching_desc(guest_depth_desc, isolated_depth_desc) ||
+      (!depth_only_target &&
+       !matching_desc(guest_color_desc, isolated_color_desc)) ||
+      guest_depth_desc.Width > UINT32_MAX ||
+      (!depth_only_target && guest_color_desc.Width > UINT32_MAX)) {
+    result.status = system::GraphicsIsolatedDrawPublicationStatus::kTargetMismatch;
+    return result;
+  }
+
+  const D3D12_RESOURCE_STATES guest_depth_state =
+      guest_depth->SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST);
+  const D3D12_RESOURCE_STATES guest_color_state =
+      guest_color ? guest_color->SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST)
+                  : D3D12_RESOURCE_STATE_COMMON;
+  const D3D12_RESOURCE_STATES isolated_depth_state =
+      isolated_depth->SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE);
+  const D3D12_RESOURCE_STATES isolated_color_state =
+      isolated_color
+          ? isolated_color->SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE)
+          : D3D12_RESOURCE_STATE_COMMON;
+  command_processor_.PushTransitionBarrier(
+      guest_depth->resource(), guest_depth_state,
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  if (guest_color) {
+    command_processor_.PushTransitionBarrier(
+        guest_color->resource(), guest_color_state,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+  }
+  command_processor_.PushTransitionBarrier(
+      isolated_depth->resource(), isolated_depth_state,
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  if (isolated_color) {
+    command_processor_.PushTransitionBarrier(
+        isolated_color->resource(), isolated_color_state,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+  }
+  command_processor_.SubmitBarriers();
+
+  DeferredCommandList& command_list =
+      command_processor_.GetDeferredCommandList();
+  command_list.BeginDebugMarker(depth_only_target
+                                    ? "PinyonShift NR-05F native shadow-depth publication"
+                                    : "PinyonShift NR-04D native retained-pass publication");
+  command_list.D3DCopyResource(guest_depth->resource(),
+                               isolated_depth->resource());
+  if (guest_color && isolated_color) {
+    command_list.D3DCopyResource(guest_color->resource(),
+                                 isolated_color->resource());
+  }
+  command_list.EndDebugMarker();
+
+  guest_depth->SetResourceState(guest_depth_state);
+  if (guest_color) {
+    guest_color->SetResourceState(guest_color_state);
+  }
+  isolated_depth->SetResourceState(isolated_depth_state);
+  if (isolated_color) {
+    isolated_color->SetResourceState(isolated_color_state);
+  }
+  command_processor_.PushTransitionBarrier(
+      guest_depth->resource(), D3D12_RESOURCE_STATE_COPY_DEST,
+      guest_depth_state);
+  if (guest_color) {
+    command_processor_.PushTransitionBarrier(
+        guest_color->resource(), D3D12_RESOURCE_STATE_COPY_DEST,
+        guest_color_state);
+  }
+  command_processor_.PushTransitionBarrier(
+      isolated_depth->resource(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+      isolated_depth_state);
+  if (isolated_color) {
+    command_processor_.PushTransitionBarrier(
+        isolated_color->resource(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+        isolated_color_state);
+  }
+  command_processor_.SubmitBarriers();
+
+  result.status = system::GraphicsIsolatedDrawPublicationStatus::kPublished;
+  result.target_width = uint32_t(depth_only_target ? guest_depth_desc.Width
+                                                   : guest_color_desc.Width);
+  result.target_height =
+      depth_only_target ? guest_depth_desc.Height : guest_color_desc.Height;
+  result.sample_count = depth_only_target ? guest_depth_desc.SampleDesc.Count
+                                          : guest_color_desc.SampleDesc.Count;
+  result.color_published = !depth_only_target;
+  result.depth_stencil_published = true;
+  return result;
+}
+
+bool D3D12RenderTargetCache::BeginIsolatedReplayPreview(
+    uint64_t required_frame_sequence,
+    IsolatedReplayPreviewSource& source_out) {
+  source_out = {};
+  if (GetPath() != Path::kHostRenderTargets ||
+      !isolated_replay_color_target_ || !required_frame_sequence ||
+      isolated_replay_preview_frame_sequence_ != required_frame_sequence) {
+    return false;
+  }
+  auto* isolated_color = static_cast<D3D12RenderTarget*>(
+      isolated_replay_color_target_.get());
+  ID3D12Resource* resource = isolated_color->resource();
+  const D3D12_RESOURCE_DESC resource_desc = resource->GetDesc();
+  // The first retained Forza pass has an RGBA16F target. Keep this preview
+  // exact rather than guessing how to interpret later targets, but resolve its
+  // host MSAA representation before sampling it from the compute shader.
+  if (resource_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+      resource_desc.DepthOrArraySize != 1 || resource_desc.MipLevels != 1 ||
+      !resource_desc.SampleDesc.Count ||
+      resource_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT ||
+      resource_desc.Width > UINT32_MAX) {
+    static bool logged_unsupported_preview_target = false;
+    if (!logged_unsupported_preview_target) {
+      logged_unsupported_preview_target = true;
+      REXGPU_WARN(
+          "Native retained-pass preview target unsupported: dimension {}, "
+          "{}x{}, array {}, mips {}, format {}, samples {}, quality {}",
+          uint32_t(resource_desc.Dimension), resource_desc.Width,
+          resource_desc.Height, resource_desc.DepthOrArraySize,
+          resource_desc.MipLevels, uint32_t(resource_desc.Format),
+          resource_desc.SampleDesc.Count, resource_desc.SampleDesc.Quality);
+    }
+    return false;
+  }
+
+  source_out.resource = resource;
+  source_out.format = resource_desc.Format;
+  source_out.width = uint32_t(resource_desc.Width);
+  source_out.height = resource_desc.Height;
+  source_out.logical_width = isolated_replay_preview_width_;
+  source_out.logical_height = isolated_replay_preview_height_;
+  if (!source_out.logical_width || !source_out.logical_height ||
+      source_out.logical_width > source_out.width ||
+      source_out.logical_height > source_out.height) {
+    REXGPU_WARN(
+        "Native retained-pass preview has invalid logical extent {}x{} "
+        "for backing resource {}x{}",
+        source_out.logical_width, source_out.logical_height, source_out.width,
+        source_out.height);
+    source_out = {};
+    return false;
+  }
+  source_out.frame_sequence = isolated_replay_preview_frame_sequence_;
+  if (resource_desc.SampleDesc.Count > 1) {
+    D3D12_RESOURCE_DESC resolved_desc = resource_desc;
+    resolved_desc.Alignment = 0;
+    resolved_desc.SampleDesc.Count = 1;
+    resolved_desc.SampleDesc.Quality = 0;
+    resolved_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    bool recreate_resolved = !isolated_replay_preview_resolved_target_;
+    if (!recreate_resolved) {
+      const D3D12_RESOURCE_DESC current_desc =
+          isolated_replay_preview_resolved_target_->GetDesc();
+      recreate_resolved = current_desc.Width != resolved_desc.Width ||
+                          current_desc.Height != resolved_desc.Height ||
+                          current_desc.Format != resolved_desc.Format;
+    }
+    if (recreate_resolved) {
+      D3D12_CLEAR_VALUE clear_value{};
+      clear_value.Format = resolved_desc.Format;
+      Microsoft::WRL::ComPtr<ID3D12Resource> resolved_target;
+      ID3D12Device* device =
+          command_processor_.GetD3D12Provider().GetDevice();
+      HRESULT create_result = device ? device->CreateCommittedResource(
+                         &ui::d3d12::util::kHeapPropertiesDefault,
+                         D3D12_HEAP_FLAG_NONE, &resolved_desc,
+                         D3D12_RESOURCE_STATE_RESOLVE_DEST, &clear_value,
+                         IID_PPV_ARGS(&resolved_target)) : E_POINTER;
+      if (FAILED(create_result)) {
+        REXGPU_WARN(
+            "Native retained-pass preview resolve allocation failed: "
+            "HRESULT 0x{:08X}, {}x{}, format {}, samples {}",
+            uint32_t(create_result), resolved_desc.Width,
+            resolved_desc.Height, uint32_t(resolved_desc.Format),
+            resource_desc.SampleDesc.Count);
+        return false;
+      }
+      resolved_target->SetName(L"Isolated replay preview resolved target");
+      isolated_replay_preview_resolved_target_ = std::move(resolved_target);
+      isolated_replay_preview_resolved_target_state_ =
+          D3D12_RESOURCE_STATE_RESOLVE_DEST;
+    }
+
+    const D3D12_RESOURCE_STATES source_previous_state =
+        isolated_color->SetResourceState(
+            D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+    command_processor_.PushTransitionBarrier(
+        resource, source_previous_state,
+        D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+    command_processor_.PushTransitionBarrier(
+        isolated_replay_preview_resolved_target_.Get(),
+        isolated_replay_preview_resolved_target_state_,
+        D3D12_RESOURCE_STATE_RESOLVE_DEST);
+    command_processor_.SubmitBarriers();
+    command_processor_.GetDeferredCommandList().D3DResolveSubresource(
+        isolated_replay_preview_resolved_target_.Get(), 0, resource, 0,
+        resource_desc.Format);
+    isolated_color->SetResourceState(source_previous_state);
+    command_processor_.PushTransitionBarrier(
+        resource, D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
+        source_previous_state);
+    command_processor_.PushTransitionBarrier(
+        isolated_replay_preview_resolved_target_.Get(),
+        D3D12_RESOURCE_STATE_RESOLVE_DEST,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    isolated_replay_preview_resolved_target_state_ =
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    source_out.resource = isolated_replay_preview_resolved_target_.Get();
+    source_out.previous_state = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+    source_out.resolved = true;
+  } else {
+    source_out.previous_state = isolated_color->SetResourceState(
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    command_processor_.PushTransitionBarrier(
+        resource, source_out.previous_state,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  }
+  command_processor_.SubmitBarriers();
+  return true;
+}
+
+void D3D12RenderTargetCache::EndIsolatedReplayPreview(
+    const IsolatedReplayPreviewSource& source) {
+  if (!source.resource || !isolated_replay_color_target_) {
+    return;
+  }
+  if (source.resolved) {
+    if (isolated_replay_preview_resolved_target_.Get() != source.resource) {
+      return;
+    }
+    command_processor_.PushTransitionBarrier(
+        source.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        source.previous_state);
+    isolated_replay_preview_resolved_target_state_ = source.previous_state;
+    return;
+  }
+  auto* isolated_color = static_cast<D3D12RenderTarget*>(
+      isolated_replay_color_target_.get());
+  if (isolated_color->resource() != source.resource) {
+    return;
+  }
+  isolated_color->SetResourceState(source.previous_state);
+  command_processor_.PushTransitionBarrier(
+      source.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+      source.previous_state);
 }
 
 bool D3D12RenderTargetCache::IsHostDepthEncodingDifferent(

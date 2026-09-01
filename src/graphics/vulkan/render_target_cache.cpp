@@ -1137,6 +1137,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   if (!draw_util::GetResolveInfo(register_file(), memory, draw_resolution_scale_x(),
                                  draw_resolution_scale_y(), IsFixedRG16TruncatedToMinus1To1(),
                                  IsFixedRGBA16TruncatedToMinus1To1(), resolve_info)) {
+    draw_util::LogResolveFailureState(register_file(), memory);
     return false;
   }
 

@@ -70,6 +70,79 @@ class GraphicsSystem : public system::IGraphicsSystem {
 
   RegisterFile* register_file() { return &register_file_; }
   CommandProcessor* command_processor() const { return command_processor_.get(); }
+  void SetDrawObserver(system::GraphicsDrawObserver observer) override {
+    draw_observer_.store(observer, std::memory_order_release);
+  }
+  system::GraphicsDrawObserver draw_observer() const {
+    return draw_observer_.load(std::memory_order_acquire);
+  }
+  void SetIndirectBufferObserver(
+      system::GraphicsIndirectBufferObserver observer) override {
+    indirect_buffer_observer_.store(observer, std::memory_order_release);
+  }
+  system::GraphicsIndirectBufferObserver indirect_buffer_observer() const {
+    return indirect_buffer_observer_.load(std::memory_order_acquire);
+  }
+  void SetCopyObserver(system::GraphicsCopyObserver observer) override {
+    copy_observer_.store(observer, std::memory_order_release);
+  }
+  system::GraphicsCopyObserver copy_observer() const {
+    return copy_observer_.load(std::memory_order_acquire);
+  }
+  void SetShaderTranslationObserver(
+      system::GraphicsShaderTranslationObserver observer) override {
+    shader_translation_observer_.store(observer, std::memory_order_release);
+  }
+  system::GraphicsShaderTranslationObserver shader_translation_observer() const {
+    return shader_translation_observer_.load(std::memory_order_acquire);
+  }
+  void SetPreparedDrawObserver(system::GraphicsPreparedDrawObserver observer) override {
+    prepared_draw_observer_.store(observer, std::memory_order_release);
+  }
+  system::GraphicsPreparedDrawObserver prepared_draw_observer() const {
+    return prepared_draw_observer_.load(std::memory_order_acquire);
+  }
+  void SetDrawOutcomeObserver(
+      system::GraphicsDrawOutcomeObserver observer) override {
+    draw_outcome_observer_.store(observer, std::memory_order_release);
+  }
+  system::GraphicsDrawOutcomeObserver draw_outcome_observer() const {
+    return draw_outcome_observer_.load(std::memory_order_acquire);
+  }
+  void SetIsolatedDrawRequestObserver(
+      system::GraphicsIsolatedDrawRequestObserver observer) override {
+    isolated_draw_request_observer_.store(observer,
+                                          std::memory_order_release);
+  }
+  system::GraphicsIsolatedDrawRequestObserver isolated_draw_request_observer()
+      const {
+    return isolated_draw_request_observer_.load(std::memory_order_acquire);
+  }
+  void SetNativeTextureSetObserver(
+      system::GraphicsNativeTextureSetObserver observer) override {
+    native_texture_set_observer_.store(observer, std::memory_order_release);
+  }
+  system::GraphicsNativeTextureSetObserver native_texture_set_observer() const {
+    return native_texture_set_observer_.load(std::memory_order_acquire);
+  }
+  void SetNativeResolveObserver(
+      system::GraphicsNativeResolveObserver observer) override {
+    native_resolve_observer_.store(observer, std::memory_order_release);
+  }
+  system::GraphicsNativeResolveObserver native_resolve_observer() const {
+    return native_resolve_observer_.load(std::memory_order_acquire);
+  }
+  void SetNativeGuestOutputRenderer(
+      system::NativeGuestOutputRenderer renderer) override {
+    native_guest_output_renderer_.Set(renderer);
+  }
+  bool HasNativeGuestOutputRenderer() const override {
+    return native_guest_output_renderer_.IsRegistered();
+  }
+  const system::NativeGuestOutputRendererRegistration&
+  native_guest_output_renderer() const {
+    return native_guest_output_renderer_;
+  }
 
   void InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) override;
   void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) override;
@@ -128,6 +201,24 @@ class GraphicsSystem : public system::IGraphicsSystem {
 
  private:
   std::unique_ptr<::rex::ui::Presenter> presenter_;
+
+  std::atomic<system::GraphicsDrawObserver> draw_observer_{nullptr};
+  std::atomic<system::GraphicsIndirectBufferObserver>
+      indirect_buffer_observer_{nullptr};
+  std::atomic<system::GraphicsCopyObserver> copy_observer_{nullptr};
+  std::atomic<system::GraphicsShaderTranslationObserver>
+      shader_translation_observer_{nullptr};
+  std::atomic<system::GraphicsPreparedDrawObserver> prepared_draw_observer_{
+      nullptr};
+  std::atomic<system::GraphicsDrawOutcomeObserver> draw_outcome_observer_{
+      nullptr};
+  std::atomic<system::GraphicsIsolatedDrawRequestObserver>
+      isolated_draw_request_observer_{nullptr};
+  std::atomic<system::GraphicsNativeTextureSetObserver>
+      native_texture_set_observer_{nullptr};
+  std::atomic<system::GraphicsNativeResolveObserver> native_resolve_observer_{
+      nullptr};
+  system::NativeGuestOutputRendererRegistration native_guest_output_renderer_;
 
   std::atomic_flag host_gpu_loss_reported_;
 };

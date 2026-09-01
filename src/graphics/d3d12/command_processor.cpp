@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -57,6 +58,9 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/apply_gamma_table_fxaa_luma_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/fxaa_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/fxaa_extreme_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/native_guest_output_retained_pass_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/native_guest_output_hybrid_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/native_guest_output_triangle_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_downscale_cs.h"
 }  // namespace shaders
 
@@ -152,6 +156,13 @@ void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path&
 
 bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
                                                                uint32_t packet, uint32_t count) {
+  ZPDMode mode = GetZPDMode();
+  if (mode == ZPDMode::kFast || mode == ZPDMode::kStrict) {
+    return ExecuteModernZPD(reader, packet, count);
+  }
+  if (mode == ZPDMode::kFake) {
+    return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
+  }
   if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_) {
     return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
   }
@@ -214,6 +225,164 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
     return write_fallback_result();
   }
 
+  return true;
+}
+
+ZPDMode D3D12CommandProcessor::GetZPDMode() const {
+  const std::string& mode = REXCVAR_GET(occlusion_query);
+  if (mode == "fake") {
+    return ZPDMode::kFake;
+  }
+  if (mode == "fast") {
+    return ZPDMode::kFast;
+  }
+  if (mode == "strict") {
+    return ZPDMode::kStrict;
+  }
+  return ZPDMode::kLegacy;
+}
+
+bool D3D12CommandProcessor::ExecuteModernZPD(memory::RingBuffer* reader, uint32_t packet,
+                                             uint32_t count) {
+  assert_true(count == 1);
+  uint32_t initiator = reader->ReadAndSwap<uint32_t>();
+  WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
+
+  if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_) {
+    PERF_counter_inc(kZpdFakeFallbacks);
+    // The packet payload has already been consumed, so reproduce the safe fake
+    // completion locally instead of delegating to the base packet reader.
+    uint32_t address = register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
+    auto* report = memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(address);
+    if (report && XenosZPDReport::HasPendingSentinel(report)) {
+      XenosZPDReport::WriteSampleCount(report,
+                                       uint32_t(REXCVAR_GET(query_occlusion_fake_sample_count)));
+    }
+    return true;
+  }
+
+  RetireModernZPDQueries();
+  if (!BeginSubmission(true)) {
+    PERF_counter_inc(kZpdFakeFallbacks);
+    return true;
+  }
+
+  uint32_t address = register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
+  uint32_t record_base = XenosZPDReport::GetRecordBase(address);
+  auto* guest_report =
+      record_base ? memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(record_base)
+                  : nullptr;
+  if (!guest_report) {
+    PERF_counter_inc(kZpdMalformedRecords);
+    return true;
+  }
+
+  bool logical_current = zpd_lifecycle_.active().logical_active &&
+                         zpd_lifecycle_.active().slot_base == XenosZPDReport::GetSlotBase(address);
+  ZPDClassificationResult classification = ClassifyZPD(address, guest_report, logical_current);
+  LogZPDObservation(address, guest_report, logical_current, classification);
+
+  if (classification.classification == ZPDClassification::kBegin) {
+    // A new BEGIN implicitly closes an older logical lifetime.
+    if (zpd_lifecycle_.active().logical_active) {
+      ZPDLifecycle::Report* old_report = zpd_lifecycle_.active_report();
+      ZPDLifecycle::ReportHandle old_handle = zpd_lifecycle_.active().report_handle;
+      uint32_t old_end = old_report ? old_report->end_record : 0;
+      if (old_end) {
+        CloseModernZPDSegment();
+        zpd_lifecycle_.End(old_end);
+        PERF_counter_inc(kZpdReportsEnded);
+        old_report = zpd_lifecycle_.Find(old_handle);
+        if (old_report && old_report->pending_segments == 0) {
+          WriteModernZPDReport(*old_report, 1);
+          ZPDLifecycle::Report abandoned;
+          bool commit = false;
+          zpd_lifecycle_.Abandon(old_handle, 1, abandoned, commit);
+          PERF_counter_inc(kZpdFakeFallbacks);
+        } else if (old_report && GetZPDMode() == ZPDMode::kFast) {
+          uint32_t speculative = old_report->has_cached_delta ? old_report->cached_delta : 1;
+          WriteModernZPDReport(*old_report, speculative);
+          PERF_counter_inc(kZpdFastSpeculativeWrites);
+        } else if (old_report) {
+          AwaitModernZPDReport(old_handle, 2);
+          BeginSubmission(true);
+        }
+      }
+    }
+    uint32_t slot_base = XenosZPDReport::GetSlotBase(address);
+    bool same_slot_reuse = zpd_lifecycle_.HasPendingSlot(slot_base);
+    if (same_slot_reuse && GetZPDMode() == ZPDMode::kStrict) {
+      ZPDLifecycle::ReportHandle pending = zpd_lifecycle_.OldestPendingSlot(slot_base);
+      if (pending != ZPDLifecycle::kInvalidReportHandle) {
+        AwaitModernZPDReport(pending, 2);
+        // Awaiting closes the current submission. Reopen before BeginQuery.
+        BeginSubmission(true);
+      }
+    }
+    std::memset(guest_report, 0, sizeof(*guest_report));
+    auto begin = zpd_lifecycle_.Begin(address);
+    if (begin.report_handle == ZPDLifecycle::kInvalidReportHandle) {
+      PERF_counter_inc(kZpdMalformedRecords);
+      return true;
+    }
+    PERF_counter_inc(kZpdReportsStarted);
+    if (same_slot_reuse || begin.same_slot_reuse) {
+      PERF_counter_inc(kZpdSameSlotReuse);
+    }
+    OpenModernZPDSegment();
+    return true;
+  }
+
+  if (classification.classification == ZPDClassification::kMalformed) {
+    if (XenosZPDReport::HasPendingSentinel(guest_report)) {
+      PERF_counter_inc(kZpdFakeFallbacks);
+      XenosZPDReport::WriteSampleCount(guest_report,
+                                       uint32_t(REXCVAR_GET(query_occlusion_fake_sample_count)));
+    }
+    RecoverStalledZPDSentinel(address, guest_report);
+    return true;
+  }
+
+  ZPDLifecycle::Report* active_report = zpd_lifecycle_.active_report();
+  if (classification.classification == ZPDClassification::kOrphanedEnd || !active_report ||
+      active_report->slot_base != XenosZPDReport::GetSlotBase(address)) {
+    // Orphan END: never leave the guest polling the sentinel.
+    uint32_t cached = zpd_lifecycle_.CachedDelta(record_base, 1);
+    XenosZPDReport::WriteSampleCount(guest_report, cached);
+    PERF_counter_inc(kZpdFastSpeculativeWrites);
+    RecoverStalledZPDSentinel(address, guest_report);
+    return true;
+  }
+
+  ZPDLifecycle::ReportHandle handle = zpd_lifecycle_.active().report_handle;
+  CloseModernZPDSegment();
+  zpd_lifecycle_.End(address);
+  PERF_counter_inc(kZpdReportsEnded);
+
+  active_report = zpd_lifecycle_.Find(handle);
+  if (!active_report) {
+    return true;
+  }
+
+  if (active_report->pending_segments == 0) {
+    // Pool exhaustion or a failed segment open must still release guest
+    // polling. Unknown visibility is conservatively treated as visible.
+    WriteModernZPDReport(*active_report, 1);
+    ZPDLifecycle::Report abandoned;
+    bool commit = false;
+    zpd_lifecycle_.Abandon(handle, 1, abandoned, commit);
+    PERF_counter_inc(kZpdFakeFallbacks);
+    return true;
+  }
+
+  if (GetZPDMode() == ZPDMode::kFast) {
+    uint32_t speculative = active_report->has_cached_delta ? active_report->cached_delta : 1;
+    WriteModernZPDReport(*active_report, speculative);
+    PERF_counter_inc(kZpdFastSpeculativeWrites);
+  } else {
+    AwaitModernZPDReport(handle, 2);
+  }
+  RecoverStalledZPDSentinel(address, guest_report);
   return true;
 }
 
@@ -1619,6 +1788,7 @@ bool D3D12CommandProcessor::SetupContext() {
   }
 
   occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
+  InitializeNativeGuestOutputGpuTiming();
 
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
@@ -1629,6 +1799,7 @@ bool D3D12CommandProcessor::SetupContext() {
 void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
   InvalidateAllVertexBufferResidency();
+  ShutdownNativeGuestOutputGpuTiming();
   ShutdownOcclusionQueryResources();
 
   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
@@ -1681,6 +1852,23 @@ void D3D12CommandProcessor::ShutdownContext() {
 
   fxaa_source_texture_submission_ = 0;
   fxaa_source_texture_.Reset();
+
+  native_guest_output_display_target_submission_ = 0;
+  native_guest_output_display_target_.Reset();
+  native_guest_output_display_target_state_ =
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  native_guest_output_retained_pass_pipeline_.Reset();
+  native_guest_output_retained_pass_root_signature_.Reset();
+  native_guest_output_linear_target_.Reset();
+  native_guest_output_linear_target_submission_ = 0;
+  native_guest_output_hybrid_target_submission_ = 0;
+  native_guest_output_hybrid_target_.Reset();
+  native_guest_output_hybrid_target_state_ =
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  native_guest_output_hybrid_pipeline_.Reset();
+  native_guest_output_hybrid_root_signature_.Reset();
+  native_guest_output_triangle_pipeline_.Reset();
+  native_guest_output_triangle_root_signature_.Reset();
 
   fxaa_extreme_pipeline_.Reset();
   fxaa_pipeline_.Reset();
@@ -1891,6 +2079,760 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_up_to_date_ = false;
 }
 
+bool ClearNativeGuestOutput(
+    const system::NativeGuestOutputRenderContext& context,
+    const float color[4]) {
+  auto* command_processor =
+      static_cast<D3D12CommandProcessor*>(context.command_context);
+  auto* resource = static_cast<ID3D12Resource*>(context.guest_output);
+  auto* device = static_cast<ID3D12Device*>(context.device);
+  if (!command_processor || !resource || !device || !color) {
+    return false;
+  }
+
+  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor;
+  if (!command_processor->RequestOneUseSingleViewDescriptors(1, &descriptor)) {
+    return false;
+  }
+
+  D3D12_UNORDERED_ACCESS_VIEW_DESC view_desc{};
+  view_desc.Format = ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+  view_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+  device->CreateUnorderedAccessView(resource, nullptr, &view_desc,
+                                    descriptor.first);
+  command_processor->PushTransitionBarrier(
+      resource, ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  command_processor->SubmitBarriers();
+  command_processor->GetDeferredCommandList().D3DClearUnorderedAccessViewFloat(
+      descriptor.second, descriptor.first, resource, color, 0, nullptr);
+  command_processor->PushTransitionBarrier(
+      resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
+  return true;
+}
+
+bool D3D12CommandProcessor::DrawNativeGuestOutputDiagnosticTriangle(
+    ID3D12Resource* resource, uint32_t width, uint32_t height,
+    uint32_t phase) {
+  if (!resource || !width || !height) {
+    return false;
+  }
+
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  if (!device) {
+    return false;
+  }
+
+  if (!native_guest_output_triangle_root_signature_) {
+    D3D12_ROOT_PARAMETER root_parameters
+        [uint32_t(NativeGuestOutputTriangleRootParameter::kCount)]{};
+    auto& constants = root_parameters
+        [uint32_t(NativeGuestOutputTriangleRootParameter::kConstants)];
+    constants.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    constants.Constants.ShaderRegister = 0;
+    constants.Constants.RegisterSpace = 0;
+    constants.Constants.Num32BitValues =
+        sizeof(NativeGuestOutputTriangleConstants) / sizeof(uint32_t);
+    constants.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_DESCRIPTOR_RANGE output_range{};
+    output_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    output_range.NumDescriptors = 1;
+    output_range.BaseShaderRegister = 0;
+    output_range.RegisterSpace = 0;
+    output_range.OffsetInDescriptorsFromTableStart = 0;
+    auto& output = root_parameters
+        [uint32_t(NativeGuestOutputTriangleRootParameter::kOutput)];
+    output.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    output.DescriptorTable.NumDescriptorRanges = 1;
+    output.DescriptorTable.pDescriptorRanges = &output_range;
+    output.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC root_signature_desc{};
+    root_signature_desc.NumParameters =
+        uint32_t(NativeGuestOutputTriangleRootParameter::kCount);
+    root_signature_desc.pParameters = root_parameters;
+    root_signature_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+    *native_guest_output_triangle_root_signature_.ReleaseAndGetAddressOf() =
+        ui::d3d12::util::CreateRootSignature(provider, root_signature_desc);
+    if (!native_guest_output_triangle_root_signature_) {
+      REXGPU_ERROR("Failed to create the native guest-output triangle root signature");
+      return false;
+    }
+  }
+
+  if (!native_guest_output_triangle_pipeline_) {
+    *native_guest_output_triangle_pipeline_.ReleaseAndGetAddressOf() =
+        ui::d3d12::util::CreateComputePipeline(
+            device, shaders::native_guest_output_triangle_cs,
+            sizeof(shaders::native_guest_output_triangle_cs),
+            native_guest_output_triangle_root_signature_.Get());
+    if (!native_guest_output_triangle_pipeline_) {
+      REXGPU_ERROR("Failed to create the native guest-output triangle pipeline");
+      return false;
+    }
+  }
+
+  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor;
+  if (!RequestOneUseSingleViewDescriptors(1, &descriptor)) {
+    return false;
+  }
+
+  D3D12_UNORDERED_ACCESS_VIEW_DESC view_desc{};
+  view_desc.Format = ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+  view_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+  device->CreateUnorderedAccessView(resource, nullptr, &view_desc,
+                                    descriptor.first);
+
+  NativeGuestOutputTriangleConstants triangle_constants{{width, height},
+                                                         phase & 1};
+  PushTransitionBarrier(
+      resource, ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  deferred_command_list_.D3DSetComputeRootSignature(
+      native_guest_output_triangle_root_signature_.Get());
+  deferred_command_list_.D3DSetComputeRoot32BitConstants(
+      uint32_t(NativeGuestOutputTriangleRootParameter::kConstants),
+      sizeof(triangle_constants) / sizeof(uint32_t), &triangle_constants, 0);
+  deferred_command_list_.D3DSetComputeRootDescriptorTable(
+      uint32_t(NativeGuestOutputTriangleRootParameter::kOutput),
+      descriptor.second);
+  SetExternalPipeline(native_guest_output_triangle_pipeline_.Get());
+  SubmitBarriers();
+  deferred_command_list_.D3DDispatch((width + 7) / 8, (height + 7) / 8, 1);
+  PushTransitionBarrier(resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
+  return true;
+}
+
+bool D3D12CommandProcessor::DrawNativeGuestOutputRetainedPass(
+    ID3D12Resource* resource, uint32_t width, uint32_t height,
+    system::NativeGuestOutputRetainedPassMode mode, bool use_pwl_gamma_ramp) {
+  if (!resource || !width || !height || !render_target_cache_) {
+    return false;
+  }
+  const bool comparison =
+      mode == system::NativeGuestOutputRetainedPassMode::kCompareNative ||
+      mode == system::NativeGuestOutputRetainedPassMode::kCompareXenos ||
+      mode ==
+          system::NativeGuestOutputRetainedPassMode::kPrototypeCompareNative ||
+      mode ==
+          system::NativeGuestOutputRetainedPassMode::kPrototypeCompareXenos;
+  const bool present_native =
+      mode != system::NativeGuestOutputRetainedPassMode::kCompareXenos &&
+      mode !=
+          system::NativeGuestOutputRetainedPassMode::kPrototypeCompareXenos;
+  const bool prototype =
+      mode == system::NativeGuestOutputRetainedPassMode::kPrototypeNative ||
+      mode == system::NativeGuestOutputRetainedPassMode::kPrototypeHybrid ||
+      mode ==
+          system::NativeGuestOutputRetainedPassMode::kPrototypeCompareNative ||
+      mode ==
+          system::NativeGuestOutputRetainedPassMode::kPrototypeCompareXenos;
+  const bool hybrid =
+      mode == system::NativeGuestOutputRetainedPassMode::kPrototypeHybrid;
+
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  if (!device) {
+    return false;
+  }
+
+  if (!native_guest_output_retained_pass_root_signature_) {
+    D3D12_ROOT_PARAMETER root_parameters
+        [uint32_t(NativeGuestOutputRetainedPassRootParameter::kCount)]{};
+    auto& constants = root_parameters[uint32_t(
+        NativeGuestOutputRetainedPassRootParameter::kConstants)];
+    constants.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    constants.Constants.ShaderRegister = 0;
+    constants.Constants.RegisterSpace = 0;
+    constants.Constants.Num32BitValues =
+        sizeof(NativeGuestOutputRetainedPassConstants) / sizeof(uint32_t);
+    constants.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_DESCRIPTOR_RANGE source_range{};
+    source_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    source_range.NumDescriptors = 1;
+    source_range.BaseShaderRegister = 0;
+    source_range.RegisterSpace = 0;
+    source_range.OffsetInDescriptorsFromTableStart = 0;
+    auto& source = root_parameters[
+        uint32_t(NativeGuestOutputRetainedPassRootParameter::kSource)];
+    source.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    source.DescriptorTable.NumDescriptorRanges = 1;
+    source.DescriptorTable.pDescriptorRanges = &source_range;
+    source.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_DESCRIPTOR_RANGE output_range{};
+    output_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    output_range.NumDescriptors = 1;
+    output_range.BaseShaderRegister = 0;
+    output_range.RegisterSpace = 0;
+    output_range.OffsetInDescriptorsFromTableStart = 0;
+    auto& output = root_parameters[
+        uint32_t(NativeGuestOutputRetainedPassRootParameter::kOutput)];
+    output.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    output.DescriptorTable.NumDescriptorRanges = 1;
+    output.DescriptorTable.pDescriptorRanges = &output_range;
+    output.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC root_signature_desc{};
+    root_signature_desc.NumParameters =
+        uint32_t(NativeGuestOutputRetainedPassRootParameter::kCount);
+    root_signature_desc.pParameters = root_parameters;
+    root_signature_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+    *native_guest_output_retained_pass_root_signature_
+         .ReleaseAndGetAddressOf() =
+        ui::d3d12::util::CreateRootSignature(provider, root_signature_desc);
+    if (!native_guest_output_retained_pass_root_signature_) {
+      REXGPU_ERROR(
+          "Failed to create the native guest-output retained-pass root "
+          "signature");
+      return false;
+    }
+  }
+
+  if (!native_guest_output_retained_pass_pipeline_) {
+    *native_guest_output_retained_pass_pipeline_.ReleaseAndGetAddressOf() =
+        ui::d3d12::util::CreateComputePipeline(
+            device, shaders::native_guest_output_retained_pass_cs,
+            sizeof(shaders::native_guest_output_retained_pass_cs),
+            native_guest_output_retained_pass_root_signature_.Get());
+    if (!native_guest_output_retained_pass_pipeline_) {
+      REXGPU_ERROR(
+          "Failed to create the native guest-output retained-pass pipeline");
+      return false;
+    }
+  }
+
+  bool recreate_display_target = !native_guest_output_display_target_;
+  if (!recreate_display_target) {
+    const D3D12_RESOURCE_DESC display_desc =
+        native_guest_output_display_target_->GetDesc();
+    recreate_display_target =
+        display_desc.Width != width || display_desc.Height != height ||
+        display_desc.Format != ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+  }
+  if (recreate_display_target) {
+    if (native_guest_output_display_target_) {
+      if (submission_completed_ <
+          native_guest_output_display_target_submission_) {
+        native_guest_output_display_target_->AddRef();
+        resources_for_deletion_.emplace_back(
+            native_guest_output_display_target_submission_,
+            native_guest_output_display_target_.Get());
+      }
+      native_guest_output_display_target_.Reset();
+      native_guest_output_display_target_submission_ = 0;
+    }
+    D3D12_RESOURCE_DESC display_desc{};
+    display_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    display_desc.Width = width;
+    display_desc.Height = height;
+    display_desc.DepthOrArraySize = 1;
+    display_desc.MipLevels = 1;
+    display_desc.Format =
+        ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+    display_desc.SampleDesc.Count = 1;
+    display_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    display_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    HRESULT create_result = device->CreateCommittedResource(
+        &ui::d3d12::util::kHeapPropertiesDefault,
+        provider.GetHeapFlagCreateNotZeroed(), &display_desc,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+        IID_PPV_ARGS(&native_guest_output_display_target_));
+    if (FAILED(create_result)) {
+      static bool logged_display_target_failure = false;
+      if (!logged_display_target_failure) {
+        logged_display_target_failure = true;
+        REXGPU_WARN(
+            "Native guest-output display target allocation failed: "
+            "HRESULT 0x{:08X}, {}x{}",
+            uint32_t(create_result), width, height);
+      }
+      return false;
+    }
+    native_guest_output_display_target_->SetName(
+        L"Native guest-output display target");
+    native_guest_output_display_target_state_ =
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  }
+
+  if (prototype) {
+    constexpr uint32_t kLogicalSceneWidth = 512;
+    constexpr uint32_t kLogicalSceneHeight = 288;
+    bool recreate_linear_target = !native_guest_output_linear_target_;
+    if (!recreate_linear_target) {
+      const D3D12_RESOURCE_DESC linear_desc =
+          native_guest_output_linear_target_->GetDesc();
+      recreate_linear_target = linear_desc.Width != width ||
+                               linear_desc.Height != height ||
+                               linear_desc.Format !=
+                                   DXGI_FORMAT_R16G16B16A16_FLOAT;
+    }
+    if (recreate_linear_target) {
+      if (native_guest_output_linear_target_) {
+        if (submission_completed_ <
+            native_guest_output_linear_target_submission_) {
+          native_guest_output_linear_target_->AddRef();
+          resources_for_deletion_.emplace_back(
+              native_guest_output_linear_target_submission_,
+              native_guest_output_linear_target_.Get());
+        }
+        native_guest_output_linear_target_.Reset();
+        native_guest_output_linear_target_submission_ = 0;
+      }
+      D3D12_RESOURCE_DESC linear_desc{};
+      linear_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+      linear_desc.Width = width;
+      linear_desc.Height = height;
+      linear_desc.DepthOrArraySize = 1;
+      linear_desc.MipLevels = 1;
+      linear_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+      linear_desc.SampleDesc.Count = 1;
+      linear_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+      linear_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+      HRESULT create_result = device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesDefault,
+          provider.GetHeapFlagCreateNotZeroed(), &linear_desc,
+          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+          IID_PPV_ARGS(&native_guest_output_linear_target_));
+      if (FAILED(create_result)) {
+        static bool logged_linear_target_failure = false;
+        if (!logged_linear_target_failure) {
+          logged_linear_target_failure = true;
+          REXGPU_WARN(
+              "Native guest-output linear target allocation failed: "
+              "HRESULT 0x{:08X}, {}x{}",
+              uint32_t(create_result), width, height);
+        }
+        return false;
+      }
+      native_guest_output_linear_target_->SetName(
+          L"Native guest-output logical-scene linear target");
+      native_guest_output_linear_target_state_ =
+          D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+  }
+
+  NativeGuestOutputGpuTimingSlot* timing_slot = nullptr;
+  uint32_t timing_query_base = 0;
+  if (comparison) {
+    native_guest_output_gpu_timing_active_ = true;
+    if (native_guest_output_gpu_query_heap_ &&
+        native_guest_output_gpu_query_readback_) {
+      const uint32_t slot_index =
+          uint32_t(frame_current_ % kQueueFrames);
+      auto& candidate_slot =
+          native_guest_output_gpu_timing_slots_[slot_index];
+      if (!candidate_slot.submission) {
+        timing_slot = &candidate_slot;
+        timing_slot->guest_timed = timing_slot->frame_started;
+        timing_query_base =
+            slot_index * kNativeGuestOutputGpuQueriesPerFrame;
+        deferred_command_list_.D3DEndQuery(
+            native_guest_output_gpu_query_heap_.Get(),
+            D3D12_QUERY_TYPE_TIMESTAMP, timing_query_base + 1);
+      } else {
+        PROFILE_NATIVE_GPU_TIMING_DROP();
+      }
+    } else {
+      PROFILE_NATIVE_GPU_TIMING_DROP();
+    }
+  }
+
+  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[5];
+  if (!RequestOneUseSingleViewDescriptors(prototype ? 5 : 2, descriptors)) {
+    static bool logged_retained_preview_descriptor_failure = false;
+    if (!logged_retained_preview_descriptor_failure) {
+      logged_retained_preview_descriptor_failure = true;
+      REXGPU_WARN(
+          "Native retained-pass preview could not allocate view descriptors");
+    }
+    return false;
+  }
+  D3D12RenderTargetCache::IsolatedReplayPreviewSource preview_source;
+  if (!render_target_cache_->BeginIsolatedReplayPreview(
+          observation_frame_sequence_, preview_source)) {
+    static bool logged_retained_preview_begin_failure = false;
+    if (!logged_retained_preview_begin_failure) {
+      logged_retained_preview_begin_failure = true;
+      REXGPU_WARN(
+          "Native retained-pass preview unavailable for frame {}, retained "
+          "frame {}",
+          observation_frame_sequence_,
+          render_target_cache_->GetIsolatedReplayPreviewFrameSequence());
+    }
+    return false;
+  }
+  D3D12_SHADER_RESOURCE_VIEW_DESC source_view_desc{};
+  source_view_desc.Format = preview_source.format;
+  source_view_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  source_view_desc.Shader4ComponentMapping =
+      D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  source_view_desc.Texture2D.MostDetailedMip = 0;
+  source_view_desc.Texture2D.MipLevels = 1;
+  source_view_desc.Texture2D.PlaneSlice = 0;
+  source_view_desc.Texture2D.ResourceMinLODClamp = 0.0f;
+  device->CreateShaderResourceView(preview_source.resource, &source_view_desc,
+                                   descriptors[0].first);
+  D3D12_UNORDERED_ACCESS_VIEW_DESC output_view_desc{};
+  output_view_desc.Format = ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+  output_view_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+  device->CreateUnorderedAccessView(native_guest_output_display_target_.Get(),
+                                    nullptr, &output_view_desc,
+                                    descriptors[1].first);
+
+  ui::d3d12::util::DescriptorCpuGpuHandlePair gamma_ramp_descriptor;
+  if (prototype) {
+    if (bindless_resources_used_) {
+      gamma_ramp_descriptor = GetSystemBindlessViewHandlePair(
+          use_pwl_gamma_ramp ? SystemBindlessView::kGammaRampPWLSRV
+                             : SystemBindlessView::kGammaRampTableSRV);
+    } else {
+      gamma_ramp_descriptor = descriptors[2];
+      WriteGammaRampSRV(use_pwl_gamma_ramp, gamma_ramp_descriptor.first);
+    }
+    D3D12_UNORDERED_ACCESS_VIEW_DESC linear_uav_desc{};
+    linear_uav_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    linear_uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    device->CreateUnorderedAccessView(native_guest_output_linear_target_.Get(),
+                                      nullptr, &linear_uav_desc,
+                                      descriptors[3].first);
+    D3D12_SHADER_RESOURCE_VIEW_DESC linear_srv_desc{};
+    linear_srv_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    linear_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    linear_srv_desc.Shader4ComponentMapping =
+        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    linear_srv_desc.Texture2D.MipLevels = 1;
+    device->CreateShaderResourceView(native_guest_output_linear_target_.Get(),
+                                     &linear_srv_desc,
+                                     descriptors[4].first);
+  }
+
+  NativeGuestOutputRetainedPassConstants preview_constants{
+      {width, height},
+      {preview_source.width, preview_source.height},
+      {prototype ? preview_source.logical_width
+                 : std::min(preview_source.width, uint32_t(512)),
+       prototype ? preview_source.logical_height
+                 : std::min(preview_source.height, uint32_t(512))},
+      prototype ? 1u : 0u,
+      0u};
+  PushTransitionBarrier(native_guest_output_display_target_.Get(),
+                        native_guest_output_display_target_state_,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  if (prototype) {
+    PushTransitionBarrier(native_guest_output_linear_target_.Get(),
+                          native_guest_output_linear_target_state_,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    deferred_command_list_.D3DSetComputeRootSignature(
+        native_guest_output_retained_pass_root_signature_.Get());
+    deferred_command_list_.D3DSetComputeRoot32BitConstants(
+        uint32_t(NativeGuestOutputRetainedPassRootParameter::kConstants),
+        sizeof(preview_constants) / sizeof(uint32_t), &preview_constants, 0);
+    deferred_command_list_.D3DSetComputeRootDescriptorTable(
+        uint32_t(NativeGuestOutputRetainedPassRootParameter::kSource),
+        descriptors[0].second);
+    deferred_command_list_.D3DSetComputeRootDescriptorTable(
+        uint32_t(NativeGuestOutputRetainedPassRootParameter::kOutput),
+        descriptors[3].second);
+    SetExternalPipeline(native_guest_output_retained_pass_pipeline_.Get());
+    SubmitBarriers();
+    deferred_command_list_.D3DDispatch((width + 7) / 8,
+                                       (height + 7) / 8, 1);
+    PushTransitionBarrier(native_guest_output_linear_target_.Get(),
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    native_guest_output_linear_target_state_ =
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    ApplyGammaConstants gamma_constants{{width, height}};
+    deferred_command_list_.D3DSetComputeRootSignature(
+        apply_gamma_root_signature_.Get());
+    deferred_command_list_.D3DSetComputeRoot32BitConstants(
+        uint32_t(ApplyGammaRootParameter::kConstants),
+        sizeof(gamma_constants) / sizeof(uint32_t), &gamma_constants, 0);
+    deferred_command_list_.D3DSetComputeRootDescriptorTable(
+        uint32_t(ApplyGammaRootParameter::kDestination),
+        descriptors[1].second);
+    deferred_command_list_.D3DSetComputeRootDescriptorTable(
+        uint32_t(ApplyGammaRootParameter::kSource), descriptors[4].second);
+    deferred_command_list_.D3DSetComputeRootDescriptorTable(
+        uint32_t(ApplyGammaRootParameter::kRamp),
+        gamma_ramp_descriptor.second);
+    SetExternalPipeline(use_pwl_gamma_ramp ? apply_gamma_pwl_pipeline_.Get()
+                                           : apply_gamma_table_pipeline_.Get());
+  } else {
+    deferred_command_list_.D3DSetComputeRootSignature(
+        native_guest_output_retained_pass_root_signature_.Get());
+    deferred_command_list_.D3DSetComputeRoot32BitConstants(
+        uint32_t(NativeGuestOutputRetainedPassRootParameter::kConstants),
+        sizeof(preview_constants) / sizeof(uint32_t), &preview_constants, 0);
+    deferred_command_list_.D3DSetComputeRootDescriptorTable(
+        uint32_t(NativeGuestOutputRetainedPassRootParameter::kSource),
+        descriptors[0].second);
+    deferred_command_list_.D3DSetComputeRootDescriptorTable(
+        uint32_t(NativeGuestOutputRetainedPassRootParameter::kOutput),
+        descriptors[1].second);
+    SetExternalPipeline(native_guest_output_retained_pass_pipeline_.Get());
+  }
+  SubmitBarriers();
+  if (comparison) {
+    deferred_command_list_.BeginDebugMarker(
+        "PinyonShift NR-04C native display composition");
+  }
+  if (prototype) {
+    deferred_command_list_.D3DDispatch((width + 15) / 16,
+                                       (height + 7) / 8, 1);
+    PushTransitionBarrier(native_guest_output_linear_target_.Get(),
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    native_guest_output_linear_target_state_ =
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    native_guest_output_linear_target_submission_ = submission_current_;
+  } else {
+    deferred_command_list_.D3DDispatch((width + 7) / 8,
+                                       (height + 7) / 8, 1);
+  }
+  render_target_cache_->EndIsolatedReplayPreview(preview_source);
+  PushTransitionBarrier(native_guest_output_display_target_.Get(),
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+  SubmitBarriers();
+  native_guest_output_display_target_state_ =
+      D3D12_RESOURCE_STATE_COPY_SOURCE;
+  native_guest_output_display_target_submission_ = submission_current_;
+  if (comparison) {
+    deferred_command_list_.EndDebugMarker();
+  }
+  if (timing_slot) {
+    deferred_command_list_.D3DEndQuery(
+        native_guest_output_gpu_query_heap_.Get(),
+        D3D12_QUERY_TYPE_TIMESTAMP, timing_query_base + 2);
+  }
+  ID3D12Resource* selected_native_resource =
+      native_guest_output_display_target_.Get();
+  if (hybrid) {
+    bool recreate_hybrid_target = !native_guest_output_hybrid_target_;
+    if (!recreate_hybrid_target) {
+      const D3D12_RESOURCE_DESC hybrid_desc =
+          native_guest_output_hybrid_target_->GetDesc();
+      recreate_hybrid_target = hybrid_desc.Width != width ||
+                               hybrid_desc.Height != height ||
+                               hybrid_desc.Format !=
+                                   ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+    }
+    if (recreate_hybrid_target) {
+      if (native_guest_output_hybrid_target_) {
+        if (submission_completed_ <
+            native_guest_output_hybrid_target_submission_) {
+          native_guest_output_hybrid_target_->AddRef();
+          resources_for_deletion_.emplace_back(
+              native_guest_output_hybrid_target_submission_,
+              native_guest_output_hybrid_target_.Get());
+        }
+        native_guest_output_hybrid_target_.Reset();
+        native_guest_output_hybrid_target_submission_ = 0;
+      }
+      D3D12_RESOURCE_DESC hybrid_desc =
+          native_guest_output_display_target_->GetDesc();
+      HRESULT create_result = device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesDefault,
+          provider.GetHeapFlagCreateNotZeroed(), &hybrid_desc,
+          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+          IID_PPV_ARGS(&native_guest_output_hybrid_target_));
+      if (FAILED(create_result)) {
+        return false;
+      }
+      native_guest_output_hybrid_target_->SetName(
+          L"Native guest-output conservative hybrid target");
+      native_guest_output_hybrid_target_state_ =
+          D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+    if (!native_guest_output_hybrid_root_signature_) {
+      D3D12_ROOT_PARAMETER parameters[
+          uint32_t(NativeGuestOutputHybridRootParameter::kCount)]{};
+      auto& constants = parameters[uint32_t(
+          NativeGuestOutputHybridRootParameter::kConstants)];
+      constants.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+      constants.Constants.ShaderRegister = 0;
+      constants.Constants.Num32BitValues =
+          sizeof(NativeGuestOutputHybridConstants) / sizeof(uint32_t);
+      D3D12_DESCRIPTOR_RANGE sources_range{};
+      sources_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+      sources_range.NumDescriptors = 2;
+      sources_range.BaseShaderRegister = 0;
+      auto& sources = parameters[
+          uint32_t(NativeGuestOutputHybridRootParameter::kSources)];
+      sources.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+      sources.DescriptorTable.NumDescriptorRanges = 1;
+      sources.DescriptorTable.pDescriptorRanges = &sources_range;
+      D3D12_DESCRIPTOR_RANGE output_range{};
+      output_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+      output_range.NumDescriptors = 1;
+      output_range.BaseShaderRegister = 0;
+      auto& output = parameters[
+          uint32_t(NativeGuestOutputHybridRootParameter::kOutput)];
+      output.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+      output.DescriptorTable.NumDescriptorRanges = 1;
+      output.DescriptorTable.pDescriptorRanges = &output_range;
+      D3D12_ROOT_SIGNATURE_DESC root_desc{};
+      root_desc.NumParameters =
+          uint32_t(NativeGuestOutputHybridRootParameter::kCount);
+      root_desc.pParameters = parameters;
+      *native_guest_output_hybrid_root_signature_.ReleaseAndGetAddressOf() =
+          ui::d3d12::util::CreateRootSignature(provider, root_desc);
+      if (!native_guest_output_hybrid_root_signature_) {
+        return false;
+      }
+    }
+    if (!native_guest_output_hybrid_pipeline_) {
+      *native_guest_output_hybrid_pipeline_.ReleaseAndGetAddressOf() =
+          ui::d3d12::util::CreateComputePipeline(
+              device, shaders::native_guest_output_hybrid_cs,
+              sizeof(shaders::native_guest_output_hybrid_cs),
+              native_guest_output_hybrid_root_signature_.Get());
+      if (!native_guest_output_hybrid_pipeline_) {
+        return false;
+      }
+    }
+    ui::d3d12::util::DescriptorCpuGpuHandlePair hybrid_descriptors[3];
+    if (!RequestOneUseSingleViewDescriptors(3, hybrid_descriptors)) {
+      return false;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC output_srv_desc{};
+    output_srv_desc.Format =
+        ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+    output_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    output_srv_desc.Shader4ComponentMapping =
+        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    output_srv_desc.Texture2D.MipLevels = 1;
+    device->CreateShaderResourceView(native_guest_output_display_target_.Get(),
+                                     &output_srv_desc,
+                                     hybrid_descriptors[0].first);
+    device->CreateShaderResourceView(resource, &output_srv_desc,
+                                     hybrid_descriptors[1].first);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC hybrid_uav_desc{};
+    hybrid_uav_desc.Format =
+        ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+    hybrid_uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    device->CreateUnorderedAccessView(native_guest_output_hybrid_target_.Get(),
+                                      nullptr, &hybrid_uav_desc,
+                                      hybrid_descriptors[2].first);
+    PushTransitionBarrier(native_guest_output_display_target_.Get(),
+                          D3D12_RESOURCE_STATE_COPY_SOURCE,
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    PushTransitionBarrier(resource,
+                          ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    PushTransitionBarrier(native_guest_output_hybrid_target_.Get(),
+                          native_guest_output_hybrid_target_state_,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    NativeGuestOutputHybridConstants hybrid_constants{
+        {width, height}, 0.5f / 255.0f, 0};
+    deferred_command_list_.D3DSetComputeRootSignature(
+        native_guest_output_hybrid_root_signature_.Get());
+    deferred_command_list_.D3DSetComputeRoot32BitConstants(
+        uint32_t(NativeGuestOutputHybridRootParameter::kConstants),
+        sizeof(hybrid_constants) / sizeof(uint32_t), &hybrid_constants, 0);
+    deferred_command_list_.D3DSetComputeRootDescriptorTable(
+        uint32_t(NativeGuestOutputHybridRootParameter::kSources),
+        hybrid_descriptors[0].second);
+    deferred_command_list_.D3DSetComputeRootDescriptorTable(
+        uint32_t(NativeGuestOutputHybridRootParameter::kOutput),
+        hybrid_descriptors[2].second);
+    SetExternalPipeline(native_guest_output_hybrid_pipeline_.Get());
+    SubmitBarriers();
+    deferred_command_list_.BeginDebugMarker(
+        "PinyonShift native conservative hybrid composition");
+    deferred_command_list_.D3DDispatch((width + 7) / 8,
+                                       (height + 7) / 8, 1);
+    deferred_command_list_.EndDebugMarker();
+    PushTransitionBarrier(native_guest_output_display_target_.Get(),
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                          D3D12_RESOURCE_STATE_COPY_SOURCE);
+    PushTransitionBarrier(resource,
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                          ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
+    PushTransitionBarrier(native_guest_output_hybrid_target_.Get(),
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_COPY_SOURCE);
+    SubmitBarriers();
+    native_guest_output_hybrid_target_state_ =
+        D3D12_RESOURCE_STATE_COPY_SOURCE;
+    native_guest_output_hybrid_target_submission_ = submission_current_;
+    selected_native_resource = native_guest_output_hybrid_target_.Get();
+  }
+  if (present_native) {
+    if (comparison) {
+      deferred_command_list_.BeginDebugMarker(
+          "PinyonShift NR-04C native output selection");
+    }
+    if (timing_slot) {
+      timing_slot->selection_timed = true;
+      deferred_command_list_.D3DEndQuery(
+          native_guest_output_gpu_query_heap_.Get(),
+          D3D12_QUERY_TYPE_TIMESTAMP, timing_query_base + 3);
+    }
+    PushTransitionBarrier(
+        resource, ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    SubmitBarriers();
+    deferred_command_list_.D3DCopyResource(
+        resource, selected_native_resource);
+    PushTransitionBarrier(resource, D3D12_RESOURCE_STATE_COPY_DEST,
+                          ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
+    SubmitBarriers();
+    if (timing_slot) {
+      deferred_command_list_.D3DEndQuery(
+          native_guest_output_gpu_query_heap_.Get(),
+          D3D12_QUERY_TYPE_TIMESTAMP, timing_query_base + 4);
+    }
+    if (comparison) {
+      deferred_command_list_.EndDebugMarker();
+    }
+  }
+  if (timing_slot) {
+    const uint32_t first_query =
+        timing_query_base + (timing_slot->guest_timed ? 0 : 1);
+    const uint32_t last_query = timing_query_base +
+        (timing_slot->selection_timed ? 4 : 2);
+    deferred_command_list_.D3DResolveQueryData(
+        native_guest_output_gpu_query_heap_.Get(),
+        D3D12_QUERY_TYPE_TIMESTAMP, first_query,
+        last_query - first_query + 1,
+        native_guest_output_gpu_query_readback_.Get(),
+        uint64_t(first_query) * sizeof(uint64_t));
+    timing_slot->submission = submission_current_;
+  }
+  return true;
+}
+
+bool InvokeNativeGuestOutputDiagnosticTriangle(
+    const system::NativeGuestOutputRenderContext& context, uint32_t phase) {
+  auto* command_processor =
+      static_cast<D3D12CommandProcessor*>(context.command_context);
+  auto* resource = static_cast<ID3D12Resource*>(context.guest_output);
+  return command_processor &&
+         command_processor->DrawNativeGuestOutputDiagnosticTriangle(
+             resource, context.guest_output_width, context.guest_output_height,
+             phase);
+}
+
+bool InvokeNativeGuestOutputRetainedPass(
+    const system::NativeGuestOutputRenderContext& context,
+    system::NativeGuestOutputRetainedPassMode mode) {
+  auto* command_processor =
+      static_cast<D3D12CommandProcessor*>(context.command_context);
+  auto* resource = static_cast<ID3D12Resource*>(context.guest_output);
+  return command_processor &&
+         command_processor->DrawNativeGuestOutputRetainedPass(
+             resource, context.guest_output_width,
+             context.guest_output_height, mode, context.use_pwl_gamma_ramp);
+}
+
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
@@ -1985,10 +2927,16 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
 
+  // A multi-draw private replay becomes display-fresh only at the swap
+  // boundary, after every admitted draw in this guest frame has completed.
+  render_target_cache_->CommitDeferredIsolatedReplayPreview(
+      observation_frame_sequence_);
+
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, &swap_texture_srv_desc, frontbuffer_format, swap_texture_resource, guest_output_width,
-       guest_output_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+       guest_output_height, display_width,
+       display_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
         ID3D12Device* device = provider.GetDevice();
 
@@ -2247,6 +3195,32 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         // presenter so it can submit its own commands for displaying it to the
         // queue.
         SubmitBarriers();
+        if (auto renderer = graphics_system_->native_guest_output_renderer().Get()) {
+          system::NativeGuestOutputRenderContext native_context;
+          native_context.backend = system::NativeGuestOutputBackend::kD3D12;
+          native_context.guest_output_width = guest_output_width;
+          native_context.guest_output_height = guest_output_height;
+          native_context.display_width = display_width;
+          native_context.display_height = display_height;
+          native_context.output_format =
+              uint32_t(ui::d3d12::D3D12Presenter::kGuestOutputFormat);
+          native_context.device = device;
+          native_context.command_context = this;
+          native_context.guest_output = guest_output_resource;
+          native_context.submission = submission_current_;
+          native_context.frame_sequence = observation_frame_sequence_;
+          native_context.retained_pass_frame_sequence =
+              render_target_cache_->GetIsolatedReplayPreviewFrameSequence();
+          native_context.use_pwl_gamma_ramp = use_pwl_gamma_ramp;
+          native_context.xenos_fxaa_applied = use_fxaa;
+          native_context.clear_color = &ClearNativeGuestOutput;
+          native_context.draw_diagnostic_triangle =
+              &InvokeNativeGuestOutputDiagnosticTriangle;
+          native_context.draw_retained_pass =
+              &InvokeNativeGuestOutputRetainedPass;
+          renderer(native_context);
+        }
+        SubmitBarriers();
         EndSubmission(true);
         return true;
       });
@@ -2277,11 +3251,35 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   ID3D12Device* device = GetD3D12Provider().GetDevice();
   const RegisterFile& regs = *register_file_;
+  auto draw_outcome_observer = graphics_system_->draw_outcome_observer();
+  bool draw_prepared = false;
+  system::GraphicsIsolatedDrawRequest isolated_draw_request;
+  const auto observe_draw_outcome =
+      [&](system::GraphicsDrawOutcomeStatus status, bool succeeded) {
+        if (!succeeded &&
+            isolated_draw_request.defer_preview_publication_until_swap) {
+          render_target_cache_->CancelDeferredIsolatedReplayPreview(
+              isolated_draw_request.frame_sequence);
+        }
+        if (draw_outcome_observer) {
+          system::GraphicsDrawOutcomeObservation observation;
+          observation.status = status;
+          observation.frame_sequence = observation_frame_sequence_;
+          observation.draw_sequence = observation_draw_sequence_;
+          observation.packet_physical_address =
+              observation_packet_physical_address_;
+          observation.prepared = draw_prepared;
+          observation.succeeded = succeeded;
+          draw_outcome_observer(observation);
+        }
+        return succeeded;
+      };
 
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
-    return IssueCopy();
+    return observe_draw_outcome(system::GraphicsDrawOutcomeStatus::kEdramCopy,
+                                IssueCopy());
   }
 
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
@@ -2290,7 +3288,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   auto vertex_shader = static_cast<D3D12Shader*>(active_vertex_shader());
   if (!vertex_shader) {
     // Always need a vertex shader.
-    return false;
+    return observe_draw_outcome(
+        system::GraphicsDrawOutcomeStatus::kMissingVertexShader, false);
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
@@ -2301,7 +3300,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (surface_pitch_is_zero && is_rasterization_done) {
     // Doesn't actually draw.
     // Unlikely that zero would even really be legal though.
-    return true;
+    return observe_draw_outcome(
+        system::GraphicsDrawOutcomeStatus::kZeroSurfacePitch, true);
   }
   D3D12Shader* pixel_shader = nullptr;
   if (is_rasterization_done) {
@@ -2321,24 +3321,30 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // cache.
     if (!memexport_used_vertex) {
       // This draw has no effect.
-      return true;
+      return observe_draw_outcome(
+          system::GraphicsDrawOutcomeStatus::kNoRasterizationOrMemexport,
+          true);
     }
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
 
   if (!BeginSubmission(true)) {
-    return false;
+    return observe_draw_outcome(
+        system::GraphicsDrawOutcomeStatus::kSubmissionFailed, false);
   }
 
   // Process primitives.
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
   if (!primitive_processor_->Process(primitive_processing_result)) {
-    return false;
+    return observe_draw_outcome(
+        system::GraphicsDrawOutcomeStatus::kPrimitiveProcessingFailed,
+        false);
   }
   if (!primitive_processing_result.host_draw_vertex_count) {
     // Nothing to draw.
-    return true;
+    return observe_draw_outcome(
+        system::GraphicsDrawOutcomeStatus::kNoHostVertices, true);
   }
 
   reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
@@ -2366,7 +3372,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                    : 0;
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
-    return false;
+    return observe_draw_outcome(
+        system::GraphicsDrawOutcomeStatus::kRenderTargetUpdateFailed, false);
   }
 
   // Create the pipeline (for this, need the actually used render target formats
@@ -2396,11 +3403,59 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
           normalized_depth_control, normalized_color_mask, bound_depth_and_color_render_target_bits,
           bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature)) {
-    return false;
+    return observe_draw_outcome(
+        system::GraphicsDrawOutcomeStatus::kPipelineConfigurationFailed,
+        false);
   }
   if (REXCVAR_GET(async_shader_compilation) &&
       pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
-    return true;
+    return observe_draw_outcome(
+        system::GraphicsDrawOutcomeStatus::kPipelinePending, true);
+  }
+  draw_prepared = true;
+  auto prepared_draw_observer = graphics_system_->prepared_draw_observer();
+  auto isolated_draw_request_observer =
+      graphics_system_->isolated_draw_request_observer();
+  system::GraphicsPreparedDrawObservation prepared_observation;
+  if (prepared_draw_observer || isolated_draw_request_observer) {
+    prepared_observation.vertex_shader_hash = vertex_shader->ucode_data_hash();
+    prepared_observation.pixel_shader_hash =
+        pixel_shader ? pixel_shader->ucode_data_hash() : 0;
+    prepared_observation.vertex_specialization_mask =
+        vertex_shader_modification.value;
+    prepared_observation.pixel_specialization_mask =
+        pixel_shader_modification.value;
+    prepared_observation.guest_primitive_type =
+        uint32_t(primitive_processing_result.guest_primitive_type);
+    prepared_observation.host_primitive_type =
+        uint32_t(primitive_processing_result.host_primitive_type);
+    prepared_observation.host_vertex_shader_type =
+        uint32_t(primitive_processing_result.host_vertex_shader_type);
+    prepared_observation.tessellation_mode =
+        uint32_t(primitive_processing_result.tessellation_mode);
+    prepared_observation.index_buffer_type =
+        uint32_t(primitive_processing_result.index_buffer_type);
+    prepared_observation.host_index_format =
+        uint32_t(primitive_processing_result.host_index_format);
+    prepared_observation.host_primitive_reset_enabled =
+        primitive_processing_result.host_primitive_reset_enabled;
+    prepared_observation.normalized_depth_control =
+        normalized_depth_control.value;
+    prepared_observation.normalized_color_mask = normalized_color_mask;
+    prepared_observation.bound_render_target_bits =
+        bound_depth_and_color_render_target_bits;
+    std::memcpy(prepared_observation.bound_render_target_formats,
+                bound_depth_and_color_render_target_formats,
+                sizeof(prepared_observation.bound_render_target_formats));
+    prepared_observation.flags = uint32_t(host_render_targets_used) |
+                                 (uint32_t(is_rasterization_done) << 1);
+    if (prepared_draw_observer) {
+      prepared_draw_observer(prepared_observation);
+    }
+    if (isolated_draw_request_observer) {
+      isolated_draw_request_observer(prepared_observation,
+                                     isolated_draw_request);
+    }
   }
 
   // Update the textures - this may bind pipelines.
@@ -2408,14 +3463,27 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
   texture_cache_->RequestTextures(used_texture_mask);
+  if (auto native_texture_set_observer =
+          graphics_system_->native_texture_set_observer()) {
+    system::GraphicsNativeTextureSetObservation texture_observation;
+    texture_observation.current_submission = submission_current_;
+    texture_observation.completed_submission = submission_completed_;
+    texture_cache_->ObserveNativeTextures(used_texture_mask,
+                                           texture_observation);
+    native_texture_set_observer(texture_observation);
+  }
 
   // Bind the pipeline after configuring it and doing everything that may bind
   // other pipelines.
-  if (current_guest_pipeline_ != pipeline_handle) {
-    deferred_command_list_.SetPipelineStateHandle(reinterpret_cast<void*>(pipeline_handle));
-    current_guest_pipeline_ = pipeline_handle;
-    current_external_pipeline_ = nullptr;
-  }
+  const auto bind_prepared_guest_pipeline = [this, pipeline_handle]() {
+    if (current_guest_pipeline_ != pipeline_handle) {
+      deferred_command_list_.SetPipelineStateHandle(
+          reinterpret_cast<void*>(pipeline_handle));
+      current_guest_pipeline_ = pipeline_handle;
+      current_external_pipeline_ = nullptr;
+    }
+  };
+  bind_prepared_guest_pipeline();
 
   // Get dynamic rasterizer state.
   uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
@@ -2459,6 +3527,20 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   scissor.extent[0] *= draw_resolution_scale_x;
   scissor.extent[1] *= draw_resolution_scale_y;
 
+  const auto saturated_extent_end = [](uint32_t offset,
+                                       uint32_t extent) {
+    return uint32_t(std::min(uint64_t(offset) + extent,
+                             uint64_t(UINT32_MAX)));
+  };
+  const uint32_t isolated_replay_logical_width = std::min(
+      saturated_extent_end(viewport_info.xy_offset[0],
+                           viewport_info.xy_extent[0]),
+      saturated_extent_end(scissor.offset[0], scissor.extent[0]));
+  const uint32_t isolated_replay_logical_height = std::min(
+      saturated_extent_end(viewport_info.xy_offset[1],
+                           viewport_info.xy_extent[1]),
+      saturated_extent_end(scissor.offset[1], scissor.extent[1]));
+
   // Update viewport, scissor, blend factor and stencil reference.
   UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal, normalized_depth_control);
 
@@ -2471,8 +3553,22 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   // Update constant buffers, descriptors and root parameters.
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
-    return false;
+    return observe_draw_outcome(
+        system::GraphicsDrawOutcomeStatus::kBindingUpdateFailed, false);
   }
+  const auto restore_prepared_guest_graphics_state = [&]() -> bool {
+    // Diagnostic MSAA depth extraction records compute descriptors after the
+    // guest bindings have been prepared. A descriptor-heap switch invalidates
+    // graphics root tables even though the graphics root signature itself is
+    // unchanged, so force every cached root parameter to be rebound.
+    current_graphics_root_up_to_date_ = 0;
+    if (!UpdateBindings(vertex_shader, pixel_shader, root_signature,
+                        memexport_used)) {
+      return false;
+    }
+    bind_prepared_guest_pipeline();
+    return true;
+  };
   // Must not call anything that can change the descriptor heap from now on!
 
   // Ensure vertex buffers are resident.
@@ -2500,11 +3596,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
               "This is incorrect behavior, but you can try bypassing this by "
               "launching Xenia with --gpu_allow_invalid_fetch_constants=true.",
               vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
-          return false;
+          return observe_draw_outcome(
+              system::GraphicsDrawOutcomeStatus::kInvalidVertexFetch,
+              false);
         default:
           REXGPU_WARN("Vertex fetch constant {} ({:08X} {:08X}) is completely invalid!",
                       vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
-          return false;
+          return observe_draw_outcome(
+              system::GraphicsDrawOutcomeStatus::kInvalidVertexFetch,
+              false);
       }
       VertexBufferState& state = vertex_buffer_states_[vfetch_index];
       if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
@@ -2516,7 +3616,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
             "shared memory",
             vfetch_constant.address << 2, vfetch_constant.size << 2);
-        return false;
+        return observe_draw_outcome(
+            system::GraphicsDrawOutcomeStatus::kVertexResidencyFailed,
+            false);
       }
       state.address = vfetch_constant.address;
       state.size = vfetch_constant.size;
@@ -2541,7 +3643,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           "Failed to request memexport stream at 0x{:08X} (size {}) in the "
           "shared memory",
           memexport_range.base_address_dwords << 2, memexport_range.size_bytes);
-      return false;
+      return observe_draw_outcome(
+          system::GraphicsDrawOutcomeStatus::kMemexportResidencyFailed,
+          false);
     }
   }
   if (memexport_used && memexport_ranges_.empty()) {
@@ -2549,7 +3653,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       REXGPU_ERROR(
           "Failed to request full shared memory residency for unresolved "
           "memexport destinations");
-      return false;
+      return observe_draw_outcome(
+          system::GraphicsDrawOutcomeStatus::kMemexportResidencyFailed,
+          false);
     }
   }
 
@@ -2582,7 +3688,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             "processor is not supported by the Direct3D 12 command processor",
             uint32_t(primitive_processing_result.host_primitive_type));
         assert_unhandled_case(primitive_processing_result.host_primitive_type);
-        return false;
+        return observe_draw_outcome(
+            system::GraphicsDrawOutcomeStatus::kUnsupportedPrimitive,
+            false);
     }
   } else {
     switch (primitive_processing_result.host_primitive_type) {
@@ -2611,11 +3719,80 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             "supported by the Direct3D 12 command processor",
             uint32_t(primitive_processing_result.host_primitive_type));
         assert_unhandled_case(primitive_processing_result.host_primitive_type);
-        return false;
+        return observe_draw_outcome(
+            system::GraphicsDrawOutcomeStatus::kUnsupportedPrimitive,
+            false);
     }
   }
   SetPrimitiveTopology(primitive_topology);
   // Must not call anything that may change the primitive topology from now on!
+
+  bool isolated_replay_recorded = false;
+  const auto queue_consumer_reference_readback = [&](bool before_draw) {
+    if (!isolated_draw_request.consumer_reference_readback_requested &&
+        !isolated_draw_request.consumer_reference_depth_readback_requested) {
+      return;
+    }
+    const auto queue = [&](bool depth) {
+      auto completion = depth
+                            ? (before_draw
+                                   ? isolated_draw_request
+                                         .consumer_reference_before_depth_readback_completion
+                                   : isolated_draw_request
+                                         .consumer_reference_after_depth_readback_completion)
+                            : (before_draw
+                                   ? isolated_draw_request
+                                         .consumer_reference_before_readback_completion
+                                   : isolated_draw_request
+                                         .consumer_reference_after_readback_completion);
+      if (!completion) {
+        return;
+      }
+      uint32_t readback_detail = 0;
+      auto readback_status =
+          depth ? render_target_cache_->QueueGuestConsumerDepthReadback(
+                      before_draw, completion, &readback_detail)
+                : render_target_cache_->QueueGuestConsumerColorReadback(
+                      before_draw, completion, &readback_detail);
+      if (readback_status !=
+          system::GraphicsIsolatedDrawReadbackStatus::kReady) {
+        system::GraphicsIsolatedDrawReadback readback_result;
+        readback_result.status = readback_status;
+        readback_result.detail = readback_detail;
+        completion(readback_result);
+      }
+    };
+    if (isolated_draw_request.consumer_reference_readback_requested) {
+      queue(false);
+    }
+    if (isolated_draw_request.consumer_reference_depth_readback_requested) {
+      queue(true);
+    }
+  };
+  system::GraphicsIsolatedDrawPublicationResult isolated_publication;
+  bool isolated_publication_attempted = false;
+  const auto publish_isolated_replay_to_guest = [&]() -> bool {
+    if (!isolated_draw_request.publish_to_guest_requested ||
+        isolated_publication_attempted) {
+      return isolated_publication.guest_draw_suppressed;
+    }
+    isolated_publication_attempted = true;
+    if (isolated_replay_recorded) {
+      isolated_publication =
+          render_target_cache_->PublishIsolatedReplayTarget(
+              isolated_draw_request.depth_only_target);
+    }
+    isolated_publication.guest_draw_suppressed =
+        isolated_draw_request.suppress_guest_draw_if_published &&
+        isolated_publication.status ==
+            system::GraphicsIsolatedDrawPublicationStatus::kPublished &&
+        isolated_publication.color_published &&
+        isolated_publication.depth_stencil_published;
+    if (isolated_draw_request.publication_completion) {
+      isolated_draw_request.publication_completion(isolated_publication);
+    }
+    return isolated_publication.guest_draw_suppressed;
+  };
 
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
@@ -2626,10 +3803,198 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       shared_memory_->UseForReading();
     }
     SubmitBarriers();
-    PROFILE_DRAW_CALL();
-    PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
-    deferred_command_list_.D3DDrawInstanced(primitive_processing_result.host_draw_vertex_count, 1,
-                                            0, 0);
+    if (isolated_draw_request.requested) {
+      system::GraphicsIsolatedDrawResult isolated_result;
+      if (memexport_used || !host_render_targets_used ||
+          !is_rasterization_done) {
+        isolated_result.status =
+            system::GraphicsIsolatedDrawStatus::kUnsupportedState;
+      } else if ((!isolated_draw_request.reuse_target &&
+                  render_target_cache_->BeginIsolatedReplayTarget(
+                      isolated_result.target_width,
+                      isolated_result.target_height,
+                      isolated_replay_logical_width,
+                      isolated_replay_logical_height,
+                      isolated_draw_request.stencil_seed_probe_requested,
+                      isolated_draw_request.depth_only_target)) ||
+                 (isolated_draw_request.reuse_target &&
+                  render_target_cache_->ResumeIsolatedReplayTarget(
+                      isolated_result.target_width,
+                      isolated_result.target_height,
+                      isolated_replay_logical_width,
+                      isolated_replay_logical_height,
+                      isolated_draw_request.depth_only_target))) {
+        if (isolated_draw_request.reference_seed_depth_readback_requested &&
+            isolated_draw_request.reference_seed_depth_readback_completion) {
+          uint32_t readback_detail = 0;
+          auto readback_status =
+              render_target_cache_->QueueGuestSeedDepthReadback(
+                  isolated_draw_request.reference_seed_depth_readback_completion,
+                  &readback_detail);
+          if (readback_status !=
+              system::GraphicsIsolatedDrawReadbackStatus::kReady) {
+            system::GraphicsIsolatedDrawReadback readback_result;
+            readback_result.status = readback_status;
+            readback_result.detail = readback_detail;
+            isolated_draw_request.reference_seed_depth_readback_completion(
+                readback_result);
+          }
+        }
+        if (isolated_draw_request.seed_depth_readback_requested &&
+            isolated_draw_request.seed_depth_readback_completion) {
+          uint32_t readback_detail = 0;
+          auto readback_status =
+              render_target_cache_->QueueIsolatedReplaySeedDepthReadback(
+                  isolated_draw_request.seed_depth_readback_completion,
+                  &readback_detail);
+          if (readback_status !=
+              system::GraphicsIsolatedDrawReadbackStatus::kReady) {
+            system::GraphicsIsolatedDrawReadback readback_result;
+            readback_result.status = readback_status;
+            readback_result.detail = readback_detail;
+            isolated_draw_request.seed_depth_readback_completion(
+                readback_result);
+          }
+        }
+        if (!restore_prepared_guest_graphics_state()) {
+          render_target_cache_->EndIsolatedReplayTarget(
+              isolated_draw_request.frame_sequence,
+              isolated_draw_request.defer_preview_publication_until_swap,
+              isolated_draw_request.depth_only_target);
+          if (isolated_draw_request.defer_preview_publication_until_swap) {
+            render_target_cache_->CancelDeferredIsolatedReplayPreview(
+                isolated_draw_request.frame_sequence);
+          }
+          isolated_result.status =
+              system::GraphicsIsolatedDrawStatus::kUnsupportedState;
+          if (isolated_draw_request.completion) {
+            isolated_draw_request.completion(isolated_result);
+          }
+          return observe_draw_outcome(
+              system::GraphicsDrawOutcomeStatus::kBindingUpdateFailed, false);
+        }
+        deferred_command_list_.BeginDebugMarker(
+            isolated_draw_request.reuse_target
+                ? "PinyonShift NR-02F isolated native pass follower"
+                : "PinyonShift NR-02F isolated native auto-index draw");
+        deferred_command_list_.D3DDrawInstanced(
+            primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
+        deferred_command_list_.EndDebugMarker();
+        if (isolated_draw_request.readback_requested &&
+            isolated_draw_request.readback_completion) {
+          uint32_t readback_detail = 0;
+          auto readback_status =
+              render_target_cache_->QueueIsolatedReplayReadback(
+                  isolated_draw_request.readback_completion,
+                  &readback_detail);
+          if (readback_status !=
+              system::GraphicsIsolatedDrawReadbackStatus::kReady) {
+            system::GraphicsIsolatedDrawReadback readback_result;
+            readback_result.status = readback_status;
+            readback_result.detail = readback_detail;
+            isolated_draw_request.readback_completion(readback_result);
+          }
+        }
+        if (isolated_draw_request.depth_readback_requested &&
+            isolated_draw_request.depth_readback_completion) {
+          uint32_t readback_detail = 0;
+          auto readback_status =
+              render_target_cache_->QueueIsolatedReplayDepthReadback(
+                  isolated_draw_request.depth_readback_completion,
+                  &readback_detail);
+          if (readback_status !=
+              system::GraphicsIsolatedDrawReadbackStatus::kReady) {
+            system::GraphicsIsolatedDrawReadback readback_result;
+            readback_result.status = readback_status;
+            readback_result.detail = readback_detail;
+            isolated_draw_request.depth_readback_completion(readback_result);
+          }
+        }
+        render_target_cache_->EndIsolatedReplayTarget(
+            isolated_draw_request.frame_sequence,
+            isolated_draw_request.defer_preview_publication_until_swap,
+            isolated_draw_request.depth_only_target);
+        isolated_replay_recorded = true;
+        isolated_result.status =
+            system::GraphicsIsolatedDrawStatus::kRecorded;
+      } else {
+        isolated_result.status =
+            system::GraphicsIsolatedDrawStatus::kTargetCreationFailed;
+      }
+      if (isolated_draw_request.defer_preview_publication_until_swap &&
+          isolated_result.status !=
+              system::GraphicsIsolatedDrawStatus::kRecorded) {
+        render_target_cache_->CancelDeferredIsolatedReplayPreview(
+            isolated_draw_request.frame_sequence);
+      }
+      if (isolated_draw_request.completion) {
+        isolated_draw_request.completion(isolated_result);
+      }
+    }
+    const bool suppress_guest_draw =
+        isolated_draw_request.suppress_guest_draw_if_published &&
+        publish_isolated_replay_to_guest();
+    queue_consumer_reference_readback(true);
+    if (isolated_draw_request.consumer_reference_marker_requested) {
+      deferred_command_list_.BeginDebugMarker(
+          "PinyonShift NR-00E authoritative consumer family draw");
+    } else if (isolated_draw_request.reference_marker_requested) {
+      deferred_command_list_.BeginDebugMarker(
+          isolated_draw_request.reuse_target
+              ? "PinyonShift NR-02F authoritative Xenos pass follower"
+              : "PinyonShift NR-02F authoritative Xenos auto-index draw");
+    }
+    if (!suppress_guest_draw) {
+      if (isolated_draw_request.requested) {
+        if (!restore_prepared_guest_graphics_state()) {
+          return observe_draw_outcome(
+              system::GraphicsDrawOutcomeStatus::kBindingUpdateFailed, false);
+        }
+      } else {
+        bind_prepared_guest_pipeline();
+      }
+      PROFILE_DRAW_CALL();
+      PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+      deferred_command_list_.D3DDrawInstanced(
+          primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
+    }
+    if (isolated_draw_request.consumer_reference_marker_requested ||
+        isolated_draw_request.reference_marker_requested) {
+      deferred_command_list_.EndDebugMarker();
+    }
+    queue_consumer_reference_readback(false);
+    if (isolated_draw_request.reference_readback_requested &&
+        isolated_draw_request.reference_readback_completion) {
+      uint32_t readback_detail = 0;
+      auto readback_status = render_target_cache_->QueueGuestColorReadback(
+          isolated_draw_request.reference_readback_completion,
+          &readback_detail);
+      if (readback_status !=
+          system::GraphicsIsolatedDrawReadbackStatus::kReady) {
+        system::GraphicsIsolatedDrawReadback readback_result;
+        readback_result.status = readback_status;
+        readback_result.detail = readback_detail;
+        isolated_draw_request.reference_readback_completion(readback_result);
+      }
+    }
+    if (isolated_draw_request.reference_depth_readback_requested &&
+        isolated_draw_request.reference_depth_readback_completion) {
+      uint32_t readback_detail = 0;
+      auto readback_status = render_target_cache_->QueueGuestDepthReadback(
+          isolated_draw_request.reference_depth_readback_completion,
+          &readback_detail);
+      if (readback_status !=
+          system::GraphicsIsolatedDrawReadbackStatus::kReady) {
+        system::GraphicsIsolatedDrawReadback readback_result;
+        readback_result.status = readback_status;
+        readback_result.detail = readback_detail;
+        isolated_draw_request.reference_depth_readback_completion(
+            readback_result);
+      }
+    }
+    if (!isolated_draw_request.suppress_guest_draw_if_published) {
+      publish_isolated_replay_to_guest();
+    }
   } else {
     D3D12_INDEX_BUFFER_VIEW index_buffer_view;
     index_buffer_view.SizeInBytes = primitive_processing_result.host_draw_vertex_count;
@@ -2650,7 +4015,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           scratch_index_buffer = RequestScratchGPUBuffer(index_buffer_view.SizeInBytes,
                                                          D3D12_RESOURCE_STATE_COPY_DEST);
           if (scratch_index_buffer == nullptr) {
-            return false;
+            return observe_draw_outcome(
+                system::GraphicsDrawOutcomeStatus::kScratchIndexBufferFailed,
+                false);
           }
           shared_memory_->UseAsCopySource();
           SubmitBarriers();
@@ -2676,7 +4043,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         break;
       default:
         assert_unhandled_case(primitive_processing_result.index_buffer_type);
-        return false;
+        return observe_draw_outcome(
+            system::GraphicsDrawOutcomeStatus::kUnsupportedIndexBuffer,
+            false);
     }
     deferred_command_list_.D3DIASetIndexBuffer(&index_buffer_view);
     if (memexport_used) {
@@ -2685,16 +4054,210 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       shared_memory_->UseForReading();
     }
     SubmitBarriers();
-    PROFILE_DRAW_CALL();
-    PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
-    deferred_command_list_.D3DDrawIndexedInstanced(
-        primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
+    if (isolated_draw_request.requested) {
+      system::GraphicsIsolatedDrawResult isolated_result;
+      const bool isolated_index_buffer_supported =
+          primitive_processing_result.index_buffer_type ==
+              PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA ||
+          primitive_processing_result.index_buffer_type ==
+              PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted;
+      if (memexport_used || !host_render_targets_used ||
+          !is_rasterization_done || !isolated_index_buffer_supported) {
+        isolated_result.status =
+            system::GraphicsIsolatedDrawStatus::kUnsupportedState;
+      } else if ((!isolated_draw_request.reuse_target &&
+                  render_target_cache_->BeginIsolatedReplayTarget(
+                      isolated_result.target_width,
+                      isolated_result.target_height,
+                      isolated_replay_logical_width,
+                      isolated_replay_logical_height,
+                      isolated_draw_request.stencil_seed_probe_requested,
+                      isolated_draw_request.depth_only_target)) ||
+                 (isolated_draw_request.reuse_target &&
+                  render_target_cache_->ResumeIsolatedReplayTarget(
+                      isolated_result.target_width,
+                      isolated_result.target_height,
+                      isolated_replay_logical_width,
+                      isolated_replay_logical_height,
+                      isolated_draw_request.depth_only_target))) {
+        if (isolated_draw_request.reference_seed_depth_readback_requested &&
+            isolated_draw_request.reference_seed_depth_readback_completion) {
+          uint32_t readback_detail = 0;
+          auto readback_status =
+              render_target_cache_->QueueGuestSeedDepthReadback(
+                  isolated_draw_request.reference_seed_depth_readback_completion,
+                  &readback_detail);
+          if (readback_status !=
+              system::GraphicsIsolatedDrawReadbackStatus::kReady) {
+            system::GraphicsIsolatedDrawReadback readback_result;
+            readback_result.status = readback_status;
+            readback_result.detail = readback_detail;
+            isolated_draw_request.reference_seed_depth_readback_completion(
+                readback_result);
+          }
+        }
+        if (isolated_draw_request.seed_depth_readback_requested &&
+            isolated_draw_request.seed_depth_readback_completion) {
+          uint32_t readback_detail = 0;
+          auto readback_status =
+              render_target_cache_->QueueIsolatedReplaySeedDepthReadback(
+                  isolated_draw_request.seed_depth_readback_completion,
+                  &readback_detail);
+          if (readback_status !=
+              system::GraphicsIsolatedDrawReadbackStatus::kReady) {
+            system::GraphicsIsolatedDrawReadback readback_result;
+            readback_result.status = readback_status;
+            readback_result.detail = readback_detail;
+            isolated_draw_request.seed_depth_readback_completion(
+                readback_result);
+          }
+        }
+        if (!restore_prepared_guest_graphics_state()) {
+          render_target_cache_->EndIsolatedReplayTarget(
+              isolated_draw_request.frame_sequence,
+              isolated_draw_request.defer_preview_publication_until_swap,
+              isolated_draw_request.depth_only_target);
+          if (isolated_draw_request.defer_preview_publication_until_swap) {
+            render_target_cache_->CancelDeferredIsolatedReplayPreview(
+                isolated_draw_request.frame_sequence);
+          }
+          isolated_result.status =
+              system::GraphicsIsolatedDrawStatus::kUnsupportedState;
+          if (isolated_draw_request.completion) {
+            isolated_draw_request.completion(isolated_result);
+          }
+          return observe_draw_outcome(
+              system::GraphicsDrawOutcomeStatus::kBindingUpdateFailed, false);
+        }
+        deferred_command_list_.BeginDebugMarker(
+            isolated_draw_request.retain_target
+                ? "PinyonShift NR-02F isolated native pass anchor"
+                : "PinyonShift NR-02E isolated native draw");
+        deferred_command_list_.D3DDrawIndexedInstanced(
+            primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
+        deferred_command_list_.EndDebugMarker();
+        if (isolated_draw_request.readback_requested &&
+            isolated_draw_request.readback_completion) {
+          uint32_t readback_detail = 0;
+          auto readback_status =
+              render_target_cache_->QueueIsolatedReplayReadback(
+                  isolated_draw_request.readback_completion,
+                  &readback_detail);
+          if (readback_status !=
+              system::GraphicsIsolatedDrawReadbackStatus::kReady) {
+            system::GraphicsIsolatedDrawReadback readback_result;
+            readback_result.status = readback_status;
+            readback_result.detail = readback_detail;
+            isolated_draw_request.readback_completion(readback_result);
+          }
+        }
+        if (isolated_draw_request.depth_readback_requested &&
+            isolated_draw_request.depth_readback_completion) {
+          uint32_t readback_detail = 0;
+          auto readback_status =
+              render_target_cache_->QueueIsolatedReplayDepthReadback(
+                  isolated_draw_request.depth_readback_completion,
+                  &readback_detail);
+          if (readback_status !=
+              system::GraphicsIsolatedDrawReadbackStatus::kReady) {
+            system::GraphicsIsolatedDrawReadback readback_result;
+            readback_result.status = readback_status;
+            readback_result.detail = readback_detail;
+            isolated_draw_request.depth_readback_completion(readback_result);
+          }
+        }
+        render_target_cache_->EndIsolatedReplayTarget(
+            isolated_draw_request.frame_sequence,
+            isolated_draw_request.defer_preview_publication_until_swap,
+            isolated_draw_request.depth_only_target);
+        isolated_replay_recorded = true;
+        isolated_result.status =
+            system::GraphicsIsolatedDrawStatus::kRecorded;
+      } else {
+        isolated_result.status =
+            system::GraphicsIsolatedDrawStatus::kTargetCreationFailed;
+      }
+      if (isolated_draw_request.defer_preview_publication_until_swap &&
+          isolated_result.status !=
+              system::GraphicsIsolatedDrawStatus::kRecorded) {
+        render_target_cache_->CancelDeferredIsolatedReplayPreview(
+            isolated_draw_request.frame_sequence);
+      }
+      if (isolated_draw_request.completion) {
+        isolated_draw_request.completion(isolated_result);
+      }
+    }
+    const bool suppress_guest_draw =
+        isolated_draw_request.suppress_guest_draw_if_published &&
+        publish_isolated_replay_to_guest();
+    queue_consumer_reference_readback(true);
+    if (isolated_draw_request.consumer_reference_marker_requested) {
+      deferred_command_list_.BeginDebugMarker(
+          "PinyonShift NR-00E authoritative consumer family draw");
+    } else if (isolated_draw_request.reference_marker_requested) {
+      deferred_command_list_.BeginDebugMarker(
+          isolated_draw_request.retain_target
+              ? "PinyonShift NR-02F authoritative Xenos pass anchor"
+              : "PinyonShift NR-02E authoritative Xenos draw");
+    }
+    if (!suppress_guest_draw) {
+      if (isolated_draw_request.requested) {
+        if (!restore_prepared_guest_graphics_state()) {
+          return observe_draw_outcome(
+              system::GraphicsDrawOutcomeStatus::kBindingUpdateFailed, false);
+        }
+      } else {
+        bind_prepared_guest_pipeline();
+      }
+      PROFILE_DRAW_CALL();
+      PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+      deferred_command_list_.D3DDrawIndexedInstanced(
+          primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
+    }
+    if (isolated_draw_request.consumer_reference_marker_requested ||
+        isolated_draw_request.reference_marker_requested) {
+      deferred_command_list_.EndDebugMarker();
+    }
+    queue_consumer_reference_readback(false);
+    if (isolated_draw_request.reference_readback_requested &&
+        isolated_draw_request.reference_readback_completion) {
+      uint32_t readback_detail = 0;
+      auto readback_status = render_target_cache_->QueueGuestColorReadback(
+          isolated_draw_request.reference_readback_completion,
+          &readback_detail);
+      if (readback_status !=
+          system::GraphicsIsolatedDrawReadbackStatus::kReady) {
+        system::GraphicsIsolatedDrawReadback readback_result;
+        readback_result.status = readback_status;
+        readback_result.detail = readback_detail;
+        isolated_draw_request.reference_readback_completion(readback_result);
+      }
+    }
+    if (isolated_draw_request.reference_depth_readback_requested &&
+        isolated_draw_request.reference_depth_readback_completion) {
+      uint32_t readback_detail = 0;
+      auto readback_status = render_target_cache_->QueueGuestDepthReadback(
+          isolated_draw_request.reference_depth_readback_completion,
+          &readback_detail);
+      if (readback_status !=
+          system::GraphicsIsolatedDrawReadbackStatus::kReady) {
+        system::GraphicsIsolatedDrawReadback readback_result;
+        readback_result.status = readback_status;
+        readback_result.detail = readback_detail;
+        isolated_draw_request.reference_depth_readback_completion(
+            readback_result);
+      }
+    }
+    if (!isolated_draw_request.suppress_guest_draw_if_published) {
+      publish_isolated_replay_to_guest();
+    }
     if (scratch_index_buffer != nullptr) {
       ReleaseScratchGPUBuffer(scratch_index_buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
     }
   }
 
   if (memexport_used) {
+    PROFILE_MEMEXPORT_DRAW();
     // Make sure this memexporting draw is ordered with other work using shared
     // memory as a UAV.
     // TODO(Triang3l): Find some PM4 command that can be used for indication of
@@ -2718,6 +4281,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         memexport_total_size += memexport_range.size_bytes;
       }
       if (memexport_total_size != 0) {
+        PROFILE_MEMEXPORT_BYTES(memexport_total_size);
         if (REXCVAR_GET(readback_memexport_fast)) {
           IssueDraw_MemexportReadbackFastPath(memexport_total_size);
         } else {
@@ -2727,7 +4291,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
-  return true;
+  return observe_draw_outcome(
+      system::GraphicsDrawOutcomeStatus::kCompleted, true);
 }
 
 bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_size) {
@@ -2751,6 +4316,7 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_s
     readback_buffer_offset += memexport_range.size_bytes;
   }
 
+  PROFILE_MEMEXPORT_QUEUE_WAIT();
   if (!AwaitAllQueueOperationsCompletion()) {
     return true;
   }
@@ -2832,6 +4398,7 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
   const uint32_t read_index = 1 - write_index;
   const uint32_t readback_size = AlignReadbackBufferSize(total_size);
   if (!ensure_readback_slot(write_index, readback_size)) {
+    PROFILE_MEMEXPORT_SYNC_FALLBACK();
     return IssueDraw_MemexportReadbackFullPath(total_size);
   }
 
@@ -2855,6 +4422,8 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
                              readback.submission_written[read_index] &&
                              readback.submission_written[read_index] <= submission_completed_;
   if (!previous_slot_ready) {
+    PROFILE_MEMEXPORT_FENCE_WAIT();
+    PROFILE_MEMEXPORT_SYNC_FALLBACK();
     IssueDraw_MemexportReadbackFullPath(total_size);
     readback.current_index = read_index;
     return true;
@@ -2877,37 +4446,72 @@ bool D3D12CommandProcessor::IssueCopy() {
   if (!BeginSubmission(true)) {
     return false;
   }
+  uint32_t written_address = 0;
+  uint32_t written_length = 0;
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
+  bool copy_succeeded;
   if (readback_mode == ReadbackResolveMode::kDisabled) {
-    uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+    copy_succeeded = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                                   written_address, written_length);
+  } else {
+    copy_succeeded = IssueCopy_ReadbackResolvePath(written_address, written_length);
   }
-  return IssueCopy_ReadbackResolvePath();
+
+  auto copy_observer = graphics_system_->copy_observer();
+  auto native_resolve_observer = graphics_system_->native_resolve_observer();
+  if (copy_observer || native_resolve_observer) {
+    system::GraphicsCopyObservation observation;
+    observation.frame_sequence = observation_frame_sequence_;
+    observation.copy_sequence = ++observation_copy_sequence_;
+    observation.current_submission = GetCurrentSubmission();
+    observation.completed_submission = submission_completed_;
+    observation.written_address = written_address;
+    observation.written_length = written_length;
+    observation.rb_copy_control = register_file_->Get<reg::RB_COPY_CONTROL>().value;
+    observation.rb_copy_dest_base = (*register_file_)[XE_GPU_REG_RB_COPY_DEST_BASE];
+    observation.rb_copy_dest_info = register_file_->Get<reg::RB_COPY_DEST_INFO>().value;
+    observation.rb_copy_dest_pitch = register_file_->Get<reg::RB_COPY_DEST_PITCH>().value;
+    observation.surface_info = register_file_->Get<reg::RB_SURFACE_INFO>().value;
+    for (uint32_t i = 0; i < 4; ++i) {
+      observation.color_info[i] =
+          (*register_file_)[reg::RB_COLOR_INFO::rt_register_indices[i]];
+    }
+    observation.depth_info = register_file_->Get<reg::RB_DEPTH_INFO>().value;
+    observation.succeeded = copy_succeeded;
+    if (copy_observer) {
+      copy_observer(observation);
+    }
+    if (native_resolve_observer) {
+      native_resolve_observer(observation);
+    }
+  }
+  return copy_succeeded;
 }
 
-bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
-  uint32_t written_address, written_length;
-  if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, written_address,
-                                     written_length)) {
+bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath(uint32_t& written_address_out,
+                                                         uint32_t& written_length_out) {
+  if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                     written_address_out, written_length_out)) {
     return false;
   }
 
-  if (!written_length) {
+  if (!written_length_out) {
     return true;
   }
 
-  if (!memory_->TranslatePhysical(written_address)) {
+  PROFILE_RESOLVE_READBACK_REQUEST();
+
+  if (!memory_->TranslatePhysical(written_address_out)) {
     return true;
   }
 
   bool is_scaled = texture_cache_->IsDrawResolutionScaled();
-  uint64_t resolve_key = MakeReadbackResolveKey(written_address, written_length);
+  uint64_t resolve_key = MakeReadbackResolveKey(written_address_out, written_length_out);
   ReadbackBuffer& rb = readback_buffers_[resolve_key];
   rb.last_used_frame = frame_current_;
 
   uint32_t write_index = rb.current_index;
-  uint32_t size = AlignReadbackBufferSize(written_length);
+  uint32_t size = AlignReadbackBufferSize(written_length_out);
 
   if (size > rb.sizes[write_index]) {
     const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
@@ -2959,7 +4563,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       return true;
     }
     uint32_t tile_size_1x = 32 * 32 * (uint32_t(1) << pixel_size_log2);
-    uint32_t tile_count = written_length / tile_size_1x;
+    uint32_t tile_count = written_length_out / tile_size_1x;
     if (!tile_count) {
       return true;
     }
@@ -2970,7 +4574,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       return true;
     }
 
-    uint32_t downscale_buffer_size = AlignReadbackBufferSize(written_length);
+    uint32_t downscale_buffer_size = AlignReadbackBufferSize(written_length_out);
     if (downscale_buffer_size > resolve_downscale_buffer_size_) {
       const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
       ID3D12Device* device = provider.GetDevice();
@@ -3022,7 +4626,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
                                         scaled_resolve_buffer, aligned_scaled_length,
                                         source_offset);
     uint32_t aligned_written_length =
-        rex::align(written_length, uint32_t(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT));
+        rex::align(written_length_out, uint32_t(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT));
     ui::d3d12::util::CreateBufferRawUAV(device, downscale_descriptors[1].first,
                                         resolve_downscale_buffer_.Get(), aligned_written_length, 0);
 
@@ -3056,7 +4660,8 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
                           D3D12_RESOURCE_STATE_COPY_SOURCE);
     SubmitBarriers();
     deferred_command_list_.D3DCopyBufferRegion(rb.buffers[write_index], 0,
-                                               resolve_downscale_buffer_.Get(), 0, written_length);
+                                               resolve_downscale_buffer_.Get(), 0,
+                                               written_length_out);
     PushTransitionBarrier(resolve_downscale_buffer_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     texture_cache_->TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -3066,35 +4671,51 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     SubmitBarriers();
     ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
     deferred_command_list_.D3DCopyBufferRegion(rb.buffers[write_index], 0, shared_memory_buffer,
-                                               written_address, written_length);
+                                               written_address_out, written_length_out);
   }
 
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   bool use_delayed_sync =
       readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
+  auto await_resolve_readback = [&]() {
+    PROFILE_RESOLVE_READBACK_FULL_WAIT();
+    auto wait_start = std::chrono::steady_clock::now();
+    bool completed = AwaitAllQueueOperationsCompletion();
+    auto wait_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - wait_start)
+                            .count();
+    PROFILE_RESOLVE_READBACK_WAIT_TIME_NS(wait_time_ns);
+    return completed;
+  };
   uint32_t read_index = write_index;
   if (use_delayed_sync) {
     read_index = 1 - write_index;
-  } else if (!AwaitAllQueueOperationsCompletion()) {
+  } else if (!await_resolve_readback()) {
     return true;
   }
 
   bool is_cache_miss = false;
-  if (use_delayed_sync && (!rb.buffers[read_index] || written_length > rb.sizes[read_index] ||
+  if (use_delayed_sync && (!rb.buffers[read_index] || written_length_out > rb.sizes[read_index] ||
                            !rb.mapped_data[read_index])) {
+    PROFILE_RESOLVE_READBACK_CACHE_MISS();
     is_cache_miss = true;
     read_index = write_index;
-    if (!AwaitAllQueueOperationsCompletion()) {
+    if (!await_resolve_readback()) {
       return true;
     }
   }
 
   bool should_copy = (readback_mode == ReadbackResolveMode::kSome) ? is_cache_miss : true;
-  if (should_copy && rb.buffers[read_index] && written_length <= rb.sizes[read_index] &&
+  if (should_copy && rb.buffers[read_index] && written_length_out <= rb.sizes[read_index] &&
       rb.mapped_data[read_index]) {
-    uint8_t* destination = memory_->TranslatePhysical(written_address);
+    uint8_t* destination = memory_->TranslatePhysical(written_address_out);
     if (destination) {
-      std::memcpy(destination, static_cast<uint8_t*>(rb.mapped_data[read_index]), written_length);
+      std::memcpy(destination, static_cast<uint8_t*>(rb.mapped_data[read_index]),
+                  written_length_out);
+      PROFILE_RESOLVE_READBACK_BYTES(written_length_out);
+      if (readback_mode == ReadbackResolveMode::kFast) {
+        PROFILE_RESOLVE_READBACK_FAST_COPY();
+      }
     }
   }
 
@@ -3144,6 +4765,8 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   if (submission_completed_ < await_submission) {
     REXGPU_ERROR("Failed to await a submission completion Direct3D 12 fence");
   }
+  RetireModernZPDQueries();
+  RetireNativeGuestOutputGpuTimings();
   if (submission_completed_ <= submission_completed_before) {
     // Not updated - no need to reclaim or download things.
     return;
@@ -3267,6 +4890,9 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   if (FAILED(device_removed_reason)) {
     device_removed_ = true;
     LogDeviceRemovalDiagnostics(device, device_removed_reason);
+    // The GPU-loss callback terminates the process. Persist the HRESULT and
+    // any available DRED breadcrumbs before control reaches the fatal path.
+    rex::FlushLogging();
     if (graphics_system_) {
       graphics_system_->OnHostGpuLossFromAnyThread(device_removed_reason !=
                                                    DXGI_ERROR_DEVICE_REMOVED);
@@ -3302,6 +4928,9 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     // end of the submission (when async pipeline creation requests are
     // fulfilled).
     deferred_command_list_.Reset();
+    if (is_opening_frame) {
+      BeginNativeGuestOutputGpuTimingFrame();
+    }
 
     // Reset cached state of the command list.
     ff_viewport_update_needed_ = true;
@@ -3368,6 +4997,11 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     texture_cache_->BeginFrame();
   }
 
+  if ((GetZPDMode() == ZPDMode::kFast || GetZPDMode() == ZPDMode::kStrict) &&
+      zpd_lifecycle_.active().segment_pending_begin) {
+    OpenModernZPDSegment();
+  }
+
   return true;
 }
 
@@ -3402,7 +5036,10 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   if (submission_open_) {
     assert_false(scratch_buffer_used_);
 
-    if (active_occlusion_query_.valid && occlusion_query_heap_) {
+    if ((GetZPDMode() == ZPDMode::kFast || GetZPDMode() == ZPDMode::kStrict) &&
+        modern_occlusion_query_active_index_ != UINT32_MAX) {
+      CloseModernZPDSegment();
+    } else if (active_occlusion_query_.valid && occlusion_query_heap_) {
       deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
                                          active_occlusion_query_.host_index);
       active_occlusion_query_ = {};
@@ -3819,6 +5456,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
 
   // Texture signedness / gamma.
   uint32_t textures_resolution_scaled = 0;
+  uint32_t textures_normalized_fixed_point = 0;
   uint32_t textures_remaining = used_texture_mask;
   uint32_t texture_index;
   while (rex::bit_scan_forward(textures_remaining, &texture_index)) {
@@ -3832,9 +5470,16 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     texture_signs_uint = (texture_signs_uint & ~texture_signs_mask) | texture_signs_shifted;
     textures_resolution_scaled |=
         uint32_t(texture_cache_->IsActiveTextureResolutionScaled(texture_index)) << texture_index;
+    textures_normalized_fixed_point |=
+        uint32_t(texture_cache_->IsActiveTextureNormalizedFixedPoint(texture_index))
+        << texture_index;
   }
   dirty |= system_constants_.textures_resolution_scaled != textures_resolution_scaled;
   system_constants_.textures_resolution_scaled = textures_resolution_scaled;
+  dirty |= system_constants_.textures_normalized_fixed_point !=
+           textures_normalized_fixed_point;
+  system_constants_.textures_normalized_fixed_point =
+      textures_normalized_fixed_point;
 
   // Log2 of sample count, for alpha to mask and with ROV, for EDRAM address
   // calculation with MSAA.
@@ -4802,9 +6447,159 @@ ID3D12Resource* D3D12CommandProcessor::RequestReadbackBuffer(uint32_t size) {
   return readback_buffer_;
 }
 
+bool D3D12CommandProcessor::InitializeNativeGuestOutputGpuTiming() {
+  native_guest_output_gpu_query_heap_.Reset();
+  native_guest_output_gpu_query_readback_.Reset();
+  native_guest_output_gpu_query_mapping_ = nullptr;
+  native_guest_output_gpu_timestamp_frequency_ = 0;
+  native_guest_output_gpu_timing_slots_ = {};
+  native_guest_output_gpu_timing_active_ = false;
+
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  ID3D12CommandQueue* direct_queue = GetD3D12Provider().GetDirectQueue();
+  if (!device || !direct_queue ||
+      FAILED(direct_queue->GetTimestampFrequency(
+          &native_guest_output_gpu_timestamp_frequency_)) ||
+      !native_guest_output_gpu_timestamp_frequency_) {
+    REXGPU_WARN("Native guest-output GPU timestamps are unavailable");
+    return false;
+  }
+
+  D3D12_QUERY_HEAP_DESC heap_desc{};
+  heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+  heap_desc.Count =
+      kQueueFrames * kNativeGuestOutputGpuQueriesPerFrame;
+  if (FAILED(device->CreateQueryHeap(
+          &heap_desc,
+          IID_PPV_ARGS(&native_guest_output_gpu_query_heap_)))) {
+    REXGPU_WARN("Failed to create native guest-output GPU timestamp heap");
+    return false;
+  }
+
+  const uint64_t readback_size =
+      sizeof(uint64_t) * heap_desc.Count;
+  D3D12_RESOURCE_DESC buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(
+      buffer_desc, readback_size, D3D12_RESOURCE_FLAG_NONE);
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback,
+          GetD3D12Provider().GetHeapFlagCreateNotZeroed(), &buffer_desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+          IID_PPV_ARGS(&native_guest_output_gpu_query_readback_)))) {
+    REXGPU_WARN(
+        "Failed to allocate native guest-output GPU timestamp readback");
+    native_guest_output_gpu_query_heap_.Reset();
+    return false;
+  }
+
+  D3D12_RANGE read_range{0, SIZE_T(readback_size)};
+  void* mapping = nullptr;
+  if (FAILED(native_guest_output_gpu_query_readback_->Map(
+          0, &read_range, &mapping))) {
+    REXGPU_WARN("Failed to map native guest-output GPU timestamps");
+    native_guest_output_gpu_query_readback_.Reset();
+    native_guest_output_gpu_query_heap_.Reset();
+    return false;
+  }
+  native_guest_output_gpu_query_mapping_ =
+      static_cast<uint64_t*>(mapping);
+  return true;
+}
+
+void D3D12CommandProcessor::ShutdownNativeGuestOutputGpuTiming() {
+  RetireNativeGuestOutputGpuTimings();
+  if (native_guest_output_gpu_query_readback_ &&
+      native_guest_output_gpu_query_mapping_) {
+    native_guest_output_gpu_query_readback_->Unmap(0, nullptr);
+  }
+  native_guest_output_gpu_query_mapping_ = nullptr;
+  native_guest_output_gpu_query_readback_.Reset();
+  native_guest_output_gpu_query_heap_.Reset();
+  native_guest_output_gpu_timestamp_frequency_ = 0;
+  native_guest_output_gpu_timing_slots_ = {};
+  native_guest_output_gpu_timing_active_ = false;
+}
+
+void D3D12CommandProcessor::BeginNativeGuestOutputGpuTimingFrame() {
+  if (!native_guest_output_gpu_timing_active_ ||
+      !native_guest_output_gpu_query_heap_) {
+    return;
+  }
+  const uint32_t slot_index = uint32_t(frame_current_ % kQueueFrames);
+  auto& slot = native_guest_output_gpu_timing_slots_[slot_index];
+  if (slot.submission) {
+    PROFILE_NATIVE_GPU_TIMING_DROP();
+    return;
+  }
+  slot = {};
+  slot.frame_started = true;
+  const uint32_t query_base =
+      slot_index * kNativeGuestOutputGpuQueriesPerFrame;
+  deferred_command_list_.D3DEndQuery(
+      native_guest_output_gpu_query_heap_.Get(),
+      D3D12_QUERY_TYPE_TIMESTAMP, query_base);
+}
+
+void D3D12CommandProcessor::RetireNativeGuestOutputGpuTimings() {
+  if (!native_guest_output_gpu_query_mapping_ ||
+      !native_guest_output_gpu_timestamp_frequency_) {
+    return;
+  }
+  auto ticks_to_ns = [this](uint64_t ticks) -> int64_t {
+    const long double nanoseconds =
+        static_cast<long double>(ticks) * 1000000000.0L /
+        static_cast<long double>(
+            native_guest_output_gpu_timestamp_frequency_);
+    return static_cast<int64_t>(nanoseconds);
+  };
+  for (uint32_t slot_index = 0; slot_index < kQueueFrames;
+       ++slot_index) {
+    auto& slot = native_guest_output_gpu_timing_slots_[slot_index];
+    if (!slot.submission || slot.submission > submission_completed_) {
+      continue;
+    }
+    const uint32_t query_base =
+        slot_index * kNativeGuestOutputGpuQueriesPerFrame;
+    const uint64_t* timestamps =
+        native_guest_output_gpu_query_mapping_ + query_base;
+    bool valid = timestamps[2] >= timestamps[1];
+    if (slot.guest_timed) {
+      valid &= timestamps[1] >= timestamps[0];
+    }
+    if (slot.selection_timed) {
+      valid &= timestamps[4] >= timestamps[3];
+    }
+    if (valid) {
+      if (slot.guest_timed) {
+        PROFILE_GUEST_FRAME_GPU_TIME_NS(
+            ticks_to_ns(timestamps[1] - timestamps[0]));
+        PROFILE_GUEST_FRAME_GPU_TIMING_SAMPLE();
+      }
+      PROFILE_NATIVE_COMPOSITION_GPU_TIME_NS(
+          ticks_to_ns(timestamps[2] - timestamps[1]));
+      PROFILE_NATIVE_COMPOSITION_GPU_TIMING_SAMPLE();
+      if (slot.selection_timed) {
+        PROFILE_NATIVE_SELECTION_GPU_TIME_NS(
+            ticks_to_ns(timestamps[4] - timestamps[3]));
+        PROFILE_NATIVE_SELECTION_GPU_TIMING_SAMPLE();
+      }
+    } else {
+      PROFILE_NATIVE_GPU_TIMING_DROP();
+    }
+    slot = {};
+  }
+}
+
 bool D3D12CommandProcessor::InitializeOcclusionQueryResources() {
   active_occlusion_query_ = {};
   occlusion_query_cursor_ = 0;
+  zpd_lifecycle_.Reset();
+  modern_occlusion_query_free_indices_.clear();
+  modern_occlusion_query_generations_.clear();
+  modern_occlusion_queries_pending_.clear();
+  modern_occlusion_query_active_index_ = UINT32_MAX;
+  modern_occlusion_query_active_generation_ = 0;
+  modern_occlusion_query_active_report_ = ZPDLifecycle::kInvalidReportHandle;
   occlusion_query_resources_available_ = false;
   occlusion_query_heap_.Reset();
   occlusion_query_readback_.Reset();
@@ -4851,12 +6646,30 @@ bool D3D12CommandProcessor::InitializeOcclusionQueryResources() {
   }
 
   occlusion_query_readback_mapping_ = reinterpret_cast<uint64_t*>(mapping);
+  modern_occlusion_query_generations_.resize(kMaxOcclusionQueries, 0);
+  modern_occlusion_query_free_indices_.reserve(kMaxOcclusionQueries);
+  for (uint32_t i = kMaxOcclusionQueries; i != 0; --i) {
+    modern_occlusion_query_free_indices_.push_back(i - 1);
+  }
   occlusion_query_resources_available_ = true;
   return true;
 }
 
 void D3D12CommandProcessor::ShutdownOcclusionQueryResources() {
+  if (modern_occlusion_query_active_index_ != UINT32_MAX && submission_open_ &&
+      occlusion_query_heap_ && occlusion_query_readback_) {
+    CloseModernZPDSegment();
+    EndSubmission(false);
+  }
   DisableHostOcclusionQueries();
+
+  zpd_lifecycle_.Reset();
+  modern_occlusion_query_free_indices_.clear();
+  modern_occlusion_query_generations_.clear();
+  modern_occlusion_queries_pending_.clear();
+  modern_occlusion_query_active_index_ = UINT32_MAX;
+  modern_occlusion_query_active_generation_ = 0;
+  modern_occlusion_query_active_report_ = ZPDLifecycle::kInvalidReportHandle;
 
   if (occlusion_query_readback_ && occlusion_query_readback_mapping_) {
     occlusion_query_readback_->Unmap(0, nullptr);
@@ -4985,6 +6798,164 @@ void D3D12CommandProcessor::WriteGuestOcclusionResult(
   sample_counts->ZFail_B = 0;
   sample_counts->StencilFail_A = 0;
   sample_counts->StencilFail_B = 0;
+}
+
+bool D3D12CommandProcessor::AcquireModernOcclusionQuery(uint32_t& host_index_out,
+                                                        uint32_t& generation_out) {
+  RetireModernZPDQueries();
+  if (modern_occlusion_query_free_indices_.empty()) {
+    return false;
+  }
+  host_index_out = modern_occlusion_query_free_indices_.back();
+  modern_occlusion_query_free_indices_.pop_back();
+  generation_out = ++modern_occlusion_query_generations_[host_index_out];
+  if (!generation_out) {
+    generation_out = ++modern_occlusion_query_generations_[host_index_out];
+  }
+  return true;
+}
+
+void D3D12CommandProcessor::ReleaseModernOcclusionQuery(uint32_t host_index, uint32_t generation) {
+  if (host_index >= modern_occlusion_query_generations_.size() ||
+      modern_occlusion_query_generations_[host_index] != generation) {
+    return;
+  }
+  modern_occlusion_query_free_indices_.push_back(host_index);
+}
+
+bool D3D12CommandProcessor::OpenModernZPDSegment() {
+  if (!submission_open_ || !occlusion_query_heap_ ||
+      modern_occlusion_query_active_index_ != UINT32_MAX ||
+      !zpd_lifecycle_.active().logical_active || !zpd_lifecycle_.active().segment_pending_begin) {
+    return false;
+  }
+  uint32_t index = UINT32_MAX;
+  uint32_t generation = 0;
+  if (!AcquireModernOcclusionQuery(index, generation)) {
+    return false;
+  }
+  deferred_command_list_.D3DBeginQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
+                                       index);
+  modern_occlusion_query_active_index_ = index;
+  modern_occlusion_query_active_generation_ = generation;
+  modern_occlusion_query_active_report_ = zpd_lifecycle_.active().report_handle;
+  zpd_lifecycle_.SegmentOpened();
+  return true;
+}
+
+bool D3D12CommandProcessor::CloseModernZPDSegment() {
+  if (modern_occlusion_query_active_index_ == UINT32_MAX || !submission_open_ ||
+      !occlusion_query_heap_ || !occlusion_query_readback_) {
+    return false;
+  }
+  uint32_t index = modern_occlusion_query_active_index_;
+  uint32_t generation = modern_occlusion_query_active_generation_;
+  ZPDLifecycle::ReportHandle handle = modern_occlusion_query_active_report_;
+  modern_occlusion_query_active_index_ = UINT32_MAX;
+  modern_occlusion_query_active_generation_ = 0;
+  modern_occlusion_query_active_report_ = ZPDLifecycle::kInvalidReportHandle;
+
+  deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
+                                     index);
+  deferred_command_list_.D3DResolveQueryData(
+      occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, index, 1,
+      occlusion_query_readback_.Get(), sizeof(uint64_t) * index);
+  modern_occlusion_queries_pending_.push_back({submission_current_, index, generation, handle});
+  zpd_lifecycle_.SegmentClosed(submission_current_);
+  PERF_counter_inc(kZpdReportSegments);
+  return true;
+}
+
+void D3D12CommandProcessor::RetireModernZPDQueries() {
+  if (!submission_fence_ || modern_occlusion_queries_pending_.empty()) {
+    return;
+  }
+  submission_completed_ = std::max(submission_completed_, submission_fence_->GetCompletedValue());
+  while (!modern_occlusion_queries_pending_.empty() &&
+         modern_occlusion_queries_pending_.front().submission <= submission_completed_) {
+    PendingModernOcclusionQuery pending = modern_occlusion_queries_pending_.front();
+    modern_occlusion_queries_pending_.pop_front();
+    bool generation_matches =
+        pending.host_index < modern_occlusion_query_generations_.size() &&
+        modern_occlusion_query_generations_[pending.host_index] == pending.generation;
+    uint64_t samples = generation_matches && occlusion_query_readback_mapping_
+                           ? occlusion_query_readback_mapping_[pending.host_index]
+                           : 0;
+    uint32_t delta = 0;
+    bool commit = false;
+    ZPDLifecycle::Report report;
+    bool resolved =
+        generation_matches &&
+        zpd_lifecycle_.Resolve(pending.report_handle, samples,
+                               texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1,
+                               texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1,
+                               delta, commit, report);
+    if (!resolved || !commit) {
+      if (!zpd_lifecycle_.Find(pending.report_handle)) {
+        PERF_counter_inc(kZpdStaleResultRejections);
+      }
+    } else {
+      WriteModernZPDReport(report, delta);
+      PERF_counter_inc(kZpdAsyncResultPatches);
+    }
+    ReleaseModernOcclusionQuery(pending.host_index, pending.generation);
+  }
+}
+
+bool D3D12CommandProcessor::AwaitModernZPDReport(ZPDLifecycle::ReportHandle report_handle,
+                                                 uint32_t timeout_ms) {
+  if (!zpd_lifecycle_.Find(report_handle)) {
+    return true;
+  }
+  if (submission_open_) {
+    EndSubmission(false);
+  }
+  PERF_counter_inc(kZpdStrictWaits);
+  auto wait_start = std::chrono::steady_clock::now();
+  uint64_t wait_submission = 0;
+  for (const PendingModernOcclusionQuery& pending : modern_occlusion_queries_pending_) {
+    if (pending.report_handle == report_handle) {
+      wait_submission = std::max(wait_submission, pending.submission);
+    }
+  }
+  bool signaled = wait_submission == 0 || submission_completed_ >= wait_submission;
+  if (!signaled && submission_fence_ &&
+      SUCCEEDED(
+          submission_fence_->SetEventOnCompletion(wait_submission, fence_completion_event_))) {
+    signaled = WaitForSingleObject(fence_completion_event_, timeout_ms) == WAIT_OBJECT_0;
+  }
+  auto elapsed = std::chrono::steady_clock::now() - wait_start;
+  PERF_counter_add(kZpdStrictWaitTimeNs,
+                   std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+  if (signaled) {
+    RetireModernZPDQueries();
+    return zpd_lifecycle_.Find(report_handle) == nullptr;
+  }
+
+  ZPDLifecycle::Report report;
+  bool commit = false;
+  uint32_t fallback = 1;
+  if (const ZPDLifecycle::Report* pending = zpd_lifecycle_.Find(report_handle)) {
+    fallback = pending->has_cached_delta ? pending->cached_delta : 1;
+  }
+  if (zpd_lifecycle_.Abandon(report_handle, fallback, report, commit) && commit) {
+    WriteModernZPDReport(report, fallback);
+  }
+  PERF_counter_inc(kZpdRetireTimeouts);
+  return false;
+}
+
+void D3D12CommandProcessor::WriteModernZPDReport(const ZPDLifecycle::Report& report,
+                                                 uint32_t delta) {
+  auto* begin =
+      report.begin_record
+          ? memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(report.begin_record)
+          : nullptr;
+  auto* end =
+      report.end_record
+          ? memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(report.end_record)
+          : nullptr;
+  XenosZPDReport::WriteReportDelta(begin, end, report.begin_value, delta, begin && begin != end);
 }
 
 void D3D12CommandProcessor::WriteGammaRampSRV(bool is_pwl,

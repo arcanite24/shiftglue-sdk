@@ -785,7 +785,11 @@ class PrimitiveProcessor {
 
   void* memory_invalidation_callback_handle_ = nullptr;
 
-  std::mutex cache_mutex_;
+  // Physical-memory invalidation is dispatched from the access-violation
+  // handler and can re-enter the primitive cache on the faulting thread.
+  // Keep this lock recursive so nested invalidation cannot corrupt the SRW
+  // lock state while unwinding the callback.
+  std::recursive_mutex cache_mutex_;
   // Modified by both the processor and the invalidation callback.
   std::unordered_map<CacheKey, size_t, CacheKey::Hasher> cache_map_;
   // The conversion is performed while the lock is released since it may take a
@@ -808,7 +812,7 @@ class PrimitiveProcessor {
   // Must be called in a global critical region.
   void UpdateCacheBucketsNonEmptyL2(
       uint32_t bucket_index_div_64,
-      [[maybe_unused]] const std::lock_guard<std::mutex>& cache_lock) {
+      [[maybe_unused]] const std::lock_guard<std::recursive_mutex>& cache_lock) {
     uint64_t& cache_buckets_non_empty_l2_ref =
         cache_buckets_non_empty_l2_[bucket_index_div_64 >> 6];
     uint64_t cache_buckets_non_empty_l2_bit = uint64_t(1) << (bucket_index_div_64 & 63);

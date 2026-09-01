@@ -11,6 +11,7 @@
  */
 
 #include <atomic>
+#include <csetjmp>
 #include <condition_variable>
 #include <mutex>
 #include <string>
@@ -30,6 +31,10 @@
 namespace rex::system {
 
 constexpr memory::fourcc_t kThreadSaveSignature = memory::make_fourcc("THRD");
+
+// High-volume restored-continuation diagnostics are opt-in so ordinary
+// gameplay does not synchronously write thousands of trace lines.
+bool IsReentryTraceEnabled();
 
 class XEvent;
 
@@ -343,6 +348,10 @@ class XThread : public XObject {
 
   virtual void Execute();
 
+  // Abandon the current static AOT call chain and resume execution at a
+  // restored guest continuation. Used by guest fiber/context switches.
+  virtual void Reenter(uint32_t address);
+
   rex::thread::Fiber* main_fiber() const { return main_fiber_; }
   void set_main_fiber(rex::thread::Fiber* fiber) { main_fiber_ = fiber; }
 
@@ -431,6 +440,9 @@ class XThread : public XObject {
   std::mutex suspend_mutex_;
   std::condition_variable suspend_cv_;
 #endif
+
+  std::jmp_buf reentry_jmp_buf_;
+  uint32_t reentry_address_ = 0;
 
   std::mutex thread_lock_;
 

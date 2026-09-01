@@ -98,7 +98,9 @@ target_include_directories(rexcore PRIVATE
     ${PROJECT_SOURCE_DIR}/thirdparty/cli11/include
 )
 
-if(APPLE)
+if(WIN32)
+    target_link_libraries(rexcore PUBLIC ws2_32)
+elseif(APPLE)
     target_link_libraries(rexcore PRIVATE pthread)
 elseif(UNIX)
     target_link_libraries(rexcore PRIVATE pthread rt dl)
@@ -110,10 +112,10 @@ target_link_libraries(rexcore
         simde
         tomlplusplus
         spdlog::spdlog
+        xxHash::xxhash
     PRIVATE
         disruptorplus
         utf8cpp
-        xxHash::xxhash
 )
 
 if(REXGLUE_USE_D3D12)

@@ -18,6 +18,8 @@ void ReXModule_Register(rex::runtime::IModuleRegistrar* registrar) {
 void {{ project }}_RegisterFunctions(rex::runtime::IModuleRegistrar* registrar) {
 {% endif %}
 {% for fn in functions %}{% if not fn.below_code_base or fn.is_import %}  registrar->SetFunction({{ fn.address }}, {{ fn.name }});
+{% for alias in fn.resume_aliases %}  registrar->SetFunction({{ alias }}, {{ fn.name }});
+{% endfor %}
 {% endif %}{% endfor %}}
 
 {% if is_dll %}

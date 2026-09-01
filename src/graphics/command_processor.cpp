@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -24,6 +25,7 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
 #include <rex/graphics/xenos.h>
@@ -44,6 +46,24 @@ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
 
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_STRING(occlusion_query, "legacy", "GPU",
+                      "Select ZPD occlusion report handling.\n"
+                      " legacy: Existing synchronous renderer path (default)\n"
+                      " fake: Guest-visible fake sample counts\n"
+                      " fast: Asynchronous host queries with speculative writes\n"
+                      " strict: Bounded host-query retirement before writeback")
+    .allowed({"legacy", "fake", "fast", "strict"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_STRING(zpd_end_policy, "auto", "GPU",
+                      "Classify ZPD END records by title-aware policy.")
+    .allowed({"auto", "report_layout", "pairwise_sentinel", "relaxed_sentinel"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(zpd_end_fallback, "auto", "GPU",
+                      "Fallback when report-layout ZPD classification is inconclusive.")
+    .allowed({"auto", "none", "pairwise_sentinel", "relaxed_sentinel"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
                       "Controls CPU readback of render-to-texture resolve results.\n"
@@ -615,6 +635,13 @@ void CommandProcessor::ReturnFromWait() {}
 uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index) {
   SCOPE_profile_cpu_f("gpu");
 
+  const ObservationCommandBufferContext previous_observation_command_buffer =
+      observation_command_buffer_;
+  observation_command_buffer_ = {primary_buffer_ptr_,
+                                 uint32_t(primary_buffer_size_ /
+                                          sizeof(uint32_t)),
+                                 UINT32_MAX, primary_buffer_ptr_, 0};
+
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
   reader.set_read_offset(read_index * sizeof(uint32_t));
@@ -630,11 +657,24 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
 
   OnPrimaryBufferEnd();
 
+  observation_command_buffer_ = previous_observation_command_buffer;
+
   return write_index;
 }
 
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
+
+  const ObservationCommandBufferContext previous_observation_command_buffer =
+      observation_command_buffer_;
+  const uint32_t depth = previous_observation_command_buffer.depth + 1;
+  const uint32_t root_physical_address =
+      previous_observation_command_buffer.depth
+          ? previous_observation_command_buffer.root_physical_address
+          : ptr;
+  observation_command_buffer_ = {ptr, count,
+                                 observation_packet_physical_address_,
+                                 root_physical_address, depth};
 
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
@@ -647,9 +687,14 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
       break;
     }
   } while (reader.read_count());
+
+  observation_command_buffer_ = previous_observation_command_buffer;
 }
 
 void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
+  const ObservationCommandBufferContext previous_observation_command_buffer =
+      observation_command_buffer_;
+  observation_command_buffer_ = {ptr, count, UINT32_MAX, ptr, 0};
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
@@ -660,9 +705,20 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
       break;
     }
   } while (reader.read_count());
+  observation_command_buffer_ = previous_observation_command_buffer;
 }
 
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+  const uintptr_t packet_host_address =
+      reinterpret_cast<uintptr_t>(reader->buffer()) + reader->read_offset();
+  const uintptr_t physical_host_base =
+      reinterpret_cast<uintptr_t>(memory_->physical_membase());
+  const uintptr_t physical_offset = packet_host_address - physical_host_base;
+  observation_packet_physical_address_ =
+      packet_host_address >= physical_host_base &&
+              physical_offset < UINT32_C(0x20000000)
+          ? uint32_t(physical_offset)
+          : UINT32_MAX;
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
   if (packet == 0) {
@@ -960,6 +1016,10 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
+  ++observation_frame_sequence_;
+  observation_draw_sequence_ = 0;
+  observation_copy_sequence_ = 0;
+
   ++counter_;
   return true;
 }
@@ -971,7 +1031,32 @@ bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* re
   uint32_t list_length = reader->ReadAndSwap<uint32_t>();
   assert_zero(list_length & ~0xFFFFF);
   list_length &= 0xFFFFF;
-  ExecuteIndirectBuffer(GpuToCpu(list_ptr), list_length);
+  const uint32_t target_physical_address = GpuToCpu(list_ptr);
+  auto observer = graphics_system_->indirect_buffer_observer();
+  system::GraphicsIndirectBufferObservation observation;
+  if (observer) {
+    observation.packet_physical_address =
+        observation_packet_physical_address_;
+    observation.parent_buffer_physical_address =
+        observation_command_buffer_.physical_address;
+    observation.parent_buffer_length_dwords =
+        observation_command_buffer_.length_dwords;
+    observation.target_buffer_physical_address = target_physical_address;
+    observation.target_buffer_length_dwords = list_length;
+    observation.root_buffer_physical_address =
+        observation_command_buffer_.depth
+            ? observation_command_buffer_.root_physical_address
+            : target_physical_address;
+    observation.depth = observation_command_buffer_.depth + 1;
+    observation.opcode = (packet >> 8) & 0x7F;
+    observation.entering = true;
+    observer(observation);
+  }
+  ExecuteIndirectBuffer(target_physical_address, list_length);
+  if (observer) {
+    observation.entering = false;
+    observer(observation);
+  }
   return true;
 }
 
@@ -1248,8 +1333,6 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
 
 bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
                                                           uint32_t packet, uint32_t count) {
-  // Set by D3D as BE but struct ABI is LE
-  const uint32_t kQueryFinished = rex::byte_swap(0xFFFFFEED);
   assert_true(count == 1);
   uint32_t initiator = reader->ReadAndSwap<uint32_t>();
   // Writeback initiator.
@@ -1260,26 +1343,102 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
   // As a workaround report some fixed amount of passed samples.
   auto fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
   if (fake_sample_count >= 0) {
-    auto* pSampleCounts = memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(
-        register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR]);
+    uint32_t report_address = register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
+    uint32_t record_base = XenosZPDReport::GetRecordBase(report_address);
+    auto* pSampleCounts = record_base
+                              ? memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(record_base)
+                              : nullptr;
     if (!pSampleCounts) {
       return true;
     }
-    // 0xFFFFFEED is written to this two locations by D3D only on D3DISSUE_END
-    // and used to detect a finished query.
-    bool is_end_via_z_pass =
-        pSampleCounts->ZPass_A == kQueryFinished || pSampleCounts->ZPass_B == kQueryFinished;
-    // Older versions of D3D also checks for ZFail (4D5307D5).
-    bool is_end_via_z_fail =
-        pSampleCounts->ZFail_A == kQueryFinished || pSampleCounts->ZFail_B == kQueryFinished;
+    bool logical_current = zpd_fake_logical_active_ &&
+                           zpd_fake_slot_base_ == XenosZPDReport::GetSlotBase(report_address);
+    auto classification = ClassifyZPD(report_address, pSampleCounts, logical_current);
+    LogZPDObservation(report_address, pSampleCounts, logical_current, classification);
     std::memset(pSampleCounts, 0, sizeof(xe_gpu_depth_sample_counts));
-    if (is_end_via_z_pass || is_end_via_z_fail) {
+    if (classification.classification == ZPDClassification::kEnd ||
+        classification.classification == ZPDClassification::kOrphanedEnd) {
       pSampleCounts->ZPass_A = fake_sample_count;
       pSampleCounts->Total_A = fake_sample_count;
+      zpd_fake_logical_active_ = false;
+      zpd_fake_slot_base_ = 0;
+    } else if (classification.classification == ZPDClassification::kBegin) {
+      zpd_fake_logical_active_ = true;
+      zpd_fake_slot_base_ = XenosZPDReport::GetSlotBase(report_address);
     }
+    RecoverStalledZPDSentinel(report_address, pSampleCounts);
   }
 
   return true;
+}
+
+ZPDPolicySettings CommandProcessor::GetZPDPolicySettings() const {
+  uint32_t title_id = kernel_state_ ? kernel_state_->title_id() : 0;
+  return ResolveZPDPolicy(REXCVAR_GET(zpd_end_policy), REXCVAR_GET(zpd_end_fallback), title_id);
+}
+
+ZPDClassificationResult CommandProcessor::ClassifyZPD(
+    uint32_t report_address, const xenos::xe_gpu_depth_sample_counts* report,
+    bool logical_active) const {
+  return ClassifyZPDReport(report_address, report, logical_active, GetZPDPolicySettings());
+}
+
+void CommandProcessor::LogZPDObservation(uint32_t report_address,
+                                         const xenos::xe_gpu_depth_sample_counts* report,
+                                         bool logical_active,
+                                         const ZPDClassificationResult& classification) {
+  switch (classification.classification) {
+    case ZPDClassification::kBegin:
+      PERF_counter_inc(kZpdClassifiedBegins);
+      break;
+    case ZPDClassification::kEnd:
+      PERF_counter_inc(kZpdClassifiedEnds);
+      break;
+    case ZPDClassification::kOrphanedEnd:
+      PERF_counter_inc(kZpdClassifiedOrphanedEnds);
+      break;
+    default:
+      PERF_counter_inc(kZpdMalformedRecords);
+      break;
+  }
+  if (classification.reason == ZPDClassificationReason::kPairwiseFallback ||
+      classification.reason == ZPDClassificationReason::kRelaxedFallback) {
+    PERF_counter_inc(kZpdPolicyFallbacks);
+  }
+
+  uint32_t zpass_a = report ? uint32_t(report->ZPass_A) : 0u;
+  uint32_t zpass_b = report ? uint32_t(report->ZPass_B) : 0u;
+  uint32_t zfail_a = report ? uint32_t(report->ZFail_A) : 0u;
+  uint32_t zfail_b = report ? uint32_t(report->ZFail_B) : 0u;
+  uint64_t signature = report_address;
+  for (uint32_t value :
+       {zpass_a, zpass_b, zfail_a, zfail_b, uint32_t(classification.classification),
+        uint32_t(classification.reason), uint32_t(logical_active)}) {
+    signature ^= uint64_t(value) + 0x9E3779B97F4A7C15ull + (signature << 6) + (signature >> 2);
+  }
+  ZPDObservationRateLimit rate_limit = zpd_observation_rate_limiter_.Observe(signature);
+  if (rate_limit.ShouldLog()) {
+    REXGPU_INFO(
+        "zpd.event classification={} reason={} address={:08X} slot={:08X} "
+        "logical_active={} zpass_a={:08X} zpass_b={:08X} zfail_a={:08X} "
+        "zfail_b={:08X} repeat={} rate_limit_bucket={}",
+        ZPDClassificationName(classification.classification),
+        ZPDClassificationReasonName(classification.reason), report_address,
+        XenosZPDReport::GetSlotBase(report_address), logical_active, zpass_a, zpass_b, zfail_a,
+        zfail_b, rate_limit.count, rate_limit.overflow_sample ? "overflow_sample" : "signature");
+  }
+}
+
+void CommandProcessor::RecoverStalledZPDSentinel(uint32_t report_address,
+                                                 xenos::xe_gpu_depth_sample_counts* report) {
+  if (!XenosZPDReport::HasPendingSentinel(report)) {
+    return;
+  }
+  uint32_t fallback = uint32_t(std::max(REXCVAR_GET(query_occlusion_fake_sample_count), 1));
+  XenosZPDReport::WriteSampleCount(report, fallback);
+  PERF_counter_inc(kZpdWatchdogRecoveries);
+  REXGPU_WARN("zpd.watchdog address={:08X} slot={:08X} action=visible_fallback", report_address,
+              XenosZPDReport::GetSlotBase(report_address));
 }
 
 bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32_t packet,
@@ -1378,12 +1537,309 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 
       bool major_mode_explicit =
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
+      auto draw_observer = graphics_system_->draw_observer();
+      if (draw_observer) {
+        system::GraphicsDrawObservation observation;
+        observation.frame_sequence = observation_frame_sequence_;
+        observation.draw_sequence = ++observation_draw_sequence_;
+        observation.vertex_shader_hash =
+            active_vertex_shader_ ? active_vertex_shader_->ucode_data_hash() : 0;
+        observation.pixel_shader_hash =
+            active_pixel_shader_ ? active_pixel_shader_->ucode_data_hash() : 0;
+        observation.packet_physical_address =
+            observation_packet_physical_address_;
+        observation.command_buffer_physical_address =
+            observation_command_buffer_.physical_address;
+        observation.command_buffer_length_dwords =
+            observation_command_buffer_.length_dwords;
+        observation.command_buffer_parent_packet_physical_address =
+            observation_command_buffer_.parent_packet_physical_address;
+        observation.command_buffer_root_physical_address =
+            observation_command_buffer_.root_physical_address;
+        observation.command_buffer_depth = observation_command_buffer_.depth;
+        observation.packet = packet;
+        observation.initiator = vgt_draw_initiator.value;
+        observation.primitive_type = uint32_t(vgt_draw_initiator.prim_type);
+        observation.index_count = vgt_draw_initiator.num_indices;
+        observation.source_select = uint32_t(vgt_draw_initiator.source_select);
+        observation.indexed = is_indexed;
+        observation.major_mode_explicit = major_mode_explicit;
+        observation.vertex_memexport =
+            active_vertex_shader_ && !active_vertex_shader_->memexport_stream_constants().empty();
+        if (is_indexed) {
+          observation.index_buffer_address = index_buffer_info.guest_base;
+          observation.index_buffer_length = uint32_t(index_buffer_info.length);
+          observation.index_format = uint32_t(index_buffer_info.format);
+          observation.index_endianness = uint32_t(index_buffer_info.endianness);
+          observation.index_reset =
+              register_file_->Get<reg::VGT_MULTI_PRIM_IB_RESET_INDX>()
+                  .reset_indx;
+          observation.index_reset_enabled =
+              register_file_->Get<reg::PA_SU_SC_MODE_CNTL>()
+                  .multi_prim_ib_ena;
+        }
+        observation.vertex_index_offset =
+            register_file_->Get<reg::VGT_INDX_OFFSET>().indx_offset;
+        observation.vertex_index_min =
+            register_file_->Get<reg::VGT_MIN_VTX_INDX>().min_indx;
+        observation.vertex_index_max =
+            register_file_->Get<reg::VGT_MAX_VTX_INDX>().max_indx;
+        if (active_vertex_shader_) {
+          const auto& vertex_bindings = active_vertex_shader_->vertex_bindings();
+          observation.vertex_binding_count = uint32_t(vertex_bindings.size());
+          for (const Shader::VertexBinding& binding : vertex_bindings) {
+            observation.vertex_attribute_count +=
+                uint32_t(binding.attributes.size());
+          }
+          uint32_t attribute_index = 0;
+          for (uint32_t i = 0;
+               i < observation.vertex_binding_count &&
+               i < system::kGraphicsVertexBindingObservationLimit;
+               ++i) {
+            const Shader::VertexBinding& binding = vertex_bindings[i];
+            const xenos::xe_gpu_vertex_fetch_t fetch =
+                register_file_->GetVertexFetch(binding.fetch_constant);
+            observation.vertex_bindings[i].fetch_constant = binding.fetch_constant;
+            observation.vertex_bindings[i].address = fetch.address << 2;
+            observation.vertex_bindings[i].size = fetch.size << 2;
+            observation.vertex_bindings[i].stride_words = binding.stride_words;
+            observation.vertex_bindings[i].endianness = uint32_t(fetch.endian);
+            for (const Shader::VertexBinding::Attribute& attribute :
+                 binding.attributes) {
+              if (attribute_index >=
+                  system::kGraphicsVertexAttributeObservationLimit) {
+                continue;
+              }
+              const ParsedVertexFetchInstruction& fetch_instruction =
+                  attribute.fetch_instr;
+              auto& output = observation.vertex_attributes[attribute_index];
+              output.binding_index = uint32_t(binding.binding_index);
+              output.fetch_constant = binding.fetch_constant;
+              output.offset_words = fetch_instruction.attributes.offset;
+              output.stride_words = fetch_instruction.attributes.stride;
+              output.data_format =
+                  uint32_t(fetch_instruction.attributes.data_format);
+              output.fetch_word_mask = xenos::GetVertexFormatNeededWords(
+                  fetch_instruction.attributes.data_format,
+                  fetch_instruction.result.GetUsedResultComponents());
+              output.exp_adjust = fetch_instruction.attributes.exp_adjust;
+              output.signed_rf_mode =
+                  uint32_t(fetch_instruction.attributes.signed_rf_mode);
+              output.result_storage_target =
+                  uint32_t(fetch_instruction.result.storage_target);
+              output.result_storage_index =
+                  fetch_instruction.result.storage_index;
+              output.result_write_mask =
+                  fetch_instruction.result.GetUsedWriteMask();
+              for (uint32_t component = 0; component < 4; ++component) {
+                output.result_components |=
+                    uint32_t(fetch_instruction.result.components[component])
+                    << (component * 3);
+              }
+              output.flags =
+                  (fetch_instruction.is_mini_fetch ? 1u : 0u) |
+                  (fetch_instruction.is_predicated ? 2u : 0u) |
+                  (fetch_instruction.predicate_condition ? 4u : 0u) |
+                  (fetch_instruction.attributes.is_index_rounded ? 8u : 0u) |
+                  (fetch_instruction.attributes.is_signed ? 16u : 0u) |
+                  (fetch_instruction.attributes.is_integer ? 32u : 0u);
+              ++attribute_index;
+            }
+          }
+          observation.vertex_binding_overflow =
+              observation.vertex_binding_count > system::kGraphicsVertexBindingObservationLimit;
+          observation.vertex_attribute_overflow =
+              observation.vertex_attribute_count >
+              system::kGraphicsVertexAttributeObservationLimit;
+        }
+        observation.surface_info = register_file_->Get<reg::RB_SURFACE_INFO>().value;
+        for (uint32_t i = 0; i < 4; ++i) {
+          observation.color_info[i] =
+              (*register_file_)[reg::RB_COLOR_INFO::rt_register_indices[i]];
+        }
+        observation.depth_info = register_file_->Get<reg::RB_DEPTH_INFO>().value;
+        observation.window_scissor_tl =
+            register_file_->Get<reg::PA_SC_WINDOW_SCISSOR_TL>().value;
+        observation.window_scissor_br =
+            register_file_->Get<reg::PA_SC_WINDOW_SCISSOR_BR>().value;
+        observation.viewport_xscale =
+            (*register_file_)[XE_GPU_REG_PA_CL_VPORT_XSCALE];
+        observation.viewport_xoffset =
+            (*register_file_)[XE_GPU_REG_PA_CL_VPORT_XOFFSET];
+        observation.viewport_yscale =
+            (*register_file_)[XE_GPU_REG_PA_CL_VPORT_YSCALE];
+        observation.viewport_yoffset =
+            (*register_file_)[XE_GPU_REG_PA_CL_VPORT_YOFFSET];
+        observation.viewport_transform_control =
+            register_file_->Get<reg::PA_CL_VTE_CNTL>().value;
+        observation.rb_modecontrol = register_file_->Get<reg::RB_MODECONTROL>().value;
+        observation.viz_query_condition = viz_query_condition;
+        observation.pa_sc_viz_query = viz_query.value;
+        observation.rb_color_mask = register_file_->Get<reg::RB_COLOR_MASK>().value;
+        for (uint32_t i = 0; i < 4; ++i) {
+          observation.rb_blendcontrol[i] =
+              (*register_file_)[reg::RB_BLENDCONTROL::rt_register_indices[i]];
+        }
+        observation.rb_depthcontrol =
+            register_file_->Get<reg::RB_DEPTHCONTROL>().value;
+        observation.pa_su_sc_mode_cntl =
+            register_file_->Get<reg::PA_SU_SC_MODE_CNTL>().value;
+        observation.pa_su_vtx_cntl = register_file_->Get<reg::PA_SU_VTX_CNTL>().value;
+        auto capture_float_constants = [&](Shader* shader, uint32_t register_base,
+                                           system::GraphicsFloatConstantObservation* output,
+                                           uint32_t& output_count, uint32_t& overflow) {
+          if (!shader) {
+            return;
+          }
+          const Shader::ConstantRegisterMap& constant_map =
+              shader->constant_register_map();
+          output_count = constant_map.float_count;
+          uint32_t output_index = 0;
+          for (uint32_t block = 0; block < 4; ++block) {
+            uint64_t remaining = constant_map.float_bitmap[block];
+            uint32_t bit;
+            while (rex::bit_scan_forward(remaining, &bit)) {
+              remaining &= ~(uint64_t(1) << bit);
+              if (output_index >=
+                  system::kGraphicsFloatConstantObservationLimit) {
+                overflow = 1;
+                continue;
+              }
+              const uint32_t constant_index = block * 64 + bit;
+              output[output_index].index = constant_index;
+              std::memcpy(output[output_index].values,
+                          &(*register_file_)[register_base + constant_index * 4],
+                          sizeof(output[output_index].values));
+              ++output_index;
+            }
+          }
+        };
+        capture_float_constants(
+            active_vertex_shader_, XE_GPU_REG_SHADER_CONSTANT_000_X,
+            observation.vertex_float_constants,
+            observation.vertex_float_constant_count,
+            observation.vertex_float_constant_overflow);
+        capture_float_constants(
+            active_pixel_shader_, XE_GPU_REG_SHADER_CONSTANT_256_X,
+            observation.pixel_float_constants,
+            observation.pixel_float_constant_count,
+            observation.pixel_float_constant_overflow);
+        auto capture_bool_loop_usage = [&](Shader* shader) {
+          if (!shader) {
+            return;
+          }
+          const Shader::ConstantRegisterMap& constant_map =
+              shader->constant_register_map();
+          for (uint32_t i = 0; i < 8; ++i) {
+            observation.bool_constant_bitmap[i] |= constant_map.bool_bitmap[i];
+          }
+          observation.loop_constant_bitmap |= constant_map.loop_bitmap;
+        };
+        capture_bool_loop_usage(active_vertex_shader_);
+        capture_bool_loop_usage(active_pixel_shader_);
+        std::memcpy(
+            observation.bool_constant_values,
+            &(*register_file_)[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031],
+            sizeof(observation.bool_constant_values));
+        std::memcpy(observation.loop_constant_values,
+                    &(*register_file_)[XE_GPU_REG_SHADER_CONSTANT_LOOP_00],
+                    sizeof(observation.loop_constant_values));
+        auto capture_texture_fetches = [&](Shader* shader, uint32_t stage) {
+          if (!shader) {
+            return;
+          }
+          for (const Shader::TextureBinding& binding : shader->texture_bindings()) {
+            const uint32_t fetch_index = binding.fetch_constant;
+            if (fetch_index >= 32) {
+              continue;
+            }
+            const xenos::xe_gpu_texture_fetch_t fetch =
+                register_file_->GetTextureFetch(fetch_index);
+            observation.texture_fetch_mask |= uint32_t(1) << fetch_index;
+            observation.texture_fetch_addresses[fetch_index] = fetch.base_address << 12;
+            observation.texture_fetch_mip_addresses[fetch_index] = fetch.mip_address << 12;
+            TextureInfo texture_info;
+            if (fetch.type == xenos::FetchConstantType::kTexture &&
+                TextureInfo::Prepare(fetch, &texture_info)) {
+              observation.texture_fetch_base_lengths[fetch_index] =
+                  texture_info.memory.base_size;
+              observation.texture_fetch_mip_lengths[fetch_index] =
+                  texture_info.memory.mip_size;
+              observation.texture_fetch_layout_valid_mask |=
+                  uint32_t(1) << fetch_index;
+            }
+            const uint32_t state_index = observation.texture_state_count++;
+            if (state_index >= system::kGraphicsTextureFetchObservationLimit) {
+              observation.texture_state_overflow = 1;
+              continue;
+            }
+            const ParsedTextureFetchInstruction& instruction = binding.fetch_instr;
+            auto& state = observation.texture_states[state_index];
+            state.stage = stage;
+            state.fetch_constant = fetch_index;
+            std::memcpy(state.dwords, &fetch, sizeof(state.dwords));
+            state.opcode = uint32_t(instruction.opcode);
+            state.dimension = uint32_t(instruction.dimension);
+            state.filters =
+                uint32_t(instruction.attributes.mag_filter) |
+                (uint32_t(instruction.attributes.min_filter) << 4) |
+                (uint32_t(instruction.attributes.mip_filter) << 8) |
+                (uint32_t(instruction.attributes.aniso_filter) << 12) |
+                (uint32_t(instruction.attributes.vol_mag_filter) << 16) |
+                (uint32_t(instruction.attributes.vol_min_filter) << 20);
+            state.flags =
+                (instruction.is_predicated ? 1u : 0u) |
+                (instruction.predicate_condition ? 2u : 0u) |
+                (instruction.attributes.fetch_valid_only ? 4u : 0u) |
+                (instruction.attributes.unnormalized_coordinates ? 8u : 0u) |
+                (instruction.attributes.use_computed_lod ? 16u : 0u) |
+                (instruction.attributes.use_register_lod ? 32u : 0u) |
+                (instruction.attributes.use_register_gradients ? 64u : 0u);
+            std::memcpy(&state.lod_bias, &instruction.attributes.lod_bias,
+                        sizeof(state.lod_bias));
+            const auto pack_offset = [](float value) {
+              int32_t scaled = int32_t(std::lround(value * 2.0f));
+              return uint32_t(scaled) & 0xFF;
+            };
+            state.offsets = pack_offset(instruction.attributes.offset_x) |
+                            (pack_offset(instruction.attributes.offset_y) << 8) |
+                            (pack_offset(instruction.attributes.offset_z) << 16);
+            state.result_storage_target =
+                uint32_t(instruction.result.storage_target);
+            state.result_storage_index = instruction.result.storage_index;
+            state.result_write_mask = instruction.result.GetUsedWriteMask();
+            for (uint32_t component = 0; component < 4; ++component) {
+              state.result_components |=
+                  uint32_t(instruction.result.components[component])
+                  << (component * 3);
+            }
+          }
+        };
+        capture_texture_fetches(active_vertex_shader_, 1);
+        capture_texture_fetches(active_pixel_shader_, 2);
+        draw_observer(observation);
+      }
       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
       if (!draw_succeeded) {
         auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
         auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();
         auto rb_modecontrol = register_file_->Get<reg::RB_MODECONTROL>();
+        static std::atomic_flag first_failed_draw_logged = ATOMIC_FLAG_INIT;
+        if (!first_failed_draw_logged.test_and_set(std::memory_order_relaxed)) {
+          REXGPU_ERROR(
+              "M3_TRACE draw.failure.first opcode={} packet=0x{:08X} "
+              "initiator=0x{:08X} num_indices={} prim_type={} source_select={} index_size={} "
+              "major_mode={} explicit_major={} output_path=0x{:08X} path_select={} "
+              "hos_control=0x{:08X} tess_mode={} rb_modecontrol=0x{:08X} edram_mode={}",
+              opcode_name, packet, vgt_draw_initiator.value,
+              uint32_t(vgt_draw_initiator.num_indices), uint32_t(vgt_draw_initiator.prim_type),
+              uint32_t(vgt_draw_initiator.source_select), uint32_t(vgt_draw_initiator.index_size),
+              uint32_t(vgt_draw_initiator.major_mode), uint32_t(major_mode_explicit),
+              vgt_output_path_cntl.value, uint32_t(vgt_output_path_cntl.path_select),
+              vgt_hos_cntl.value, uint32_t(vgt_hos_cntl.tess_mode), rb_modecontrol.value,
+              uint32_t(rb_modecontrol.edram_mode));
+        }
         REXGPU_ERROR(
             "{}({}, {}, {}): Failed in backend "
             "(major_mode={}, explicit_major={}, path_select={}, tess_mode={}, edram_mode={})",
@@ -1594,11 +2050,9 @@ bool CommandProcessor::ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader, 
     // On hardware this clears the internal state of the scan converter (which
     // is different to the register)
     WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, VIZQUERY_START);
-    REXGPU_INFO("Begin viz query ID {:02X}", id);
   } else {
     // end the viz query
     WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, VIZQUERY_END);
-    REXGPU_INFO("End viz query ID {:02X}", id);
     // The scan converter writes the internal result back to the register here.
     // We just fake it and say it was visible in case it is read back.
     if (id < 32) {

@@ -1006,8 +1006,15 @@ FunctionBlocks FunctionScanner::discover_blocks(rex::guest_addr_t entry_point,
         guest_addr_t target = instr.branch_target.value();
         block.successors.push_back(target);
 
-        // Check known_callables_ FIRST (gathered before discovery)
-        bool is_tail_call = known_callables_.contains(static_cast<uint32_t>(target));
+        // A chunk owned by this function remains an internal block even though
+        // its entry is also registered as a callable continuation target.
+        const bool is_owned_chunk =
+            isWithinChunk(static_cast<uint32_t>(target), static_cast<uint32_t>(entry_point));
+
+        // Check known_callables_ FIRST (gathered before discovery), except for
+        // an explicitly parent-owned chunk of the function being scanned.
+        bool is_tail_call =
+            !is_owned_chunk && known_callables_.contains(static_cast<uint32_t>(target));
 
         // Backward branch to unknown = probably tail call
         if (!is_tail_call && target < entry_point) {
@@ -1036,7 +1043,7 @@ FunctionBlocks FunctionScanner::discover_blocks(rex::guest_addr_t entry_point,
 
         // CRITICAL: Check if target looks like a function entry (has prologue)
         // If branching to a prologue, it's definitely a tail call to another function
-        if (!is_tail_call && is_prologue_pattern(target)) {
+        if (!is_tail_call && !is_owned_chunk && is_prologue_pattern(target)) {
           REXCODEGEN_TRACE("discover_blocks: target 0x{:08X} has prologue pattern (TAIL CALL)",
                            target);
           is_tail_call = true;

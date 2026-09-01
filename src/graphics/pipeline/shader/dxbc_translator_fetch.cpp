@@ -1945,6 +1945,40 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
     if (signs_temp != UINT32_MAX) {
       PopSystemTemp();
     }
+
+    // Xenos exposes normalized fixed-point point samples at 16 fractional
+    // bits. Host UNORM sampling may retain slightly more precision, placing
+    // threshold comparisons on the wrong side (visible as the striped block
+    // below vehicles in Forza Horizon). Keep this deliberately restricted to
+    // explicit point-filter fetches; runtime fetch-constant sampler state has
+    // not been validated for this behavior.
+    if (instr.attributes.mag_filter == xenos::TextureFilter::kPoint &&
+        instr.attributes.min_filter == xenos::TextureFilter::kPoint &&
+        instr.attributes.mip_filter == xenos::TextureFilter::kPoint &&
+        instr.attributes.aniso_filter == xenos::AnisoFilter::kDisabled) {
+      uint32_t normalized_fixed_point_temp = PushSystemTemp();
+      a_.OpAnd(
+          dxbc::Dest::R(normalized_fixed_point_temp, 0b0001),
+          LoadSystemConstant(
+              SystemConstants::Index::kTexturesNormalizedFixedPoint,
+              offsetof(SystemConstants, textures_normalized_fixed_point),
+              dxbc::Src::kXXXX),
+          dxbc::Src::LU(UINT32_C(1) << tfetch_index));
+      a_.OpIf(true,
+              dxbc::Src::R(normalized_fixed_point_temp, dxbc::Src::kXXXX));
+      a_.OpMul(
+          dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
+          dxbc::Src::R(system_temp_result_), dxbc::Src::LF(65536.0f));
+      a_.OpRoundNE(
+          dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
+          dxbc::Src::R(system_temp_result_));
+      a_.OpMul(
+          dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
+          dxbc::Src::R(system_temp_result_),
+          dxbc::Src::LF(1.0f / 65536.0f));
+      a_.OpEndIf();
+      PopSystemTemp();
+    }
   }
 
   if (size_and_is_3d_temp != UINT32_MAX) {

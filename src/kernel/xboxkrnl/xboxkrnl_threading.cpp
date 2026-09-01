@@ -254,6 +254,8 @@ u32 NtSuspendThread_entry(u32 handle, mapped_u32 suspend_count_ptr) {
 
 namespace {
 
+std::atomic_bool g_m3_logged_current_stack_pointers{false};
+
 void UpdateGuestStackPointers(X_KTHREAD* kthread, X_KPCR* pcr, PPCContext* ctx, uint32_t sp,
                               uint32_t stack_alloc_base, uint32_t stack_base,
                               uint32_t stack_limit) {
@@ -275,8 +277,26 @@ void KeSetCurrentStackPointers_entry(mapped_void stack_ptr, ppc_ptr_t<X_KTHREAD>
   auto pcr =
       REX_KERNEL_MEMORY()->TranslateVirtual<X_KPCR*>(static_cast<uint32_t>(context->r13.u64));
 
+  bool expected = false;
+  if (IsReentryTraceEnabled() &&
+      g_m3_logged_current_stack_pointers.compare_exchange_strong(expected, true)) {
+    REXKRNL_INFO(
+        "M3_TRACE stack.reentry.first lr={:08X} thread={:08X} current_thread={:08X} "
+        "fiber={:08X} sp={:08X} alloc={:08X} base={:08X} limit={:08X}",
+        context->lr, thread.guest_address(), current_thread->guest_object(),
+        static_cast<uint32_t>(thread->fiber_ptr), stack_ptr.guest_address(),
+        stack_alloc_base.guest_address(), stack_base.guest_address(), stack_limit.guest_address());
+  }
+
   UpdateGuestStackPointers(thread, pcr, context, stack_ptr.guest_address(),
                            stack_alloc_base.value(), stack_base.value(), stack_limit.value());
+
+  // The restored registers belong to a different guest fiber continuation.
+  // Returning through the old static AOT callers would execute them with the
+  // new context, so abandon that host call chain and dispatch at the saved LR.
+  if (thread->fiber_ptr && current_thread->guest_object() == thread.guest_address()) {
+    current_thread->Reenter(static_cast<uint32_t>(context->lr));
+  }
 }
 
 u32 KeSetAffinityThread_entry(mapped_void thread_ptr, u32 affinity,

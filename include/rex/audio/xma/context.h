@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <mutex>
+#include <span>
 
 #include <rex/kernel.h>
 #include <rex/memory.h>
@@ -170,6 +171,98 @@ struct kPacketInfo {
   }
 };
 
+enum class XmaPacketStatus : uint8_t {
+  kValid,
+  kInvalidContext,
+  kBufferInvalid,
+  kNullAddress,
+  kPacketOutOfRange,
+};
+
+struct XmaPacketHandle {
+  uint32_t buffer_index = 0;
+  uint32_t packet_index = 0;
+  XmaPacketStatus status = XmaPacketStatus::kInvalidContext;
+
+  bool valid() const { return status == XmaPacketStatus::kValid; }
+};
+
+enum class XmaPayloadStatus : uint8_t {
+  kValid,
+  kInvalidFrameOffset,
+  kZeroLength,
+  kInvalidFrameSize,
+  kCapacityExceeded,
+  kPacketUnavailable,
+};
+
+struct AssembledXmaPayload {
+  uint32_t valid_bits = 0;
+  uint32_t packet_count = 0;
+  XmaPayloadStatus status = XmaPayloadStatus::kInvalidFrameOffset;
+  XmaPacketHandle failed_packet;
+
+  bool valid() const { return status == XmaPayloadStatus::kValid; }
+};
+
+struct XmaStallMetrics {
+  uint32_t consecutive_no_space_stalls = 0;
+  uint32_t consecutive_no_progress_stalls = 0;
+  uint64_t total_no_space_stalls = 0;
+  uint64_t total_no_progress_stalls = 0;
+  uint64_t total_recoveries = 0;
+  uint32_t last_progress_input_offset = 0;
+  uint8_t last_progress_output_read_offset = 0;
+  uint8_t last_progress_output_write_offset = 0;
+};
+
+struct XmaNoSpaceObservation {
+  uint32_t input_offset = 0;
+  int32_t remaining_blocks = 0;
+  int32_t required_blocks = 0;
+  uint8_t current_buffer = 0;
+  uint8_t output_read_offset = 0;
+  uint8_t output_write_offset = 0;
+  bool input_buffer_0_valid = false;
+  bool input_buffer_1_valid = false;
+
+  bool Matches(const XmaNoSpaceObservation& other) const;
+};
+
+struct XmaNoSpaceObservationResult {
+  bool repeated = false;
+  bool log_recovery = false;
+};
+
+// State-only helper so the bounded reporting cadence and recovery semantics
+// can be tested without an FFmpeg decoder or guest-memory fixture.
+class XmaStallTracker {
+ public:
+  static constexpr uint32_t kNoSpaceConfirmationObservations = 8;
+  static bool ShouldLogSummary(uint64_t total_count);
+
+  XmaNoSpaceObservationResult ObserveNoSpace(const XmaNoSpaceObservation& observation);
+  bool NoteNoSpaceStall();
+  bool NoteNoProgressStall();
+  bool NoteProgress(uint32_t input_offset, uint8_t output_read_offset, uint8_t output_write_offset);
+  void Reset(uint32_t initial_input_offset);
+
+  const XmaStallMetrics& metrics() const { return metrics_; }
+
+ private:
+  XmaStallMetrics metrics_;
+  XmaNoSpaceObservation no_space_observation_;
+  uint32_t no_space_observation_count_ = 0;
+  bool has_no_space_observation_ = false;
+  bool recovery_log_pending_ = false;
+};
+
+// Resolves a logical packet number relative to starting_buffer_index. Packet
+// numbers at or beyond current_buffer_packet_count continue in the alternate
+// guest buffer without losing their index within that buffer.
+XmaPacketHandle ResolvePacket(const XMA_CONTEXT_DATA& data, uint32_t starting_buffer_index,
+                              uint32_t logical_packet_index, uint32_t current_buffer_packet_count);
+
 static constexpr int kIdToSampleRate[4] = {24000, 32000, 44100, 48000};
 
 class XmaContext {
@@ -180,6 +273,8 @@ class XmaContext {
   static const uint32_t kBitsPerFrameHeader = 15;
   static const uint32_t kBytesPerPacketHeader = 4;
   static const uint32_t kBytesPerPacketData = kBytesPerPacket - kBytesPerPacketHeader;
+  static const uint32_t kBitsPerPacketData = kBytesPerPacketData * 8;
+  static const uint32_t kMaxAssembledPackets = 4;
 
   static const uint32_t kBytesPerSample = 2;
   static const uint32_t kSamplesPerFrame = 512;
@@ -206,6 +301,15 @@ class XmaContext {
 
   int Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr);
   bool Work();
+
+  AssembledXmaPayload AssemblePacketPayloads(XMA_CONTEXT_DATA* data, uint32_t first_logical_packet,
+                                             uint32_t current_input_packet_count,
+                                             uint32_t frame_offset_in_packet,
+                                             uint32_t bits_required,
+                                             std::span<uint8_t> destination);
+  static bool IsValidFrameSize(uint32_t frame_size);
+
+  const XmaStallMetrics& stall_metrics() const { return stall_tracker_.metrics(); }
 
   void Enable();
   bool Block(bool poll);
@@ -243,12 +347,25 @@ class XmaContext {
   static uint32_t GetCurrentInputBufferSize(XMA_CONTEXT_DATA* data);
 
   kPacketInfo GetPacketInfo(uint8_t* packet, uint32_t frame_offset);
-  uint32_t GetAmountOfBitsToRead(uint32_t remaining_stream_bits, uint32_t frame_size);
+  const uint8_t* GetPacket(XMA_CONTEXT_DATA* data, const XmaPacketHandle& packet_handle);
   const uint8_t* GetNextPacket(XMA_CONTEXT_DATA* data, uint32_t next_packet_index,
-                               uint32_t current_input_packet_count);
+                               uint32_t current_input_packet_count,
+                               XmaPacketHandle* packet_handle = nullptr);
   uint32_t GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_packet_index,
-                                   uint32_t current_input_packet_count);
-  uint8_t* GetCurrentInputBuffer(XMA_CONTEXT_DATA* data);
+                                   uint32_t current_input_packet_count,
+                                   uint32_t* resolved_packet_index, bool* packet_found);
+  uint32_t GetNextPacketReadOffset(XMA_CONTEXT_DATA* data, uint32_t next_packet_index,
+                                   uint32_t current_input_packet_count,
+                                   XmaPacketHandle* packet_handle);
+  void WarnPacketResolution(const XmaPacketHandle& packet_handle, uint32_t logical_packet_index);
+  void WarnPayloadAssembly(const AssembledXmaPayload& payload, uint32_t first_logical_packet,
+                           uint32_t frame_offset_in_packet, uint32_t bits_required);
+  void NoteNoSpaceStall(const XMA_CONTEXT_DATA& data, int32_t minimum_subframe_decode_count);
+  void NoteNoProgressStall(const XMA_CONTEXT_DATA& data);
+  void NoteProgress(const XMA_CONTEXT_DATA& data, const memory::RingBuffer& output_rb,
+                    uint32_t previous_input_offset);
+  void ResetStallMetrics();
+  static uint8_t GetOutputPaddingHeadroom(uint8_t requested_padding, int32_t remaining_after_write);
 
   void Decode(XMA_CONTEXT_DATA* data);
   void Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* data);
@@ -281,8 +398,8 @@ class XmaContext {
   AVCodecContext* av_context_ = nullptr;
   AVFrame* av_frame_ = nullptr;
 
-  // Packet data buffer (two packets worth for split frame handling)
-  std::array<uint8_t, kBytesPerPacketData * 2> input_buffer_;
+  // Header-free packet payloads assembled for frames spanning guest packets.
+  std::array<uint8_t, kBytesPerPacketData * kMaxAssembledPackets> input_buffer_;
   // First byte contains bit offset information
   std::array<uint8_t, 1 + 4096> xma_frame_;
   // Conversion buffer for up to 2-channel frame
@@ -306,6 +423,12 @@ class XmaContext {
   bool carry_valid_ = false;
   uint8_t pending_output_limit_ = 0;
   uint8_t pending_start_skip_ = 0;
+
+  // One bit per XmaPacketStatus. Malformed guest input is reported once per
+  // context lifetime rather than once per Work() re-entry.
+  uint32_t packet_warning_mask_ = 0;
+  uint32_t payload_warning_mask_ = 0;
+  XmaStallTracker stall_tracker_;
 };
 
 }  // namespace rex::audio

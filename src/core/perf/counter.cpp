@@ -37,7 +37,17 @@ constexpr const char* kCounterNames[] = {
     "draw_calls",
     "command_buffer_stalls",
     "vertices_processed",
+    "guest_frame_gpu_time_ns",
+    "native_composition_gpu_time_ns",
+    "native_selection_gpu_time_ns",
+    "guest_frame_gpu_timing_samples",
+    "native_composition_gpu_timing_samples",
+    "native_selection_gpu_timing_samples",
+    "native_gpu_timing_drops",
     "xma_frames_decoded",
+    "xma_no_space_stalls",
+    "xma_no_progress_stalls",
+    "xma_stall_recoveries",
     "audio_frame_latency_us",
     "buffer_queue_depth",
     "functions_dispatched",
@@ -49,6 +59,43 @@ constexpr const char* kCounterNames[] = {
     "texture_cache_misses",
     "pipeline_cache_hits",
     "pipeline_cache_misses",
+    "memexport_draws",
+    "memexport_bytes",
+    "memexport_sync_fallbacks",
+    "memexport_queue_waits",
+    "memexport_fence_waits",
+    "resolve_readback_requests",
+    "resolve_readback_bytes",
+    "resolve_readback_fast_copies",
+    "resolve_readback_cache_misses",
+    "resolve_readback_full_waits",
+    "resolve_readback_wait_time_ns",
+    "zpd_reports_started",
+    "zpd_reports_ended",
+    "zpd_report_segments",
+    "zpd_same_slot_reuse",
+    "zpd_fast_speculative_writes",
+    "zpd_async_result_patches",
+    "zpd_strict_waits",
+    "zpd_strict_wait_time_ns",
+    "zpd_retire_timeouts",
+    "zpd_fake_fallbacks",
+    "zpd_malformed_records",
+    "zpd_stale_result_rejections",
+    "zpd_classified_begins",
+    "zpd_classified_ends",
+    "zpd_classified_orphaned_ends",
+    "zpd_policy_fallbacks",
+    "zpd_watchdog_recoveries",
+    "guest_vblank_count",
+    "guest_vblank_delta_ns",
+    "simulation_tick_count",
+    "present_count",
+    "present_delta_ns",
+    "present_queue_depth",
+    "present_deadline_misses",
+    "duplicate_present_count",
+    "dropped_present_count",
 };
 static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
 
@@ -60,7 +107,17 @@ constexpr bool kIsGauge[] = {
     false,  // kDrawCalls
     false,  // kCommandBufferStalls
     false,  // kVerticesProcessed
+    false,  // kGuestFrameGpuTimeNs
+    false,  // kNativeCompositionGpuTimeNs
+    false,  // kNativeSelectionGpuTimeNs
+    false,  // kGuestFrameGpuTimingSamples
+    false,  // kNativeCompositionGpuTimingSamples
+    false,  // kNativeSelectionGpuTimingSamples
+    false,  // kNativeGpuTimingDrops
     false,  // kXmaFramesDecoded
+    false,  // kXmaNoSpaceStalls
+    false,  // kXmaNoProgressStalls
+    false,  // kXmaStallRecoveries
     false,  // kAudioFrameLatencyUs
     false,  // kBufferQueueDepth  (set each frame)
     false,  // kFunctionsDispatched
@@ -72,6 +129,43 @@ constexpr bool kIsGauge[] = {
     false,  // kTextureCacheMisses
     false,  // kPipelineCacheHits
     false,  // kPipelineCacheMisses
+    false,  // kMemexportDraws
+    false,  // kMemexportBytes
+    false,  // kMemexportSyncFallbacks
+    false,  // kMemexportQueueWaits
+    false,  // kMemexportFenceWaits
+    false,  // kResolveReadbackRequests
+    false,  // kResolveReadbackBytes
+    false,  // kResolveReadbackFastCopies
+    false,  // kResolveReadbackCacheMisses
+    false,  // kResolveReadbackFullWaits
+    false,  // kResolveReadbackWaitTimeNs
+    false,  // kZpdReportsStarted
+    false,  // kZpdReportsEnded
+    false,  // kZpdReportSegments
+    false,  // kZpdSameSlotReuse
+    false,  // kZpdFastSpeculativeWrites
+    false,  // kZpdAsyncResultPatches
+    false,  // kZpdStrictWaits
+    false,  // kZpdStrictWaitTimeNs
+    false,  // kZpdRetireTimeouts
+    false,  // kZpdFakeFallbacks
+    false,  // kZpdMalformedRecords
+    false,  // kZpdStaleResultRejections
+    false,  // kZpdClassifiedBegins
+    false,  // kZpdClassifiedEnds
+    false,  // kZpdClassifiedOrphanedEnds
+    false,  // kZpdPolicyFallbacks
+    false,  // kZpdWatchdogRecoveries
+    false,  // kGuestVblankCount
+    false,  // kGuestVblankDeltaNs
+    false,  // kSimulationTickCount
+    false,  // kPresentCount
+    false,  // kPresentDeltaNs
+    false,  // kPresentQueueDepth
+    false,  // kPresentDeadlineMisses
+    false,  // kDuplicatePresentCount
+    false,  // kDroppedPresentCount
 };
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 

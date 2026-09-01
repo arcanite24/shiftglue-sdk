@@ -86,6 +86,19 @@ extern PPCFuncMapping PPCFuncMappings[];
 #endif
 #endif
 
+// A guest `b` to another function is a tail branch, not a nested call. Make
+// that contract explicit on Clang so loops crossing configured function
+// boundaries cannot retain one host stack frame per guest iteration.
+#if defined(__clang__) && !defined(REXGLUE_PROFILE_GUEST_FUNCTIONS)
+#define REX_TAIL_CALL(name) [[clang::musttail]] return name(ctx, base)
+#else
+#define REX_TAIL_CALL(name) \
+  do {                      \
+    name(ctx, base);        \
+    return;                 \
+  } while (false)
+#endif
+
 //=============================================================================
 // Function Prologue
 //=============================================================================

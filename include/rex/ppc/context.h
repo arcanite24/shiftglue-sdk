@@ -278,6 +278,13 @@ struct alignas(0x40) PPCContext {
    */
   uint32_t last_indirect_target = 0;
 
+  /**
+   * Guest address requested by table-based dispatch. Generated functions
+   * consume this on entry so a saved LR that points immediately after a
+   * linked call can resume inside its owning AOT function.
+   */
+  uint32_t dispatch_address = 0;
+
   PPCRegister f0;
   PPCRegister f1;
   PPCRegister f2;

@@ -85,6 +85,8 @@ u32 XexGetModuleSection_entry(mapped_void hmodule, mapped_string name, mapped_u3
 
 u32 XexLoadImage_entry(mapped_string module_name, u32 module_flags, u32 min_version,
                        mapped_u32 hmodule_ptr) {
+  REXKRNL_INFO("M2_TRACE module.load.request name={:?} flags={:#x} min_version={:#x}",
+               module_name.value(), module_flags, min_version);
   X_STATUS result = X_STATUS_NO_SUCH_FILE;
 
   uint32_t hmodule = 0;
@@ -117,6 +119,9 @@ u32 XexLoadImage_entry(mapped_string module_name, u32 module_flags, u32 min_vers
   }
 
   *hmodule_ptr = hmodule;
+
+  REXKRNL_INFO("M2_TRACE module.load.result name={:?} status={:08X} hmodule={:08X}",
+               module_name.value(), result, hmodule);
 
   return result;
 }

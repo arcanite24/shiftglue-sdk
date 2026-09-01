@@ -494,6 +494,27 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     TextureKey old_key = binding.key;
     uint8_t old_swizzled_signs = binding.swizzled_signs;
     BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
+    switch (fetch.format) {
+      case xenos::TextureFormat::k_16_FLOAT:
+      case xenos::TextureFormat::k_16_16_FLOAT:
+      case xenos::TextureFormat::k_16_16_16_16_FLOAT:
+      case xenos::TextureFormat::k_32_FLOAT:
+      case xenos::TextureFormat::k_32_32_FLOAT:
+      case xenos::TextureFormat::k_32_32_32_FLOAT:
+      case xenos::TextureFormat::k_32_32_32_32_FLOAT:
+      case xenos::TextureFormat::k_24_8_FLOAT:
+      case xenos::TextureFormat::k_2_10_10_10_FLOAT_EDRAM:
+        binding.normalized_fixed_point = false;
+        break;
+      default:
+        // Keep the Xenos Q16 point-sample behavior scoped to unsigned fixed
+        // fetches. Signed, biased, gamma and mixed-sign fetches may use the
+        // same num_format encoding but have different conversion semantics.
+        binding.normalized_fixed_point =
+            fetch.num_format == 0 &&
+            binding.swizzled_signs == kSwizzledSignsUnsigned;
+        break;
+    }
     texture_bindings_in_sync_ |= index_bit;
     if (!binding.key.is_valid) {
       if (old_key.is_valid) {

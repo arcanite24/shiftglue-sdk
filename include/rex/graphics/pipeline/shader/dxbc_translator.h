@@ -111,7 +111,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // If anything in this is structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
     // version number (0xYYYYMMDD)!
-    static constexpr uint32_t kVersion = 0x20260226;
+    static constexpr uint32_t kVersion = 0x20260827;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -307,6 +307,9 @@ class DxbcShaderTranslator : public ShaderTranslator {
 
     // Whether each texture in fetch constants is resolution-scaled.
     uint32_t textures_resolution_scaled;
+    // Bit per fetch constant. Normalized fixed-point point samples are rounded
+    // to the 16-fractional-bit precision observed on Xenos.
+    uint32_t textures_normalized_fixed_point;
     // Log2 of X and Y sample size. Used for alpha to mask, and for MSAA with
     // ROV, this is used for EDRAM address calculation.
     uint32_t sample_count_log2[2];
@@ -414,6 +417,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
       kTextureSwizzledSigns,
 
       kTexturesResolutionScaled,
+      kTexturesNormalizedFixedPoint,
       kSampleCountLog2,
       kAlphaTestReference,
 

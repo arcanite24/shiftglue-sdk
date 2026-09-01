@@ -2,6 +2,7 @@
 
 add_executable(unit_tests
     test_memory.cpp
+    audio/xma_packet_test.cpp
     memory/heap_allocation_test.cpp
     kernel/object_table_test.cpp
     core/cvar_test.cpp
@@ -10,8 +11,11 @@ add_executable(unit_tests
     core/hash_test.cpp
     core/stream_test.cpp
     core/chrono_test.cpp
+    codegen/resume_entry_test.cpp
+    codegen/resume_template_test.cpp
     ppc/import_function_test.cpp
     ppc/stack_test.cpp
+    ppc/vector_math_test.cpp
     system/guest_path_test.cpp
     system/achievement_manager_test.cpp
     system/function_dispatcher_test.cpp
@@ -19,6 +23,10 @@ add_executable(unit_tests
     codegen/codegen_writer_test.cpp
     codegen/output_partition_test.cpp
     codegen/output_stamp_test.cpp
+    filesystem/cache_mount_test.cpp
+    graphics/zpd_lifecycle_test.cpp
+    graphics/native_guest_output_test.cpp
+    ui/presentation_pacer_test.cpp
 )
 
 target_sources(unit_tests PRIVATE

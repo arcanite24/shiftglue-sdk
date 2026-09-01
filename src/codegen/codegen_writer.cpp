@@ -53,6 +53,23 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
   }
 
   // Build functions JSON array
+  // A discontinuous/overlapping function graph can expose the same linked-call
+  // return PC through more than one FunctionNode. Runtime registration replaces
+  // earlier mappings with later ones, so choose that same deterministic owner
+  // here and emit each resume alias exactly once.
+  std::unordered_map<uint32_t, const rex::codegen::FunctionNode*> resumeAliasOwners;
+  for (const auto* fn : functions) {
+    if (fn->authority() == rex::codegen::FunctionAuthority::IMPORT) {
+      continue;
+    }
+    for (uint32_t address : fn->resumableReturnAddresses(ctx.binary())) {
+      const auto* explicitEntry = ctx.graph.getFunction(address);
+      if (!explicitEntry || explicitEntry == fn) {
+        resumeAliasOwners[address] = fn;
+      }
+    }
+  }
+
   nlohmann::json functionsJson = nlohmann::json::array();
   for (const auto* fn : functions) {
     std::string funcName;
@@ -70,12 +87,23 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
       funcName = fmt::format("sub_{:08X}", fn->base());
     }
 
+    nlohmann::json resumeAliases = nlohmann::json::array();
+    if (fn->authority() != rex::codegen::FunctionAuthority::IMPORT) {
+      for (uint32_t address : fn->resumableReturnAddresses(ctx.binary())) {
+        const auto owner = resumeAliasOwners.find(address);
+        if (owner != resumeAliasOwners.end() && owner->second == fn) {
+          resumeAliases.push_back(fmt::format("0x{:X}", address));
+        }
+      }
+    }
+
     functionsJson.push_back({
         {"address", fmt::format("0x{:X}", fn->base())},
         {"name", funcName},
         {"is_rexcrt", isRexcrt},
         {"below_code_base", (fn->base() < codeMin)},
         {"is_import", fn->authority() == rex::codegen::FunctionAuthority::IMPORT},
+        {"resume_aliases", std::move(resumeAliases)},
     });
   }
 

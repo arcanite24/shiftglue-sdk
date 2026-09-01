@@ -91,6 +91,24 @@ class DeferredCommandList {
     }
   }
 
+  void D3DClearUnorderedAccessViewFloat(
+      D3D12_GPU_DESCRIPTOR_HANDLE view_gpu_handle_in_current_heap,
+      D3D12_CPU_DESCRIPTOR_HANDLE view_cpu_handle, ID3D12Resource* resource,
+      const FLOAT values[4], UINT num_rects, const D3D12_RECT* rects) {
+    auto args = reinterpret_cast<ClearUnorderedAccessViewHeader*>(
+        WriteCommand(Command::kD3DClearUnorderedAccessViewFloat,
+                     sizeof(ClearUnorderedAccessViewHeader) +
+                         num_rects * sizeof(D3D12_RECT)));
+    args->view_gpu_handle_in_current_heap = view_gpu_handle_in_current_heap;
+    args->view_cpu_handle = view_cpu_handle;
+    args->resource = resource;
+    std::memcpy(args->values_float, values, 4 * sizeof(FLOAT));
+    args->num_rects = num_rects;
+    if (num_rects != 0) {
+      std::memcpy(args + 1, rects, num_rects * sizeof(D3D12_RECT));
+    }
+  }
+
   void D3DCopyBufferRegion(ID3D12Resource* dst_buffer, UINT64 dst_offset,
                            ID3D12Resource* src_buffer, UINT64 src_offset, UINT64 num_bytes) {
     auto& args = *reinterpret_cast<D3DCopyBufferRegionArguments*>(
@@ -134,6 +152,20 @@ class DeferredCommandList {
     } else {
       args.has_src_box = false;
     }
+  }
+
+  void D3DResolveSubresource(ID3D12Resource* dst_resource,
+                             UINT dst_subresource,
+                             ID3D12Resource* src_resource,
+                             UINT src_subresource, DXGI_FORMAT format) {
+    auto& args = *reinterpret_cast<D3DResolveSubresourceArguments*>(
+        WriteCommand(Command::kD3DResolveSubresource,
+                     sizeof(D3DResolveSubresourceArguments)));
+    args.dst_resource = dst_resource;
+    args.dst_subresource = dst_subresource;
+    args.src_resource = src_resource;
+    args.src_subresource = src_subresource;
+    args.format = format;
   }
 
   void D3DDispatch(UINT thread_group_count_x, UINT thread_group_count_y,
@@ -456,10 +488,12 @@ class DeferredCommandList {
     kD3DClearDepthStencilView,
     kD3DClearRenderTargetView,
     kD3DClearUnorderedAccessViewUint,
+    kD3DClearUnorderedAccessViewFloat,
     kD3DCopyBufferRegion,
     kD3DCopyResource,
     kCopyTexture,
     kD3DCopyTextureRegion,
+    kD3DResolveSubresource,
     kD3DDispatch,
     kD3DDrawIndexedInstanced,
     kD3DDrawInstanced,
@@ -554,6 +588,14 @@ class DeferredCommandList {
     D3D12_TEXTURE_COPY_LOCATION src;
     D3D12_BOX src_box;
     bool has_src_box;
+  };
+
+  struct D3DResolveSubresourceArguments {
+    ID3D12Resource* dst_resource;
+    UINT dst_subresource;
+    ID3D12Resource* src_resource;
+    UINT src_subresource;
+    DXGI_FORMAT format;
   };
 
   struct D3DDispatchArguments {

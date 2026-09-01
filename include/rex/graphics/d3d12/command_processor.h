@@ -36,6 +36,7 @@
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
+#include <rex/graphics/zpd_lifecycle.h>
 #include <rex/system/kernel_state.h>
 #include <rex/ui/d3d12/d3d12_descriptor_heap_pool.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
@@ -58,6 +59,10 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   ui::d3d12::D3D12Provider& GetD3D12Provider() const {
     return *static_cast<ui::d3d12::D3D12Provider*>(graphics_system_->provider());
+  }
+
+  system::GraphicsShaderTranslationObserver GetShaderTranslationObserver() const {
+    return graphics_system_->shader_translation_observer();
   }
 
   // Returns the deferred drawing command list for the currently open
@@ -194,6 +199,16 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   // Returns the text to display in the GPU backend name in the window title.
   std::string GetWindowTitleText() const;
+
+  bool DrawNativeGuestOutputDiagnosticTriangle(ID3D12Resource* resource,
+                                               uint32_t width,
+                                               uint32_t height,
+                                               uint32_t phase);
+  bool DrawNativeGuestOutputRetainedPass(ID3D12Resource* resource,
+                                         uint32_t width,
+                                         uint32_t height,
+                                         system::NativeGuestOutputRetainedPassMode mode,
+                                         bool use_pwl_gamma_ramp);
 
  protected:
   bool SetupContext() override;
@@ -365,9 +380,15 @@ class D3D12CommandProcessor : public CommandProcessor {
                                   uint32_t normalized_color_mask);
   bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
                       ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
-  bool IssueCopy_ReadbackResolvePath();
+  bool IssueCopy_ReadbackResolvePath(uint32_t& written_address_out,
+                                     uint32_t& written_length_out);
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
+
+  bool InitializeNativeGuestOutputGpuTiming();
+  void ShutdownNativeGuestOutputGpuTiming();
+  void BeginNativeGuestOutputGpuTimingFrame();
+  void RetireNativeGuestOutputGpuTimings();
 
   // Returns a buffer for reading GPU data back to the CPU. Assuming
   // synchronizing immediately after use. Always in COPY_DEST state.
@@ -412,6 +433,15 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
   void WriteGuestOcclusionResult(xenos::xe_gpu_depth_sample_counts* sample_counts,
                                  uint64_t samples);
+  ZPDMode GetZPDMode() const;
+  bool ExecuteModernZPD(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
+  bool AcquireModernOcclusionQuery(uint32_t& host_index_out, uint32_t& generation_out);
+  void ReleaseModernOcclusionQuery(uint32_t host_index, uint32_t generation);
+  bool OpenModernZPDSegment();
+  bool CloseModernZPDSegment();
+  void RetireModernZPDQueries();
+  bool AwaitModernZPDReport(ZPDLifecycle::ReportHandle report_handle, uint32_t timeout_ms);
+  void WriteModernZPDReport(const ZPDLifecycle::Report& report, uint32_t delta);
   void InvalidateAllVertexBufferResidency();
   void InvalidateVertexBufferResidency(uint32_t vfetch_index);
   void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
@@ -597,6 +627,85 @@ class D3D12CommandProcessor : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fxaa_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fxaa_extreme_pipeline_;
 
+  struct NativeGuestOutputTriangleConstants {
+    uint32_t output_size[2];
+    uint32_t phase;
+  };
+  enum class NativeGuestOutputTriangleRootParameter : uint32_t {
+    kConstants,
+    kOutput,
+    kCount,
+  };
+  Microsoft::WRL::ComPtr<ID3D12RootSignature>
+      native_guest_output_triangle_root_signature_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState>
+      native_guest_output_triangle_pipeline_;
+
+  struct NativeGuestOutputRetainedPassConstants {
+    uint32_t output_size[2];
+    uint32_t source_size[2];
+    uint32_t crop_size[2];
+    uint32_t presentation_mode;
+    uint32_t padding;
+  };
+  enum class NativeGuestOutputRetainedPassRootParameter : uint32_t {
+    kConstants,
+    kSource,
+    kOutput,
+    kCount,
+  };
+  Microsoft::WRL::ComPtr<ID3D12RootSignature>
+      native_guest_output_retained_pass_root_signature_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState>
+      native_guest_output_retained_pass_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12Resource>
+      native_guest_output_display_target_;
+  D3D12_RESOURCE_STATES native_guest_output_display_target_state_ =
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  uint64_t native_guest_output_display_target_submission_ = 0;
+  Microsoft::WRL::ComPtr<ID3D12Resource>
+      native_guest_output_linear_target_;
+  D3D12_RESOURCE_STATES native_guest_output_linear_target_state_ =
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  uint64_t native_guest_output_linear_target_submission_ = 0;
+  struct NativeGuestOutputHybridConstants {
+    uint32_t output_size[2];
+    float agreement_epsilon;
+    uint32_t padding;
+  };
+  enum class NativeGuestOutputHybridRootParameter : uint32_t {
+    kConstants,
+    kSources,
+    kOutput,
+    kCount,
+  };
+  Microsoft::WRL::ComPtr<ID3D12RootSignature>
+      native_guest_output_hybrid_root_signature_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState>
+      native_guest_output_hybrid_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12Resource>
+      native_guest_output_hybrid_target_;
+  D3D12_RESOURCE_STATES native_guest_output_hybrid_target_state_ =
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  uint64_t native_guest_output_hybrid_target_submission_ = 0;
+
+  static constexpr uint32_t kNativeGuestOutputGpuQueriesPerFrame = 5;
+  struct NativeGuestOutputGpuTimingSlot {
+    uint64_t submission = 0;
+    bool frame_started = false;
+    bool guest_timed = false;
+    bool selection_timed = false;
+  };
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap>
+      native_guest_output_gpu_query_heap_;
+  Microsoft::WRL::ComPtr<ID3D12Resource>
+      native_guest_output_gpu_query_readback_;
+  uint64_t* native_guest_output_gpu_query_mapping_ = nullptr;
+  uint64_t native_guest_output_gpu_timestamp_frequency_ = 0;
+  std::array<NativeGuestOutputGpuTimingSlot, kQueueFrames>
+      native_guest_output_gpu_timing_slots_{};
+  bool native_guest_output_gpu_timing_active_ = false;
+
   struct ResolveDownscaleConstants {
     uint32_t scale_x;
     uint32_t scale_y;
@@ -659,6 +768,20 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t host_index = UINT32_MAX;
     bool valid = false;
   } active_occlusion_query_;
+  struct PendingModernOcclusionQuery {
+    uint64_t submission = 0;
+    uint32_t host_index = UINT32_MAX;
+    uint32_t generation = 0;
+    ZPDLifecycle::ReportHandle report_handle = ZPDLifecycle::kInvalidReportHandle;
+  };
+  ZPDLifecycle zpd_lifecycle_;
+  std::vector<uint32_t> modern_occlusion_query_free_indices_;
+  std::vector<uint32_t> modern_occlusion_query_generations_;
+  std::deque<PendingModernOcclusionQuery> modern_occlusion_queries_pending_;
+  uint32_t modern_occlusion_query_active_index_ = UINT32_MAX;
+  uint32_t modern_occlusion_query_active_generation_ = 0;
+  ZPDLifecycle::ReportHandle modern_occlusion_query_active_report_ =
+      ZPDLifecycle::kInvalidReportHandle;
   struct VertexBufferState {
     uint32_t address = UINT32_MAX;
     uint32_t size = UINT32_MAX;

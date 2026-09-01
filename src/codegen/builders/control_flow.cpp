@@ -29,7 +29,7 @@ bool build_b(BuilderContext& ctx) {
 
   // Use graph to classify the target - handles thunks that branch to nearby functions
   // false = branch instruction (not a call), so own-base means loop back
-  auto kind = ctx.graph().classifyTarget(target, ctx.base, false);
+  auto kind = ctx.graph().classifyTarget(target, ctx.fn, false);
 
   switch (kind) {
     case TargetKind::InternalLabel:
@@ -40,8 +40,7 @@ bool build_b(BuilderContext& ctx) {
     case TargetKind::Function:
     case TargetKind::Import:
       // Tail call to another function or import
-      ctx.emit_function_call(target);
-      ctx.println("\treturn;");
+      ctx.emit_tail_function_call(target);
       break;
 
     case TargetKind::Unknown:
@@ -67,7 +66,7 @@ bool build_bl(BuilderContext& ctx) {
 
   // Use graph to classify the target
   // true = call instruction, so own-base means recursive call (not loop back)
-  auto kind = ctx.graph().classifyTarget(target, ctx.base, true);
+  auto kind = ctx.graph().classifyTarget(target, ctx.fn, true);
 
   switch (kind) {
     case TargetKind::InternalLabel:
@@ -138,26 +137,14 @@ bool build_bctr(BuilderContext& ctx) {
         continue;
       }
 
-      auto kind = ctx.graph().classifyTarget(label, ctx.base, false);
+      auto kind = ctx.graph().classifyTarget(label, ctx.fn, false);
       switch (kind) {
         case TargetKind::InternalLabel:
           ctx.println("\t\tgoto loc_{:X};", label);
           break;
         case TargetKind::Function:
         case TargetKind::Import:
-          if (auto* targetFn = ctx.graph().getFunction(label)) {
-            ctx.emitCtx.reference(targetFn->name());
-            ctx.println("\t\t{}(ctx, base);", targetFn->name());
-          } else {
-            REXCODEGEN_ERROR(
-                "Jump target 0x{:08X} classified as function but not in graph at bctr 0x{:08X}",
-                label, ctx.base);
-            ctx.println(
-                "\t\tREX_FATAL(\"Jump target 0x{:08X} classified as function but not "
-                "in graph at bctr 0x{:08X}\");",
-                label, ctx.base);
-          }
-          ctx.println("\t\treturn;");
+          ctx.emit_tail_function_call(label, "\t\t");
           break;
         default:
           REXCODEGEN_ERROR("Jump target 0x{:08X} unresolved at bctr 0x{:08X}", label, ctx.base);

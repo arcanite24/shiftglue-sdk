@@ -1229,7 +1229,24 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator& translator,
                                                     : "d3d12");
   }
 
-  return translation.is_valid();
+  if (!translation.is_valid()) {
+    return false;
+  }
+
+  auto shader_translation_observer =
+      command_processor_.GetShaderTranslationObserver();
+  if (shader_translation_observer) {
+    system::GraphicsShaderTranslationObservation observation;
+    observation.stage = shader.type() == xenos::ShaderType::kVertex
+                            ? system::GraphicsShaderStage::kVertex
+                            : system::GraphicsShaderStage::kPixel;
+    observation.guest_hash = shader.ucode_data_hash();
+    observation.specialization_mask = translation.modification();
+    observation.bytecode = translation.translated_binary().data();
+    observation.bytecode_size = translation.translated_binary().size();
+    shader_translation_observer(observation);
+  }
+  return true;
 }
 
 bool PipelineCache::GetCurrentStateDescription(

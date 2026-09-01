@@ -28,9 +28,19 @@ enum class CounterId : uint16_t {
   kDrawCalls,
   kCommandBufferStalls,
   kVerticesProcessed,
+  kGuestFrameGpuTimeNs,
+  kNativeCompositionGpuTimeNs,
+  kNativeSelectionGpuTimeNs,
+  kGuestFrameGpuTimingSamples,
+  kNativeCompositionGpuTimingSamples,
+  kNativeSelectionGpuTimingSamples,
+  kNativeGpuTimingDrops,
 
   // Audio
   kXmaFramesDecoded,
+  kXmaNoSpaceStalls,
+  kXmaNoProgressStalls,
+  kXmaStallRecoveries,
   kAudioFrameLatencyUs,
   kBufferQueueDepth,
 
@@ -48,6 +58,51 @@ enum class CounterId : uint16_t {
   kTextureCacheMisses,
   kPipelineCacheHits,
   kPipelineCacheMisses,
+
+  // D3D12 memexport coherency
+  kMemexportDraws,
+  kMemexportBytes,
+  kMemexportSyncFallbacks,
+  kMemexportQueueWaits,
+  kMemexportFenceWaits,
+
+  // D3D12 resolve readback
+  kResolveReadbackRequests,
+  kResolveReadbackBytes,
+  kResolveReadbackFastCopies,
+  kResolveReadbackCacheMisses,
+  kResolveReadbackFullWaits,
+  kResolveReadbackWaitTimeNs,
+
+  // D3D12 ZPD report lifecycle
+  kZpdReportsStarted,
+  kZpdReportsEnded,
+  kZpdReportSegments,
+  kZpdSameSlotReuse,
+  kZpdFastSpeculativeWrites,
+  kZpdAsyncResultPatches,
+  kZpdStrictWaits,
+  kZpdStrictWaitTimeNs,
+  kZpdRetireTimeouts,
+  kZpdFakeFallbacks,
+  kZpdMalformedRecords,
+  kZpdStaleResultRejections,
+  kZpdClassifiedBegins,
+  kZpdClassifiedEnds,
+  kZpdClassifiedOrphanedEnds,
+  kZpdPolicyFallbacks,
+  kZpdWatchdogRecoveries,
+
+  // Guest timing and host presentation pacing
+  kGuestVblankCount,
+  kGuestVblankDeltaNs,
+  kSimulationTickCount,
+  kPresentCount,
+  kPresentDeltaNs,
+  kPresentQueueDepth,
+  kPresentDeadlineMisses,
+  kDuplicatePresentCount,
+  kDroppedPresentCount,
 
   kCount  // sentinel -- must be last
 };
@@ -146,9 +201,24 @@ class Profiler {
 #define PROFILE_FUNCTION_DISPATCHED() PERF_counter_inc(kFunctionsDispatched)
 #define PROFILE_INTERRUPT_DISPATCHED() PERF_counter_inc(kInterruptDispatches)
 #define PROFILE_XMA_FRAME_DECODED() PERF_counter_inc(kXmaFramesDecoded)
+#define PROFILE_XMA_NO_SPACE_STALL() PERF_counter_inc(kXmaNoSpaceStalls)
+#define PROFILE_XMA_NO_PROGRESS_STALL() PERF_counter_inc(kXmaNoProgressStalls)
+#define PROFILE_XMA_STALL_RECOVERY() PERF_counter_inc(kXmaStallRecoveries)
 #define PROFILE_DRAW_CALL() PERF_counter_inc(kDrawCalls)
 #define PROFILE_VERTICES(n) PERF_counter_add(kVerticesProcessed, n)
 #define PROFILE_CMD_BUFFER_STALL() PERF_counter_inc(kCommandBufferStalls)
+#define PROFILE_GUEST_FRAME_GPU_TIME_NS(n) PERF_counter_add(kGuestFrameGpuTimeNs, n)
+#define PROFILE_NATIVE_COMPOSITION_GPU_TIME_NS(n) \
+  PERF_counter_add(kNativeCompositionGpuTimeNs, n)
+#define PROFILE_NATIVE_SELECTION_GPU_TIME_NS(n) \
+  PERF_counter_add(kNativeSelectionGpuTimeNs, n)
+#define PROFILE_GUEST_FRAME_GPU_TIMING_SAMPLE() \
+  PERF_counter_inc(kGuestFrameGpuTimingSamples)
+#define PROFILE_NATIVE_COMPOSITION_GPU_TIMING_SAMPLE() \
+  PERF_counter_inc(kNativeCompositionGpuTimingSamples)
+#define PROFILE_NATIVE_SELECTION_GPU_TIMING_SAMPLE() \
+  PERF_counter_inc(kNativeSelectionGpuTimingSamples)
+#define PROFILE_NATIVE_GPU_TIMING_DROP() PERF_counter_inc(kNativeGpuTimingDrops)
 #define PROFILE_AUDIO_LATENCY_US(value) PERF_counter_set(kAudioFrameLatencyUs, value)
 #define PROFILE_BUFFER_QUEUE_DEPTH(value) PERF_counter_set(kBufferQueueDepth, value)
 #define PROFILE_THREAD_CREATED() PERF_counter_inc(kActiveThreads)
@@ -159,6 +229,26 @@ class Profiler {
 #define PROFILE_TEXTURE_CACHE_MISS() PERF_counter_inc(kTextureCacheMisses)
 #define PROFILE_PIPELINE_CACHE_HIT() PERF_counter_inc(kPipelineCacheHits)
 #define PROFILE_PIPELINE_CACHE_MISS() PERF_counter_inc(kPipelineCacheMisses)
+#define PROFILE_MEMEXPORT_DRAW() PERF_counter_inc(kMemexportDraws)
+#define PROFILE_MEMEXPORT_BYTES(n) PERF_counter_add(kMemexportBytes, n)
+#define PROFILE_MEMEXPORT_SYNC_FALLBACK() PERF_counter_inc(kMemexportSyncFallbacks)
+#define PROFILE_MEMEXPORT_QUEUE_WAIT() PERF_counter_inc(kMemexportQueueWaits)
+#define PROFILE_MEMEXPORT_FENCE_WAIT() PERF_counter_inc(kMemexportFenceWaits)
+#define PROFILE_RESOLVE_READBACK_REQUEST() PERF_counter_inc(kResolveReadbackRequests)
+#define PROFILE_RESOLVE_READBACK_BYTES(n) PERF_counter_add(kResolveReadbackBytes, n)
+#define PROFILE_RESOLVE_READBACK_FAST_COPY() PERF_counter_inc(kResolveReadbackFastCopies)
+#define PROFILE_RESOLVE_READBACK_CACHE_MISS() PERF_counter_inc(kResolveReadbackCacheMisses)
+#define PROFILE_RESOLVE_READBACK_FULL_WAIT() PERF_counter_inc(kResolveReadbackFullWaits)
+#define PROFILE_RESOLVE_READBACK_WAIT_TIME_NS(n) PERF_counter_add(kResolveReadbackWaitTimeNs, n)
+#define PROFILE_GUEST_VBLANK() PERF_counter_inc(kGuestVblankCount)
+#define PROFILE_GUEST_VBLANK_DELTA_NS(value) PERF_counter_set(kGuestVblankDeltaNs, value)
+#define PROFILE_SIMULATION_TICK() PERF_counter_inc(kSimulationTickCount)
+#define PROFILE_PRESENT() PERF_counter_inc(kPresentCount)
+#define PROFILE_PRESENT_DELTA_NS(value) PERF_counter_set(kPresentDeltaNs, value)
+#define PROFILE_PRESENT_QUEUE_DEPTH(value) PERF_counter_set(kPresentQueueDepth, value)
+#define PROFILE_PRESENT_DEADLINE_MISS(n) PERF_counter_add(kPresentDeadlineMisses, n)
+#define PROFILE_DUPLICATE_PRESENT() PERF_counter_inc(kDuplicatePresentCount)
+#define PROFILE_DROPPED_PRESENT() PERF_counter_inc(kDroppedPresentCount)
 
 #else
 
@@ -171,18 +261,48 @@ class Profiler {
 #define PROFILE_FUNCTION_DISPATCHED()
 #define PROFILE_INTERRUPT_DISPATCHED()
 #define PROFILE_XMA_FRAME_DECODED()
+#define PROFILE_XMA_NO_SPACE_STALL()
+#define PROFILE_XMA_NO_PROGRESS_STALL()
+#define PROFILE_XMA_STALL_RECOVERY()
 #define PROFILE_DRAW_CALL()
 #define PROFILE_VERTICES(n)
 #define PROFILE_CMD_BUFFER_STALL()
+#define PROFILE_GUEST_FRAME_GPU_TIME_NS(n)
+#define PROFILE_NATIVE_COMPOSITION_GPU_TIME_NS(n)
+#define PROFILE_NATIVE_SELECTION_GPU_TIME_NS(n)
+#define PROFILE_GUEST_FRAME_GPU_TIMING_SAMPLE()
+#define PROFILE_NATIVE_COMPOSITION_GPU_TIMING_SAMPLE()
+#define PROFILE_NATIVE_SELECTION_GPU_TIMING_SAMPLE()
+#define PROFILE_NATIVE_GPU_TIMING_DROP()
 #define PROFILE_AUDIO_LATENCY_US(value)
 #define PROFILE_BUFFER_QUEUE_DEPTH(value)
 #define PROFILE_THREAD_CREATED()
 #define PROFILE_THREAD_EXITED()
 #define PROFILE_APC_QUEUE_DEPTH(value)
 #define PROFILE_CRITICAL_REGION_CONTENTION()
+#define PROFILE_MEMEXPORT_DRAW()
+#define PROFILE_MEMEXPORT_BYTES(n)
+#define PROFILE_MEMEXPORT_SYNC_FALLBACK()
+#define PROFILE_MEMEXPORT_QUEUE_WAIT()
+#define PROFILE_MEMEXPORT_FENCE_WAIT()
+#define PROFILE_RESOLVE_READBACK_REQUEST()
+#define PROFILE_RESOLVE_READBACK_BYTES(n)
+#define PROFILE_RESOLVE_READBACK_FAST_COPY()
+#define PROFILE_RESOLVE_READBACK_CACHE_MISS()
+#define PROFILE_RESOLVE_READBACK_FULL_WAIT()
+#define PROFILE_RESOLVE_READBACK_WAIT_TIME_NS(n)
 #define PROFILE_TEXTURE_CACHE_HIT()
 #define PROFILE_TEXTURE_CACHE_MISS()
 #define PROFILE_PIPELINE_CACHE_HIT()
 #define PROFILE_PIPELINE_CACHE_MISS()
+#define PROFILE_GUEST_VBLANK()
+#define PROFILE_GUEST_VBLANK_DELTA_NS(value)
+#define PROFILE_SIMULATION_TICK()
+#define PROFILE_PRESENT()
+#define PROFILE_PRESENT_DELTA_NS(value)
+#define PROFILE_PRESENT_QUEUE_DEPTH(value)
+#define PROFILE_PRESENT_DEADLINE_MISS(n)
+#define PROFILE_DUPLICATE_PRESENT()
+#define PROFILE_DROPPED_PRESENT()
 
 #endif

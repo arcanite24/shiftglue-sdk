@@ -11,9 +11,13 @@
 
 #pragma once
 
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <tuple>
 #include <type_traits>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -28,19 +32,99 @@
 // Hook Macros
 //=============================================================================
 
+namespace rex::diagnostics {
+inline const char* StubModuleName(const char* path) {
+  const char* name = path;
+  for (const char* cursor = path; *cursor; ++cursor) {
+    if (*cursor == '/' || *cursor == '\\') name = cursor + 1;
+  }
+  return name;
+}
+
+class StubReachabilityEntry;
+inline std::mutex stub_reachability_mutex;
+inline std::vector<StubReachabilityEntry*> stub_reachability_entries;
+inline std::once_flag stub_reachability_summary_once;
+inline std::atomic<uint32_t> stub_reachability_dropped{0};
+constexpr size_t kMaximumStubReachabilityEntries = 128;
+inline void EmitStubReachabilitySummary();
+
+class StubReachabilityEntry {
+ public:
+  StubReachabilityEntry(const char* module, const char* symbol) : module_(module), symbol_(symbol) {
+    std::call_once(stub_reachability_summary_once, [] { std::atexit(EmitStubReachabilitySummary); });
+    std::lock_guard lock(stub_reachability_mutex);
+    if (stub_reachability_entries.size() < kMaximumStubReachabilityEntries) {
+      stub_reachability_entries.push_back(this);
+    } else {
+      stub_reachability_dropped.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  uint64_t Hit(uint32_t caller) {
+    const uint64_t count = count_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count == 1) {
+      first_caller_.store(caller, std::memory_order_relaxed);
+      REXKRNL_INFO("SDK_STUB first module={} symbol={} caller={:08X}", module_, symbol_, caller);
+    }
+    return count;
+  }
+  const char* module() const { return module_; }
+  const char* symbol() const { return symbol_; }
+  uint64_t count() const { return count_.load(std::memory_order_relaxed); }
+  uint32_t first_caller() const { return first_caller_.load(std::memory_order_relaxed); }
+ private:
+  const char* module_;
+  const char* symbol_;
+  std::atomic<uint64_t> count_{0};
+  std::atomic<uint32_t> first_caller_{0};
+};
+
+inline void EmitStubReachabilitySummary() {
+  std::lock_guard lock(stub_reachability_mutex);
+  REXKRNL_INFO("SDK_STUB summary.begin reached={} dropped={}", stub_reachability_entries.size(),
+               stub_reachability_dropped.load(std::memory_order_relaxed));
+  for (const auto* entry : stub_reachability_entries) {
+    REXKRNL_INFO("SDK_STUB summary module={} symbol={} caller={:08X} count={}", entry->module(),
+                 entry->symbol(), entry->first_caller(), entry->count());
+  }
+  REXKRNL_INFO("SDK_STUB summary.end");
+}
+}  // namespace rex::diagnostics
+
+#define REX_TRACK_STUB_REACH(subroutine)                                         \
+  static rex::diagnostics::StubReachabilityEntry rex_stub_reachability_(         \
+      rex::diagnostics::StubModuleName(__FILE__), #subroutine);                  \
+  const uint64_t rex_stub_call_count_ =                                          \
+      rex_stub_reachability_.Hit(static_cast<uint32_t>(ctx.lr))
+
 // Hook a recompiled function with an auto-marshaled native C++ function.
 // The native function uses plain types (u32, mapped_u32, etc.) and
 // HostToGuestFunction handles register translation automatically.
+#ifdef REXGLUE_TRACE_IMPORTS
+#define REX_TRACE_IMPORT_REACH(subroutine)                                              \
+  do {                                                                                 \
+    static std::atomic_flag rex_import_seen_ = ATOMIC_FLAG_INIT;                       \
+    if (!rex_import_seen_.test_and_set(std::memory_order_relaxed)) {                   \
+      REXKRNL_INFO("M2_TRACE import.first name={} lr={:08X}", #subroutine,              \
+                   static_cast<uint32_t>(ctx.lr));                                     \
+    }                                                                                  \
+  } while (0)
+#else
+#define REX_TRACE_IMPORT_REACH(subroutine) ((void)0)
+#endif
+
 #ifdef REXGLUE_ENABLE_PROFILING
 #include <tracy/Tracy.hpp>
 #define REX_HOOK(subroutine, function)                           \
   extern "C" REX_FUNC(subroutine) {                              \
     ZoneNamedN(___tracy_hook_zone, #subroutine, TracyIsStarted); \
+    REX_TRACE_IMPORT_REACH(subroutine);                          \
     rex::ppc::HostToGuestFunction<function>(ctx, base);          \
   }
 #else
 #define REX_HOOK(subroutine, function)                  \
   extern "C" REX_FUNC(subroutine) {                     \
+    REX_TRACE_IMPORT_REACH(subroutine);                 \
     rex::ppc::HostToGuestFunction<function>(ctx, base); \
   }
 #endif
@@ -52,18 +136,24 @@
 #define REX_STUB(subroutine)              \
   extern "C" REX_FUNC(subroutine) {       \
     (void)base;                           \
+    REX_TRACK_STUB_REACH(subroutine);     \
+    if (rex_stub_call_count_ == 1)        \
     REXKRNL_WARN("{} STUB", #subroutine); \
   }
 
 #define REX_STUB_LOG(subroutine, msg)               \
   extern "C" REX_FUNC(subroutine) {                 \
     (void)base;                                     \
+    REX_TRACK_STUB_REACH(subroutine);               \
+    if (rex_stub_call_count_ == 1)                  \
     REXKRNL_WARN("{} STUB - {}", #subroutine, msg); \
   }
 
 #define REX_STUB_RETURN(subroutine, value)                                                \
   extern "C" REX_FUNC(subroutine) {                                                       \
     (void)base;                                                                           \
+    REX_TRACK_STUB_REACH(subroutine);                                                     \
+    if (rex_stub_call_count_ == 1)                                                        \
     REXKRNL_WARN("{} STUB - returning {:#x}", #subroutine, static_cast<uint32_t>(value)); \
     ctx.r3.u64 = (value);                                                                 \
   }

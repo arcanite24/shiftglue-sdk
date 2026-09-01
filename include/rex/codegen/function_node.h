@@ -98,6 +98,10 @@ class FunctionNode {
   /// For normal functions: emits REX_FUNC with blocks and instructions
   std::string emitCpp(const EmitContext& ctx) const;
 
+  /// Return PCs immediately following linked branches that can safely resume
+  /// inside this function's emitted blocks.
+  std::vector<uint32_t> resumableReturnAddresses(const BinaryView& binary) const;
+
   //=========================================================================
   // Instruction access (valid after discover)
   //=========================================================================

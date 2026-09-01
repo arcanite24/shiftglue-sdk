@@ -75,6 +75,9 @@ class MnkInputDriver final : public InputDriver,
 
   std::mutex state_mutex_;
   bool key_down_[256] = {};
+  // Preserve a button transition until at least one guest state poll observes
+  // it. Without this, a short host key tap may begin and end between polls.
+  uint16_t latched_buttons_ = 0;
 
   // Mouse delta tracking. Fractional because relative motion arrives in
   // fractions of a pixel, and truncating each event drops slow movement.

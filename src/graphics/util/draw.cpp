@@ -10,7 +10,9 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstring>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -41,6 +43,71 @@ REXCVAR_DEFINE_BOOL(resolve_resolution_scale_fill_half_pixel_offset, true, "GPU"
 //     "GPU");
 
 namespace rex::graphics::draw_util {
+
+void LogResolveFailureState(const RegisterFile& regs, const memory::Memory& memory) {
+  static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+  if (logged.test_and_set(std::memory_order_relaxed)) {
+    return;
+  }
+
+  xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(0);
+  uint32_t vertex_words[6] = {};
+  const uint32_t vertex_address = fetch.address * sizeof(uint32_t);
+  std::memcpy(vertex_words, memory.TranslatePhysical(vertex_address), sizeof(vertex_words));
+
+  float vertices[6];
+  int32_t vertices_fixed[6];
+  const float half_pixel_offset =
+      regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero ? 0.5f : 0.0f;
+  for (size_t i = 0; i < rex::countof(vertices); ++i) {
+    float vertex_word;
+    std::memcpy(&vertex_word, &vertex_words[i], sizeof(vertex_word));
+    vertices[i] = xenos::GpuSwap(vertex_word, fetch.endian);
+    vertices_fixed[i] = ui::FloatToD3D11Fixed16p8(vertices[i] + half_pixel_offset);
+  }
+
+  int32_t x0 = std::min(std::min(vertices_fixed[0], vertices_fixed[2]), vertices_fixed[4]);
+  int32_t y0 = std::min(std::min(vertices_fixed[1], vertices_fixed[3]), vertices_fixed[5]);
+  int32_t x1 = std::max(std::max(vertices_fixed[0], vertices_fixed[2]), vertices_fixed[4]);
+  int32_t y1 = std::max(std::max(vertices_fixed[1], vertices_fixed[3]), vertices_fixed[5]);
+  x0 = (x0 + 127) >> 8;
+  y0 = (y0 + 127) >> 8;
+  x1 = (x1 + 127) >> 8;
+  y1 = (y1 + 127) >> 8;
+
+  const auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  const auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+  const auto pa_sc_window_scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+  const auto pa_sc_window_scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+  Scissor scissor;
+  GetScissor(regs, scissor, false);
+  const auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+  const auto rb_copy_control = regs.Get<reg::RB_COPY_CONTROL>();
+
+  REXGPU_ERROR(
+      "M3_TRACE resolve.failure.first vfetch=[0x{:08X},0x{:08X}] address_dw=0x{:08X} "
+      "address_bytes=0x{:08X} type={} endian={} size_words={} format=32_32_FLOAT "
+      "raw_vertices=[0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X}] "
+      "decoded=[{},{},{},{},{},{}] fixed16p8=[{},{},{},{},{},{}] "
+      "pixel_bounds_pre_offset=[{},{},{},{}] half_pixel_offset={} "
+      "vtx_window_offset_enable={} window_offset=[{},{}] "
+      "window_scissor=[0x{:08X},0x{:08X}] effective_scissor=[{},{},{},{}] "
+      "rb_surface_info=0x{:08X} surface_pitch={} msaa_samples={} "
+      "rb_copy_control=0x{:08X} copy_src={} sample_select={} copy_command={}",
+      fetch.dword_0, fetch.dword_1, uint32_t(fetch.address), vertex_address, uint32_t(fetch.type),
+      uint32_t(fetch.endian), uint32_t(fetch.size), vertex_words[0], vertex_words[1], vertex_words[2],
+      vertex_words[3], vertex_words[4], vertex_words[5], vertices[0], vertices[1], vertices[2],
+      vertices[3], vertices[4], vertices[5], vertices_fixed[0], vertices_fixed[1],
+      vertices_fixed[2], vertices_fixed[3], vertices_fixed[4], vertices_fixed[5], x0, y0, x1,
+      y1, half_pixel_offset, uint32_t(pa_su_sc_mode_cntl.vtx_window_offset_enable),
+      int32_t(pa_sc_window_offset.window_x_offset), int32_t(pa_sc_window_offset.window_y_offset),
+      pa_sc_window_scissor_tl.value, pa_sc_window_scissor_br.value, scissor.offset[0],
+      scissor.offset[1], scissor.extent[0], scissor.extent[1], rb_surface_info.value,
+      uint32_t(rb_surface_info.surface_pitch), uint32_t(rb_surface_info.msaa_samples),
+      rb_copy_control.value, uint32_t(rb_copy_control.copy_src_select),
+      uint32_t(rb_copy_control.copy_sample_select),
+      uint32_t(rb_copy_control.copy_command));
+}
 
 bool IsRasterizationPotentiallyDone(const RegisterFile& regs, bool primitive_polygonal) {
   // TODO(Triang3l): Investigate EdramMode::kNoOperation better, with respect to
@@ -882,9 +949,19 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
     y1 = y0 + int32_t(xenos::kMaxResolveSize);
   }
 
+  // Copy mode is rasterized like any other draw. If clipping leaves no
+  // fragments, the draw completed successfully and there is no copy or clear.
+  if (x0 >= x1 || y0 >= y1) {
+    info_out.coordinate_info.width_div_8 = 0;
+    info_out.height_div_8 = 0;
+    return true;
+  }
+
   assert_true(x0 < x1 && y0 < y1);
   if (x0 >= x1 || y0 >= y1) {
-    REXGPU_ERROR("Resolve region is empty");
+    REXGPU_ERROR(
+        "M2_TRACE resolve.empty x0={} x1={} y0={} y1={} scale_x={} scale_y={}", x0, x1, y0,
+        y1, draw_resolution_scale_x, draw_resolution_scale_y);
     return false;
   }
 

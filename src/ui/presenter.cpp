@@ -12,11 +12,14 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <thread>
 #include <utility>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/perf/counter.h>
 #include <rex/platform.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
@@ -28,6 +31,13 @@
 
 REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                     "Allow presentation from non-UI thread");
+
+REXCVAR_DEFINE_INT32(host_present_fps_limit, 60, "UI/Presenter",
+                     "Host presentation FPS limit (0 disables pacing)")
+    .range(0, 240);
+
+REXCVAR_DEFINE_BOOL(host_present_sleep_spin, true, "UI/Presenter",
+                    "Use a sleep/yield hybrid for host presentation pacing");
 
 REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
                     "Enable letterboxing for non-native aspect ratios");
@@ -592,6 +602,13 @@ bool Presenter::RefreshGuestOutput(
       last_acquired_and_ready,
       (last_acquired_and_ready & 3) | (guest_output_mailbox_writable_ << 2),
       std::memory_order_acq_rel, std::memory_order_relaxed)) {}
+  const uint32_t published_acquired = last_acquired_and_ready & 3;
+  const uint32_t replaced_ready = (last_acquired_and_ready >> 2) & 3;
+  if (replaced_ready != published_acquired) {
+    PROFILE_DROPPED_PRESENT();
+  }
+  guest_output_refresh_sequence_.fetch_add(1, std::memory_order_release);
+  PROFILE_PRESENT_QUEUE_DEPTH(1);
   // Now, it's known that `ready == writable` on the host presentation side.
   // Take the next `writable` with this assumption about its current value in
   // mind.
@@ -839,6 +856,7 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
     desired_acquired_and_ready =
         (old_acquired_and_ready & ~uint32_t(3)) | (old_acquired_and_ready >> 2);
   }
+  PROFILE_PRESENT_QUEUE_DEPTH(0);
   uint32_t mailbox_index = desired_acquired_and_ready & 3;
   // Give the current acquired image to the caller, or UINT32_MAX if it's
   // inactive.
@@ -1497,7 +1515,47 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
 Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
   assert_true(surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable);
+  std::lock_guard<std::mutex> pacing_lock(presentation_pacing_mutex_);
+  using PresentationClock = std::chrono::steady_clock;
+  auto now = PresentationClock::now();
+  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             now.time_since_epoch())
+                             .count();
+  const auto pacing = presentation_deadline_scheduler_.Plan(
+      now_ns, uint32_t(REXCVAR_GET(host_present_fps_limit)));
+  if (pacing.missed_deadlines) {
+    PROFILE_PRESENT_DEADLINE_MISS(int64_t(pacing.missed_deadlines));
+  }
+  if (pacing.wait_ns > 0) {
+    auto deadline = PresentationClock::time_point(
+        std::chrono::nanoseconds(pacing.deadline_ns));
+    if (REXCVAR_GET(host_present_sleep_spin) && pacing.wait_ns > 500000) {
+      std::this_thread::sleep_until(deadline - std::chrono::microseconds(500));
+      while (PresentationClock::now() < deadline) {
+        std::this_thread::yield();
+      }
+    } else {
+      std::this_thread::sleep_until(deadline);
+    }
+  }
   PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
+  if (result == PaintResult::kPresented || result == PaintResult::kPresentedSuboptimal) {
+    const int64_t present_time_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            PresentationClock::now().time_since_epoch())
+            .count();
+    PROFILE_PRESENT();
+    if (last_present_time_ns_) {
+      PROFILE_PRESENT_DELTA_NS(present_time_ns - last_present_time_ns_);
+    }
+    last_present_time_ns_ = present_time_ns;
+    const uint64_t refresh_sequence =
+        guest_output_refresh_sequence_.load(std::memory_order_acquire);
+    if (refresh_sequence == last_presented_refresh_sequence_) {
+      PROFILE_DUPLICATE_PRESENT();
+    }
+    last_presented_refresh_sequence_ = refresh_sequence;
+  }
   switch (result) {
     case PaintResult::kPresented:
       surface_paint_connection_was_optimal_at_successful_paint_ = true;

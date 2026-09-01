@@ -287,6 +287,10 @@ struct Scissor {
 };
 void GetScissor(const RegisterFile& regs, Scissor& scissor_out, bool clamp_to_surface_pitch = true);
 
+// Emits one process-wide snapshot of the input and register state for the first
+// resolve rejected by GetResolveInfo. Observation-only M3 diagnostic.
+void LogResolveFailureState(const RegisterFile& regs, const memory::Memory& memory);
+
 // Returns the color component write mask for the draw command taking into
 // account which color targets are written to by the pixel shader, as well as
 // components that don't exist in the formats of the render targets (render

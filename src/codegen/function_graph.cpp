@@ -346,6 +346,39 @@ void emit_print(std::string& out, fmt::format_string<Args...> fmt, Args&&... arg
 
 }  // namespace
 
+std::vector<uint32_t> FunctionNode::resumableReturnAddresses(const BinaryView& binary) const {
+  std::vector<uint32_t> addresses;
+
+  for (const auto& block : blocks()) {
+    const auto* blockData = binary.translate(block.base);
+    if (!blockData) {
+      continue;
+    }
+
+    for (uint32_t address = block.base; address < block.end(); address += 4) {
+      const uint32_t instruction = load_and_swap<uint32_t>(blockData + address - block.base);
+      const uint32_t opcode = PPC_OP(instruction);
+      const uint32_t extendedOpcode = PPC_XOP(instruction);
+      const bool isLinkedBranch =
+          PPC_BL(instruction) &&
+          (opcode == PPC_OP_B || opcode == PPC_OP_BC ||
+           (opcode == PPC_OP_CTR && (extendedOpcode == 16 || extendedOpcode == 528)));
+      if (!isLinkedBranch) {
+        continue;
+      }
+
+      const uint32_t returnAddress = address + 4;
+      if (containsAddress(returnAddress)) {
+        addresses.push_back(returnAddress);
+      }
+    }
+  }
+
+  std::sort(addresses.begin(), addresses.end());
+  addresses.erase(std::unique(addresses.begin(), addresses.end()), addresses.end());
+  return addresses;
+}
+
 std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   if (authority() == FunctionAuthority::IMPORT) {
     return "";
@@ -385,6 +418,8 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   // --- First pass: collect labels from all blocks ---
   std::unordered_set<size_t> labels;
   labels.reserve(64);
+  const auto resumeAddresses = resumableReturnAddresses(ctx.binary);
+  labels.insert(resumeAddresses.begin(), resumeAddresses.end());
 
   for (const auto& block : blocks()) {
     auto* blockData = reinterpret_cast<const uint32_t*>(ctx.binary.translate(block.base));
@@ -494,6 +529,21 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   std::string body;
   body.reserve(4096);
 
+  if (!resumeAddresses.empty()) {
+    emit_println(body, "\tconst uint32_t rex_dispatch_address = ctx.dispatch_address;");
+    emit_println(body, "\tctx.dispatch_address = 0;");
+    emit_println(body, "\tswitch (rex_dispatch_address) {{");
+    emit_println(body, "\t\tcase 0:");
+    emit_println(body, "\t\tcase 0x{:08X}: break;", base());
+    for (uint32_t address : resumeAddresses) {
+      emit_println(body, "\t\tcase 0x{:08X}: goto loc_{:X};", address, address);
+    }
+    emit_println(body, "\t\tdefault: break;");
+    emit_println(body, "\t}}\n");
+  } else {
+    emit_println(body, "\tctx.dispatch_address = 0;");
+  }
+
   ppc_insn insn;
   std::unordered_set<size_t> emittedLabels;
 
@@ -600,6 +650,26 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
 
       blockBase += 4;
       ++data;
+    }
+  }
+
+  // A configured split may end immediately before another callable entry
+  // without an explicit guest branch. PowerPC execution naturally falls
+  // through in that case, so preserve it as a host tail call. This is limited
+  // to an exact registered boundary and a final non-control-flow instruction;
+  // explicit branches and returns already emit their own transfer.
+  if (!blocks().empty() && blocks().back().end() == end()) {
+    const auto* fallthroughTarget = ctx.graph.getFunction(end());
+    const auto* lastInstructionData = ctx.binary.translate(end() - 4);
+    if (fallthroughTarget && fallthroughTarget != this && lastInstructionData) {
+      const uint32_t lastInstruction = load_and_swap<uint32_t>(lastInstructionData);
+      const uint32_t opcode = PPC_OP(lastInstruction);
+      const bool hasExplicitTransfer =
+          (opcode == PPC_OP_B || opcode == PPC_OP_CTR) && !PPC_BL(lastInstruction);
+      if (!hasExplicitTransfer) {
+        ctx.reference(fallthroughTarget->name());
+        emit_println(body, "\tREX_TAIL_CALL({});", fallthroughTarget->name());
+      }
     }
   }
 
@@ -934,6 +1004,23 @@ void FunctionGraph::addUnresolvedJumpToFunction(uint32_t entry, uint32_t site, u
   if (!node)
     return;
 
+  // A configured chunk is both a callable entry and an internal block of its
+  // owning function. Keep an owning function's branch unresolved until the
+  // merge phase, where internal labels are deliberately checked before
+  // function entries. Other callers still resolve the chunk as a tail call.
+  if (!isCall) {
+    const bool isOwnedChunk = std::ranges::any_of(chunks_, [&](const ChunkInfo& chunk) {
+      return chunk.base == target && chunk.parent == entry;
+    });
+    if (isOwnedChunk) {
+      node->addUnresolvedJump(site, target, false, conditional);
+      REXCODEGEN_TRACE(
+          "FunctionGraph: deferred owned-chunk jump 0x{:08X}->0x{:08X} in function 0x{:08X}",
+          site, target, entry);
+      return;
+    }
+  }
+
   // Try immediate resolution against existing functions/imports
   if (auto* targetFn = getFunction(target)) {
     // Target is a known function - resolve as call or tail call
@@ -1111,9 +1198,10 @@ void FunctionGraph::sealAll() {
 // Vacancy Checking
 //=============================================================================
 
-void FunctionGraph::registerChunk(uint32_t base, uint32_t size) {
-  chunks_.emplace_back(base, size);
-  REXCODEGEN_TRACE("FunctionGraph: registered chunk 0x{:08X}-0x{:08X}", base, base + size);
+void FunctionGraph::registerChunk(uint32_t base, uint32_t size, uint32_t parent) {
+  chunks_.push_back({base, size, parent});
+  REXCODEGEN_TRACE("FunctionGraph: registered chunk 0x{:08X}-0x{:08X} parent=0x{:08X}",
+                   base, base + size, parent);
 }
 
 bool FunctionGraph::isVacant(uint32_t fromAddr, uint32_t targetAddr) const {
@@ -1131,10 +1219,10 @@ bool FunctionGraph::isVacant(uint32_t fromAddr, uint32_t targetAddr) const {
   }
 
   // Rule 2: Check if any chunk claims the target region
-  for (const auto& [chunkBase, chunkSize] : chunks_) {
-    if (targetAddr >= chunkBase && targetAddr < chunkBase + chunkSize) {
+  for (const auto& chunk : chunks_) {
+    if (targetAddr >= chunk.base && targetAddr < chunk.base + chunk.size) {
       REXCODEGEN_TRACE("FunctionGraph::isVacant: chunk 0x{:08X}-0x{:08X} claims 0x{:08X}",
-                       chunkBase, chunkBase + chunkSize, targetAddr);
+                       chunk.base, chunk.base + chunk.size, targetAddr);
       return false;
     }
   }
@@ -1249,37 +1337,45 @@ bool FunctionGraph::isMergeableEntryPoint(uint32_t addr) const {
   return node->authority() == FunctionAuthority::GAP_FILL;
 }
 
-TargetKind FunctionGraph::classifyTarget(uint32_t target, uint32_t callerAddr,
+TargetKind FunctionGraph::classifyTarget(uint32_t target, const FunctionNode& caller,
                                          bool isCallInstruction) const {
-  // Find the caller's function
-  const FunctionNode* callerFn = getFunctionContaining(callerAddr);
-
   // Case 1: Target is an import - always a call/tail-call
   if (isImport(target)) {
     return TargetKind::Import;
   }
 
   // Case 2: Target is the caller's own entry point
-  if (callerFn && target == callerFn->base()) {
+  if (target == caller.base()) {
     // bl to own base = recursive call (Function)
     // b to own base = loop back to start (InternalLabel)
     return isCallInstruction ? TargetKind::Function : TargetKind::InternalLabel;
   }
 
-  // Case 3: Target is a DIFFERENT function's entry point - this is a call/tail-call
+  // Case 3: A branch into a configured chunk owned by this exact function is
+  // internal. The chunk remains a callable function for all other callers.
+  if (!isCallInstruction) {
+    const bool isOwnedChunk = std::ranges::any_of(chunks_, [&](const ChunkInfo& chunk) {
+      return chunk.base == target && chunk.parent == caller.base();
+    });
+    if (isOwnedChunk && caller.containsAddress(target)) {
+      return TargetKind::InternalLabel;
+    }
+  }
+
+  // Case 4: Target is a DIFFERENT function's entry point - this is a call/tail-call
   // This handles cases where a small thunk function branches to another function
   // whose entry point happens to fall within the thunk's address range
   if (isEntryPoint(target)) {
     return TargetKind::Function;
   }
 
-  // Case 4: Target is inside caller's function -> InternalLabel
+  // Case 5: Target is inside caller's function -> InternalLabel
   // For bl, this would be a rare PIC code pattern
-  if (callerFn && callerFn->containsAddress(target)) {
+  if (caller.containsAddress(target)) {
     return TargetKind::InternalLabel;
   }
 
-  // Case 5: Unknown target
+  // Case 6: Unknown target
   return TargetKind::Unknown;
 }
 

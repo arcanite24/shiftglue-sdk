@@ -558,7 +558,7 @@ VoidResult registerEntryPoints(CodegenContext& ctx) {
     configFuncs++;
 
     if (cfg.isChunk()) {
-      graph.registerChunk(address, size);
+      graph.registerChunk(address, size, cfg.parent);
       configChunks++;
     }
   }

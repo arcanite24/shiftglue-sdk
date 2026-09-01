@@ -164,8 +164,10 @@ class FunctionGraph {
   // Set the memory reader for null-dword checking
   void setMemoryReader(MemoryReader reader) { memoryReader_ = std::move(reader); }
 
-  // Register a chunk (address range claimed by config, blocks vacancy)
-  void registerChunk(uint32_t base, uint32_t size);
+  // Register a chunk (address range claimed by config, blocks vacancy).
+  // Parent ownership also distinguishes an internal branch into the chunk
+  // from a genuine tail call to the chunk's separately callable entry.
+  void registerChunk(uint32_t base, uint32_t size, uint32_t parent);
 
   // Check if a region is vacant for absorption
   // fromAddr: the address we're expanding from (to check for null boundary)
@@ -185,18 +187,26 @@ class FunctionGraph {
 
   // Classify a branch target for code generation.
   // target: address being branched to
-  // callerAddr: address of the branch instruction
+  // caller: exact function currently being emitted (important when configured
+  // functions overlap a PDATA function)
   // isCallInstruction: true for bl (expects return), false for b (no return)
   // Returns how the target should be treated during code generation.
-  TargetKind classifyTarget(uint32_t target, uint32_t callerAddr, bool isCallInstruction) const;
+  TargetKind classifyTarget(uint32_t target, const FunctionNode& caller,
+                            bool isCallInstruction) const;
 
  private:
+  struct ChunkInfo {
+    uint32_t base;
+    uint32_t size;
+    uint32_t parent;
+  };
+
   std::vector<CodeBuffer> codeBuffers_;
   std::unordered_map<uint32_t, std::unique_ptr<FunctionNode>> functions_;
   std::map<uint32_t, FunctionNode*>
       functionsByBase_;  // sorted by base for O(log f) interval lookup
   std::unordered_map<uint32_t, bool> functionHasXrefs_;  // entry -> hasXrefs
-  std::vector<std::pair<uint32_t, uint32_t>> chunks_;    // base, size pairs
+  std::vector<ChunkInfo> chunks_;
   MemoryReader memoryReader_;
 
   // Notify all PENDING functions that a new function was added

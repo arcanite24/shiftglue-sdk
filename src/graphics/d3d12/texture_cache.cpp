@@ -34,6 +34,14 @@
 
 namespace rex::graphics::d3d12 {
 
+static void RetainNativeTextureResource(void* resource) {
+  static_cast<ID3D12Resource*>(resource)->AddRef();
+}
+
+static void ReleaseNativeTextureResource(void* resource) {
+  static_cast<ID3D12Resource*>(resource)->Release();
+}
+
 // Generated with `xb buildshaders`.
 namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/texture_load_128bpb_cs.h"
@@ -763,6 +771,72 @@ void D3D12TextureCache::RequestTextures(uint32_t used_texture_mask) {
           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
+  }
+}
+
+void D3D12TextureCache::ObserveNativeTextures(
+    uint32_t used_texture_mask,
+    system::GraphicsNativeTextureSetObservation& observation) const {
+  observation.backend = system::GraphicsNativeTextureBackend::kD3D12;
+  observation.used_texture_mask = used_texture_mask;
+  uint32_t textures_remaining = used_texture_mask;
+  uint32_t index;
+  while (rex::bit_scan_forward(textures_remaining, &index)) {
+    textures_remaining &= ~(uint32_t(1) << index);
+    const TextureBinding* binding = GetValidTextureBinding(index);
+    if (!binding) {
+      continue;
+    }
+    const D3D12Texture* texture =
+        static_cast<const D3D12Texture*>(binding->texture);
+    if (!texture) {
+      texture = static_cast<const D3D12Texture*>(binding->texture_signed);
+    }
+    if (!texture || !texture->resource()) {
+      continue;
+    }
+    if (observation.resource_count >=
+        system::kGraphicsNativeTextureResourceObservationLimit) {
+      ++observation.resource_overflow;
+      continue;
+    }
+    system::GraphicsNativeTextureResourceObservation& resource =
+        observation.resources[observation.resource_count++];
+    const TextureKey& key = texture->key();
+    const xenos::xe_gpu_texture_fetch_t fetch =
+        register_file().GetTextureFetch(index);
+    std::memcpy(resource.fetch_dwords, &fetch, sizeof(resource.fetch_dwords));
+    resource.fetch_constant = index;
+    resource.base_address = key.base_page << 12;
+    resource.base_length = texture->GetGuestBaseSize();
+    resource.mip_address = key.mip_page << 12;
+    resource.mip_length = texture->GetGuestMipsSize();
+    resource.guest_format = uint32_t(key.format);
+    resource.guest_dimension = uint32_t(key.dimension);
+    resource.guest_width = key.GetWidth();
+    resource.guest_height = key.GetHeight();
+    resource.guest_depth_or_array_size = key.GetDepthOrArraySize();
+    resource.guest_pitch = key.pitch << 5;
+    resource.guest_row_pitch_bytes =
+        texture->guest_layout().base.row_pitch_bytes;
+    resource.guest_endianness = uint32_t(key.endianness);
+    resource.guest_mip_max_level = key.mip_max_level;
+    resource.guest_tiled = key.tiled;
+    resource.guest_packed_mips = key.packed_mips;
+    const D3D12_RESOURCE_DESC host_desc = texture->resource()->GetDesc();
+    resource.host_resource_format = uint32_t(host_desc.Format);
+    resource.host_view_format = uint32_t(GetDXGIUnormFormat(key));
+    resource.host_swizzle = binding->host_swizzle;
+    resource.host_swizzled_signs = binding->swizzled_signs;
+    resource.host_dimension = uint32_t(host_desc.Dimension);
+    resource.host_mip_levels = host_desc.MipLevels;
+    resource.host_depth_or_array_size = host_desc.DepthOrArraySize;
+    resource.host_width = host_desc.Width;
+    resource.host_height = host_desc.Height;
+    resource.host_allocation_bytes = texture->GetHostMemoryUsage();
+    resource.resource = texture->resource();
+    resource.retain = &RetainNativeTextureResource;
+    resource.release = &ReleaseNativeTextureResource;
   }
 }
 

@@ -223,6 +223,8 @@ bool ManifestConfig::WriteSdkVersionStamp(const std::filesystem::path& path,
   }
 
   if (stamp_idx) {
+    if (lines[*stamp_idx] == stamp_line)
+      return true;
     lines[*stamp_idx] = stamp_line;
   } else if (project_header_idx) {
     lines.insert(lines.begin() + *project_header_idx + 1, stamp_line);

@@ -276,12 +276,74 @@ void BuilderContext::emit_function_call(uint32_t address) {
   println("\tREX_FATAL(\"Unresolved call from 0x{:08X} to 0x{:08X}\");", base, address);
 }
 
+void BuilderContext::emit_tail_function_call(uint32_t address, std::string_view indent) {
+  const auto& cfg = config();
+
+  if (address == cfg.longJmpAddress || address == cfg.setJmpAddress) {
+    emit_function_call(address);
+    println("{}return;", indent);
+    return;
+  }
+
+  if (const auto* target = findCallTarget(base)) {
+    if (target->isFunction()) {
+      auto* targetFn = target->asFunction();
+      const auto& name = targetFn->name();
+      if (cfg.nonVolatileRegistersAsLocalVariables &&
+          (name.find("__rest") == 0 || name.find("__save") == 0)) {
+        println("{}return;", indent);
+        return;
+      }
+      // A tail branch never comes back to this frame. Publish localized
+      // non-volatiles before entering a shared-register SEH funclet, but do not
+      // emit the normal post-call reload sequence.
+      if (targetFn->sharesRegisters() && localizeNonVolatiles()) {
+        for (size_t i = 14; i < 32; ++i) {
+          if (locals.r[i])
+            println("{}ctx.r{} = r{};", indent, i, i);
+        }
+      }
+      emitCtx.reference(name);
+      println("{}REX_TAIL_CALL({});", indent, name);
+      return;
+    }
+
+    if (target->isImport()) {
+      const auto& importTarget = std::get<CallTarget::ToImport>(target->value);
+      std::string func_name;
+      auto at_pos = importTarget.name.find('@');
+      if (at_pos != std::string::npos && emitCtx.resolver) {
+        auto lib_name = importTarget.name.substr(0, at_pos);
+        auto ordinal_str = importTarget.name.substr(at_pos + 1);
+        uint16_t ordinal = static_cast<uint16_t>(std::stoul(ordinal_str));
+        auto* exp = emitCtx.resolver->GetExportByOrdinal(lib_name + ".xex", ordinal);
+        if (!exp)
+          exp = emitCtx.resolver->GetExportByOrdinal(lib_name, ordinal);
+        if (exp)
+          func_name = "__imp__" + std::string(exp->name);
+      }
+      if (func_name.empty()) {
+        func_name = "__imp__" + importTarget.name;
+        std::replace(func_name.begin(), func_name.end(), '@', '_');
+        std::replace(func_name.begin(), func_name.end(), '.', '_');
+      }
+      emitCtx.reference(func_name);
+      println("{}REX_TAIL_CALL({});", indent, func_name);
+      return;
+    }
+  }
+
+  REXCODEGEN_ERROR("Unresolved tail call 0x{:08X} from 0x{:08X}", address, base);
+  println("{}REX_FATAL(\"Unresolved tail call from 0x{:08X} to 0x{:08X}\");", indent, base,
+          address);
+}
+
 void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
   uint32_t target = insn.operands[1];
 
   // Use classifyTarget for consistent branch classification
   // false = branch instruction (not a call), so own-base means loop back
-  auto kind = graph().classifyTarget(target, base, false);
+  auto kind = graph().classifyTarget(target, fn, false);
 
   switch (kind) {
     case TargetKind::InternalLabel:
@@ -292,26 +354,11 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
 
     case TargetKind::Function:
     case TargetKind::Import:
-      // Conditional tail call to another function - check pre-resolved call target
-      if (const auto* callTarget = findCallTarget(base)) {
-        if (callTarget->isFunction()) {
-          auto* targetFn = callTarget->asFunction();
-          emitCtx.reference(targetFn->name());
-          println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
-          println("\t\t{}(ctx, base);", targetFn->name());
-          println("\t\treturn;");
-          println("\t}}");
-        } else if (callTarget->isImport()) {
-          const auto& importTarget = std::get<CallTarget::ToImport>(callTarget->value);
-          std::string func_name = "__imp__" + importTarget.name;
-          std::replace(func_name.begin(), func_name.end(), '@', '_');
-          std::replace(func_name.begin(), func_name.end(), '.', '_');
-          emitCtx.reference(func_name);
-          println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
-          println("\t\t{}(ctx, base);", func_name);
-          println("\t\treturn;");
-          println("\t}}");
-        }
+      // Conditional guest branches are tail branches too.
+      if (findCallTarget(base)) {
+        println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
+        emit_tail_function_call(target, "\t\t");
+        println("\t}}");
       } else {
         REXCODEGEN_ERROR("Unresolved conditional branch to 0x{:08X} from 0x{:08X} (no CallTarget)",
                          target, base);

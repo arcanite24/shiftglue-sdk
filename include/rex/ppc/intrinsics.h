@@ -13,8 +13,10 @@
 
 #pragma once
 
+#include <bit>
 #include <climits>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 
 #include <simde/x86/avx.h>
@@ -115,6 +117,53 @@ inline uint8_t VectorShiftTableR[] = {
 //=============================================================================
 // SIMD Helper Functions
 //=============================================================================
+
+// Xenon vmsum3fp128/vmsum4fp128 return QNaN when a dot product of finite
+// inputs overflows its single-precision result. simde_mm_dp_ps instead returns
+// +/-infinity, which changes ordered comparisons in guest collision code.
+inline float simde_mm_vmsum_narrow_result(double accumulator) noexcept {
+  const float result = static_cast<float>(accumulator);
+  if (std::isinf(result) && !std::isinf(accumulator)) {
+    return std::bit_cast<float>(uint32_t{0x7FC00000});
+  }
+
+  // The generated instruction path runs with FTZ/DAZ enabled. Keep the same
+  // output behavior when the scalar-double implementation produces a denormal.
+  const uint32_t result_bits = std::bit_cast<uint32_t>(result);
+  if ((result_bits & 0x7FFFFFFFu) != 0 && (result_bits & 0x7F800000u) == 0) {
+    return std::bit_cast<float>(result_bits & 0x80000000u);
+  }
+  return result;
+}
+
+// Guest vector elements are reversed relative to host lanes. Accumulate exact
+// float products in double and preserve Xenia's hardware-verified reduction
+// order: (x + z) + y for vmsum3fp128.
+inline simde__m128 simde_mm_vmsum3fp128(simde__m128 a, simde__m128 b) noexcept {
+  alignas(16) float a_lanes[4];
+  alignas(16) float b_lanes[4];
+  simde_mm_store_ps(a_lanes, a);
+  simde_mm_store_ps(b_lanes, b);
+
+  const double x = static_cast<double>(a_lanes[3]) * static_cast<double>(b_lanes[3]);
+  const double y = static_cast<double>(a_lanes[2]) * static_cast<double>(b_lanes[2]);
+  const double z = static_cast<double>(a_lanes[1]) * static_cast<double>(b_lanes[1]);
+  return simde_mm_set1_ps(simde_mm_vmsum_narrow_result((x + z) + y));
+}
+
+// vmsum4fp128 uses the pairwise reduction (x + z) + (y + w).
+inline simde__m128 simde_mm_vmsum4fp128(simde__m128 a, simde__m128 b) noexcept {
+  alignas(16) float a_lanes[4];
+  alignas(16) float b_lanes[4];
+  simde_mm_store_ps(a_lanes, a);
+  simde_mm_store_ps(b_lanes, b);
+
+  const double x = static_cast<double>(a_lanes[3]) * static_cast<double>(b_lanes[3]);
+  const double y = static_cast<double>(a_lanes[2]) * static_cast<double>(b_lanes[2]);
+  const double z = static_cast<double>(a_lanes[1]) * static_cast<double>(b_lanes[1]);
+  const double w = static_cast<double>(a_lanes[0]) * static_cast<double>(b_lanes[0]);
+  return simde_mm_set1_ps(simde_mm_vmsum_narrow_result((x + z) + (y + w)));
+}
 
 // Unsigned 32-bit saturating add
 inline simde__m128i simde_mm_adds_epu32(simde__m128i a, simde__m128i b) {

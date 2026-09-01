@@ -314,11 +314,13 @@ class PhysicalHeap : public BaseHeap {
                uint32_t* old_protect = nullptr) override;
 
   void EnableAccessCallbacks(uint32_t physical_address, uint32_t length,
-                             bool enable_invalidation_notifications, bool enable_data_providers);
+                             bool enable_invalidation_notifications, bool enable_data_providers,
+                             bool enable_access_notifications = false);
   // Returns true if any page in the range was watched.
   bool TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                         uint32_t virtual_address, uint32_t length, bool is_write,
-                        bool unwatch_exact_range, bool unprotect = true);
+                        bool unwatch_exact_range, bool unprotect = true,
+                        bool notify_access_observers = false);
 
   uint32_t GetPhysicalAddress(uint32_t address) const;
 
@@ -340,6 +342,8 @@ class PhysicalHeap : public BaseHeap {
     // Whether writing to each page should result trigger invalidation
     // callbacks.
     uint64_t notify_on_invalidation;
+    // Whether the next real guest CPU read or write should be observed.
+    uint64_t notify_on_access;
   };
   // Protected by global_critical_region. Flags for each 64 system pages,
   // interleaved as blocks, so bit scan can be used to quickly extract ranges.
@@ -495,11 +499,22 @@ class Memory {
   // RegisterPhysicalMemoryInvalidationCallback.
   void UnregisterPhysicalMemoryInvalidationCallback(void* callback_handle);
 
+  // One-shot observation of real guest CPU accesses to explicitly armed
+  // physical pages. Unlike invalidation callbacks, this reports reads as well
+  // as writes and is not dispatched by host-side explicit invalidations.
+  typedef void (*PhysicalMemoryAccessCallback)(void* context_ptr,
+                                               uint32_t physical_address_start,
+                                               uint32_t length, bool is_write);
+  void* RegisterPhysicalMemoryAccessCallback(PhysicalMemoryAccessCallback callback,
+                                             void* callback_context);
+  void UnregisterPhysicalMemoryAccessCallback(void* callback_handle);
+
   // Enables physical memory access callbacks for the specified memory range,
   // snapped to system page boundaries.
   void EnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint32_t length,
                                            bool enable_invalidation_notifications,
-                                           bool enable_data_providers);
+                                           bool enable_data_providers,
+                                           bool enable_access_notifications = false);
 
   // Forces triggering of watch callbacks for a virtual address range if pages
   // are watched there and unwatching them. Returns whether any page was
@@ -624,6 +639,8 @@ class Memory {
   rex::thread::global_critical_region global_critical_region_;
   std::vector<std::pair<PhysicalMemoryInvalidationCallback, void*>*>
       physical_memory_invalidation_callbacks_;
+  std::vector<std::pair<PhysicalMemoryAccessCallback, void*>*>
+      physical_memory_access_callbacks_;
 };
 
 }  // namespace rex::memory

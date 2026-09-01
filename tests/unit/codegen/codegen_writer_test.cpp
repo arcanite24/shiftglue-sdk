@@ -224,6 +224,7 @@ TEST_CASE("Every name a recomp file calls is declared in its header", "[codegen_
   REQUIRE(writer.write(false));
 
   static const std::regex callRe(R"(\b([A-Za-z_][A-Za-z0-9_]*)\(ctx, base\))");
+  static const std::regex tailCallRe(R"(REX_TAIL_CALL\(([A-Za-z_][A-Za-z0-9_]*)\))");
   static const std::regex declRe(R"(DECLARE_REX_FUNC\(([A-Za-z_][A-Za-z0-9_]*)\))");
 
   for (const auto& entry : fs::directory_iterator(fx.outputDir())) {
@@ -250,5 +251,62 @@ TEST_CASE("Every name a recomp file calls is declared in its header", "[codegen_
       INFO("file " << name << " calls " << called << " with no declaration");
       CHECK(declared.contains(called));
     }
+    for (std::sregex_iterator it(body.begin(), body.end(), tailCallRe), end; it != end; ++it) {
+      auto called = (*it)[1].str();
+      INFO("file " << name << " tail-calls " << called << " with no declaration");
+      CHECK(declared.contains(called));
+    }
   }
+}
+
+TEST_CASE("Overlapping functions emit each resume alias once", "[codegen_writer][resume]") {
+  const fs::path root = fs::temp_directory_path() / "rexglue_writer_test" / "resume_alias_owner";
+  fs::remove_all(root);
+  fs::create_directories(root);
+
+  // bl +8; bl +4; blr. Both overlapping functions contain the linked branch at
+  // +4 and therefore discover the same return PC at +8.
+  std::array<uint8_t, 12> data{0x48, 0x00, 0x00, 0x09, 0x48, 0x00,
+                               0x00, 0x05, 0x4E, 0x80, 0x00, 0x20};
+  TestModule module;
+  module.Load(kBaseAddress, data.data(), data.size());
+
+  RecompilerConfig config;
+  config.projectName = "testproj";
+  config.outDirectoryPath = "generated";
+  auto ctx = CodegenContext::Create(BinaryView::fromModule(module), std::move(config));
+  ctx.setConfigDir(root);
+  ctx.analysisState().format = "xex";
+  ctx.analysisState().loadAddress = kBaseAddress;
+  ctx.analysisState().entryPoint = kBaseAddress;
+  ctx.analysisState().imageSize = static_cast<uint32_t>(data.size());
+
+  auto* outer = ctx.graph.addFunction(kBaseAddress, 12, FunctionAuthority::DISCOVERED, true);
+  REQUIRE(outer != nullptr);
+  outer->discover({{kBaseAddress, 12}}, {}, {});
+  outer->seal();
+
+  auto* inner =
+      ctx.graph.addFunction(kBaseAddress + 4, 8, FunctionAuthority::DISCOVERED, true);
+  REQUIRE(inner != nullptr);
+  inner->discover({{kBaseAddress + 4, 8}}, {}, {});
+  inner->seal();
+
+  CodegenWriter writer(ctx);
+  REQUIRE(writer.write(false));
+
+  const std::string init = ReadAll(root / "generated" / "testproj_init.cpp");
+  const std::string aliasAddress = fmt::format("{{ 0x{:X},", kBaseAddress + 8);
+  const std::string alias = fmt::format("{{ 0x{:X}, sub_{:08X} }}", kBaseAddress + 8,
+                                        kBaseAddress + 4);
+  size_t aliasCount = 0;
+  for (size_t offset = 0; (offset = init.find(aliasAddress, offset)) != std::string::npos;
+       offset += aliasAddress.size()) {
+    ++aliasCount;
+  }
+  CHECK(aliasCount == 1);
+  CHECK(init.find(alias) != std::string::npos);
+
+  std::error_code ec;
+  fs::remove_all(root, ec);
 }
