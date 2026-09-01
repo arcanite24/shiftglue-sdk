@@ -415,6 +415,13 @@ struct GraphicsNativeFrameAccumulatorResult {
   uint32_t source_guest_msaa_samples = 0;
   uint32_t draw_resolution_scale_x = 0;
   uint32_t draw_resolution_scale_y = 0;
+  uint32_t requested_source_x = 0;
+  uint32_t requested_source_y = 0;
+  uint32_t requested_source_width = 0;
+  uint32_t requested_source_height = 0;
+  uint32_t requested_copy_row_count = 0;
+  uint32_t requested_padding_row_count = 0;
+  uint32_t requested_sample_select = 0;
   bool native_2x_msaa = false;
   bool committed = false;
 };
@@ -432,6 +439,13 @@ struct GraphicsNativeFrameAccumulatorRequest {
   uint32_t storage_height = 0;
   uint32_t destination_row = 0;
   uint32_t storage_row_count = 0;
+  uint32_t source_x = 0;
+  uint32_t source_y = 0;
+  uint32_t source_width = 0;
+  uint32_t source_height = 0;
+  uint32_t copy_row_count = 0;
+  uint32_t padding_row_count = 0;
+  uint32_t sample_select = 0;
   bool begin = false;
   bool append = false;
   bool commit = false;

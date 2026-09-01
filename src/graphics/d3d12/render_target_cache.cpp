@@ -2609,6 +2609,13 @@ D3D12RenderTargetCache::ApplyIsolatedReplayFrameAccumulator(
     const system::GraphicsNativeFrameAccumulatorRequest& request) {
   system::GraphicsNativeFrameAccumulatorResult result;
   result.frame_sequence = frame_sequence;
+  result.requested_source_x = request.source_x;
+  result.requested_source_y = request.source_y;
+  result.requested_source_width = request.source_width;
+  result.requested_source_height = request.source_height;
+  result.requested_copy_row_count = request.copy_row_count;
+  result.requested_padding_row_count = request.padding_row_count;
+  result.requested_sample_select = request.sample_select;
   const auto clear_active = [&]() {
     isolated_replay_frame_accumulator_frame_sequence_ = 0;
     isolated_replay_frame_accumulator_committed_frame_sequence_ = 0;
