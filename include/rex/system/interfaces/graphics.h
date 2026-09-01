@@ -303,6 +303,22 @@ struct GraphicsDrawObservation {
 
 using GraphicsDrawObserver = void (*)(const GraphicsDrawObservation& observation);
 
+struct GraphicsShaderConstantWriteObservation {
+  uint64_t frame_sequence = 0;
+  uint32_t packet_physical_address = UINT32_MAX;
+  uint32_t command_buffer_physical_address = UINT32_MAX;
+  uint32_t command_buffer_length_dwords = 0;
+  uint32_t command_buffer_parent_packet_physical_address = UINT32_MAX;
+  uint32_t command_buffer_root_physical_address = UINT32_MAX;
+  uint32_t command_buffer_depth = 0;
+  uint32_t packet = 0;
+  uint32_t register_index = 0;
+  uint32_t value = 0;
+};
+
+using GraphicsShaderConstantWriteObserver = void (*)(
+    const GraphicsShaderConstantWriteObservation& observation);
+
 struct GraphicsIndirectBufferObservation {
   uint32_t packet_physical_address = UINT32_MAX;
   uint32_t parent_buffer_physical_address = UINT32_MAX;
@@ -596,6 +612,10 @@ class IGraphicsSystem {
   // Optional read-only command-stream observation. Backends invoke this
   // before draw submission and observers cannot alter draw behavior.
   virtual void SetDrawObserver(GraphicsDrawObserver observer) {
+    (void)observer;
+  }
+  virtual void SetShaderConstantWriteObserver(
+      GraphicsShaderConstantWriteObserver observer) {
     (void)observer;
   }
   virtual void SetIndirectBufferObserver(

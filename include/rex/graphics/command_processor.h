@@ -279,6 +279,7 @@ class CommandProcessor {
   uint64_t observation_draw_sequence_ = 0;
   uint64_t observation_copy_sequence_ = 0;
   uint32_t observation_packet_physical_address_ = UINT32_MAX;
+  uint32_t observation_packet_ = 0;
   struct ObservationCommandBufferContext {
     uint32_t physical_address = UINT32_MAX;
     uint32_t length_dwords = 0;

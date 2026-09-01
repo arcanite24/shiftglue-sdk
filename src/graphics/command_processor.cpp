@@ -375,6 +375,29 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
+  if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+      index < XE_GPU_REG_SHADER_CONSTANT_000_X + 512 * 4) {
+    auto observer = graphics_system_->shader_constant_write_observer();
+    if (observer) {
+      system::GraphicsShaderConstantWriteObservation observation;
+      observation.frame_sequence = observation_frame_sequence_;
+      observation.packet_physical_address =
+          observation_packet_physical_address_;
+      observation.command_buffer_physical_address =
+          observation_command_buffer_.physical_address;
+      observation.command_buffer_length_dwords =
+          observation_command_buffer_.length_dwords;
+      observation.command_buffer_parent_packet_physical_address =
+          observation_command_buffer_.parent_packet_physical_address;
+      observation.command_buffer_root_physical_address =
+          observation_command_buffer_.root_physical_address;
+      observation.command_buffer_depth = observation_command_buffer_.depth;
+      observation.packet = observation_packet_;
+      observation.register_index = index;
+      observation.value = value;
+      observer(observation);
+    }
+  }
   if (!regs.GetRegisterInfo(index)) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
@@ -720,6 +743,7 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
           ? uint32_t(physical_offset)
           : UINT32_MAX;
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
+  observation_packet_ = packet;
   const uint32_t packet_type = packet >> 30;
   if (packet == 0) {
     return true;

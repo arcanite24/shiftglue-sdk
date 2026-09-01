@@ -76,6 +76,15 @@ class GraphicsSystem : public system::IGraphicsSystem {
   system::GraphicsDrawObserver draw_observer() const {
     return draw_observer_.load(std::memory_order_acquire);
   }
+  void SetShaderConstantWriteObserver(
+      system::GraphicsShaderConstantWriteObserver observer) override {
+    shader_constant_write_observer_.store(observer,
+                                          std::memory_order_release);
+  }
+  system::GraphicsShaderConstantWriteObserver
+  shader_constant_write_observer() const {
+    return shader_constant_write_observer_.load(std::memory_order_acquire);
+  }
   void SetIndirectBufferObserver(
       system::GraphicsIndirectBufferObserver observer) override {
     indirect_buffer_observer_.store(observer, std::memory_order_release);
@@ -203,6 +212,8 @@ class GraphicsSystem : public system::IGraphicsSystem {
   std::unique_ptr<::rex::ui::Presenter> presenter_;
 
   std::atomic<system::GraphicsDrawObserver> draw_observer_{nullptr};
+  std::atomic<system::GraphicsShaderConstantWriteObserver>
+      shader_constant_write_observer_{nullptr};
   std::atomic<system::GraphicsIndirectBufferObserver>
       indirect_buffer_observer_{nullptr};
   std::atomic<system::GraphicsCopyObserver> copy_observer_{nullptr};
