@@ -506,6 +506,8 @@ enum class GraphicsIsolatedDrawTargetFailure : uint32_t {
 struct GraphicsIsolatedDrawResult {
   GraphicsIsolatedDrawStatus status =
       GraphicsIsolatedDrawStatus::kUnsupportedState;
+  uint64_t frame_sequence = 0;
+  bool frame_accumulator_source = false;
   uint32_t target_width = 0;
   uint32_t target_height = 0;
   GraphicsIsolatedDrawTargetFailure target_failure =

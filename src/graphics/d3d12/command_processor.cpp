@@ -3805,6 +3805,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     SubmitBarriers();
     if (isolated_draw_request.requested) {
       system::GraphicsIsolatedDrawResult isolated_result;
+      isolated_result.frame_sequence = isolated_draw_request.frame_sequence;
+      isolated_result.frame_accumulator_source =
+          isolated_draw_request.frame_accumulator_source;
       if (memexport_used || !host_render_targets_used ||
           !is_rasterization_done) {
         isolated_result.status =
@@ -4061,6 +4064,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     SubmitBarriers();
     if (isolated_draw_request.requested) {
       system::GraphicsIsolatedDrawResult isolated_result;
+      isolated_result.frame_sequence = isolated_draw_request.frame_sequence;
+      isolated_result.frame_accumulator_source =
+          isolated_draw_request.frame_accumulator_source;
       const bool isolated_index_buffer_supported =
           primitive_processing_result.index_buffer_type ==
               PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA ||
