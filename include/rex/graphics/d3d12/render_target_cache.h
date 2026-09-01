@@ -100,12 +100,16 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // EndIsolatedReplayTarget restores the guest bindings without changing the
   // guest attachments or ownership.
   bool BeginIsolatedReplayTarget(uint32_t& width_out, uint32_t& height_out,
+                                 system::GraphicsIsolatedDrawTargetFailure&
+                                     failure_out,
                                  uint32_t logical_width,
                                  uint32_t logical_height,
                                  bool stencil_seed_probe_requested,
                                  bool depth_only_target = false,
                                  bool color_only_target = false);
   bool ResumeIsolatedReplayTarget(uint32_t& width_out, uint32_t& height_out,
+                                  system::GraphicsIsolatedDrawTargetFailure&
+                                      failure_out,
                                   uint32_t logical_width,
                                   uint32_t logical_height,
                                   bool depth_only_target = false,

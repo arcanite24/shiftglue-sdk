@@ -1790,14 +1790,18 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(Rend
 
 bool D3D12RenderTargetCache::BeginIsolatedReplayTarget(
     uint32_t& width_out, uint32_t& height_out,
+    system::GraphicsIsolatedDrawTargetFailure& failure_out,
     uint32_t logical_width, uint32_t logical_height,
     bool stencil_seed_probe_requested, bool depth_only_target,
     bool color_only_target) {
   width_out = 0;
   height_out = 0;
+  failure_out = system::GraphicsIsolatedDrawTargetFailure::kNone;
   isolated_replay_active_depth_target_ = nullptr;
   if ((depth_only_target && color_only_target) ||
       (stencil_seed_probe_requested && color_only_target)) {
+    failure_out =
+        system::GraphicsIsolatedDrawTargetFailure::kIncompatibleModes;
     return false;
   }
   if (!depth_only_target) {
@@ -1808,18 +1812,31 @@ bool D3D12RenderTargetCache::BeginIsolatedReplayTarget(
     isolated_replay_active_preview_height_ = 0;
   }
   if (GetPath() != Path::kHostRenderTargets) {
+    failure_out = system::GraphicsIsolatedDrawTargetFailure::kUnsupportedPath;
     return false;
   }
   RenderTarget* const* guest_targets =
       last_update_accumulated_render_targets();
-  if ((!color_only_target && !guest_targets[0]) ||
-      (color_only_target && guest_targets[0]) ||
-      (!depth_only_target && !guest_targets[1])) {
+  if (!color_only_target && !guest_targets[0]) {
+    failure_out =
+        system::GraphicsIsolatedDrawTargetFailure::kMissingDepthTarget;
+    return false;
+  }
+  if (color_only_target && guest_targets[0]) {
+    failure_out =
+        system::GraphicsIsolatedDrawTargetFailure::kUnexpectedDepthTarget;
+    return false;
+  }
+  if (!depth_only_target && !guest_targets[1]) {
+    failure_out =
+        system::GraphicsIsolatedDrawTargetFailure::kMissingColorTarget;
     return false;
   }
   for (uint32_t i = depth_only_target ? 1 : 2;
        i <= xenos::kMaxColorRenderTargets; ++i) {
     if (guest_targets[i]) {
+      failure_out = system::GraphicsIsolatedDrawTargetFailure::
+          kUnexpectedAdditionalColorTarget;
       return false;
     }
   }
@@ -1843,6 +1860,11 @@ bool D3D12RenderTargetCache::BeginIsolatedReplayTarget(
   }
   if ((!color_only_target && !isolated_replay_depth_target) ||
       (!depth_only_target && !isolated_replay_color_target_)) {
+    failure_out = !color_only_target && !isolated_replay_depth_target
+                      ? system::GraphicsIsolatedDrawTargetFailure::
+                            kDepthTargetCreationFailed
+                      : system::GraphicsIsolatedDrawTargetFailure::
+                            kColorTargetCreationFailed;
     if (!color_only_target) {
       isolated_replay_depth_target.reset();
     }
@@ -1881,6 +1903,8 @@ bool D3D12RenderTargetCache::BeginIsolatedReplayTarget(
         std::min(logical_height, height_out);
     if (!isolated_replay_active_preview_width_ ||
         !isolated_replay_active_preview_height_) {
+      failure_out =
+          system::GraphicsIsolatedDrawTargetFailure::kInvalidLogicalExtent;
       return false;
     }
   }
@@ -1950,6 +1974,8 @@ bool D3D12RenderTargetCache::BeginIsolatedReplayTarget(
                                            &depth_format_info,
                                            sizeof(depth_format_info))) ||
         !depth_format_info.PlaneCount) {
+      failure_out =
+          system::GraphicsIsolatedDrawTargetFailure::kDepthFormatUnavailable;
       return false;
     }
     for (uint32_t plane = 0; plane < depth_format_info.PlaneCount; ++plane) {
@@ -2002,19 +2028,23 @@ bool D3D12RenderTargetCache::BeginIsolatedReplayTarget(
 }
 
 bool D3D12RenderTargetCache::ResumeIsolatedReplayTarget(
-    uint32_t& width_out, uint32_t& height_out, uint32_t logical_width,
-    uint32_t logical_height, bool depth_only_target,
+    uint32_t& width_out, uint32_t& height_out,
+    system::GraphicsIsolatedDrawTargetFailure& failure_out,
+    uint32_t logical_width, uint32_t logical_height, bool depth_only_target,
     bool color_only_target) {
   if (isolated_replay_frame_accumulator_reseed_required_) {
     isolated_replay_frame_accumulator_reseed_required_ = false;
     return BeginIsolatedReplayTarget(
-        width_out, height_out, logical_width, logical_height, false,
+        width_out, height_out, failure_out, logical_width, logical_height, false,
         depth_only_target, color_only_target);
   }
   width_out = 0;
   height_out = 0;
+  failure_out = system::GraphicsIsolatedDrawTargetFailure::kNone;
   isolated_replay_active_depth_target_ = nullptr;
   if (depth_only_target && color_only_target) {
+    failure_out =
+        system::GraphicsIsolatedDrawTargetFailure::kIncompatibleModes;
     return false;
   }
   auto& isolated_replay_depth_target =
@@ -2023,26 +2053,49 @@ bool D3D12RenderTargetCache::ResumeIsolatedReplayTarget(
   if (GetPath() != Path::kHostRenderTargets ||
       (!color_only_target && !isolated_replay_depth_target) ||
       (!depth_only_target && !isolated_replay_color_target_)) {
+    failure_out = system::GraphicsIsolatedDrawTargetFailure::
+        kRetainedTargetUnavailable;
     isolated_replay_active_depth_target_ = nullptr;
     return false;
   }
   RenderTarget* const* guest_targets =
       last_update_accumulated_render_targets();
-  if ((!color_only_target && !guest_targets[0]) ||
-      (color_only_target && guest_targets[0]) ||
-      (!depth_only_target && !guest_targets[1]) ||
-      (!color_only_target &&
-       guest_targets[0]->key() != isolated_replay_depth_target->key())) {
+  if (!color_only_target && !guest_targets[0]) {
+    failure_out =
+        system::GraphicsIsolatedDrawTargetFailure::kMissingDepthTarget;
+    isolated_replay_active_depth_target_ = nullptr;
+    return false;
+  }
+  if (color_only_target && guest_targets[0]) {
+    failure_out =
+        system::GraphicsIsolatedDrawTargetFailure::kUnexpectedDepthTarget;
+    isolated_replay_active_depth_target_ = nullptr;
+    return false;
+  }
+  if (!depth_only_target && !guest_targets[1]) {
+    failure_out =
+        system::GraphicsIsolatedDrawTargetFailure::kMissingColorTarget;
+    isolated_replay_active_depth_target_ = nullptr;
+    return false;
+  }
+  if (!color_only_target &&
+      guest_targets[0]->key() != isolated_replay_depth_target->key()) {
+    failure_out =
+        system::GraphicsIsolatedDrawTargetFailure::kRetainedTargetMismatch;
     isolated_replay_active_depth_target_ = nullptr;
     return false;
   }
   if (!depth_only_target &&
       guest_targets[1]->key() != isolated_replay_color_target_->key()) {
+    failure_out =
+        system::GraphicsIsolatedDrawTargetFailure::kRetainedTargetMismatch;
     return false;
   }
   for (uint32_t i = depth_only_target ? 1 : 2;
        i <= xenos::kMaxColorRenderTargets; ++i) {
     if (guest_targets[i]) {
+      failure_out = system::GraphicsIsolatedDrawTargetFailure::
+          kUnexpectedAdditionalColorTarget;
       return false;
     }
   }

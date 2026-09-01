@@ -3813,6 +3813,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                   render_target_cache_->BeginIsolatedReplayTarget(
                       isolated_result.target_width,
                       isolated_result.target_height,
+                      isolated_result.target_failure,
                       isolated_replay_logical_width,
                       isolated_replay_logical_height,
                       isolated_draw_request.stencil_seed_probe_requested,
@@ -3822,6 +3823,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                   render_target_cache_->ResumeIsolatedReplayTarget(
                       isolated_result.target_width,
                       isolated_result.target_height,
+                      isolated_result.target_failure,
                       isolated_replay_logical_width,
                       isolated_replay_logical_height,
                       isolated_draw_request.depth_only_target,
@@ -4071,6 +4073,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                   render_target_cache_->BeginIsolatedReplayTarget(
                       isolated_result.target_width,
                       isolated_result.target_height,
+                      isolated_result.target_failure,
                       isolated_replay_logical_width,
                       isolated_replay_logical_height,
                       isolated_draw_request.stencil_seed_probe_requested,
@@ -4080,6 +4083,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                   render_target_cache_->ResumeIsolatedReplayTarget(
                       isolated_result.target_width,
                       isolated_result.target_height,
+                      isolated_result.target_failure,
                       isolated_replay_logical_width,
                       isolated_replay_logical_height,
                       isolated_draw_request.depth_only_target,

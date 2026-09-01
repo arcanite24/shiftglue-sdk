@@ -486,11 +486,29 @@ enum class GraphicsIsolatedDrawStatus : uint32_t {
   kTargetCreationFailed = 3,
 };
 
+enum class GraphicsIsolatedDrawTargetFailure : uint32_t {
+  kNone = 0,
+  kIncompatibleModes = 1,
+  kUnsupportedPath = 2,
+  kMissingDepthTarget = 3,
+  kUnexpectedDepthTarget = 4,
+  kMissingColorTarget = 5,
+  kUnexpectedAdditionalColorTarget = 6,
+  kDepthTargetCreationFailed = 7,
+  kColorTargetCreationFailed = 8,
+  kInvalidLogicalExtent = 9,
+  kDepthFormatUnavailable = 10,
+  kRetainedTargetUnavailable = 11,
+  kRetainedTargetMismatch = 12,
+};
+
 struct GraphicsIsolatedDrawResult {
   GraphicsIsolatedDrawStatus status =
       GraphicsIsolatedDrawStatus::kUnsupportedState;
   uint32_t target_width = 0;
   uint32_t target_height = 0;
+  GraphicsIsolatedDrawTargetFailure target_failure =
+      GraphicsIsolatedDrawTargetFailure::kNone;
 };
 
 using GraphicsIsolatedDrawCompletion = void (*)(
