@@ -2972,7 +2972,10 @@ D3D12RenderTargetCache::ApplyIsolatedReplayFrameAccumulator(
   result.appended_row_end =
       isolated_replay_frame_accumulator_appended_row_end_;
   result.committed = request.commit;
-  isolated_replay_frame_accumulator_source_frame_sequence_ = 0;
+  // A qualified retained replay target may provide multiple resolve chunks in
+  // the same frame. Keep its source identity until target reseeding or frame
+  // cancellation clears it, while the frame-sequence check above continues to
+  // reject stale and unrelated sources.
   return result;
 }
 
