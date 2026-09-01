@@ -154,6 +154,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   ApplyIsolatedReplayFrameAccumulator(
       uint64_t frame_sequence,
       const system::GraphicsNativeFrameAccumulatorRequest& request);
+  void PopulateCopySourceTopology(
+      system::GraphicsCopyObservation& observation) const;
 
   struct IsolatedReplayPreviewSource {
     ID3D12Resource* resource = nullptr;

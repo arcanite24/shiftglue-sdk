@@ -4496,6 +4496,7 @@ bool D3D12CommandProcessor::IssueCopy() {
           (*register_file_)[reg::RB_COLOR_INFO::rt_register_indices[i]];
     }
     observation.depth_info = register_file_->Get<reg::RB_DEPTH_INFO>().value;
+    render_target_cache_->PopulateCopySourceTopology(observation);
     observation.succeeded = copy_succeeded;
     if (copy_observer) {
       copy_observer(observation);

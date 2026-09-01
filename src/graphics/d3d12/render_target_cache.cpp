@@ -2929,6 +2929,35 @@ D3D12RenderTargetCache::ApplyIsolatedReplayFrameAccumulator(
   return result;
 }
 
+void D3D12RenderTargetCache::PopulateCopySourceTopology(
+    system::GraphicsCopyObservation& observation) const {
+  observation.draw_resolution_scale_x = draw_resolution_scale_x();
+  observation.draw_resolution_scale_y = draw_resolution_scale_y();
+  observation.native_2x_msaa = msaa_2x_supported();
+  if (GetPath() != Path::kHostRenderTargets) {
+    return;
+  }
+  const uint32_t copy_source = observation.rb_copy_control & 7;
+  RenderTarget* const* guest_targets =
+      last_update_accumulated_render_targets();
+  RenderTarget* source_target =
+      copy_source < 4 ? guest_targets[1 + copy_source] : guest_targets[0];
+  if (!source_target) {
+    return;
+  }
+  const auto* d3d12_source =
+      static_cast<const D3D12RenderTarget*>(source_target);
+  const D3D12_RESOURCE_DESC source_desc = d3d12_source->resource()->GetDesc();
+  observation.source_resource_width = uint32_t(source_desc.Width);
+  observation.source_resource_height = source_desc.Height;
+  observation.source_resource_format = uint32_t(source_desc.Format);
+  observation.source_sample_count = source_desc.SampleDesc.Count;
+  observation.source_sample_quality = source_desc.SampleDesc.Quality;
+  observation.source_guest_msaa_samples =
+      uint32_t(1) << uint32_t(source_target->key().msaa_samples);
+  observation.source_target_available = true;
+}
+
 void D3D12RenderTargetCache::EndIsolatedReplayTarget(
     uint64_t frame_sequence, bool defer_preview_publication_until_swap,
     bool depth_only_target, bool frame_accumulator_source) {

@@ -354,6 +354,16 @@ struct GraphicsCopyObservation {
   uint32_t surface_info = 0;
   uint32_t color_info[4] = {};
   uint32_t depth_info = 0;
+  uint32_t source_resource_width = 0;
+  uint32_t source_resource_height = 0;
+  uint32_t source_resource_format = 0;
+  uint32_t source_sample_count = 0;
+  uint32_t source_sample_quality = 0;
+  uint32_t source_guest_msaa_samples = 0;
+  uint32_t draw_resolution_scale_x = 0;
+  uint32_t draw_resolution_scale_y = 0;
+  bool source_target_available = false;
+  bool native_2x_msaa = false;
   bool succeeded = false;
 };
 
