@@ -145,6 +145,10 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   void CancelDeferredIsolatedReplayPreview(uint64_t frame_sequence);
   system::GraphicsIsolatedDrawPublicationResult PublishIsolatedReplayTarget(
       bool depth_only_target = false);
+  system::GraphicsNativeFrameAccumulatorResult
+  ApplyIsolatedReplayFrameAccumulator(
+      uint64_t frame_sequence,
+      const system::GraphicsNativeFrameAccumulatorRequest& request);
 
   struct IsolatedReplayPreviewSource {
     ID3D12Resource* resource = nullptr;
@@ -156,6 +160,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     uint32_t logical_height = 0;
     uint64_t frame_sequence = 0;
     bool resolved = false;
+    bool frame_accumulator = false;
   };
   bool BeginIsolatedReplayPreview(uint64_t required_frame_sequence,
                                   IsolatedReplayPreviewSource& source_out);
@@ -743,6 +748,21 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       isolated_replay_preview_resolved_target_;
   D3D12_RESOURCE_STATES isolated_replay_preview_resolved_target_state_ =
       D3D12_RESOURCE_STATE_RESOLVE_DEST;
+  Microsoft::WRL::ComPtr<ID3D12Resource>
+      isolated_replay_frame_accumulator_target_;
+  D3D12_RESOURCE_STATES isolated_replay_frame_accumulator_target_state_ =
+      D3D12_RESOURCE_STATE_COPY_DEST;
+  Microsoft::WRL::ComPtr<ID3D12Resource>
+      isolated_replay_frame_accumulator_tile_;
+  D3D12_RESOURCE_STATES isolated_replay_frame_accumulator_tile_state_ =
+      D3D12_RESOURCE_STATE_RESOLVE_DEST;
+  uint64_t isolated_replay_frame_accumulator_frame_sequence_ = 0;
+  uint64_t isolated_replay_frame_accumulator_committed_frame_sequence_ = 0;
+  uint32_t isolated_replay_frame_accumulator_width_ = 0;
+  uint32_t isolated_replay_frame_accumulator_height_ = 0;
+  uint32_t isolated_replay_frame_accumulator_logical_height_ = 0;
+  uint32_t isolated_replay_frame_accumulator_appended_row_end_ = 0;
+  bool isolated_replay_frame_accumulator_reseed_required_ = false;
   uint64_t isolated_replay_preview_frame_sequence_ = 0;
   uint64_t isolated_replay_deferred_preview_frame_sequence_ = 0;
   uint32_t isolated_replay_active_preview_width_ = 0;

@@ -141,6 +141,16 @@ class GraphicsSystem : public system::IGraphicsSystem {
   system::GraphicsNativeResolveObserver native_resolve_observer() const {
     return native_resolve_observer_.load(std::memory_order_acquire);
   }
+  void SetNativeFrameAccumulatorPlanner(
+      system::GraphicsNativeFrameAccumulatorPlanner planner) override {
+    native_frame_accumulator_planner_.store(planner,
+                                             std::memory_order_release);
+  }
+  system::GraphicsNativeFrameAccumulatorPlanner
+  native_frame_accumulator_planner() const {
+    return native_frame_accumulator_planner_.load(
+        std::memory_order_acquire);
+  }
   void SetNativeGuestOutputRenderer(
       system::NativeGuestOutputRenderer renderer) override {
     native_guest_output_renderer_.Set(renderer);
@@ -229,6 +239,8 @@ class GraphicsSystem : public system::IGraphicsSystem {
       native_texture_set_observer_{nullptr};
   std::atomic<system::GraphicsNativeResolveObserver> native_resolve_observer_{
       nullptr};
+  std::atomic<system::GraphicsNativeFrameAccumulatorPlanner>
+      native_frame_accumulator_planner_{nullptr};
   system::NativeGuestOutputRendererRegistration native_guest_output_renderer_;
 
   std::atomic_flag host_gpu_loss_reported_;

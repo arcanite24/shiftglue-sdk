@@ -359,6 +359,51 @@ struct GraphicsCopyObservation {
 
 using GraphicsCopyObserver = void (*)(const GraphicsCopyObservation& observation);
 
+enum class GraphicsNativeFrameAccumulatorStatus : uint32_t {
+  kRecorded = 1,
+  kCancelled = 2,
+  kInvalidRequest = 3,
+  kUnavailable = 4,
+  kUnsupportedTarget = 5,
+  kAllocationFailed = 6,
+};
+
+struct GraphicsNativeFrameAccumulatorResult {
+  GraphicsNativeFrameAccumulatorStatus status =
+      GraphicsNativeFrameAccumulatorStatus::kInvalidRequest;
+  uint64_t frame_sequence = 0;
+  uint32_t resource_width = 0;
+  uint32_t resource_height = 0;
+  uint32_t logical_width = 0;
+  uint32_t logical_height = 0;
+  uint32_t appended_row_end = 0;
+  bool committed = false;
+};
+
+using GraphicsNativeFrameAccumulatorCompletion = void (*)(
+    const GraphicsNativeFrameAccumulatorResult& result);
+
+// A fail-closed request to copy rows from the current private isolated color
+// replay target into a private single-sample frame accumulator. The request is
+// produced only after the authoritative Xenos resolve succeeds. It cannot
+// alter the guest resolve, publish to guest memory, or suppress a guest draw.
+struct GraphicsNativeFrameAccumulatorRequest {
+  uint32_t logical_width = 0;
+  uint32_t logical_height = 0;
+  uint32_t storage_height = 0;
+  uint32_t destination_row = 0;
+  uint32_t storage_row_count = 0;
+  bool begin = false;
+  bool append = false;
+  bool commit = false;
+  bool cancel = false;
+  GraphicsNativeFrameAccumulatorCompletion completion = nullptr;
+};
+
+using GraphicsNativeFrameAccumulatorPlanner = bool (*)(
+    const GraphicsCopyObservation& observation,
+    GraphicsNativeFrameAccumulatorRequest& request_out);
+
 enum class GraphicsShaderStage : uint32_t {
   kVertex = 1,
   kPixel = 2,
@@ -656,6 +701,10 @@ class IGraphicsSystem {
   virtual void SetNativeResolveObserver(
       GraphicsNativeResolveObserver observer) {
     (void)observer;
+  }
+  virtual void SetNativeFrameAccumulatorPlanner(
+      GraphicsNativeFrameAccumulatorPlanner planner) {
+    (void)planner;
   }
   virtual void SetNativeGuestOutputRenderer(NativeGuestOutputRenderer renderer) {
     (void)renderer;

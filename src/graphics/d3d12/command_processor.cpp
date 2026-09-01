@@ -4463,7 +4463,10 @@ bool D3D12CommandProcessor::IssueCopy() {
 
   auto copy_observer = graphics_system_->copy_observer();
   auto native_resolve_observer = graphics_system_->native_resolve_observer();
-  if (copy_observer || native_resolve_observer) {
+  auto native_frame_accumulator_planner =
+      graphics_system_->native_frame_accumulator_planner();
+  if (copy_observer || native_resolve_observer ||
+      native_frame_accumulator_planner) {
     system::GraphicsCopyObservation observation;
     observation.frame_sequence = observation_frame_sequence_;
     observation.copy_sequence = ++observation_copy_sequence_;
@@ -4484,6 +4487,18 @@ bool D3D12CommandProcessor::IssueCopy() {
     observation.succeeded = copy_succeeded;
     if (copy_observer) {
       copy_observer(observation);
+    }
+    if (native_frame_accumulator_planner && observation.succeeded) {
+      system::GraphicsNativeFrameAccumulatorRequest accumulator_request;
+      if (native_frame_accumulator_planner(observation,
+                                           accumulator_request)) {
+        system::GraphicsNativeFrameAccumulatorResult accumulator_result =
+            render_target_cache_->ApplyIsolatedReplayFrameAccumulator(
+                observation.frame_sequence, accumulator_request);
+        if (accumulator_request.completion) {
+          accumulator_request.completion(accumulator_result);
+        }
+      }
     }
     if (native_resolve_observer) {
       native_resolve_observer(observation);
