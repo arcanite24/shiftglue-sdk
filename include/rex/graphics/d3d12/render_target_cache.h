@@ -884,6 +884,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   uint64_t direct_resolve_attempt_count_ = 0;
   uint64_t direct_resolve_success_count_ = 0;
   uint64_t direct_resolve_fallback_count_ = 0;
+  draw_util::ResolveInfo copy_observation_resolve_info_{};
+  bool copy_observation_resolve_info_valid_ = false;
 
   // Parameter 0 - 2 root constants (red, green).
   ID3D12RootSignature* uint32_rtv_clear_root_signature_ = nullptr;

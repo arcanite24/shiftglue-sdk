@@ -1251,6 +1251,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                                      uint32_t& written_address_out, uint32_t& written_length_out) {
   written_address_out = 0;
   written_length_out = 0;
+  copy_observation_resolve_info_valid_ = false;
 
   bool draw_resolution_scaled = IsDrawResolutionScaled();
 
@@ -1262,6 +1263,8 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
     draw_util::LogResolveFailureState(register_file(), memory);
     return false;
   }
+  copy_observation_resolve_info_ = resolve_info;
+  copy_observation_resolve_info_valid_ = true;
 
   // Nothing to copy/clear.
   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
@@ -2955,7 +2958,49 @@ void D3D12RenderTargetCache::PopulateCopySourceTopology(
   observation.source_sample_quality = source_desc.SampleDesc.Quality;
   observation.source_guest_msaa_samples =
       uint32_t(1) << uint32_t(source_target->key().msaa_samples);
+  observation.source_target_base_tiles = source_target->key().base_tiles;
+  observation.source_target_pitch_tiles_at_32bpp =
+      source_target->key().pitch_tiles_at_32bpp;
   observation.source_target_available = true;
+  if (!copy_observation_resolve_info_valid_) {
+    return;
+  }
+  const draw_util::ResolveInfo& resolve_info =
+      copy_observation_resolve_info_;
+  const draw_util::ResolveEdramInfo& source_info =
+      resolve_info.IsCopyingDepth() ? resolve_info.depth_edram_info
+                                    : resolve_info.color_edram_info;
+  observation.resolve_source_base_tiles = source_info.base_tiles;
+  observation.resolve_source_pitch_tiles = source_info.pitch_tiles;
+  observation.resolve_source_format = source_info.format;
+  observation.resolve_source_guest_msaa_samples =
+      uint32_t(1) << uint32_t(source_info.msaa_samples);
+  observation.resolve_guest_offset_x =
+      resolve_info.coordinate_info.edram_offset_x_div_8 << 3;
+  observation.resolve_guest_offset_y =
+      resolve_info.coordinate_info.edram_offset_y_div_8 << 3;
+  observation.resolve_guest_width =
+      resolve_info.coordinate_info.width_div_8 << 3;
+  observation.resolve_guest_height = resolve_info.height_div_8 << 3;
+  observation.resolve_physical_offset_x =
+      observation.resolve_guest_offset_x * draw_resolution_scale_x();
+  observation.resolve_physical_offset_y =
+      observation.resolve_guest_offset_y * draw_resolution_scale_y();
+  observation.resolve_physical_width =
+      observation.resolve_guest_width * draw_resolution_scale_x();
+  observation.resolve_physical_height =
+      observation.resolve_guest_height * draw_resolution_scale_y();
+  observation.resolve_dest_offset_x =
+      resolve_info.copy_dest_coordinate_info.offset_x_div_8 << 3;
+  observation.resolve_dest_offset_y =
+      resolve_info.copy_dest_coordinate_info.offset_y_div_8 << 3;
+  observation.resolve_dest_pitch =
+      resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32 << 5;
+  observation.resolve_dest_height =
+      resolve_info.copy_dest_coordinate_info.height_aligned_div_32 << 5;
+  observation.resolve_sample_select = uint32_t(
+      resolve_info.copy_dest_coordinate_info.copy_sample_select);
+  observation.resolve_info_valid = true;
 }
 
 void D3D12RenderTargetCache::EndIsolatedReplayTarget(
