@@ -469,6 +469,10 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
             case 'x':
               emit_print(out, "PPCXERRegister& xer");
               break;
+            case 'l':
+              if (reg == "lr")
+                emit_print(out, "uint64_t& lr");
+              break;
             case 'r':
               emit_print(out, "PPCRegister& {}", reg);
               break;
