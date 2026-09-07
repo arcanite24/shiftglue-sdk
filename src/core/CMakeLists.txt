@@ -77,7 +77,7 @@ elseif(UNIX)
 endif()
 
 # Xenos data-format layer (stateless; headers under include/rex/graphics/).
-# The GPU emulation consuming it lives in the rexgpu-xenos plugin.
+# The FH1 GPU compatibility code consuming it lives in the rexgpu-fh1 plugin.
 target_sources(rexcore PRIVATE
     ${PROJECT_SOURCE_DIR}/src/graphics/xenos.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/texture/info.cpp

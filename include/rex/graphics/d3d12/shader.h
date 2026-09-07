@@ -14,7 +14,9 @@
 #include <atomic>
 
 #include <rex/graphics/pipeline/shader/dxbc.h>
+#if defined(REXGPU_FH1_SHADER_PRODUCER)
 #include <rex/ui/d3d12/d3d12_provider.h>
+#endif
 
 namespace rex::graphics::d3d12 {
 
@@ -25,10 +27,12 @@ class D3D12Shader : public DxbcShader {
     D3D12Translation(D3D12Shader& shader, uint64_t modification)
         : DxbcTranslation(shader, modification) {}
 
-    void DisassembleDxbcAndDxil(const ui::d3d12::D3D12Provider& provider, bool disassemble_dxbc,
-                                IDxbcConverter* dxbc_converter = nullptr,
-                                IDxcUtils* dxc_utils = nullptr,
-                                IDxcCompiler* dxc_compiler = nullptr);
+#if defined(REXGPU_FH1_SHADER_PRODUCER)
+    void DisassembleDxbcAndDxil(
+        const ui::d3d12::D3D12Provider& provider, bool disassemble_dxbc,
+        IDxbcConverter* dxbc_converter = nullptr,
+        IDxcUtils* dxc_utils = nullptr, IDxcCompiler* dxc_compiler = nullptr);
+#endif
   };
 
   D3D12Shader(xenos::ShaderType shader_type, uint64_t ucode_data_hash, const uint32_t* ucode_dwords,

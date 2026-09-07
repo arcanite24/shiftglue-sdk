@@ -14,6 +14,7 @@
 #include <mutex>
 #include <utility>
 #include <vector>
+#include <span>
 
 #include <rex/memory.h>
 #include <rex/thread/mutex.h>
@@ -65,8 +66,8 @@ class SharedMemory {
   // belongs to the base mip level or to the rest of the mips).
   //
   // Called with the global critical region locked. Do NOT watch or unwatch
-  // ranges from within it! The watch for the callback is cancelled after the
-  // callback - the handle becomes invalid.
+  // ranges from within it! The watch is cancelled before the callback runs;
+  // its handle is already invalid when the callback is entered.
   WatchHandle WatchMemoryRange(uint32_t start, uint32_t length, WatchCallback callback,
                                void* callback_context, void* callback_data,
                                uint64_t callback_argument);
@@ -78,6 +79,17 @@ class SharedMemory {
   // the range has been fully updated and is usable.
   bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
   bool RequestRange(uint32_t start, uint32_t length);
+
+  // Command-processor thread only. Copy CPU-authoritative bytes, rejecting any
+  // GPU-written page and leaving destination unchanged on rejection. Callers
+  // must already watch the range. Enables write protection before copying to
+  // detect writes during/after copy, without requesting a GPU upload.
+  // This neither makes GPU memory resident nor marks its contents valid.
+  bool CopyCpuRange(uint32_t start, std::span<uint8_t> destination);
+
+  // One-shot CPU snapshot with its own invalidation watch and no GPU upload.
+  // On false, discard destination: invalidation may have occurred after copying.
+  bool CopyCpuSnapshot(uint32_t start, std::span<uint8_t> destination);
 
   // Marks the range and, if not exact_range, potentially its surroundings
   // (to up to the first GPU-written page, as an access violation exception

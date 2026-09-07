@@ -14,10 +14,12 @@
 
 #include <rex/assert.h>
 #include <rex/graphics/d3d12/shader.h>
+#if defined(REXGPU_FH1_SHADER_PRODUCER)
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/dxbc.h>
 #include <rex/logging.h>
 #include <rex/ui/d3d12/d3d12_api.h>
+#endif
 
 namespace rex::graphics::d3d12 {
 
@@ -27,6 +29,7 @@ D3D12Shader::D3D12Shader(xenos::ShaderType shader_type, uint64_t ucode_data_hash
     : DxbcShader(shader_type, ucode_data_hash, ucode_dwords, ucode_dword_count,
                  ucode_source_endian) {}
 
+#if defined(REXGPU_FH1_SHADER_PRODUCER)
 void D3D12Shader::D3D12Translation::DisassembleDxbcAndDxil(const ui::d3d12::D3D12Provider& provider,
                                                            bool disassemble_dxbc,
                                                            IDxbcConverter* dxbc_converter,
@@ -92,6 +95,7 @@ void D3D12Shader::D3D12Translation::DisassembleDxbcAndDxil(const ui::d3d12::D3D1
   }
   set_host_disassembly(std::move(disassembly));
 }
+#endif
 
 Shader::Translation* D3D12Shader::CreateTranslationInstance(uint64_t modification) {
   return new D3D12Translation(*this, modification);

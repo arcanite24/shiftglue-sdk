@@ -96,12 +96,7 @@ class D3D12TextureCache final : public TextureCache {
   // (notifying the command processor about that), so this must be called before
   // binding the actual drawing pipeline.
   void RequestTextures(uint32_t used_texture_mask) override;
-
-  // Exports borrowed GPU-ready resources after RequestTextures has completed.
-  // Callers retaining a resource must use the supplied lifetime callbacks.
-  void ObserveNativeTextures(
-      uint32_t used_texture_mask,
-      system::GraphicsNativeTextureSetObservation& observation) const;
+  void RequestFh1Textures(uint32_t used_texture_mask);
 
   // Returns whether texture SRV keys stored externally are still valid for the
   // current bindings and host shader binding layout. Both keys and
@@ -167,7 +162,11 @@ class D3D12TextureCache final : public TextureCache {
   ID3D12Resource* RequestSwapTexture(D3D12_SHADER_RESOURCE_VIEW_DESC& srv_desc_out,
                                      xenos::TextureFormat& format_out,
                                      uint32_t* width_unscaled_out = nullptr,
-                                     uint32_t* height_unscaled_out = nullptr);
+                                     uint32_t* height_unscaled_out = nullptr,
+                                     D3D12_RESOURCE_STATES state =
+                                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                     const xenos::xe_gpu_texture_fetch_t*
+                                         fetch_override = nullptr);
 
  protected:
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
@@ -286,6 +285,9 @@ class D3D12TextureCache final : public TextureCache {
     // For bindless - indices in the global shader-visible descriptor heap.
     std::unordered_map<SRVDescriptorKey, uint32_t, SRVDescriptorKey::Hasher> srv_descriptors_;
   };
+
+  bool TryLoadTextureDataFromCpu(Texture& texture, bool load_base, bool load_mips) override;
+  bool request_fh1_bc3_ = false;
 
   static constexpr uint32_t kSRVDescriptorCachePageSize = 65536;
 

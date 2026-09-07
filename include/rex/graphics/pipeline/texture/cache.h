@@ -233,7 +233,10 @@ class TextureCache {
     bool mips_outdated(const std::unique_lock<std::recursive_mutex>& global_lock) const {
       return mips_outdated_;
     }
-    void MakeUpToDateAndWatch(const std::unique_lock<std::recursive_mutex>& global_lock);
+    void WatchPendingLoad(const std::unique_lock<std::recursive_mutex>& global_lock,
+                          bool load_base, bool load_mips);
+    void CompleteLoad(const std::unique_lock<std::recursive_mutex>& global_lock,
+                      bool load_base, bool load_mips);
 
     void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
 
@@ -531,6 +534,10 @@ class TextureCache {
     return load_shader_info_[load_shader_index];
   }
   bool LoadTextureData(Texture& texture);
+  // Watches are armed before this call. Return false to use the resident-memory
+  // loader; a successful CPU import must protect its source and own its upload.
+  virtual bool TryLoadTextureDataFromCpu(Texture&, bool, bool) { return false; }
+
   // Writes the texture data (for base, mips or both - but not neither) from the
   // shared memory or the scaled resolve memory. The shared memory management is
   // done outside this function, the implementation just needs to load the data

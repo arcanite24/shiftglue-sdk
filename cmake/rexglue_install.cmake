@@ -14,7 +14,7 @@ include(${CMAKE_CURRENT_LIST_DIR}/rexglue_helpers.cmake)
 # Build install target list dynamically based on backend options
 set(REXGLUE_INSTALL_TARGETS
     rexruntime
-    rexgpu-xenos
+    rexgpu-fh1
     disruptorplus renderdoc simde tomlplusplus
     aes128 mspack o1heap disasm xxhash
     libavcodec libavutil

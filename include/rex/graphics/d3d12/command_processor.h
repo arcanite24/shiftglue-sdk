@@ -19,6 +19,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -96,6 +97,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Finds or creates root signature for a pipeline.
   ID3D12RootSignature* GetRootSignature(const DxbcShader* vertex_shader,
                                         const DxbcShader* pixel_shader, bool tessellated);
+  ID3D12RootSignature* GetFh1TerrainRootSignature() const { return root_signature_fh1_terrain_; }
+  ID3D12RootSignature* GetFh1DepthRootSignature() const { return root_signature_fh1_depth_; }
+  ID3D12RootSignature* GetFh1LayeredRootSignature() const {
+    return root_signature_fh1_layered_;
+  }
 
   ui::d3d12::D3D12UploadBufferPool& GetConstantBufferPool() const { return *constant_buffer_pool_; }
 
@@ -199,16 +205,6 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   // Returns the text to display in the GPU backend name in the window title.
   std::string GetWindowTitleText() const;
-
-  bool DrawNativeGuestOutputDiagnosticTriangle(ID3D12Resource* resource,
-                                               uint32_t width,
-                                               uint32_t height,
-                                               uint32_t phase);
-  bool DrawNativeGuestOutputRetainedPass(ID3D12Resource* resource,
-                                         uint32_t width,
-                                         uint32_t height,
-                                         system::NativeGuestOutputRetainedPassMode mode,
-                                         bool use_pwl_gamma_ramp);
 
  protected:
   bool SetupContext() override;
@@ -379,49 +375,27 @@ class D3D12CommandProcessor : public CommandProcessor {
                                   reg::RB_DEPTHCONTROL normalized_depth_control,
                                   uint32_t normalized_color_mask);
   bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
-                      ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
-  bool IssueCopy_ReadbackResolvePath(uint32_t& written_address_out,
-                                     uint32_t& written_length_out);
-  bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
-  bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
+                      ID3D12RootSignature* root_signature, bool shared_memory_is_uav,
+                      D3D12_GPU_VIRTUAL_ADDRESS geometry_address,
+                      const std::array<D3D12_GPU_VIRTUAL_ADDRESS, 2>& terrain_addresses);
+  bool DrawFh1ToneMap(const D3D12Shader::TextureBinding& source,
+                      DXGI_FORMAT render_target_format, float exposure);
+  bool DrawFh1VelocityDilate(const D3D12Shader::TextureBinding& source,
+                             DXGI_FORMAT render_target_format);
 
   bool InitializeNativeGuestOutputGpuTiming();
   void ShutdownNativeGuestOutputGpuTiming();
   void BeginNativeGuestOutputGpuTimingFrame();
+  void EndNativeGuestOutputGpuTimingFrame();
+  void ObserveFh1GpuPassTimingDraw(
+      const system::GraphicsFh1ExecutionKey& key, uint64_t frame);
+  void BeginFh1GpuPassTimingCopy();
+  void ObserveFh1GpuPassTimingCopy(
+      const system::GraphicsFh1ExecutionKey& key, uint64_t frame);
+  void FinishFh1GpuPassTiming(uint64_t terminal_copy_state);
+  void EndFh1GpuPassTimingFrame();
+  void LogFh1GpuPassTimings();
   void RetireNativeGuestOutputGpuTimings();
-
-  // Returns a buffer for reading GPU data back to the CPU. Assuming
-  // synchronizing immediately after use. Always in COPY_DEST state.
-  ID3D12Resource* RequestReadbackBuffer(uint32_t size);
-  struct ReadbackBuffer {
-    ID3D12Resource* buffers[2] = {nullptr, nullptr};
-    uint32_t sizes[2] = {0, 0};
-    void* mapped_data[2] = {nullptr, nullptr};
-    uint64_t submission_written[2] = {0, 0};
-    uint32_t written_size[2] = {0, 0};
-    uint32_t current_index = 0;
-    uint64_t last_used_frame = 0;
-  };
-  void EvictOldReadbackBuffers(std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
-  static constexpr uint32_t kReadbackBufferSizeIncrement = 16 * 1024 * 1024;
-  static constexpr size_t kMaxReadbackBuffers = 256;
-  static constexpr uint64_t kReadbackBufferEvictionAgeFrames = 60;
-  static inline uint32_t AlignReadbackBufferSize(uint32_t size) {
-    if (size < 1 * 1024 * 1024) {
-      return rex::align(size, 256u * 1024u);
-    }
-    if (size < 4 * 1024 * 1024) {
-      return rex::align(size, 1u * 1024u * 1024u);
-    }
-    return rex::align(size, kReadbackBufferSizeIncrement);
-  }
-  static inline uint64_t MakeReadbackResolveKey(uint32_t address, uint32_t length) {
-    return (uint64_t(address) << 32) | uint64_t(length);
-  }
-  static inline uint64_t MakeMemexportReadbackKey(uint32_t first_base_address_dwords,
-                                                  uint32_t total_size) {
-    return (uint64_t(first_base_address_dwords) << 32) | uint64_t(total_size);
-  }
 
   bool InitializeOcclusionQueryResources();
   void ShutdownOcclusionQueryResources();
@@ -574,6 +548,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Root signatures for different descriptor counts.
   std::unordered_map<uint32_t, ID3D12RootSignature*> root_signatures_bindful_;
   ID3D12RootSignature* root_signature_bindless_vs_ = nullptr;
+  ID3D12RootSignature* root_signature_fh1_layered_ = nullptr;
+  ID3D12RootSignature* root_signature_fh1_depth_ = nullptr;
+  ID3D12RootSignature* root_signature_fh1_terrain_ = nullptr;
   ID3D12RootSignature* root_signature_bindless_ds_ = nullptr;
 
   std::unique_ptr<D3D12PrimitiveProcessor> primitive_processor_;
@@ -627,69 +604,68 @@ class D3D12CommandProcessor : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fxaa_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fxaa_extreme_pipeline_;
 
-  struct NativeGuestOutputTriangleConstants {
-    uint32_t output_size[2];
-    uint32_t phase;
-  };
-  enum class NativeGuestOutputTriangleRootParameter : uint32_t {
-    kConstants,
-    kOutput,
-    kCount,
-  };
-  Microsoft::WRL::ComPtr<ID3D12RootSignature>
-      native_guest_output_triangle_root_signature_;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState>
-      native_guest_output_triangle_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> fh1_tonemap_root_signature_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> fh1_tonemap_pipeline_;
+  DXGI_FORMAT fh1_tonemap_render_target_format_ = DXGI_FORMAT_UNKNOWN;
+  uint64_t fh1_tonemap_native_draws_ = 0;
 
-  struct NativeGuestOutputRetainedPassConstants {
-    uint32_t output_size[2];
-    uint32_t source_size[2];
-    uint32_t crop_size[2];
-    uint32_t presentation_mode;
-    uint32_t padding;
+  struct Fh1Geometry {
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    SharedMemory::WatchHandle watch = nullptr;  // Protected by the global critical region.
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
+    uint64_t allocation_bytes = 0;
+    uint64_t last_submission = 0;
+    bool keep_cpu_snapshot = false;
+    std::vector<uint8_t> cpu_snapshot;
+    struct DepthBounds {
+      std::array<uint32_t, 16> key;
+      std::optional<std::pair<uint32_t, uint32_t>> range;
+    };
+    std::vector<DepthBounds> depth_bounds;
+    uint32_t next_depth_bound = 0;
+    struct TerrainBounds {
+      std::array<uint32_t, 33> key;
+      std::optional<uint32_t> maximum;
+      std::optional<std::array<std::pair<uint32_t, uint32_t>, 3>> ranges;
+    };
+    std::vector<TerrainBounds> terrain_bounds;
+    uint32_t next_terrain_bound = 0;
   };
-  enum class NativeGuestOutputRetainedPassRootParameter : uint32_t {
-    kConstants,
-    kSource,
-    kOutput,
-    kCount,
-  };
+  D3D12_GPU_VIRTUAL_ADDRESS GetFh1OwnedGeometry(uint32_t address, uint32_t size, bool keep_cpu_snapshot = false);
+  std::span<const uint8_t> GetFh1OwnedGeometryCpuRange(uint32_t address, uint32_t size);
+  std::optional<std::pair<uint32_t, uint32_t>> GetFh1DepthGeometryRange(
+      uint32_t address, uint32_t size, std::span<const uint32_t, 8> system,
+      uint32_t width, uint32_t stride, uint32_t fetch_address, uint32_t fetch_size,
+      bool primitive_reset, uint32_t vertex_bytes = 12);
+  std::optional<std::array<std::pair<uint32_t, uint32_t>, 3>> GetFh1TerrainGeometryRanges(
+      uint32_t address, uint32_t size, std::span<const uint32_t, 8> system,
+      uint32_t width, bool primitive_reset, std::span<const float, 44> constants,
+      std::span<const uint32_t, 6> fetches);
+  void ClearFh1OwnedGeometry();  // GPU queue must be idle.
+  std::unordered_map<uint64_t, Fh1Geometry> fh1_geometry_;
+  uint64_t fh1_geometry_bytes_ = 0;
+  uint64_t fh1_geometry_imports_ = 0;
+  uint64_t fh1_geometry_cpu_imports_ = 0;
+  uint64_t fh1_geometry_hits_ = 0;
+  D3D12_GPU_VIRTUAL_ADDRESS current_fh1_geometry_address_ = 0;
+  std::array<D3D12_GPU_VIRTUAL_ADDRESS, 2> current_fh1_terrain_addresses_{};
+
   Microsoft::WRL::ComPtr<ID3D12RootSignature>
-      native_guest_output_retained_pass_root_signature_;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState>
-      native_guest_output_retained_pass_pipeline_;
-  Microsoft::WRL::ComPtr<ID3D12Resource>
-      native_guest_output_display_target_;
-  D3D12_RESOURCE_STATES native_guest_output_display_target_state_ =
-      D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-  uint64_t native_guest_output_display_target_submission_ = 0;
-  Microsoft::WRL::ComPtr<ID3D12Resource>
-      native_guest_output_linear_target_;
-  D3D12_RESOURCE_STATES native_guest_output_linear_target_state_ =
-      D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-  uint64_t native_guest_output_linear_target_submission_ = 0;
-  struct NativeGuestOutputHybridConstants {
-    uint32_t output_size[2];
-    float agreement_epsilon;
-    uint32_t padding;
-  };
-  enum class NativeGuestOutputHybridRootParameter : uint32_t {
-    kConstants,
-    kSources,
-    kOutput,
-    kCount,
-  };
-  Microsoft::WRL::ComPtr<ID3D12RootSignature>
-      native_guest_output_hybrid_root_signature_;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState>
-      native_guest_output_hybrid_pipeline_;
-  Microsoft::WRL::ComPtr<ID3D12Resource>
-      native_guest_output_hybrid_target_;
-  D3D12_RESOURCE_STATES native_guest_output_hybrid_target_state_ =
-      D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-  uint64_t native_guest_output_hybrid_target_submission_ = 0;
+      fh1_velocity_dilate_root_signature_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> fh1_velocity_dilate_pipeline_;
+  DXGI_FORMAT fh1_velocity_dilate_render_target_format_ =
+      DXGI_FORMAT_UNKNOWN;
+  uint64_t fh1_velocity_dilate_native_draws_ = 0;
+  uint64_t fh1_scene_draw_sequence_ = 0;
+  uint64_t fh1_scene_followup_sequence_ = 0;
+  uint32_t fh1_scene_binding_records_ = 0;
+  std::unordered_set<uint64_t> fh1_scene_command_snapshots_;
 
   static constexpr uint32_t kNativeGuestOutputGpuQueriesPerFrame = 5;
+  static constexpr uint32_t kFh1GpuPassTimingCapacity = 256;
+  static constexpr uint32_t kGpuTimingQueriesPerFrame =
+      kNativeGuestOutputGpuQueriesPerFrame +
+      kFh1GpuPassTimingCapacity * 3;
   struct NativeGuestOutputGpuTimingSlot {
     uint64_t submission = 0;
     bool frame_started = false;
@@ -706,24 +682,57 @@ class D3D12CommandProcessor : public CommandProcessor {
       native_guest_output_gpu_timing_slots_{};
   bool native_guest_output_gpu_timing_active_ = false;
 
-  struct ResolveDownscaleConstants {
-    uint32_t scale_x;
-    uint32_t scale_y;
-    uint32_t pixel_size_log2;
-    uint32_t tile_count;
-    uint32_t half_pixel_offset;
+  struct Fh1GpuPassTimingRecord {
+    uint64_t signature = 0;
+    uint64_t family = 0;
+    uint64_t attachment_state = 0;
+    uint64_t first_draw_family = 0;
+    uint64_t first_draw_identity = 0;
+    uint64_t terminal_copy_state = 0;
+    uint32_t draw_count = 0;
+    uint32_t query_offset = 0;
+    bool copy_started = false;
   };
-  enum class ResolveDownscaleRootParameter : UINT {
-    kConstants,
-    kSource,
-    kDestination,
-
-    kCount,
+  struct Fh1GpuPassTimingSlot {
+    uint64_t submission = 0;
+    uint32_t record_count = 0;
+    std::array<Fh1GpuPassTimingRecord, kFh1GpuPassTimingCapacity> records{};
   };
-  Microsoft::WRL::ComPtr<ID3D12RootSignature> resolve_downscale_root_signature_;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> resolve_downscale_pipeline_;
-  Microsoft::WRL::ComPtr<ID3D12Resource> resolve_downscale_buffer_;
-  uint32_t resolve_downscale_buffer_size_ = 0;
+  struct Fh1GpuPassTimingActive {
+    uint64_t frame = 0;
+    uint64_t attachment_state = 0;
+    uint64_t first_draw_family = 0;
+    uint64_t first_draw_identity = 0;
+    uint64_t running_signature = 0;
+    uint32_t slot_index = 0;
+    uint32_t draw_count = 0;
+    uint32_t hazard_flags = 0;
+    uint32_t record_index = UINT32_MAX;
+  };
+  struct Fh1GpuPassTimingAggregate {
+    uint64_t samples = 0;
+    uint64_t total_ns = 0;
+    uint64_t maximum_ns = 0;
+    uint64_t total_draw_ns = 0;
+    uint64_t total_resolve_ns = 0;
+    uint64_t maximum_resolve_ns = 0;
+    uint64_t total_draws = 0;
+    uint64_t attachment_state = 0;
+    uint64_t first_draw_family = 0;
+    uint64_t first_draw_identity = 0;
+    uint64_t terminal_copy_state = 0;
+    uint32_t minimum_draw_count = UINT32_MAX;
+    uint32_t maximum_draw_count = 0;
+  };
+  std::array<Fh1GpuPassTimingSlot, kQueueFrames>
+      fh1_gpu_pass_timing_slots_{};
+  Fh1GpuPassTimingActive fh1_gpu_pass_timing_active_{};
+  std::unordered_map<uint64_t, Fh1GpuPassTimingAggregate>
+      fh1_gpu_pass_timing_aggregates_;
+  std::unordered_map<uint64_t, Fh1GpuPassTimingAggregate>
+      fh1_gpu_pass_family_timing_aggregates_;
+  uint64_t fh1_gpu_pass_timing_drops_ = 0;
+  uint64_t fh1_gpu_pass_timing_last_log_frame_ = 0;
 
   // PWL gamma ramp can result in values with more precision than 10bpc. Though
   // those sub-10bpc bits don't have any noticeable visual effect, so normally
@@ -751,11 +760,6 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint32_t scratch_buffer_size_ = 0;
   D3D12_RESOURCE_STATES scratch_buffer_state_;
   bool scratch_buffer_used_ = false;
-
-  ID3D12Resource* readback_buffer_ = nullptr;
-  uint32_t readback_buffer_size_ = 0;
-  std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
-  std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
 
   static constexpr uint32_t kMaxOcclusionQueries = 8192;
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> occlusion_query_heap_;
@@ -869,6 +873,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::vector<D3D12TextureCache::SamplerParameters> current_samplers_pixel_;
   std::vector<uint32_t> current_sampler_bindless_indices_vertex_;
   std::vector<uint32_t> current_sampler_bindless_indices_pixel_;
+  // Last unsigned view, signed view and sampler on the fixed material root.
+  std::array<uint32_t, 3> fh1_fixed_descriptor_indices_{};
 
   // Latest bindful descriptor handles used for handling Xenos draw calls.
   D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_shared_memory_srv_and_edram_;

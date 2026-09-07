@@ -39,6 +39,9 @@ REXCVAR_DEFINE_INT32(host_present_fps_limit, 60, "UI/Presenter",
 REXCVAR_DEFINE_BOOL(host_present_sleep_spin, true, "UI/Presenter",
                     "Use a sleep/yield hybrid for host presentation pacing");
 
+REXCVAR_DEFINE_BOOL(pinyon_shift_fh1_source_presentation, false, "Pinyon Shift",
+                    "Present each real FH1 source frame exactly once");
+
 REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
                     "Enable letterboxing for non-native aspect ratios");
 
@@ -1516,6 +1519,12 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
   assert_true(surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable);
   std::lock_guard<std::mutex> pacing_lock(presentation_pacing_mutex_);
+  const uint64_t refresh_sequence =
+      guest_output_refresh_sequence_.load(std::memory_order_acquire);
+  if (REXCVAR_GET(pinyon_shift_fh1_source_presentation) &&
+      refresh_sequence == last_presented_refresh_sequence_) {
+    return PaintResult::kNotPresented;
+  }
   using PresentationClock = std::chrono::steady_clock;
   auto now = PresentationClock::now();
   const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1549,8 +1558,6 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
       PROFILE_PRESENT_DELTA_NS(present_time_ns - last_present_time_ns_);
     }
     last_present_time_ns_ = present_time_ns;
-    const uint64_t refresh_sequence =
-        guest_output_refresh_sequence_.load(std::memory_order_acquire);
     if (refresh_sequence == last_presented_refresh_sequence_) {
       PROFILE_DUPLICATE_PRESENT();
     }

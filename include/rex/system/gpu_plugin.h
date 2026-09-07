@@ -8,7 +8,7 @@
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
  *
- * @remarks     One plugin exists today (rexgpu-xenos). The factory carries an
+ * @remarks     One plugin exists today (rexgpu-fh1). The factory carries an
  *              ABI version so this can grow into a general plugin API later.
  */
 

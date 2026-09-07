@@ -41,6 +41,13 @@ class DebugOverlayDialog : public ImGuiDialog {
   static constexpr size_t kFrameHistorySize = 120;
   std::array<float, kFrameHistorySize> frame_time_history_{};
   size_t frame_history_idx_ = 0;
+  uint64_t rate_sample_tick_ = 0;
+  int64_t rate_source_frames_ = 0;
+  int64_t rate_presents_ = 0;
+  int64_t rate_simulation_time_ns_ = 0;
+  double source_fps_ = 0.0;
+  double present_fps_ = 0.0;
+  double title_speed_ = 0.0;
 #endif
 };
 

@@ -319,25 +319,6 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
   }
 }
 
-uint32_t Shader::GetInterpolatorInputMask(reg::SQ_PROGRAM_CNTL sq_program_cntl,
-                                          reg::SQ_CONTEXT_MISC sq_context_misc,
-                                          uint32_t& param_gen_pos_out) const {
-  assert_true(type() == xenos::ShaderType::kPixel);
-  uint32_t interpolator_count =
-      std::min(xenos::kMaxInterpolators,
-               std::max(register_static_address_bound(),
-                        GetDynamicAddressableRegisterCount(sq_program_cntl.ps_num_reg)));
-  uint32_t interpolator_mask = (UINT32_C(1) << interpolator_count) - 1;
-  if (sq_program_cntl.param_gen && sq_context_misc.param_gen_pos < interpolator_count) {
-    // Will be overwritten by PsParamGen.
-    interpolator_mask &= ~(UINT32_C(1) << sq_context_misc.param_gen_pos);
-    param_gen_pos_out = sq_context_misc.param_gen_pos;
-  } else {
-    param_gen_pos_out = UINT32_MAX;
-  }
-  return interpolator_mask;
-}
-
 void Shader::GatherExecInformation(const ParsedExecInstruction& instr,
                                    ucode::VertexFetchInstruction& previous_vfetch_full,
                                    uint32_t& unique_texture_bindings,
@@ -592,6 +573,7 @@ void Shader::GatherAluResultInformation(const InstructionResult& result, uint32_
   }
 }
 
+#if defined(REXGPU_FH1_SHADER_PRODUCER)
 ShaderTranslator::ShaderTranslator() = default;
 
 ShaderTranslator::~ShaderTranslator() = default;
@@ -748,6 +730,7 @@ void ShaderTranslator::TranslateControlFlowInstruction(const ControlFlowInstruct
   }
   // TODO(benvanik): return if (DoesControlFlowOpcodeEndShader(cf.opcode()))?
 }
+#endif
 
 void ParseControlFlowExec(const ControlFlowExecInstruction& cf, uint32_t cf_index,
                           ParsedExecInstruction& instr) {
@@ -871,6 +854,7 @@ void ParseControlFlowAlloc(const ControlFlowAllocInstruction& cf, uint32_t cf_in
   instr.is_vertex_shader = is_vertex_shader;
 }
 
+#if defined(REXGPU_FH1_SHADER_PRODUCER)
 void ShaderTranslator::TranslateExecInstructions(const ParsedExecInstruction& instr) {
   ProcessExecInstructionBegin(instr);
 
@@ -921,6 +905,7 @@ void ShaderTranslator::TranslateExecInstructions(const ParsedExecInstruction& in
 
   ProcessExecInstructionEnd(instr);
 }
+#endif
 
 static void ParseFetchInstructionResult(uint32_t dest, uint32_t swizzle, bool is_relative,
                                         InstructionResult& result) {

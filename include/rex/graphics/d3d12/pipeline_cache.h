@@ -22,11 +22,13 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include <rex/assert.h>
 #include <rex/graphics/d3d12/render_target_cache.h>
+#include <rex/graphics/d3d12/fh1_shader_pack.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
@@ -68,8 +70,8 @@ class PipelineCache {
 
   D3D12Shader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                           uint32_t dword_count);
-  // Analyze shader microcode on the translator thread.
-  void AnalyzeShaderUcode(Shader& shader) { shader.AnalyzeUcode(ucode_disasm_buffer_); }
+  // Normal FH1 execution must receive analysis from the offline catalog.
+  void AnalyzeShaderUcode(Shader& shader);
 
   // Retrieves the shader modification for the current state. The shader must
   // have microcode analyzed.
@@ -91,12 +93,60 @@ class PipelineCache {
                          const uint32_t* bound_depth_and_color_render_targets_formats,
                          void** pipeline_handle_out, ID3D12RootSignature** root_signature_out);
 
+  // Validate native-pass state without creating a guest PSO. Native bindings
+  // need only analyzed metadata; translated bindings require valid translations.
+  bool GetNativeDrawPipelineDescriptionHash(
+      D3D12Shader::D3D12Translation* vertex_shader,
+      D3D12Shader::D3D12Translation* pixel_shader,
+      const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+      reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
+      uint32_t bound_render_target_bits, const uint32_t* bound_render_target_formats,
+      uint64_t& hash_out, bool native_shader_bindings = false);
+
   // Returns a pipeline with deferred creation by its handle. May return nullptr
   // if failed to create the pipeline.
   ID3D12PipelineState* GetD3D12PipelineByHandle(void* handle) const {
     return reinterpret_cast<const Pipeline*>(handle)->state.load(std::memory_order_acquire);
   }
-
+  uint64_t GetPipelineDescriptionHash(void* handle) const;
+  bool IsFh1ClearPipeline(void* handle) const;
+  bool IsFh1ExecutionCovered(uint64_t identity) const {
+    return fh1_execution_allowlist_.contains(identity);
+  }
+  bool IsFh1CopyCovered(uint64_t identity) const {
+    return fh1_copy_allowlist_.contains(identity);
+  }
+  bool IsFh1PrewarmManifestLoaded() const {
+    return fh1_prewarm_manifest_loaded_;
+  }
+  bool IsFh1PipelinePrewarmed(uint64_t description_hash) const {
+    return fh1_prewarmed_pipeline_allowlist_.contains(description_hash);
+  }
+  uint64_t GetFh1RuntimeShaderTranslationCount() const {
+    return fh1_runtime_shader_translations_.load(std::memory_order_relaxed);
+  }
+  uint64_t GetFh1RuntimeSyncPipelineCreationCount() const {
+    return fh1_runtime_sync_pipeline_creations_.load(
+        std::memory_order_relaxed);
+  }
+  bool IsFh1WorldLitNativeActive() const {
+    return fh1_world_lit_native_pipeline_creations_.load(
+               std::memory_order_relaxed) != 0 &&
+           fh1_world_lit_native_pipeline_fallbacks_.load(
+               std::memory_order_relaxed) == 0;
+  }
+  bool IsFh1WorldLitUv2NativeActive() const {
+    return fh1_world_lit_uv2_native_pipeline_creations_.load(
+               std::memory_order_relaxed) != 0 &&
+           fh1_world_lit_uv2_native_pipeline_fallbacks_.load(
+               std::memory_order_relaxed) == 0;
+  }
+  bool IsFh1DepthMeshNativeActive() const {
+    return fh1_depth_mesh_native_pipeline_creations_.load(
+               std::memory_order_relaxed) != 0 &&
+           fh1_depth_mesh_native_pipeline_fallbacks_.load(
+               std::memory_order_relaxed) == 0;
+  }
  private:
   REXPACKEDSTRUCT(ShaderStoredHeader, {
     uint64_t ucode_data_hash;
@@ -266,15 +316,25 @@ class PipelineCache {
                           uint32_t dword_count, uint64_t data_hash);
 
   // Can be called from multiple threads.
-  bool TranslateAnalyzedShader(DxbcShaderTranslator& translator,
+  bool TranslateAnalyzedShader(DxbcShaderTranslator* translator,
                                D3D12Shader::D3D12Translation& translation,
                                IDxbcConverter* dxbc_converter = nullptr,
                                IDxcUtils* dxc_utils = nullptr,
                                IDxcCompiler* dxc_compiler = nullptr);
+  void RecordFh1RuntimeShaderTranslation();
+  void SetupShaderBindingLayouts(D3D12Shader& shader);
+  static std::span<const uint32_t> GetFh1PackedWorldTextureFetches(uint64_t hash);
+  bool IsFh1NativeStandaloneVertex(uint64_t hash, uint64_t modification) const;
+  bool IsFh1NativeShadowVertex(uint64_t hash, uint64_t modification) const;
+  bool IsFh1NativeShadowPipeline(const PipelineDescription& description) const;
+  bool IsFh1NativePositionPipeline(const PipelineDescription& description) const;
+  bool IsFh1NativeScenePipeline(const PipelineDescription& description) const;
+  bool PrepareFh1SceneBindings(D3D12Shader& vertex, D3D12Shader* pixel);
 
   // If draw_util::IsRasterizationPotentiallyDone is false, the pixel shader
   // MUST be made nullptr BEFORE calling this! The shaders must be translated
-  // and valid unless for_placeholder is true.
+  // and valid unless for_placeholder is true. Does not create root signatures
+  // or geometry shader bytecode; ConfigurePipeline supplies those objects.
   bool GetCurrentStateDescription(
       D3D12Shader::D3D12Translation* vertex_shader, D3D12Shader::D3D12Translation* pixel_shader,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
@@ -290,7 +350,8 @@ class PipelineCache {
   static void CreateDxbcGeometryShader(GeometryShaderKey key, std::vector<uint32_t>& shader_out);
   const std::vector<uint32_t>& GetGeometryShader(GeometryShaderKey key);
 
-  ID3D12PipelineState* CreateD3D12Pipeline(const PipelineRuntimeDescription& runtime_description);
+  ID3D12PipelineState* CreateD3D12Pipeline(
+      const PipelineRuntimeDescription& runtime_description, Pipeline* pipeline);
   bool PrepareRuntimeDescriptionForQueuedCreation(Pipeline* pipeline,
                                                   PipelineRuntimeDescription& runtime_description);
 
@@ -299,10 +360,15 @@ class PipelineCache {
   const D3D12RenderTargetCache& render_target_cache_;
   bool bindless_resources_used_;
 
-  // Temporary storage for AnalyzeUcode calls on the processor thread.
+  // Temporary storage for producer-only AnalyzeUcode calls.
+#if defined(REXGPU_FH1_SHADER_PRODUCER)
   string::StringBuffer ucode_disasm_buffer_;
-  // Reusable shader translator for the processor thread.
+#endif
+#if defined(REXGPU_FH1_SHADER_PRODUCER)
+  // The normal FH1 renderer contains no guest shader translator. This member
+  // exists only in the local offline pack producer plugin.
   std::unique_ptr<DxbcShaderTranslator> shader_translator_;
+#endif
   std::mutex translation_request_lock_;
 
   // Command processor thread DXIL conversion/disassembly interfaces, if DXIL
@@ -338,10 +404,6 @@ class PipelineCache {
   std::unordered_map<GeometryShaderKey, std::vector<uint32_t>, GeometryShaderKey::Hasher>
       geometry_shaders_;
 
-  // Empty depth-only pixel shader for writing to depth buffer via ROV when no
-  // Xenos pixel shader provided.
-  std::vector<uint8_t> depth_only_pixel_shader_;
-
   struct Pipeline {
     // nullptr if creation has failed.
     std::atomic<ID3D12PipelineState*> state{nullptr};
@@ -369,6 +431,25 @@ class PipelineCache {
   // Currently open shader storage path.
   std::filesystem::path shader_storage_cache_root_;
   uint32_t shader_storage_title_id_ = 0;
+  std::unordered_set<uint64_t> fh1_execution_allowlist_;
+  std::unordered_set<uint64_t> fh1_copy_allowlist_;
+  std::unordered_set<uint64_t> fh1_prewarmed_pipeline_allowlist_;
+  bool fh1_prewarm_manifest_loaded_ = false;
+  std::atomic<uint64_t> fh1_runtime_shader_translations_{0};
+  std::atomic<uint64_t> fh1_runtime_sync_pipeline_creations_{0};
+  Fh1ShaderPack fh1_shader_pack_;
+#if defined(REXGPU_FH1_SHADER_PRODUCER)
+  bool fh1_offline_shader_production_ = false;
+  bool fh1_analysis_catalog_dirty_ = false;
+#endif
+  std::atomic<uint64_t> fh1_shader_pack_hits_{0};
+  std::atomic<uint64_t> fh1_shader_pack_misses_{0};
+  std::atomic<uint64_t> fh1_world_lit_native_pipeline_creations_{0};
+  std::atomic<uint64_t> fh1_world_lit_native_pipeline_fallbacks_{0};
+  std::atomic<uint64_t> fh1_world_lit_uv2_native_pipeline_creations_{0};
+  std::atomic<uint64_t> fh1_world_lit_uv2_native_pipeline_fallbacks_{0};
+  std::atomic<uint64_t> fh1_depth_mesh_native_pipeline_creations_{0};
+  std::atomic<uint64_t> fh1_depth_mesh_native_pipeline_fallbacks_{0};
 
   // Shader storage output stream, for preload in the next emulator runs.
   FILE* shader_storage_file_ = nullptr;
@@ -381,7 +462,8 @@ class PipelineCache {
   FILE* pipeline_storage_file_ = nullptr;
   bool pipeline_storage_file_flush_needed_ = false;
 
-  // Thread for asynchronous writing to the storage streams.
+#if defined(REXGPU_FH1_SHADER_PRODUCER)
+  // Thread for asynchronous writing to the producer storage streams.
   void StorageWriteThread();
   std::mutex storage_write_request_lock_;
   std::condition_variable storage_write_request_cond_;
@@ -393,6 +475,7 @@ class PipelineCache {
   bool storage_write_flush_pipelines_ = false;
   bool storage_write_thread_shutdown_ = false;
   std::unique_ptr<rex::thread::Thread> storage_write_thread_;
+#endif
 
   // Pipeline creation threads.
   void CreationThread(size_t thread_index);

@@ -276,7 +276,7 @@ void PrimitiveProcessor::ClearPerFrameCache() {
   std::memset(cache_buckets_non_empty_l2_, 0, sizeof(cache_buckets_non_empty_l2_));
 }
 
-bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
+bool PrimitiveProcessor::Process(ProcessingResult& result_out, bool defer_guest_dma_residency) {
   SCOPE_profile_cpu_f("gpu");
 
   const RegisterFile& regs = register_file_;
@@ -907,7 +907,8 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
 
   // Request the indices in the shared memory if they need to be accessed from
   // there on the GPU.
-  if (cacheable.index_buffer_type == ProcessedIndexBufferType::kGuestDMA ||
+  if ((cacheable.index_buffer_type == ProcessedIndexBufferType::kGuestDMA &&
+       !defer_guest_dma_residency) ||
       cacheable.index_buffer_type == ProcessedIndexBufferType::kHostBuiltinForDMA) {
     // Request the index buffer memory.
     // TODO(Triang3l): Shared memory request cache.

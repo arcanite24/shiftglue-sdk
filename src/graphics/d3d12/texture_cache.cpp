@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/graphics/pipeline/texture/bc3_import.h>
 #include <algorithm>
 #include <array>
 #include <cfloat>
@@ -33,14 +34,6 @@
 #include <rex/ui/d3d12/d3d12_util.h>
 
 namespace rex::graphics::d3d12 {
-
-static void RetainNativeTextureResource(void* resource) {
-  static_cast<ID3D12Resource*>(resource)->AddRef();
-}
-
-static void ReleaseNativeTextureResource(void* resource) {
-  static_cast<ID3D12Resource*>(resource)->Release();
-}
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -705,6 +698,12 @@ void D3D12TextureCache::EndFrame() {
   }
 }
 
+void D3D12TextureCache::RequestFh1Textures(uint32_t used_texture_mask) {
+  request_fh1_bc3_ = true;
+  RequestTextures(used_texture_mask);
+  request_fh1_bc3_ = false;
+}
+
 void D3D12TextureCache::RequestTextures(uint32_t used_texture_mask) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
@@ -771,72 +770,6 @@ void D3D12TextureCache::RequestTextures(uint32_t used_texture_mask) {
           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
-  }
-}
-
-void D3D12TextureCache::ObserveNativeTextures(
-    uint32_t used_texture_mask,
-    system::GraphicsNativeTextureSetObservation& observation) const {
-  observation.backend = system::GraphicsNativeTextureBackend::kD3D12;
-  observation.used_texture_mask = used_texture_mask;
-  uint32_t textures_remaining = used_texture_mask;
-  uint32_t index;
-  while (rex::bit_scan_forward(textures_remaining, &index)) {
-    textures_remaining &= ~(uint32_t(1) << index);
-    const TextureBinding* binding = GetValidTextureBinding(index);
-    if (!binding) {
-      continue;
-    }
-    const D3D12Texture* texture =
-        static_cast<const D3D12Texture*>(binding->texture);
-    if (!texture) {
-      texture = static_cast<const D3D12Texture*>(binding->texture_signed);
-    }
-    if (!texture || !texture->resource()) {
-      continue;
-    }
-    if (observation.resource_count >=
-        system::kGraphicsNativeTextureResourceObservationLimit) {
-      ++observation.resource_overflow;
-      continue;
-    }
-    system::GraphicsNativeTextureResourceObservation& resource =
-        observation.resources[observation.resource_count++];
-    const TextureKey& key = texture->key();
-    const xenos::xe_gpu_texture_fetch_t fetch =
-        register_file().GetTextureFetch(index);
-    std::memcpy(resource.fetch_dwords, &fetch, sizeof(resource.fetch_dwords));
-    resource.fetch_constant = index;
-    resource.base_address = key.base_page << 12;
-    resource.base_length = texture->GetGuestBaseSize();
-    resource.mip_address = key.mip_page << 12;
-    resource.mip_length = texture->GetGuestMipsSize();
-    resource.guest_format = uint32_t(key.format);
-    resource.guest_dimension = uint32_t(key.dimension);
-    resource.guest_width = key.GetWidth();
-    resource.guest_height = key.GetHeight();
-    resource.guest_depth_or_array_size = key.GetDepthOrArraySize();
-    resource.guest_pitch = key.pitch << 5;
-    resource.guest_row_pitch_bytes =
-        texture->guest_layout().base.row_pitch_bytes;
-    resource.guest_endianness = uint32_t(key.endianness);
-    resource.guest_mip_max_level = key.mip_max_level;
-    resource.guest_tiled = key.tiled;
-    resource.guest_packed_mips = key.packed_mips;
-    const D3D12_RESOURCE_DESC host_desc = texture->resource()->GetDesc();
-    resource.host_resource_format = uint32_t(host_desc.Format);
-    resource.host_view_format = uint32_t(GetDXGIUnormFormat(key));
-    resource.host_swizzle = binding->host_swizzle;
-    resource.host_swizzled_signs = binding->swizzled_signs;
-    resource.host_dimension = uint32_t(host_desc.Dimension);
-    resource.host_mip_levels = host_desc.MipLevels;
-    resource.host_depth_or_array_size = host_desc.DepthOrArraySize;
-    resource.host_width = host_desc.Width;
-    resource.host_height = host_desc.Height;
-    resource.host_allocation_bytes = texture->GetHostMemoryUsage();
-    resource.resource = texture->resource();
-    resource.retain = &RetainNativeTextureResource;
-    resource.release = &ReleaseNativeTextureResource;
   }
 }
 
@@ -1442,9 +1375,13 @@ void D3D12TextureCache::CreateCurrentScaledResolveRangeUintPow2UAV(
 ID3D12Resource* D3D12TextureCache::RequestSwapTexture(D3D12_SHADER_RESOURCE_VIEW_DESC& srv_desc_out,
                                                       xenos::TextureFormat& format_out,
                                                       uint32_t* width_unscaled_out,
-                                                      uint32_t* height_unscaled_out) {
+                                                      uint32_t* height_unscaled_out,
+                                                      D3D12_RESOURCE_STATES state,
+                                                      const xenos::xe_gpu_texture_fetch_t*
+                                                          fetch_override) {
   const auto& regs = register_file();
-  xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(0);
+  xenos::xe_gpu_texture_fetch_t fetch =
+      fetch_override ? *fetch_override : regs.GetTextureFetch(0);
   TextureKey key;
   BindingInfoFromFetchConstant(fetch, key, nullptr);
   if (!key.is_valid || key.base_page == 0 || key.dimension != xenos::DataDimension::k2DOrStacked) {
@@ -1460,8 +1397,7 @@ ID3D12Resource* D3D12TextureCache::RequestSwapTexture(D3D12_SHADER_RESOURCE_VIEW
   // PIXEL_SHADER_RESOURCE.
   ID3D12Resource* texture_resource = texture->resource();
   command_processor_.PushTransitionBarrier(
-      texture_resource, texture->SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      texture_resource, texture->SetResourceState(state), state);
   srv_desc_out.Format = GetDXGIUnormFormat(key);
   srv_desc_out.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
   srv_desc_out.Shader4ComponentMapping =
@@ -1629,6 +1565,89 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
     return nullptr;
   }
   return std::unique_ptr<Texture>(new D3D12Texture(*this, key, resource.Get(), resource_state));
+}
+
+bool D3D12TextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_base, bool load_mips) {
+  if (!request_fh1_bc3_) return false;
+  const TextureKey key = texture.key();
+  if (key.scaled_resolve || texture.force_load_3d_tiling() ||
+      key.dimension != xenos::DataDimension::k2DOrStacked ||
+      key.GetDepthOrArraySize() != 1 || key.format != xenos::TextureFormat::k_DXT4_5 ||
+      !key.base_page || key.GetWidth() > 512 || key.GetHeight() > 512 ||
+      GetDXGIResourceFormat(key.format, key.GetWidth(), key.GetHeight()) != DXGI_FORMAT_BC3_UNORM) {
+    return false;
+  }
+  std::vector<uint8_t> base(texture.GetGuestBaseSize()), mips(texture.GetGuestMipsSize());
+  if (!shared_memory().CopyCpuRange(key.base_page << 12, base) ||
+      !shared_memory().CopyCpuRange(key.mip_page << 12, mips)) {
+    return false;
+  }
+  xenos::xe_gpu_texture_fetch_t fetch{};
+  fetch.type = xenos::FetchConstantType::kTexture;
+  fetch.dimension = key.dimension;
+  fetch.format = key.format;
+  fetch.size_2d.width = key.GetWidth() - 1;
+  fetch.size_2d.height = key.GetHeight() - 1;
+  fetch.pitch = key.pitch;
+  fetch.tiled = key.tiled;
+  fetch.packed_mips = key.packed_mips;
+  fetch.base_address = key.base_page;
+  fetch.mip_address = key.mip_page;
+  fetch.mip_max_level = key.mip_max_level;
+  fetch.endianness = key.endianness;
+  std::vector<uint8_t> linear;
+  try {
+    linear = texture_util::ImportBc3(fetch, base, mips);
+  } catch (const std::exception&) {
+    return false;
+  }
+  auto& d3d12_texture = static_cast<D3D12Texture&>(texture);
+  ID3D12Resource* resource = d3d12_texture.resource();
+  const auto desc = resource->GetDesc();
+  const uint32_t first = load_base ? 0 : 1;
+  const uint32_t last = load_mips ? key.mip_max_level : 0;
+  const uint32_t count = last - first + 1;
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[xenos::kTextureMaxMips];
+  UINT64 size;
+  command_processor_.GetD3D12Provider().GetDevice()->GetCopyableFootprints(
+      &desc, first, count, 0, footprints, nullptr, nullptr, &size);
+  ID3D12Resource* upload;
+  size_t offset;
+  uint8_t* mapping = command_processor_.GetConstantBufferPool().Request(
+      command_processor_.GetCurrentFrame(), size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT,
+      &upload, &offset, nullptr);
+  if (!mapping) return false;
+  size_t linear_offset = 0;
+  for (uint32_t mip = 0; mip <= last; ++mip) {
+    const uint32_t row_bytes = ((std::max(key.GetWidth() >> mip, 1u) + 3) / 4) * 16;
+    const uint32_t rows = (std::max(key.GetHeight() >> mip, 1u) + 3) / 4;
+    if (mip >= first) {
+      const auto& footprint = footprints[mip - first];
+      for (uint32_t row = 0; row < rows; ++row) {
+        std::memcpy(mapping + footprint.Offset + size_t(row) * footprint.Footprint.RowPitch,
+                    linear.data() + linear_offset + size_t(row) * row_bytes, row_bytes);
+      }
+    }
+    linear_offset += size_t(row_bytes) * rows;
+  }
+  d3d12_texture.MarkAsUsed();
+  command_processor_.PushTransitionBarrier(resource,
+      d3d12_texture.SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST), D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor_.SubmitBarriers();
+  D3D12_TEXTURE_COPY_LOCATION source{}, dest{};
+  source.pResource = upload;
+  source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  dest.pResource = resource;
+  dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  for (uint32_t mip = first; mip <= last; ++mip) {
+    source.PlacedFootprint = footprints[mip - first];
+    source.PlacedFootprint.Offset += offset;
+    dest.SubresourceIndex = mip;
+    command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(&dest, 0, 0, 0, &source, nullptr);
+  }
+  REXGPU_INFO("FH1 CPU BC3 import {}x{}, mips {}-{}, {} decoded bytes",
+              key.GetWidth(), key.GetHeight(), first, last, linear.size());
+  return true;
 }
 
 bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,

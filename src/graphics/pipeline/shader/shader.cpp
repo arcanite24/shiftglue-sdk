@@ -44,6 +44,82 @@ Shader::~Shader() {
   }
 }
 
+uint32_t Shader::GetInterpolatorInputMask(reg::SQ_PROGRAM_CNTL sq_program_cntl,
+                                          reg::SQ_CONTEXT_MISC sq_context_misc,
+                                          uint32_t& param_gen_pos_out) const {
+  assert_true(type() == xenos::ShaderType::kPixel);
+  uint32_t interpolator_count =
+      std::min(xenos::kMaxInterpolators,
+               std::max(register_static_address_bound(),
+                        GetDynamicAddressableRegisterCount(sq_program_cntl.ps_num_reg)));
+  uint32_t interpolator_mask = (UINT32_C(1) << interpolator_count) - 1;
+  if (sq_program_cntl.param_gen && sq_context_misc.param_gen_pos < interpolator_count) {
+    interpolator_mask &= ~(UINT32_C(1) << sq_context_misc.param_gen_pos);
+    param_gen_pos_out = sq_context_misc.param_gen_pos;
+  } else {
+    param_gen_pos_out = UINT32_MAX;
+  }
+  return interpolator_mask;
+}
+
+bool Shader::LoadRuntimeAnalysis(RuntimeAnalysis analysis) {
+  if (is_ucode_analyzed_ || analysis.vertex_bindings.size() > 96 ||
+      analysis.constant_register_map.float_count > 256 ||
+      (analysis.writes_interpolators & ~((uint32_t(1) << xenos::kMaxInterpolators) - 1)) ||
+      (analysis.writes_point_size_edge_flag_kill_vertex & ~uint32_t(0b111)) ||
+      (analysis.writes_color_targets & ~uint32_t(0b1111)) ||
+      (analysis.memexport_eM_written & ~uint8_t(0b11111))) {
+    return false;
+  }
+  uint32_t float_count = 0;
+  for (uint64_t bitmap : analysis.constant_register_map.float_bitmap) {
+    float_count += rex::bit_count(bitmap);
+  }
+  if (analysis.constant_register_map.float_dynamic_addressing) {
+    if (float_count != 256 || analysis.constant_register_map.float_count != 256) {
+      return false;
+    }
+  } else if (float_count != analysis.constant_register_map.float_count) {
+    return false;
+  }
+  uint32_t vertex_fetch_seen[3] = {};
+  for (const RuntimeAnalysis::VertexBinding& binding : analysis.vertex_bindings) {
+    if (shader_type_ != xenos::ShaderType::kVertex || binding.fetch_constant >= 96 ||
+        binding.stride_words > 0xFF ||
+        (vertex_fetch_seen[binding.fetch_constant / 32] &
+         (uint32_t(1) << (binding.fetch_constant % 32)))) {
+      return false;
+    }
+    vertex_fetch_seen[binding.fetch_constant / 32] |=
+        uint32_t(1) << (binding.fetch_constant % 32);
+  }
+  for (uint32_t constant : analysis.memexport_stream_constants) {
+    if (constant >= 256) {
+      return false;
+    }
+  }
+
+  vertex_bindings_.reserve(analysis.vertex_bindings.size());
+  for (const RuntimeAnalysis::VertexBinding& binding : analysis.vertex_bindings) {
+    vertex_bindings_.push_back({int(vertex_bindings_.size()), binding.fetch_constant,
+                                binding.stride_words, {}});
+  }
+  constant_register_map_ = analysis.constant_register_map;
+  memexport_stream_constants_ = std::move(analysis.memexport_stream_constants);
+  register_static_address_bound_ = analysis.register_static_address_bound;
+  writes_interpolators_ = analysis.writes_interpolators;
+  writes_point_size_edge_flag_kill_vertex_ =
+      analysis.writes_point_size_edge_flag_kill_vertex;
+  writes_color_targets_ = analysis.writes_color_targets;
+  memexport_eM_written_ = analysis.memexport_eM_written;
+  uses_register_dynamic_addressing_ = analysis.uses_register_dynamic_addressing;
+  kills_pixels_ = analysis.kills_pixels;
+  uses_texture_fetch_instruction_results_ = analysis.uses_texture_fetch_instruction_results;
+  writes_depth_ = analysis.writes_depth;
+  is_ucode_analyzed_ = true;
+  return true;
+}
+
 std::string Shader::Translation::GetTranslatedBinaryString() const {
   std::string result;
   result.resize(translated_binary_.size());

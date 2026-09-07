@@ -276,33 +276,10 @@ class CommandProcessor {
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;
   uint64_t observation_frame_sequence_ = 1;
-  uint64_t observation_draw_sequence_ = 0;
   uint64_t observation_copy_sequence_ = 0;
-  uint32_t observation_packet_physical_address_ = UINT32_MAX;
-  uint32_t observation_packet_ = 0;
-  struct ObservationCommandBufferContext {
-    uint32_t physical_address = UINT32_MAX;
-    uint32_t length_dwords = 0;
-    uint32_t parent_packet_physical_address = UINT32_MAX;
-    uint32_t root_physical_address = UINT32_MAX;
-    uint32_t depth = 0;
-  };
-  ObservationCommandBufferContext observation_command_buffer_{};
-  struct ShaderConstantWriteState {
-    uint64_t frame_sequence = 0;
-    uint32_t packet_physical_address = UINT32_MAX;
-    uint32_t command_buffer_physical_address = UINT32_MAX;
-    uint32_t command_buffer_length_dwords = 0;
-    uint32_t command_buffer_parent_packet_physical_address = UINT32_MAX;
-    uint32_t command_buffer_root_physical_address = UINT32_MAX;
-    uint32_t command_buffer_depth = 0;
-    uint32_t packet = 0;
-    uint32_t value = 0;
-    bool valid = false;
-  };
-  std::array<ShaderConstantWriteState, 512 * 4>
-      shader_constant_write_state_{};
-
+  uint32_t observation_draw_buffer_base_ = 0;
+  uint32_t observation_draw_buffer_bytes_ = 0;
+  uint32_t observation_draw_buffer_end_offset_ = 0;
   bool paused_ = false;
 
   // By default (such as for tools), post-processing is disabled.

@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <span>
 #include <vector>
 
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
@@ -67,6 +68,10 @@ class DxbcShader : public Shader {
     return sampler_bindings_;
   }
 
+  bool LoadPrecompiledBindings(std::span<const TextureBinding> texture_bindings,
+                               std::span<const SamplerBinding> sampler_bindings,
+                               uint32_t used_texture_mask);
+
  protected:
   Translation* CreateTranslationInstance(uint64_t modification) override;
 
@@ -74,6 +79,7 @@ class DxbcShader : public Shader {
   friend class DxbcShaderTranslator;
 
   std::atomic_flag bindings_setup_entered_ = ATOMIC_FLAG_INIT;
+  std::atomic<bool> bindings_setup_complete_ = false;
   std::vector<TextureBinding> texture_bindings_;
   std::vector<SamplerBinding> sampler_bindings_;
   uint32_t used_texture_mask_ = 0;

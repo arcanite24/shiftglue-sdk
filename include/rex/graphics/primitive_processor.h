@@ -167,7 +167,8 @@ class PrimitiveProcessor {
 
   // Submission must be open to call (may request the index buffer in the shared
   // memory).
-  bool Process(ProcessingResult& result_out);
+  // If deferred, the caller must provide an index buffer or request guest DMA residency.
+  bool Process(ProcessingResult& result_out, bool defer_guest_dma_residency = false);
 
   // Invalidates the cache within the range.
   std::pair<uint32_t, uint32_t> MemoryInvalidationCallback(uint32_t physical_address_start,

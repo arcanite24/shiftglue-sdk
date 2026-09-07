@@ -24,6 +24,7 @@
 
 #include <rex/assert.h>
 #include <rex/graphics/d3d12/shared_memory.h>
+#include <rex/graphics/d3d12/fh1_clear.h>
 #include <rex/graphics/d3d12/texture_cache.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
@@ -55,10 +56,15 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   void CompletedSubmissionUpdated();
   void BeginSubmission();
 
-  Path GetPath() const override { return path_; }
+  Path GetPath() const override { return Path::kHostRenderTargets; }
 
   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
+
+  // Called only after Update has established ownership and transferred contents.
+  bool ClearFh1Rectangles(std::span<const Fh1ClearRectangle> rectangles,
+                         std::span<const std::array<float, 4>> colors,
+                         bool color, bool depth, bool stencil, uint8_t reference);
 
   void InvalidateCommandListRenderTargets() {
     are_current_command_list_render_targets_valid_ = false;
@@ -96,86 +102,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     return depth_float24_convert_in_pixel_shader_;
   }
 
-  // Seeds and binds private clones of the current depth and first color target.
-  // EndIsolatedReplayTarget restores the guest bindings without changing the
-  // guest attachments or ownership.
-  bool BeginIsolatedReplayTarget(uint32_t& width_out, uint32_t& height_out,
-                                 system::GraphicsIsolatedDrawTargetFailure&
-                                     failure_out,
-                                 uint32_t logical_width,
-                                 uint32_t logical_height,
-                                 bool stencil_seed_probe_requested,
-                                 bool depth_only_target = false,
-                                 bool color_only_target = false);
-  bool ResumeIsolatedReplayTarget(uint32_t& width_out, uint32_t& height_out,
-                                  system::GraphicsIsolatedDrawTargetFailure&
-                                      failure_out,
-                                  uint32_t logical_width,
-                                  uint32_t logical_height,
-                                  bool depth_only_target = false,
-                                  bool color_only_target = false);
-  system::GraphicsIsolatedDrawReadbackStatus QueueIsolatedReplayReadback(
-      system::GraphicsIsolatedDrawReadbackCompletion completion,
-      uint32_t* failure_detail_out);
-  system::GraphicsIsolatedDrawReadbackStatus QueueGuestColorReadback(
-      system::GraphicsIsolatedDrawReadbackCompletion completion,
-      uint32_t* failure_detail_out);
-  system::GraphicsIsolatedDrawReadbackStatus QueueGuestConsumerColorReadback(
-      bool before_draw,
-      system::GraphicsIsolatedDrawReadbackCompletion completion,
-      uint32_t* failure_detail_out);
-  system::GraphicsIsolatedDrawReadbackStatus QueueGuestConsumerDepthReadback(
-      bool before_draw,
-      system::GraphicsIsolatedDrawReadbackCompletion completion,
-      uint32_t* failure_detail_out);
-  system::GraphicsIsolatedDrawReadbackStatus QueueIsolatedReplayDepthReadback(
-      system::GraphicsIsolatedDrawReadbackCompletion completion,
-      uint32_t* failure_detail_out);
-  system::GraphicsIsolatedDrawReadbackStatus
-  QueueIsolatedReplaySeedDepthReadback(
-      system::GraphicsIsolatedDrawReadbackCompletion completion,
-      uint32_t* failure_detail_out);
-  system::GraphicsIsolatedDrawReadbackStatus QueueGuestSeedDepthReadback(
-      system::GraphicsIsolatedDrawReadbackCompletion completion,
-      uint32_t* failure_detail_out);
-  system::GraphicsIsolatedDrawReadbackStatus QueueGuestDepthReadback(
-      system::GraphicsIsolatedDrawReadbackCompletion completion,
-      uint32_t* failure_detail_out);
-  void EndIsolatedReplayTarget(
-      uint64_t frame_sequence,
-      bool defer_preview_publication_until_swap = false,
-      bool depth_only_target = false,
-      bool frame_accumulator_source = false);
-  void CommitDeferredIsolatedReplayPreview(uint64_t frame_sequence);
-  void CancelDeferredIsolatedReplayPreview(uint64_t frame_sequence);
-  system::GraphicsIsolatedDrawPublicationResult PublishIsolatedReplayTarget(
-      bool depth_only_target = false);
-  system::GraphicsNativeFrameAccumulatorResult
-  ApplyIsolatedReplayFrameAccumulator(
-      uint64_t frame_sequence,
-      const system::GraphicsNativeFrameAccumulatorRequest& request);
   void PopulateCopySourceTopology(
       system::GraphicsCopyObservation& observation) const;
-
-  struct IsolatedReplayPreviewSource {
-    ID3D12Resource* resource = nullptr;
-    D3D12_RESOURCE_STATES previous_state = D3D12_RESOURCE_STATE_COMMON;
-    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
-    uint32_t width = 0;
-    uint32_t height = 0;
-    uint32_t logical_width = 0;
-    uint32_t logical_height = 0;
-    uint64_t frame_sequence = 0;
-    bool resolved = false;
-    bool frame_accumulator = false;
-  };
-  bool BeginIsolatedReplayPreview(uint64_t required_frame_sequence,
-                                  IsolatedReplayPreviewSource& source_out);
-  void EndIsolatedReplayPreview(
-      const IsolatedReplayPreviewSource& source);
-  uint64_t GetIsolatedReplayPreviewFrameSequence() const {
-    return isolated_replay_preview_frame_sequence_;
-  }
 
   DXGI_FORMAT GetColorResourceDXGIFormat(xenos::ColorRenderTargetFormat format) const;
   DXGI_FORMAT GetColorDrawDXGIFormat(xenos::ColorRenderTargetFormat format) const;
@@ -219,7 +147,6 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   D3D12CommandProcessor& command_processor_;
   bool bindless_resources_used_;
 
-  Path path_ = Path::kHostRenderTargets;
 
   // For host render targets, an EDRAM-sized scratch buffer for:
   // - Guest render target data copied from host render targets during copying
@@ -659,32 +586,6 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     }
   };
 
-  struct DirectResolvePushConstants {
-    draw_util::ResolveCopyShaderConstants resolve;
-    uint32_t source_base_tiles;
-    uint32_t source_pitch_tiles;
-    uint32_t dispatch_first_tile;
-  };
-
-  struct DirectResolvePipelineKey {
-    DumpPipelineKey dump_pipeline_key;
-    draw_util::ResolveCopyShaderIndex copy_shader;
-    bool draw_resolution_scaled;
-
-    uint64_t packed() const {
-      return uint64_t(dump_pipeline_key.key) | (uint64_t(size_t(copy_shader)) << 32) |
-             (uint64_t(draw_resolution_scaled ? 1 : 0) << 40);
-    }
-    struct Hasher {
-      size_t operator()(const DirectResolvePipelineKey& key) const {
-        return std::hash<uint64_t>{}(key.packed());
-      }
-    };
-    bool operator==(const DirectResolvePipelineKey& other_key) const {
-      return packed() == other_key.packed();
-    }
-  };
-
   // Returns:
   // - A pointer to 1 pipeline for writing color or depth (or stencil via
   //   SV_StencilRef).
@@ -726,11 +627,6 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   void SetCommandListRenderTargets(RenderTarget* const* depth_and_color_render_targets);
 
   ID3D12PipelineState* GetOrCreateDumpPipeline(DumpPipelineKey key);
-  ID3D12PipelineState* GetOrCreateDirectResolvePipeline(DirectResolvePipelineKey key);
-  bool TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
-                              draw_util::ResolveCopyShaderIndex copy_shader,
-                              bool draw_resolution_scaled);
-
   // Writes contents of host render targets within rectangles from
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
   bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
@@ -747,83 +643,6 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
 
   std::shared_ptr<ui::d3d12::D3D12CpuDescriptorPool> descriptor_pool_color_;
   std::shared_ptr<ui::d3d12::D3D12CpuDescriptorPool> descriptor_pool_depth_;
-  std::unique_ptr<RenderTarget> isolated_replay_color_target_;
-  std::unique_ptr<RenderTarget> isolated_replay_depth_target_;
-  std::unique_ptr<RenderTarget> isolated_replay_depth_only_target_;
-  RenderTarget* isolated_replay_active_depth_target_ = nullptr;
-  Microsoft::WRL::ComPtr<ID3D12Resource>
-      isolated_replay_preview_resolved_target_;
-  D3D12_RESOURCE_STATES isolated_replay_preview_resolved_target_state_ =
-      D3D12_RESOURCE_STATE_RESOLVE_DEST;
-  Microsoft::WRL::ComPtr<ID3D12Resource>
-      isolated_replay_frame_accumulator_target_;
-  D3D12_RESOURCE_STATES isolated_replay_frame_accumulator_target_state_ =
-      D3D12_RESOURCE_STATE_COPY_DEST;
-  Microsoft::WRL::ComPtr<ID3D12Resource>
-      isolated_replay_frame_accumulator_resolved_source_;
-  D3D12_RESOURCE_STATES
-      isolated_replay_frame_accumulator_resolved_source_state_ =
-          D3D12_RESOURCE_STATE_RESOLVE_DEST;
-  ID3D12RootSignature*
-      isolated_replay_frame_accumulator_2xmsaa_root_signature_ = nullptr;
-  ID3D12PipelineState*
-      isolated_replay_frame_accumulator_2xmsaa_pipeline_ = nullptr;
-  ID3D12PipelineState*
-      isolated_replay_frame_accumulator_4xmsaa_pipeline_ = nullptr;
-  uint64_t isolated_replay_frame_accumulator_frame_sequence_ = 0;
-  uint64_t isolated_replay_frame_accumulator_source_frame_sequence_ = 0;
-  uint64_t isolated_replay_frame_accumulator_committed_frame_sequence_ = 0;
-  uint32_t isolated_replay_frame_accumulator_width_ = 0;
-  uint32_t isolated_replay_frame_accumulator_height_ = 0;
-  uint32_t isolated_replay_frame_accumulator_logical_height_ = 0;
-  uint32_t isolated_replay_frame_accumulator_appended_row_end_ = 0;
-  bool isolated_replay_frame_accumulator_reseed_required_ = false;
-  uint64_t isolated_replay_preview_frame_sequence_ = 0;
-  uint64_t isolated_replay_deferred_preview_frame_sequence_ = 0;
-  uint32_t isolated_replay_active_preview_width_ = 0;
-  uint32_t isolated_replay_active_preview_height_ = 0;
-  uint32_t isolated_replay_preview_width_ = 0;
-  uint32_t isolated_replay_preview_height_ = 0;
-  uint32_t isolated_replay_deferred_preview_width_ = 0;
-  uint32_t isolated_replay_deferred_preview_height_ = 0;
-  struct IsolatedReplayReadback {
-    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
-    Microsoft::WRL::ComPtr<ID3D12Resource> resolved_target;
-    uint8_t* mapping = nullptr;
-    uint64_t submission = 0;
-    uint64_t data_size = 0;
-    uint32_t width = 0;
-    uint32_t height = 0;
-    uint32_t row_pitch = 0;
-    uint32_t format = 0;
-    uint32_t sample_count = 1;
-    uint32_t plane_count = 0;
-    uint64_t plane_offsets[system::GraphicsIsolatedDrawReadback::kMaxPlanes] =
-        {};
-    uint32_t
-        plane_row_pitches[system::GraphicsIsolatedDrawReadback::kMaxPlanes] =
-            {};
-    uint32_t
-        plane_row_sizes[system::GraphicsIsolatedDrawReadback::kMaxPlanes] = {};
-    uint32_t
-        plane_row_counts[system::GraphicsIsolatedDrawReadback::kMaxPlanes] = {};
-    system::GraphicsIsolatedDrawReadbackCompletion completion = nullptr;
-  } isolated_replay_readback_;
-  IsolatedReplayReadback guest_reference_readback_;
-  IsolatedReplayReadback guest_consumer_before_readback_;
-  IsolatedReplayReadback guest_consumer_after_readback_;
-  IsolatedReplayReadback guest_consumer_before_depth_readback_;
-  IsolatedReplayReadback guest_consumer_after_depth_readback_;
-  IsolatedReplayReadback isolated_replay_depth_readback_;
-  IsolatedReplayReadback guest_depth_reference_readback_;
-  IsolatedReplayReadback isolated_replay_seed_depth_readback_;
-  IsolatedReplayReadback guest_seed_depth_readback_;
-  system::GraphicsIsolatedDrawReadbackStatus QueueRenderTargetReadback(
-      D3D12RenderTarget* target, IsolatedReplayReadback& pending_readback,
-      system::GraphicsIsolatedDrawReadbackCompletion completion,
-      uint32_t* failure_detail_out);
-  ID3D12RootSignature* isolated_depth_readback_root_signature_ = nullptr;
-  ID3D12PipelineState* isolated_depth_readback_pipeline_ = nullptr;
   std::shared_ptr<ui::d3d12::D3D12CpuDescriptorPool> descriptor_pool_srv_;
   ui::d3d12::D3D12CpuDescriptorPool::Descriptor null_rtv_descriptor_ss_;
   ui::d3d12::D3D12CpuDescriptorPool::Descriptor null_rtv_descriptor_ms_;
@@ -875,7 +694,6 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // Temporary storage for DumpRenderTargets.
   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;
   std::vector<DumpInvocation> dump_invocations_;
-  std::vector<ResolveCopyDispatch> direct_resolve_dispatches_;
 
   ID3D12RootSignature* dump_root_signature_color_ = nullptr;
   ID3D12RootSignature* dump_root_signature_depth_ = nullptr;
@@ -883,14 +701,6 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // buffer. May be null if failed to create.
   std::unordered_map<DumpPipelineKey, ID3D12PipelineState*, DumpPipelineKey::Hasher>
       dump_pipelines_;
-  ID3D12RootSignature* direct_resolve_root_signature_color_ = nullptr;
-  ID3D12RootSignature* direct_resolve_root_signature_depth_ = nullptr;
-  std::unordered_map<DirectResolvePipelineKey, ID3D12PipelineState*,
-                     DirectResolvePipelineKey::Hasher>
-      direct_resolve_pipelines_;
-  uint64_t direct_resolve_attempt_count_ = 0;
-  uint64_t direct_resolve_success_count_ = 0;
-  uint64_t direct_resolve_fallback_count_ = 0;
   draw_util::ResolveInfo copy_observation_resolve_info_{};
   bool copy_observation_resolve_info_valid_ = false;
 

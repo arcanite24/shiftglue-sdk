@@ -30,6 +30,7 @@ constexpr size_t kNumCounters = static_cast<size_t>(CounterId::kCount);
 
 std::array<std::atomic<int64_t>, kNumCounters> g_counters{};
 std::array<std::atomic<int64_t>, kNumCounters> g_snapshot{};
+std::array<std::atomic<int64_t>, kNumCounters> g_totals{};
 
 constexpr const char* kCounterNames[] = {
     "frame_time_us",
@@ -90,6 +91,9 @@ constexpr const char* kCounterNames[] = {
     "guest_vblank_count",
     "guest_vblank_delta_ns",
     "simulation_tick_count",
+    "simulation_time_ns",
+    "simulation_delta_invalid",
+    "source_frame_count",
     "present_count",
     "present_delta_ns",
     "present_queue_depth",
@@ -160,6 +164,9 @@ constexpr bool kIsGauge[] = {
     false,  // kGuestVblankCount
     false,  // kGuestVblankDeltaNs
     false,  // kSimulationTickCount
+    false,  // kSimulationTimeNs
+    false,  // kSimulationDeltaInvalid
+    false,  // kSourceFrameCount
     false,  // kPresentCount
     false,  // kPresentDeltaNs
     false,  // kPresentQueueDepth
@@ -188,11 +195,17 @@ void SetCounter(CounterId id, int64_t value) {
 }
 
 void IncrementCounter(CounterId id, int64_t delta) {
-  g_counters[static_cast<size_t>(id)].fetch_add(delta, std::memory_order_relaxed);
+  const size_t index = static_cast<size_t>(id);
+  g_counters[index].fetch_add(delta, std::memory_order_relaxed);
+  g_totals[index].fetch_add(delta, std::memory_order_relaxed);
 }
 
 int64_t GetCounter(CounterId id) {
   return g_counters[static_cast<size_t>(id)].load(std::memory_order_relaxed);
+}
+
+int64_t GetTotalCounter(CounterId id) {
+  return g_totals[static_cast<size_t>(id)].load(std::memory_order_relaxed);
 }
 
 void ResetFrameCounters() {
@@ -217,6 +230,8 @@ void Init() {
     c.store(0, std::memory_order_relaxed);
   for (auto& s : g_snapshot)
     s.store(0, std::memory_order_relaxed);
+  for (auto& total : g_totals)
+    total.store(0, std::memory_order_relaxed);
 }
 
 void SetCsvLogPath(const std::string& path) {

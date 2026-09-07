@@ -583,36 +583,6 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
     return false;
   }
 
-  // Direct resolve pipeline layouts (destination storage buffer + source image).
-  auto create_direct_resolve_pipeline_layout = [&](VkDescriptorSetLayout source_layout,
-                                                   VkPipelineLayout* pipeline_layout_out) {
-    VkDescriptorSetLayout descriptor_set_layouts[] = {
-        command_processor_.GetSingleTransientDescriptorLayout(
-            VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferCompute),
-        source_layout,
-    };
-    VkPushConstantRange push_constant_range;
-    push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    push_constant_range.offset = 0;
-    push_constant_range.size = sizeof(DirectResolvePushConstants);
-    VkPipelineLayoutCreateInfo pipeline_layout_create_info;
-    pipeline_layout_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pipeline_layout_create_info.pNext = nullptr;
-    pipeline_layout_create_info.flags = 0;
-    pipeline_layout_create_info.setLayoutCount = uint32_t(rex::countof(descriptor_set_layouts));
-    pipeline_layout_create_info.pSetLayouts = descriptor_set_layouts;
-    pipeline_layout_create_info.pushConstantRangeCount = 1;
-    pipeline_layout_create_info.pPushConstantRanges = &push_constant_range;
-    if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_create_info, nullptr,
-                                   pipeline_layout_out) != VK_SUCCESS) {
-      *pipeline_layout_out = VK_NULL_HANDLE;
-    }
-  };
-  create_direct_resolve_pipeline_layout(descriptor_set_layout_sampled_image_,
-                                        &direct_resolve_pipeline_layout_color_);
-  create_direct_resolve_pipeline_layout(descriptor_set_layout_sampled_image_x2_,
-                                        &direct_resolve_pipeline_layout_depth_);
-
   // Resolve copy pipelines.
   for (size_t i = 0; i < size_t(draw_util::ResolveCopyShaderIndex::kCount); ++i) {
     const draw_util::ResolveCopyShaderInfo& resolve_copy_shader_info =
@@ -998,23 +968,6 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
     }
   }
   dump_pipelines_.clear();
-  for (const auto& direct_resolve_pipeline_pair : direct_resolve_pipelines_) {
-    bool aliased_resolve_copy_pipeline = false;
-    for (VkPipeline resolve_copy_pipeline : resolve_copy_pipelines_) {
-      if (direct_resolve_pipeline_pair.second == resolve_copy_pipeline) {
-        aliased_resolve_copy_pipeline = true;
-        break;
-      }
-    }
-    if (direct_resolve_pipeline_pair.second != VK_NULL_HANDLE && !aliased_resolve_copy_pipeline) {
-      dfn.vkDestroyPipeline(device, direct_resolve_pipeline_pair.second, nullptr);
-    }
-  }
-  direct_resolve_pipelines_.clear();
-  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
-                                         direct_resolve_pipeline_layout_depth_);
-  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
-                                         direct_resolve_pipeline_layout_color_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
                                          dump_pipeline_layout_depth_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
@@ -1163,29 +1116,17 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     if (copy_shader != draw_util::ResolveCopyShaderIndex::kUnknown) {
       const draw_util::ResolveCopyShaderInfo& copy_shader_info =
           draw_util::resolve_copy_shader_info[size_t(copy_shader)];
-      bool direct_resolved = false;
       if (GetPath() == Path::kHostRenderTargets) {
-        if (REXCVAR_GET(direct_host_resolve)) {
-          direct_resolved =
-              TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled);
-          if (direct_resolved) {
-            ++direct_resolve_success_count_;
-          } else {
-            ++direct_resolve_fallback_count_;
-          }
-        }
-        if (!direct_resolved) {
-          // Dump the current contents of the render targets owning the affected
-          // range to edram_buffer_.
-          uint32_t dump_base;
-          uint32_t dump_row_length_used;
-          uint32_t dump_rows;
-          uint32_t dump_pitch;
-          resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
-          if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
-            REXGPU_ERROR("VulkanRenderTargetCache: Failed to dump host render targets for resolve");
-            return false;
-          }
+        // Dump the current contents of the render targets owning the affected
+        // range to edram_buffer_.
+        uint32_t dump_base;
+        uint32_t dump_row_length_used;
+        uint32_t dump_rows;
+        uint32_t dump_pitch;
+        resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+        if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
+          REXGPU_ERROR("VulkanRenderTargetCache: Failed to dump host render targets for resolve");
+          return false;
         }
       }
 
@@ -5953,71 +5894,6 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
   }
   dump_pipelines_.emplace(key, pipeline);
   return pipeline;
-}
-
-VkPipeline VulkanRenderTargetCache::GetDirectResolvePipeline(DirectResolvePipelineKey key) {
-  auto pipeline_it = direct_resolve_pipelines_.find(key);
-  if (pipeline_it != direct_resolve_pipelines_.end()) {
-    return pipeline_it->second;
-  }
-  VkPipeline pipeline = VK_NULL_HANDLE;
-  // Until dedicated direct host RT -> shared memory shaders are added, reuse
-  // the resolve copy pipelines to keep all resolve shader modes wired for the
-  // direct preflight path.
-  size_t copy_shader_index = size_t(key.copy_shader);
-  if (copy_shader_index < size_t(draw_util::ResolveCopyShaderIndex::kCount)) {
-    pipeline = resolve_copy_pipelines_[copy_shader_index];
-  }
-  direct_resolve_pipelines_.emplace(key, pipeline);
-  return pipeline;
-}
-
-bool VulkanRenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
-                                                     draw_util::ResolveCopyShaderIndex copy_shader,
-                                                     bool draw_resolution_scaled) {
-  ++direct_resolve_attempt_count_;
-  (void)copy_shader;
-  (void)draw_resolution_scaled;
-  if (direct_resolve_pipeline_layout_color_ == VK_NULL_HANDLE ||
-      direct_resolve_pipeline_layout_depth_ == VK_NULL_HANDLE) {
-    return false;
-  }
-
-  uint32_t dump_base;
-  uint32_t dump_row_length_used;
-  uint32_t dump_rows;
-  uint32_t dump_pitch;
-  resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
-  GetResolveCopyDispatchesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
-                                 dump_rectangles_, direct_resolve_dispatches_);
-  if (direct_resolve_dispatches_.empty()) {
-    return false;
-  }
-
-  for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
-    const auto* render_target = static_cast<const VulkanRenderTarget*>(rectangle.render_target);
-    if (render_target == nullptr) {
-      return false;
-    }
-    DumpPipelineKey dump_pipeline_key;
-    dump_pipeline_key.msaa_samples = render_target->key().msaa_samples;
-    dump_pipeline_key.resource_format = render_target->key().resource_format;
-    dump_pipeline_key.is_depth = render_target->key().is_depth;
-    if (GetDumpPipeline(dump_pipeline_key) == VK_NULL_HANDLE) {
-      return false;
-    }
-    DirectResolvePipelineKey direct_pipeline_key;
-    direct_pipeline_key.dump_pipeline_key = dump_pipeline_key;
-    direct_pipeline_key.copy_shader = copy_shader;
-    direct_pipeline_key.draw_resolution_scaled = draw_resolution_scaled;
-    if (GetDirectResolvePipeline(direct_pipeline_key) == VK_NULL_HANDLE) {
-      return false;
-    }
-  }
-
-  // Dedicated direct resolve dispatches are staged behind the same preflight;
-  // keep using the existing dump path until source-image direct shaders land.
-  return DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch);
 }
 
 bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,

@@ -1,6 +1,6 @@
 /**
  * @file        graphics/plugin_main.cpp
- * @brief       rexgpu-xenos plugin entry points
+ * @brief       rexgpu-fh1 plugin entry points
  *
  * @copyright   Copyright (c) 2026 Tom Clay <tomc@tctechstuff.com>
  *              All rights reserved.
@@ -28,12 +28,12 @@ extern "C" REX_GPU_PLUGIN_EXPORT uint32_t rex_gpu_abi_version(void) {
 extern "C" REX_GPU_PLUGIN_EXPORT rex::system::IGraphicsSystem* rex_gpu_create(
     uint32_t abi_version, const rex::system::GpuCreateInfo* info) {
   if (abi_version != rex::system::kGpuPluginAbiVersion) {
-    REXLOG_ERROR("rexgpu-xenos: host requested ABI {}, plugin is ABI {}", abi_version,
+    REXLOG_ERROR("rexgpu-fh1: host requested ABI {}, plugin is ABI {}", abi_version,
                  rex::system::kGpuPluginAbiVersion);
     return nullptr;
   }
   if (!info || info->struct_size < sizeof(rex::system::GpuCreateInfo)) {
-    REXLOG_ERROR("rexgpu-xenos: invalid GpuCreateInfo");
+    REXLOG_ERROR("rexgpu-fh1: invalid GpuCreateInfo");
     return nullptr;
   }
 
@@ -48,6 +48,6 @@ extern "C" REX_GPU_PLUGIN_EXPORT rex::system::IGraphicsSystem* rex_gpu_create(
     return new rex::graphics::vulkan::VulkanGraphicsSystem();
   }
 #endif
-  REXLOG_ERROR("rexgpu-xenos: requested backend '{}' is not compiled into this plugin", backend);
+  REXLOG_ERROR("rexgpu-fh1: requested backend '{}' is not compiled into this plugin", backend);
   return nullptr;
 }

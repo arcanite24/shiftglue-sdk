@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cstring>
 #include <memory>
+#include <thread>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -55,6 +56,7 @@ using namespace ucode;
 //   S#/T#/U# binding index, and the second is the s#/t#/u# register index
 //   within its space.
 
+#if defined(REXGPU_FH1_SHADER_PRODUCER)
 DxbcShaderTranslator::DxbcShaderTranslator(ui::GraphicsProvider::GpuVendorID vendor_id,
                                            bool bindless_resources_used, bool edram_rov_used,
                                            bool gamma_render_target_as_unorm8,
@@ -202,6 +204,7 @@ void DxbcShaderTranslator::PopSystemTemp(uint32_t count) {
   assert_true(count <= system_temp_count_current_);
   system_temp_count_current_ -= std::min(count, system_temp_count_current_);
 }
+#endif
 
 void DxbcShaderTranslator::PWLGammaToLinear(dxbc::Assembler& a, uint32_t target_temp,
                                             uint32_t target_temp_component, uint32_t source_temp,
@@ -311,6 +314,7 @@ void DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(
   a.OpMAd(target_dest, target_src, dxbc::Src::LF(1.0f / 255.0f), temp_non_target_src);
 }
 
+#if defined(REXGPU_FH1_SHADER_PRODUCER)
 void DxbcShaderTranslator::RemapAndConvertVertexIndices(uint32_t dest_temp,
                                                         uint32_t dest_temp_components,
                                                         const dxbc::Src& src) {
@@ -1234,7 +1238,7 @@ void DxbcShaderTranslator::PostTranslation() {
   }
   DxbcShader* dxbc_shader = dynamic_cast<DxbcShader*>(&translation.shader());
   if (dxbc_shader &&
-      !dxbc_shader->bindings_setup_entered_.test_and_set(std::memory_order_relaxed)) {
+      !dxbc_shader->bindings_setup_entered_.test_and_set(std::memory_order_acq_rel)) {
     dxbc_shader->texture_bindings_.clear();
     dxbc_shader->texture_bindings_.reserve(texture_bindings_.size());
     dxbc_shader->used_texture_mask_ = 0;
@@ -1258,6 +1262,11 @@ void DxbcShaderTranslator::PostTranslation() {
       shader_binding.min_filter = translator_binding.min_filter;
       shader_binding.mip_filter = translator_binding.mip_filter;
       shader_binding.aniso_filter = translator_binding.aniso_filter;
+    }
+    dxbc_shader->bindings_setup_complete_.store(true, std::memory_order_release);
+  } else if (dxbc_shader) {
+    while (!dxbc_shader->bindings_setup_complete_.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
     }
   }
 }
@@ -3414,5 +3423,6 @@ void DxbcShaderTranslator::WriteShaderCode() {
   // Write the length.
   shader_object_[blob_position_dwords + 1] = uint32_t(shader_object_.size()) - blob_position_dwords;
 }
+#endif
 
 }  // namespace rex::graphics

@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <set>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -747,6 +748,28 @@ class Shader {
     }
   };
 
+  // The subset of microcode analysis needed by FH1 after its host shaders have
+  // been produced offline. Parsed instructions stay producer-only.
+  struct RuntimeAnalysis {
+    struct VertexBinding {
+      uint32_t fetch_constant;
+      uint32_t stride_words;
+    };
+
+    std::vector<VertexBinding> vertex_bindings;
+    ConstantRegisterMap constant_register_map = {};
+    std::set<uint32_t> memexport_stream_constants;
+    uint32_t register_static_address_bound = 0;
+    uint32_t writes_interpolators = 0;
+    uint32_t writes_point_size_edge_flag_kill_vertex = 0;
+    uint32_t writes_color_targets = 0;
+    uint8_t memexport_eM_written = 0;
+    bool uses_register_dynamic_addressing = false;
+    bool kills_pixels = false;
+    bool uses_texture_fetch_instruction_results = false;
+    bool writes_depth = false;
+  };
+
   struct ControlFlowMemExportInfo {
     // Which eM elements have potentially (regardless of conditionals, loop
     // iteration counts, predication) been written earlier in the predecessor
@@ -778,6 +801,26 @@ class Shader {
 
     // Translated shader binary (or text).
     const std::vector<uint8_t>& translated_binary() const { return translated_binary_; }
+
+    // Installs bytecode produced ahead of time by the same translator version
+    // and host configuration. The caller must validate the container first.
+    bool LoadPrecompiledBinary(std::span<const uint8_t> binary) {
+      if (is_translated_ || binary.empty()) {
+        return false;
+      }
+      translated_binary_.assign(binary.begin(), binary.end());
+      errors_.clear();
+      is_valid_ = true;
+      is_translated_ = true;
+      return true;
+    }
+
+    void RejectPrecompiledMiss() {
+      translated_binary_.clear();
+      errors_.clear();
+      is_valid_ = false;
+      is_translated_ = true;
+    }
 
     // Gets the translated shader binary as a string.
     // This is only valid if it is actually text.
@@ -839,6 +882,7 @@ class Shader {
   // ucode_disasm_buffer is temporary storage for disassembly (provided
   // externally so it won't need to be reallocated for every shader).
   void AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer);
+  bool LoadRuntimeAnalysis(RuntimeAnalysis analysis);
 
   // The following parameters, until the translation, are valid if ucode
   // information has been gathered.

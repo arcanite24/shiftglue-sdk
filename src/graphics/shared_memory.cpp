@@ -268,6 +268,55 @@ void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last, bool inv
   }
 }
 
+bool SharedMemory::CopyCpuRange(uint32_t start, std::span<uint8_t> destination) {
+  if (start > kBufferSize || destination.size() > kBufferSize - start) {
+    return false;
+  }
+  if (destination.empty()) {
+    return true;
+  }
+  if (!memory_invalidation_callback_handle_) return false;
+  // Protect before reading, outside the global lock (memory heaps have their own locks).
+  memory().EnablePhysicalMemoryAccessCallbacks(start, uint32_t(destination.size()), true, false);
+  const uint32_t first = start >> page_size_log2_;
+  const uint32_t last = (start + uint32_t(destination.size()) - 1) >> page_size_log2_;
+  auto global_lock = global_critical_region_.Acquire();
+  if ((last >> 6) >= system_page_flags_valid_and_gpu_written_.size()) {
+    return false;
+  }
+  for (uint32_t block = first >> 6; block <= last >> 6; ++block) {
+    uint64_t mask = UINT64_MAX;
+    if (block == first >> 6) mask &= UINT64_MAX << (first & 63);
+    if (block == last >> 6 && (last & 63) != 63) mask &= (uint64_t(1) << ((last & 63) + 1)) - 1;
+    if (system_page_flags_valid_and_gpu_written_[block] & mask) {
+      return false;
+    }
+  }
+  std::memcpy(destination.data(), memory().TranslatePhysical(start), destination.size());
+  return true;
+}
+
+bool SharedMemory::CopyCpuSnapshot(uint32_t start, std::span<uint8_t> destination) {
+  if (start > kBufferSize || destination.size() > kBufferSize - start) return false;
+  if (destination.empty()) return true;
+  WatchHandle watch = nullptr;
+  {
+    auto lock = global_critical_region_.Acquire();
+    watch = WatchMemoryRange(start, uint32_t(destination.size()),
+        [](const auto&, void*, void* data, uint64_t, bool) {
+          *static_cast<WatchHandle*>(data) = nullptr;
+        }, nullptr, &watch, 0);
+    if (!watch) return false;
+  }
+  // CopyCpuRange takes heap locks before the global lock. Do not retain the
+  // global lock across it, even though the critical region is recursive.
+  const bool copied = CopyCpuRange(start, destination);
+  auto lock = global_critical_region_.Acquire();
+  const bool unchanged = watch != nullptr;
+  if (watch) UnwatchMemoryRange(watch);
+  return copied && unchanged;
+}
+
 void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   if (length == 0 || start >= kBufferSize) {
     return;

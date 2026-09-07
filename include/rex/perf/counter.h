@@ -97,6 +97,9 @@ enum class CounterId : uint16_t {
   kGuestVblankCount,
   kGuestVblankDeltaNs,
   kSimulationTickCount,
+  kSimulationTimeNs,
+  kSimulationDeltaInvalid,
+  kSourceFrameCount,
   kPresentCount,
   kPresentDeltaNs,
   kPresentQueueDepth,
@@ -118,6 +121,10 @@ void IncrementCounter(CounterId id, int64_t delta = 1);
 
 // Read a counter's current live value
 int64_t GetCounter(CounterId id);
+
+// Read the monotonic total of values added through IncrementCounter. Totals
+// are not reset by the per-frame CSV snapshot.
+int64_t GetTotalCounter(CounterId id);
 
 // Snapshot current values into the read buffer and zero the live counters.
 // Called once per frame by Profiler::Flip().
@@ -243,6 +250,9 @@ class Profiler {
 #define PROFILE_GUEST_VBLANK() PERF_counter_inc(kGuestVblankCount)
 #define PROFILE_GUEST_VBLANK_DELTA_NS(value) PERF_counter_set(kGuestVblankDeltaNs, value)
 #define PROFILE_SIMULATION_TICK() PERF_counter_inc(kSimulationTickCount)
+#define PROFILE_SIMULATION_TIME_NS(value) PERF_counter_add(kSimulationTimeNs, value)
+#define PROFILE_SIMULATION_DELTA_INVALID() PERF_counter_inc(kSimulationDeltaInvalid)
+#define PROFILE_SOURCE_FRAME() PERF_counter_inc(kSourceFrameCount)
 #define PROFILE_PRESENT() PERF_counter_inc(kPresentCount)
 #define PROFILE_PRESENT_DELTA_NS(value) PERF_counter_set(kPresentDeltaNs, value)
 #define PROFILE_PRESENT_QUEUE_DEPTH(value) PERF_counter_set(kPresentQueueDepth, value)
@@ -298,6 +308,9 @@ class Profiler {
 #define PROFILE_GUEST_VBLANK()
 #define PROFILE_GUEST_VBLANK_DELTA_NS(value)
 #define PROFILE_SIMULATION_TICK()
+#define PROFILE_SIMULATION_TIME_NS(value)
+#define PROFILE_SIMULATION_DELTA_INVALID()
+#define PROFILE_SOURCE_FRAME()
 #define PROFILE_PRESENT()
 #define PROFILE_PRESENT_DELTA_NS(value)
 #define PROFILE_PRESENT_QUEUE_DEPTH(value)

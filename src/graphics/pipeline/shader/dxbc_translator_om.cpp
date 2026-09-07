@@ -22,6 +22,7 @@
 namespace rex::graphics {
 using namespace ucode;
 
+#if defined(REXGPU_FH1_SHADER_PRODUCER)
 void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
   bool any_color_targets_written = current_shader().writes_color_targets() != 0;
 
@@ -2758,6 +2759,7 @@ void DxbcShaderTranslator::CompletePixelShader() {
     CompletePixelShader_DSV_DepthTo24Bit();
   }
 }
+#endif
 
 void DxbcShaderTranslator::PreClampedFloat32To7e3(dxbc::Assembler& a, uint32_t f10_temp,
                                                   uint32_t f10_temp_component, uint32_t f32_temp,
@@ -3045,6 +3047,7 @@ void DxbcShaderTranslator::Depth20e4To32(dxbc::Assembler& a, const dxbc::Dest& f
   a.OpBFI(f32, dxbc::Src::LU(20), dxbc::Src::LU(23 - 20), mantissa_src, exponent_src);
 }
 
+#if defined(REXGPU_FH1_SHADER_PRODUCER)
 void DxbcShaderTranslator::ROV_DepthTo24Bit(uint32_t d24_temp, uint32_t d24_temp_component,
                                             uint32_t d32_temp, uint32_t d32_temp_component,
                                             uint32_t temp_temp, uint32_t temp_temp_component) {
@@ -3077,5 +3080,6 @@ void DxbcShaderTranslator::ROV_DepthTo24Bit(uint32_t d24_temp, uint32_t d24_temp
   }
   a_.OpEndIf();
 }
+#endif
 
 }  // namespace rex::graphics

@@ -30,6 +30,7 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
+#include <rex/ui/flags.h>
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
@@ -40,8 +41,22 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, 
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
                     "runtime spikes and freezes when playing the game not for the first time.");
+REXCVAR_DEFINE_UINT32(
+    pinyon_shift_fh1_render_fps_limit, 0, "Pinyon Shift",
+    "FH1 source-render FPS limit (0 follows the host display)")
+    .range(0, 240)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace {
+
+constexpr double Fh1GuestVblankHzForRenderLimit(uint32_t render_fps_limit,
+                                                double display_refresh_hz) {
+  return (render_fps_limit ? double(render_fps_limit) : display_refresh_hz) *
+         2.0;
+}
+
+static_assert(Fh1GuestVblankHzForRenderLimit(0, 144.0) == 288.0);
+static_assert(Fh1GuestVblankHzForRenderLimit(60, 144.0) == 120.0);
 
 rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
     const std::string& effect_name) {
@@ -154,7 +169,14 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
       new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
         system::X_VIDEO_MODE video_mode;
         kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
-        double refresh_rate_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
+        const uint32_t render_fps_limit =
+            REXCVAR_GET(pinyon_shift_fh1_render_fps_limit);
+        // FH1 waits for two guest vblanks per rendered frame. Follow the
+        // detected host refresh by default so completed source frames arrive
+        // at the cadence the display can actually consume.
+        const double refresh_rate_hz =
+            Fh1GuestVblankHzForRenderLimit(
+                render_fps_limit, REXCVAR_GET(video_mode_refresh_rate));
         uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
         uint64_t vsync_interval_ticks =
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));

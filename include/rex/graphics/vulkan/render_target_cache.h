@@ -753,31 +753,6 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     }
   };
 
-  struct DirectResolvePushConstants {
-    draw_util::ResolveCopyShaderConstants resolve;
-    uint32_t source_base_tiles;
-    uint32_t source_pitch_tiles;
-    uint32_t dispatch_first_tile;
-  };
-
-  struct DirectResolvePipelineKey {
-    DumpPipelineKey dump_pipeline_key;
-    draw_util::ResolveCopyShaderIndex copy_shader;
-    bool draw_resolution_scaled;
-    uint64_t packed() const {
-      return uint64_t(dump_pipeline_key.key) | (uint64_t(size_t(copy_shader)) << 32) |
-             (uint64_t(draw_resolution_scaled ? 1 : 0) << 40);
-    }
-    struct Hasher {
-      size_t operator()(const DirectResolvePipelineKey& key) const {
-        return std::hash<uint64_t>{}(key.packed());
-      }
-    };
-    bool operator==(const DirectResolvePipelineKey& other_key) const {
-      return packed() == other_key.packed();
-    }
-  };
-
   // Returns the framebuffer object, or VK_NULL_HANDLE if failed to create.
   const Framebuffer* GetHostRenderTargetsFramebuffer(
       RenderPassKey render_pass_key, uint32_t pitch_tiles_at_32bpp,
@@ -801,11 +776,6 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       const Transfer::Rectangle* resolve_clear_rectangle = nullptr);
 
   VkPipeline GetDumpPipeline(DumpPipelineKey key);
-  VkPipeline GetDirectResolvePipeline(DirectResolvePipelineKey key);
-  bool TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
-                              draw_util::ResolveCopyShaderIndex copy_shader,
-                              bool draw_resolution_scaled);
-
   // Writes contents of host render targets within rectangles from
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
   bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
@@ -852,10 +822,6 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // Compute pipelines for copying host render target contents to the EDRAM
   // buffer. VK_NULL_HANDLE if failed to create.
   std::unordered_map<DumpPipelineKey, VkPipeline, DumpPipelineKey::Hasher> dump_pipelines_;
-  VkPipelineLayout direct_resolve_pipeline_layout_color_ = VK_NULL_HANDLE;
-  VkPipelineLayout direct_resolve_pipeline_layout_depth_ = VK_NULL_HANDLE;
-  std::unordered_map<DirectResolvePipelineKey, VkPipeline, DirectResolvePipelineKey::Hasher>
-      direct_resolve_pipelines_;
 
   // Temporary storage for Resolve.
   std::vector<Transfer> clear_transfers_[2];
@@ -866,10 +832,6 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // Temporary storage for DumpRenderTargets.
   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;
   std::vector<DumpInvocation> dump_invocations_;
-  std::vector<ResolveCopyDispatch> direct_resolve_dispatches_;
-  uint64_t direct_resolve_attempt_count_ = 0;
-  uint64_t direct_resolve_success_count_ = 0;
-  uint64_t direct_resolve_fallback_count_ = 0;
 
   // For pixel (fragment) shader interlock.
 

@@ -13,6 +13,7 @@
 #include <rex/version.h>
 #include <imgui.h>
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
+#include <rex/chrono/clock.h>
 #include <rex/perf/counter.h>
 #include <cinttypes>
 #endif
@@ -27,7 +28,7 @@ DebugOverlayDialog::~DebugOverlayDialog() {}
 void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
   ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
-  ImGui::SetNextWindowSize(ImVec2(280, 280), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(310, 330), ImGuiCond_FirstUseEver);
 #else
   ImGui::SetNextWindowSize(ImVec2(220, 60), ImGuiCond_FirstUseEver);
 #endif
@@ -40,6 +41,44 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
       }
     }
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
+    ImGui::Separator();
+
+    const uint64_t now_tick = rex::chrono::Clock::QueryHostTickCount();
+    const uint64_t tick_frequency = rex::chrono::Clock::QueryHostTickFrequency();
+    const int64_t source_frames =
+        rex::perf::GetTotalCounter(rex::perf::CounterId::kSourceFrameCount);
+    const int64_t presents =
+        rex::perf::GetTotalCounter(rex::perf::CounterId::kPresentCount);
+    const int64_t simulation_time_ns =
+        rex::perf::GetTotalCounter(rex::perf::CounterId::kSimulationTimeNs);
+    if (!rate_sample_tick_) {
+      rate_sample_tick_ = now_tick;
+      rate_source_frames_ = source_frames;
+      rate_presents_ = presents;
+      rate_simulation_time_ns_ = simulation_time_ns;
+    } else if (now_tick > rate_sample_tick_ &&
+               now_tick - rate_sample_tick_ >= tick_frequency / 2) {
+      const double elapsed_seconds =
+          double(now_tick - rate_sample_tick_) / double(tick_frequency);
+      source_fps_ = double(source_frames - rate_source_frames_) / elapsed_seconds;
+      present_fps_ = double(presents - rate_presents_) / elapsed_seconds;
+      title_speed_ =
+          double(simulation_time_ns - rate_simulation_time_ns_) /
+          (elapsed_seconds * 1000000000.0);
+      rate_sample_tick_ = now_tick;
+      rate_source_frames_ = source_frames;
+      rate_presents_ = presents;
+      rate_simulation_time_ns_ = simulation_time_ns;
+    }
+
+    const double source_frame_ms = source_fps_ > 0.0 ? 1000.0 / source_fps_ : 0.0;
+    const double present_frame_ms = present_fps_ > 0.0 ? 1000.0 / present_fps_ : 0.0;
+    ImGui::Text("Render:  %6.1f FPS  %6.2f ms", source_fps_, source_frame_ms);
+    ImGui::Text("Present: %6.1f FPS  %6.2f ms", present_fps_, present_frame_ms);
+    ImGui::Text("Title speed: %5.1f%%", title_speed_ * 100.0);
+    ImGui::Text("Dropped: %" PRId64 "  Duplicates: %" PRId64,
+                rex::perf::GetTotalCounter(rex::perf::CounterId::kDroppedPresentCount),
+                rex::perf::GetTotalCounter(rex::perf::CounterId::kDuplicatePresentCount));
     ImGui::Separator();
 
     // Frame time graph
