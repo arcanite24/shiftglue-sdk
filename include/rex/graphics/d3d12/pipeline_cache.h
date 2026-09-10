@@ -478,6 +478,7 @@ class PipelineCache {
 #endif
 
   // Pipeline creation threads.
+  void StartCreationThreads(size_t desired_count);
   void CreationThread(size_t thread_index);
   void CreateQueuedPipelinesOnProcessorThread();
   std::mutex creation_request_lock_;

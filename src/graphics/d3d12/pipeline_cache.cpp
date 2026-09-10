@@ -418,13 +418,7 @@ bool PipelineCache::Initialize() {
       creation_thread_count =
           std::min(uint32_t(REXCVAR_GET(d3d12_pipeline_creation_threads)), logical_processor_count);
     }
-    for (size_t i = 0; i < creation_thread_count; ++i) {
-      std::unique_ptr<rex::thread::Thread> creation_thread =
-          rex::thread::Thread::Create({}, [this, i]() { CreationThread(i); });
-      assert_not_null(creation_thread);
-      creation_thread->set_name("D3D12 Pipelines");
-      creation_threads_.push_back(std::move(creation_thread));
-    }
+    StartCreationThreads(creation_thread_count);
   }
   return true;
 }
@@ -649,15 +643,22 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
         }
       }
       fh1_prewarm_manifest_loaded_ = true;
+      const size_t requested_count = allowed_pipelines.size();
       const size_t stored_count = pipeline_stored_descriptions.size();
       fh1_pipeline_prewarm_descriptions.reserve(stored_count);
       for (const PipelineStoredDescription& stored :
            pipeline_stored_descriptions) {
-        if (allowed_pipelines.contains(stored.description_hash)) {
+        if (allowed_pipelines.erase(stored.description_hash)) {
           fh1_pipeline_prewarm_descriptions.push_back(stored);
         }
       }
       pipeline_prewarm_descriptions = &fh1_pipeline_prewarm_descriptions;
+      if (!requested_count) {
+        REXGPU_INFO("FH1 prewarm allowlist requests no pipelines");
+      } else if (!allowed_pipelines.empty()) {
+        REXGPU_ERROR("FH1 prewarm catalog is missing requested pipelines ({} selected, {} requested)",
+                     fh1_pipeline_prewarm_descriptions.size(), requested_count);
+      }
       REXGPU_INFO(
           "FH1 V4 prewarm selected {} of {} stored pipelines; admitted {} "
           "draw and {} copy keys",
@@ -1254,29 +1255,26 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
   }
   #endif
 
-  // Create the pipelines.
-  if (!pipeline_stored_descriptions.empty()) {
+  // Create only selected pipelines; an empty allowlist is a valid no-work case.
+  if (!pipeline_prewarm_descriptions->empty()) {
     uint64_t pipeline_creation_start_ = rex::chrono::Clock::QueryHostTickCount();
 
     // Launch additional creation threads to use all cores to create
     // pipelines faster. Will also be using the main thread, so minus 1.
     size_t creation_thread_original_count = creation_threads_.size();
-    size_t creation_thread_needed_count =
-        std::max(std::min(pipeline_prewarm_descriptions->size(), logical_processor_count) -
-                     size_t(1),
-                 creation_thread_original_count);
-    while (creation_threads_.size() < creation_thread_needed_count) {
-      size_t creation_thread_index = creation_threads_.size();
-      std::unique_ptr<rex::thread::Thread> creation_thread = rex::thread::Thread::Create(
-          {}, [this, creation_thread_index]() { CreationThread(creation_thread_index); });
-      assert_not_null(creation_thread);
-      creation_thread->set_name("D3D12 Pipelines");
-      creation_threads_.push_back(std::move(creation_thread));
-    }
+    const size_t participating_threads =
+        std::min(pipeline_prewarm_descriptions->size(), logical_processor_count);
+    const size_t creation_thread_needed_count =
+        participating_threads ? participating_threads - 1 : 0;
+    StartCreationThreads(creation_thread_needed_count);
 
     size_t pipelines_created = 0;
     for (const PipelineStoredDescription& pipeline_stored_description :
          *pipeline_prewarm_descriptions) {
+      if (command_processor_.IsShutdownRequested()) {
+        REXGPU_WARN("Pipeline prewarm cancelled by shutdown");
+        break;
+      }
       const PipelineDescription& pipeline_description = pipeline_stored_description.description;
       // TODO(Triang3l): On Vulkan, skip pipelines requiring unsupported device
       // features (to keep the cache files mostly shareable across devices).
@@ -1456,6 +1454,10 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
         pipelines_created,
         (rex::chrono::Clock::QueryHostTickCount() - pipeline_creation_start_) * 1000 /
             rex::chrono::Clock::QueryHostTickFrequency());
+  }
+
+  // Storage finalization depends on the stored catalog, not the filtered selection.
+  if (!pipeline_stored_descriptions.empty()) {
     // If any pipeline descriptions were corrupted (or the whole file has excess
     // bytes in the end), truncate to the last valid pipeline description.
   #if defined(REXGPU_FH1_SHADER_PRODUCER)
@@ -4806,6 +4808,28 @@ bool PipelineCache::PrepareRuntimeDescriptionForQueuedCreation(
   }
 
   return true;
+}
+
+void PipelineCache::StartCreationThreads(size_t desired_count) {
+  size_t core_count = rex::thread::logical_processor_count();
+  if (!core_count) {
+    core_count = 6;
+  }
+  const int configured_count = REXCVAR_GET(d3d12_pipeline_creation_threads);
+  const size_t cap = configured_count < 0 ? 32 : size_t(configured_count);
+  desired_count = std::min({desired_count, core_count, cap});
+  while (creation_threads_.size() < desired_count &&
+         !command_processor_.IsShutdownRequested()) {
+    const size_t index = creation_threads_.size();
+    auto thread = rex::thread::Thread::Create({}, [this, index]() { CreationThread(index); });
+    if (!thread) {
+      REXGPU_WARN("Unable to create pipeline worker {}; continuing with {} workers", index,
+                  creation_threads_.size());
+      break;
+    }
+    thread->set_name("D3D12 Pipelines");
+    creation_threads_.push_back(std::move(thread));
+  }
 }
 
 void PipelineCache::CreationThread(size_t thread_index) {
