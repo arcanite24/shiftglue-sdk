@@ -97,6 +97,26 @@ depth_geometry_range(std::span<const uint32_t, 8> system,
   return std::pair{address, uint32_t(required)};
 }
 
+// B848 selects two packed transforms using unsigned byte indices plus c156.x.
+// Bound all 256 possible byte values so this proof does not depend on mutable
+// vertex contents. The primary stream is bounded by depth_geometry_range.
+inline std::optional<std::pair<uint32_t, uint32_t>>
+skinned_transform_range(float offset, uint32_t fetch_address, uint32_t fetch_size) {
+  constexpr uint32_t physical_size = 1u << 29;
+  const uint32_t base = fetch_address & ~3u;
+  const uint32_t size = ((fetch_size >> 2) & 0xFFFFFFu) * 4;
+  if (!std::isfinite(offset) || offset < 0 || !size || base >= physical_size ||
+      size > physical_size - base) return std::nullopt;
+  // Outward rounding also covers a different host rounding mode for the add.
+  const float upper = std::nextafter(float(double(offset) + 255.0),
+                                     std::numeric_limits<float>::infinity());
+  if (!std::isfinite(upper) || upper >= 2147483648.0f) return std::nullopt;
+  const uint64_t first = uint64_t(std::floor(double(offset))) * 12;
+  const uint64_t end = (uint64_t(std::floor(double(upper))) + 1) * 12;
+  if (end > size) return std::nullopt;
+  return std::pair{base + uint32_t(first), uint32_t(end - first)};
+}
+
 // Fetch pairs and returned ranges are ordered: vertices (95), directions (90),
 // control grid (89). An unused direction range is {0, 0}. The maximum must
 // describe the immutable indices actually bound, as for depth_geometry_range.

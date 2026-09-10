@@ -107,6 +107,11 @@ enum class CounterId : uint16_t {
   kDuplicatePresentCount,
   kDroppedPresentCount,
 
+  // Sampled D3D12 texture requests; append to preserve existing counter IDs.
+  kTextureRequestCpuTimeNs,
+  kTextureRequestTimingSamples,
+  kTextureDirtyLoadAttempts,
+
   kCount  // sentinel -- must be last
 };
 

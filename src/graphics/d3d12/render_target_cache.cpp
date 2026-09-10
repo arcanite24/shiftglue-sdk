@@ -1034,6 +1034,94 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
   return true;
 }
 
+bool D3D12RenderTargetCache::ClearFh1OwnedDepth(
+    std::span<const Fh1ClearRectangle> rectangles) {
+  const auto surface = register_file().Get<reg::RB_SURFACE_INFO>();
+  const auto depth = register_file().Get<reg::RB_DEPTH_INFO>();
+  const uint32_t scale = draw_resolution_scale_x();
+  if (GetPath() != Path::kHostRenderTargets || rectangles.empty() || rectangles.size() > 2 ||
+      draw_resolution_scale_y() != scale ||
+      surface.msaa_samples != xenos::MsaaSamples::k4X ||
+      depth.depth_format != xenos::DepthRenderTargetFormat::kD24S8) return false;
+  RenderTargetKey key;
+  key.base_tiles = depth.depth_base;
+  const uint32_t pitch = (surface.surface_pitch * 2 + 79) / 80;
+  if (!pitch || pitch > 255 || IsHostDepthEncodingDifferent(depth.depth_format)) return false;
+  key.pitch_tiles_at_32bpp = pitch;
+  key.msaa_samples = xenos::MsaaSamples::k1X;
+  key.is_depth = 1;
+  key.resource_format = uint32_t(xenos::DepthRenderTargetFormat::kD24S8);
+  auto* target = static_cast<D3D12RenderTarget*>(GetFullyOwnedRenderTarget(key));
+  if (!target) return false;
+  std::array<Fh1ClearRectangle, 2> mapped;
+  const auto desc = target->resource()->GetDesc();
+  for (size_t i = 0; i < rectangles.size(); ++i) {
+    auto rectangle = fh1_clear_to_single_sample(rectangles[i], scale, key.GetPitchTiles());
+    if (!rectangle || uint32_t(rectangle->bounds[2]) > desc.Width ||
+        uint32_t(rectangle->bounds[3]) > desc.Height) return false;
+    mapped[i] = *rectangle;
+  }
+  // Keep current ownership and independent float-depth history. Only depth
+  // changes; stencil and pixels outside the mapped rectangle stay in place.
+  command_processor_.PushTransitionBarrier(target->resource(),
+      target->SetResourceState(D3D12_RESOURCE_STATE_DEPTH_WRITE), D3D12_RESOURCE_STATE_DEPTH_WRITE);
+  command_processor_.SubmitBarriers();
+  auto& commands = command_processor_.GetDeferredCommandList();
+  commands.BeginDebugMarker("PinyonShift native owned depth clear");
+  for (size_t i = 0; i < rectangles.size(); ++i) {
+    const auto& r = mapped[i].bounds;
+    const D3D12_RECT rect{r[0],r[1],r[2],r[3]};
+    commands.D3DClearDepthStencilView(target->descriptor_draw().GetHandle(),
+        D3D12_CLEAR_FLAG_DEPTH, mapped[i].depth, 0, 1, &rect);
+  }
+  commands.EndDebugMarker();
+  static uint64_t clear_count = 0;
+  if (++clear_count == 1 || !(clear_count % 1024))
+    REXGPU_INFO("FH1 native owned depth clears {}", clear_count);
+  return true;
+}
+
+bool D3D12RenderTargetCache::ClearFh1OwnedDepthTiles(
+    std::span<const Fh1ClearRectangle> rectangles) {
+  const auto surface = register_file().Get<reg::RB_SURFACE_INFO>();
+  const auto depth = register_file().Get<reg::RB_DEPTH_INFO>();
+  const uint32_t scale = draw_resolution_scale_x();
+  if (GetPath() != Path::kHostRenderTargets || rectangles.empty() || rectangles.size() > 2 ||
+      draw_resolution_scale_y() != scale || surface.surface_pitch != 640 ||
+      surface.msaa_samples != xenos::MsaaSamples::k4X || depth.depth_base ||
+      depth.depth_format != xenos::DepthRenderTargetFormat::kD24S8) return false;
+  std::array<std::array<uint32_t, 4>, 2> tiles;
+  for (size_t i = 0; i < rectangles.size(); ++i) {
+    const auto bounds = fh1_zero_clear_tiles(rectangles[i], scale, 16);
+    if (!bounds) return false;
+    tiles[i] = *bounds;
+  }
+  RenderTargetKey key;
+  key.pitch_tiles_at_32bpp = 16;
+  key.msaa_samples = xenos::MsaaSamples::k4X;
+  key.is_depth = 1;
+  key.resource_format = uint32_t(xenos::DepthRenderTargetFormat::kD24S8);
+  auto* target = static_cast<D3D12RenderTarget*>(PrepareFh1FullTileDepthClear(
+      key, std::span<const std::array<uint32_t, 4>>(tiles).first(rectangles.size())));
+  if (!target) return false;
+  command_processor_.PushTransitionBarrier(target->resource(),
+      target->SetResourceState(D3D12_RESOURCE_STATE_DEPTH_WRITE), D3D12_RESOURCE_STATE_DEPTH_WRITE);
+  command_processor_.SubmitBarriers();
+  auto& commands = command_processor_.GetDeferredCommandList();
+  commands.BeginDebugMarker("PinyonShift native owned depth tile clear");
+  for (const auto& rectangle : rectangles) {
+    const auto& r = rectangle.bounds;
+    const D3D12_RECT rect{r[0], r[1], r[2], r[3]};
+    commands.D3DClearDepthStencilView(target->descriptor_draw().GetHandle(),
+        D3D12_CLEAR_FLAGS(D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL), 0, 0, 1, &rect);
+  }
+  commands.EndDebugMarker();
+  static uint64_t clear_count = 0;
+  if (++clear_count == 1 || !(clear_count % 1024))
+    REXGPU_INFO("FH1 native owned depth tile clears {}", clear_count);
+  return true;
+}
+
 bool D3D12RenderTargetCache::ClearFh1Rectangles(
     std::span<const Fh1ClearRectangle> rectangles,
     std::span<const std::array<float, 4>> colors,
@@ -3860,6 +3948,18 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
 
   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
+  D3D12CommandProcessor::Fh1GpuWorkTiming transfer_timing;
+  if (command_processor_.IsFh1GpuWorkTimingSampleFrame()) {
+    uint32_t transfer_count = 0;
+    for (uint32_t i = 0; i < render_target_count; ++i) {
+      if (render_targets[i]) {
+        transfer_count += uint32_t(render_target_transfers[i].size());
+      }
+    }
+    transfer_timing = command_processor_.BeginFh1RenderTargetTransferTiming(
+        transfer_count, resolve_clear_needed);
+  }
+
   D3D12_RECT clear_rect;
   if (resolve_clear_needed) {
     // Assuming the rectangle is already clamped by the setup function from the
@@ -4115,6 +4215,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
   current_temporary_descriptors_gpu_.resize(descriptor_count);
   if (!command_processor_.RequestOneUseSingleViewDescriptors(
           descriptor_count, current_temporary_descriptors_gpu_.data())) {
+    command_processor_.FinishFh1RenderTargetTransferTiming(transfer_timing);
     return;
   }
   for (uint32_t i = 0; i < descriptor_count; ++i) {
@@ -4741,6 +4842,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       }
     }
   }
+  command_processor_.FinishFh1RenderTargetTransferTiming(transfer_timing);
 }
 
 void D3D12RenderTargetCache::SetCommandListRenderTargets(

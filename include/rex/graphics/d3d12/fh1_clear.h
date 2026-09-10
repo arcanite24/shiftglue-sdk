@@ -54,6 +54,38 @@ struct Fh1ClearRectangle {
   float depth;
 };
 
+// Same-base/pitch D24S8 4x samples to a 1x owner, in host pixel coordinates.
+inline std::optional<Fh1ClearRectangle> fh1_clear_to_single_sample(
+    Fh1ClearRectangle rectangle, uint32_t scale, uint32_t pitch) {
+  const auto& r = rectangle.bounds;
+  if ((scale != 1 && scale != 2) || !pitch || pitch > 255 ||
+      r[0] < 0 || r[1] < 0 || r[0] >= r[2] || r[1] >= r[3] ||
+      !std::isfinite(rectangle.depth) || rectangle.depth < 0 || rectangle.depth > 1)
+    return std::nullopt;
+  const uint32_t tw = 40 * scale, th = 8 * scale;
+  if (uint32_t(r[2]) > pitch * tw ||
+      uint64_t((r[3] - 1) / th) * pitch + (r[2] - 1) / tw >= 2048)
+    return std::nullopt;
+  for (auto& bound : rectangle.bounds) bound *= 2;
+  return rectangle;
+}
+
+// Zeroing both D24S8 aspects overwrites every word in fully covered tiles.
+// Return tile bounds; partial tiles must retain the normal import path.
+inline std::optional<std::array<uint32_t, 4>> fh1_zero_clear_tiles(
+    Fh1ClearRectangle rectangle, uint32_t scale, uint32_t pitch) {
+  if (rectangle.depth != 0) return std::nullopt;
+  const auto mapped = fh1_clear_to_single_sample(rectangle, scale, pitch);
+  if (!mapped) return std::nullopt;
+  std::array<uint32_t, 4> tiles;
+  for (size_t i = 0; i < tiles.size(); ++i) {
+    const uint32_t extent = (i & 1 ? 16 : 80) * scale;
+    if (uint32_t(mapped->bounds[i]) % extent) return std::nullopt;
+    tiles[i] = uint32_t(mapped->bounds[i]) / extent;
+  }
+  return tiles;
+}
+
 // Lower three post-VS corners of FH1's rectangle-list primitive. Callers must
 // separately qualify shaders, raster/depth/stencil state and memory visibility.
 inline std::optional<Fh1ClearRectangle> fh1_clear_rectangle(

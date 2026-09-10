@@ -25,6 +25,7 @@
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/perf/counter.h>
 
 REXCVAR_DEFINE_INT32(texture_cache_memory_limit_render_to_texture, 24, "GPU",
                      "Texture cache memory limit for render-to-texture (MB)")
@@ -391,6 +392,7 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
     return false;
   }
 
+  PERF_counter_inc(kTextureDirtyLoadAttempts);
   if (TryLoadTextureDataFromCpu(texture, base_outdated, mips_outdated)) {
     texture.CompleteLoad(global_critical_region_.Acquire(), base_outdated, mips_outdated);
     texture.LogAction("Loaded from CPU");

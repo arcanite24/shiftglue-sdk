@@ -34,6 +34,16 @@
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+REXCVAR_DEFINE_BOOL(fh1_owned_depth_clear, true, "GPU/D3D12",
+                    "Native owned depth clear at 1x; scaled rendering keeps compatibility transfers");
+REXCVAR_DEFINE_BOOL(fh1_owned_depth_tile_clear, false, "GPU/D3D12",
+                    "Experimental full-tile base-0 depth/stencil clear ownership");
+REXCVAR_DEFINE_BOOL(fh1_recycle_geometry_buffers, false, "GPU/D3D12",
+                    "Reuse completed same-sized geometry eviction buffers");
+REXCVAR_DEFINE_BOOL(fh1_contain_geometry_windows, false, "GPU/D3D12",
+                    "Reuse the smallest same-base geometry window containing the request")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
@@ -41,11 +51,25 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(fh1_discovery_sampling, false, "GPU/D3D12",
+                    "Observe one complete source frame in 60 for manual discovery")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::graphics::d3d12 {
+
+static bool Fh1ObserveCorpusFrame(uint64_t frame) {
+  return !REXCVAR_GET(fh1_discovery_sampling) || frame % 60 == 0;
+}
 
 static bool Fh1GpuCorpusEnabled() {
   static const bool enabled =
       rex::cvar::GetFlagByName("pinyon_shift_fh1_gpu_corpus") == "true";
+  return enabled;
+}
+
+static bool Fh1SceneDumpEnabled() {
+  static const bool enabled =
+      rex::cvar::GetFlagByName("pinyon_shift_fh1_scene_dump") == "true";
   return enabled;
 }
 
@@ -937,6 +961,19 @@ void D3D12CommandProcessor::ReleaseScratchGPUBuffer(ID3D12Resource* buffer,
 }
 
 // BEGIN FH1 OWNED GEOMETRY CACHE
+auto D3D12CommandProcessor::FindFh1OwnedGeometry(uint32_t base, uint32_t size)
+    -> std::map<uint64_t, Fh1Geometry>::iterator {
+  const uint64_t key = (uint64_t(base) << 32) | size;
+  if (!REXCVAR_GET(fh1_contain_geometry_windows)) return fh1_geometry_.find(key);
+  // Choose the smallest containing owner. A later, larger import cannot switch
+  // CPU bounds to a different resource while the caller holds this owner's GPU
+  // address. Smaller requests already reuse it, so cannot insert a nearer key;
+  // last_submission prevents eviction while the address is in flight.
+  auto found = fh1_geometry_.lower_bound(key);
+  return found != fh1_geometry_.end() && uint32_t(found->first >> 32) == base
+      ? found : fh1_geometry_.end();
+}
+
 D3D12_GPU_VIRTUAL_ADDRESS D3D12CommandProcessor::GetFh1OwnedGeometry(
     uint32_t address, uint32_t size, bool keep_cpu_snapshot) {
   constexpr uint64_t kBudget = 32 * 1024 * 1024;
@@ -950,7 +987,7 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12CommandProcessor::GetFh1OwnedGeometry(
   address &= ~0xFFFFu;
   size = end - address;
   const uint64_t key = (uint64_t(address) << 32) | size;
-  auto found = fh1_geometry_.find(key);
+  auto found = FindFh1OwnedGeometry(address, size);
   if (found == fh1_geometry_.end()) {
     D3D12_RESOURCE_DESC desc;
     ui::d3d12::util::FillBufferResourceDesc(desc, size, D3D12_RESOURCE_FLAG_NONE);
@@ -960,6 +997,7 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12CommandProcessor::GetFh1OwnedGeometry(
     if (allocation > kBudget) {
       return 0;
     }
+    Fh1Geometry entry;
     // ponytail: linear eviction is bounded to 512 entries; no in-flight retirement
     // queue, so churn cannot exceed the geometry allocation budget.
     while (fh1_geometry_.size() >= 512 || fh1_geometry_bytes_ + allocation > kBudget) {
@@ -972,14 +1010,24 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12CommandProcessor::GetFh1OwnedGeometry(
         auto lock = thread::global_critical_region::AcquireDirect();
         if (oldest->second.watch) shared_memory_->UnwatchMemoryRange(oldest->second.watch);
       }
+      // The existing fence/victim policy stays authoritative. Reuse only an
+      // identical allocation; the normal full-window import replaces all bytes.
+      if (REXCVAR_GET(fh1_recycle_geometry_buffers) && !entry.buffer.Get() &&
+          uint32_t(oldest->first) == size && oldest->second.allocation_bytes == allocation) {
+        entry.buffer = std::move(oldest->second.buffer);
+        entry.state = oldest->second.state;
+        ++fh1_geometry_recycles_;
+      }
       fh1_geometry_bytes_ -= oldest->second.allocation_bytes;
       fh1_geometry_.erase(oldest);
     }
-    Fh1Geometry entry;
-    if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
-          provider.GetHeapFlagCreateNotZeroed(), &desc, D3D12_RESOURCE_STATE_COPY_DEST,
-          nullptr, IID_PPV_ARGS(&entry.buffer)))) {
-      return 0;
+    if (!entry.buffer.Get()) {
+      if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
+            provider.GetHeapFlagCreateNotZeroed(), &desc, D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr, IID_PPV_ARGS(&entry.buffer)))) {
+        return 0;
+      }
+      ++fh1_geometry_allocations_;
     }
     entry.buffer->SetName((L"FH1 owned geometry " + std::to_wstring(address) + L" " +
                            std::to_wstring(size)).c_str());
@@ -987,6 +1035,10 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12CommandProcessor::GetFh1OwnedGeometry(
     found = fh1_geometry_.emplace(key, std::move(entry)).first;
     fh1_geometry_bytes_ += allocation;
   }
+  if (found->first != key) ++fh1_geometry_contained_uses_;
+  // Watch, snapshot and import the entire selected owner, including bytes
+  // outside a nested request that a later caller may consume.
+  size = uint32_t(found->first);
   auto& entry = found->second;
   const bool add_snapshot = keep_cpu_snapshot && !entry.keep_cpu_snapshot;
   entry.keep_cpu_snapshot |= keep_cpu_snapshot;
@@ -1042,12 +1094,13 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12CommandProcessor::GetFh1OwnedGeometry(
     if (from_cpu) {
       // This import may contain CPU writes absent from shared memory. A later
       // shared draw must request residency instead of reusing an older tag.
-      for (uint32_t fetch : {89u, 90u, 95u}) {
+      for (uint32_t fetch : {89u, 90u, 94u, 95u}) {
         InvalidateVertexBufferResidency(fetch);
         vertex_buffer_states_[fetch] = {};
       }
       ++fh1_geometry_cpu_imports_;
     }
+    fh1_geometry_import_bytes_ += size;
     if (++fh1_geometry_imports_ == 1) {
       REXGPU_INFO("FH1 owned geometry first import (bytes {}, CPU {})", size, from_cpu);
     }
@@ -1055,6 +1108,10 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12CommandProcessor::GetFh1OwnedGeometry(
     if ((++fh1_geometry_hits_ & 0x3ffff) == 0) {
       REXGPU_INFO("FH1 owned geometry imports {}, CPU imports {}, cache hits {}, allocation bytes {}",
                   fh1_geometry_imports_, fh1_geometry_cpu_imports_, fh1_geometry_hits_, fh1_geometry_bytes_);
+      REXGPU_INFO("FH1 geometry storage allocations {}, recycled {}",
+                  fh1_geometry_allocations_, fh1_geometry_recycles_);
+      REXGPU_INFO("FH1 geometry containment uses {}, import bytes {}",
+                  fh1_geometry_contained_uses_, fh1_geometry_import_bytes_);
     }
   }
   entry.last_submission = submission_current_;
@@ -1067,7 +1124,7 @@ std::span<const uint8_t> D3D12CommandProcessor::GetFh1OwnedGeometryCpuRange(
       size > SharedMemory::kBufferSize - address) return {};
   const uint32_t base = address & ~0xFFFFu;
   const uint32_t end = (address + size + 0xFFFFu) & ~0xFFFFu;
-  auto found = fh1_geometry_.find((uint64_t(base) << 32) | (end - base));
+  auto found = FindFh1OwnedGeometry(base, end - base);
   if (found == fh1_geometry_.end() || found->second.cpu_snapshot.empty()) return {};
   // This is the import's immutable CPU copy, even if guest memory is now dirty.
   // A later import may replace it; callers revalidate after aliased imports.
@@ -1082,7 +1139,7 @@ std::optional<std::pair<uint32_t, uint32_t>> D3D12CommandProcessor::GetFh1DepthG
       size > SharedMemory::kBufferSize - address) return {};
   const uint32_t base = address & ~0xFFFFu;
   const uint32_t end = (address + size + 0xFFFFu) & ~0xFFFFu;
-  auto found = fh1_geometry_.find((uint64_t(base) << 32) | (end - base));
+  auto found = FindFh1OwnedGeometry(base, end - base);
   if (found == fh1_geometry_.end() || found->second.cpu_snapshot.empty()) return {};
   auto& entry = found->second;
   std::array<uint32_t, 16> key = {address, size, width, stride, fetch_address,
@@ -1113,7 +1170,7 @@ D3D12CommandProcessor::GetFh1TerrainGeometryRanges(
       size > SharedMemory::kBufferSize - address) return {};
   const uint32_t base = address & ~0xFFFFu;
   const uint32_t end = (address + size + 0xFFFFu) & ~0xFFFFu;
-  auto found = fh1_geometry_.find((uint64_t(base) << 32) | (end - base));
+  auto found = FindFh1OwnedGeometry(base, end - base);
   if (found == fh1_geometry_.end() || found->second.cpu_snapshot.empty()) return {};
   auto& entry = found->second;
   std::array<uint32_t, 33> key = {address, size, width, uint32_t(primitive_reset)};
@@ -1576,6 +1633,16 @@ bool D3D12CommandProcessor::SetupContext() {
     auto depth_desc = root_signature_bindless_desc;
     depth_desc.pParameters = layered_parameters;
     root_signature_fh1_depth_ = ui::d3d12::util::CreateRootSignature(provider, depth_desc);
+    // Skinned geometry keeps ordinary pixel tables and repurposes only the
+    // unused vertex descriptor-index CBV for its second raw input.
+    D3D12_ROOT_PARAMETER skinned_parameters[kRootParameter_Bindless_Count];
+    std::copy(std::begin(layered_parameters), std::end(layered_parameters),
+              std::begin(skinned_parameters));
+    skinned_parameters[kRootParameter_Bindless_DescriptorIndicesVertex] = geometry_parameter;
+    skinned_parameters[kRootParameter_Bindless_DescriptorIndicesVertex].Descriptor.ShaderRegister = 1;
+    auto skinned_desc = depth_desc;
+    skinned_desc.pParameters = skinned_parameters;
+    root_signature_fh1_skinned_ = ui::d3d12::util::CreateRootSignature(provider, skinned_desc);
     // Terrain uses three raw vertex streams and no texture descriptor indices.
     D3D12_ROOT_PARAMETER terrain_parameters[kRootParameter_Bindless_Count];
     std::copy(std::begin(layered_parameters), std::end(layered_parameters),
@@ -2065,6 +2132,7 @@ void D3D12CommandProcessor::ShutdownContext() {
   ui::d3d12::util::ReleaseAndNull(root_signature_bindless_vs_);
   ui::d3d12::util::ReleaseAndNull(root_signature_fh1_layered_);
   ui::d3d12::util::ReleaseAndNull(root_signature_fh1_depth_);
+  ui::d3d12::util::ReleaseAndNull(root_signature_fh1_skinned_);
   ui::d3d12::util::ReleaseAndNull(root_signature_fh1_terrain_);
   for (auto it : root_signatures_bindful_) {
     it.second->Release();
@@ -2855,7 +2923,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
   const auto fh1_prepare_start =
-      Fh1GpuCorpusEnabled() ? std::chrono::steady_clock::now()
+      Fh1GpuCorpusEnabled() && Fh1ObserveCorpusFrame(observation_frame_sequence_) ? std::chrono::steady_clock::now()
                             : std::chrono::steady_clock::time_point{};
   if (Fh1GpuCorpusEnabled()) {
     ++fh1_scene_draw_sequence_;
@@ -2943,6 +3011,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   const bool fh1_terrain_depth = fh1_vertex_hash == 0x5A28C7FAFD86F112ull ||
       fh1_vertex_hash == 0xCA293E0A1CB4B416ull || fh1_vertex_hash == 0x4E1DA281CC3D7EDBull;
   const uint32_t fh1_scene_stride =
+      fh1_vertex_hash == 0xB8489164D5A86043ull && fh1_pixel_hash == 0x68150A8E959006CDull ? 32 :
       fh1_vertex_hash == 0xA3B9ED5D5C87230Eull ? 12 :
       fh1_vertex_hash == 0x6934E161812AB10Bull ? 28 :
       fh1_vertex_hash == 0xAD2C355A6BE1EE87ull && fh1_pixel_hash == 0x2F2137BF953DA7AFull ? 20 :
@@ -3001,6 +3070,90 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   uint32_t normalized_color_mask =
       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                    : 0;
+  // A6's 2x depth-only design failed North Carson tail qualification.
+  const bool owned_depth_clear = REXCVAR_GET(fh1_owned_depth_clear) &&
+      texture_cache_->draw_resolution_scale_x() == 1 &&
+      texture_cache_->draw_resolution_scale_y() == 1 &&
+      !normalized_depth_control.stencil_enable;
+  const bool owned_tile_clear = REXCVAR_GET(fh1_owned_depth_tile_clear) &&
+      normalized_depth_control.stencil_enable &&
+      !regs.Get<reg::RB_STENCILREFMASK>().stencilref &&
+      (!normalized_depth_control.backface_enable ||
+       !regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF).stencilref);
+  if ((owned_depth_clear || owned_tile_clear) && is_rasterization_done &&
+      fh1_vertex_hash == 0x1E6883FCCDE1F688ull && !memexport_used &&
+      !pixel_shader && !normalized_color_mask &&
+      normalized_depth_control.z_enable && normalized_depth_control.z_write_enable &&
+      regs.Get<reg::RB_SURFACE_INFO>().msaa_samples == xenos::MsaaSamples::k4X &&
+      regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24S8 &&
+      !active_occlusion_query_.valid && !zpd_lifecycle_.active_report() &&
+      modern_occlusion_query_active_index_ == UINT32_MAX &&
+      (index_count == 3 || index_count == 6) &&
+      primitive_processing_result.index_buffer_type == PrimitiveProcessor::ProcessedIndexBufferType::kNone &&
+      primitive_processing_result.guest_primitive_type == xenos::PrimitiveType::kRectangleList &&
+      primitive_processing_result.host_draw_vertex_count == index_count &&
+      !regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable) {
+    const auto try_owned_clear = [&]() {
+      // Validate the same pipeline description as the established clear path,
+      // without first asking Update to materialize its 4x target.
+      auto* translation = static_cast<D3D12Shader::D3D12Translation*>(
+          vertex_shader->GetOrCreateTranslation(vertex_shader_modification.value));
+      const uint32_t formats[1 + xenos::kMaxColorRenderTargets] = {
+          uint32_t(xenos::DepthRenderTargetFormat::kD24S8)};
+      void* clear_pipeline = nullptr;
+      ID3D12RootSignature* clear_root = nullptr;
+      if (!pipeline_cache_->ConfigurePipeline(translation, nullptr, primitive_processing_result,
+          normalized_depth_control, 0, 1, formats, &clear_pipeline, &clear_root) ||
+          !pipeline_cache_->IsFh1ClearPipeline(clear_pipeline)) return false;
+      const uint32_t sx = texture_cache_->draw_resolution_scale_x();
+      const uint32_t sy = texture_cache_->draw_resolution_scale_y();
+      const bool convert = render_target_cache_->depth_float24_convert_in_pixel_shader();
+      draw_util::ViewportInfo viewport;
+      draw_util::GetHostViewportInfo(regs, sx, sy, true,
+          D3D12_VIEWPORT_BOUNDS_MAX, D3D12_VIEWPORT_BOUNDS_MAX, false,
+          normalized_depth_control, convert, true, false, viewport);
+      draw_util::Scissor clip;
+      draw_util::GetScissor(regs, clip);
+      clip.offset[0] *= sx; clip.offset[1] *= sy;
+      clip.extent[0] *= sx; clip.extent[1] *= sy;
+      UpdateSystemConstantValues(false, primitive_polygonal,
+          primitive_processing_result.line_loop_closing_index,
+          primitive_processing_result.host_shader_index_endian, viewport, 0,
+          normalized_depth_control, 0);
+      std::array<uint32_t, 120> system{};
+      static_assert(sizeof(system_constants_) <= sizeof(system));
+      std::memcpy(system.data(), &system_constants_, sizeof(system_constants_));
+      if ((system[0] & 1u) || system[4] || system[5] || system[6] ||
+          system[7] < index_count - 1 || (system[3] && system[3] < index_count)) return false;
+      const uint32_t fetch_address = regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0];
+      if ((fetch_address & 3u) != 3u) return false;
+      std::array<uint8_t, 168> bytes;
+      if (!shared_memory_->CopyCpuSnapshot(fetch_address & ~3u,
+          std::span<uint8_t>(bytes).first(index_count * 28))) return false;
+      std::array<Fh1ClearRectangle, 2> rectangles;
+      const uint32_t count = index_count / 3;
+      for (uint32_t i = 0; i < count; ++i) {
+        std::array<std::array<float, 4>, 3> vertices;
+        for (uint32_t j = 0; j < 3; ++j) {
+          const auto vertex = fh1_clear_vertex(
+              std::span<const uint8_t, 28>(bytes.data() + (i * 3 + j) * 28, 28),
+              regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_1] & 3u, system, false);
+          if (!vertex) return false;
+          std::copy_n(vertex->begin(), 4, vertices[j].begin());
+        }
+        const auto rectangle = fh1_clear_rectangle(vertices,
+            {viewport.xy_offset[0], viewport.xy_offset[1], viewport.xy_extent[0], viewport.xy_extent[1]},
+            {viewport.z_min, viewport.z_max},
+            {clip.offset[0], clip.offset[1], clip.extent[0], clip.extent[1]});
+        if (!rectangle || (convert && rectangle->depth != 0)) return false;
+        rectangles[i] = *rectangle;
+      }
+      const auto clear_rectangles = std::span<const Fh1ClearRectangle>(rectangles).first(count);
+      return owned_tile_clear ? render_target_cache_->ClearFh1OwnedDepthTiles(clear_rectangles)
+                              : render_target_cache_->ClearFh1OwnedDepth(clear_rectangles);
+    };
+    if (try_owned_clear()) return finish_draw(true);
+  }
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return finish_draw(false);
@@ -3060,6 +3213,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       : vertex_shader->GetUsedTextureMaskAfterTranslation() |
             (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
   auto prepared_draw_observer = graphics_system_->prepared_draw_observer();
+  if (!Fh1ObserveCorpusFrame(observation_frame_sequence_)) {
+    prepared_draw_observer = nullptr;
+  }
   system::GraphicsPreparedDrawObservation prepared_observation;
   const auto get_fh1_attachment_state = [&]() {
     uint64_t state = 0xCBF29CE484222325ull;
@@ -3212,7 +3368,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     fh1_key.identity = fh1_key.ComputeIdentity();
     // Diagnostic snapshots retain addresses and constants deliberately omitted
     // from prewarm identities. They are evidence, never batching admission.
-    if (prepared_draw_observer && Fh1GpuCorpusEnabled() &&
+    if (prepared_draw_observer && Fh1GpuCorpusEnabled() && Fh1SceneDumpEnabled() &&
         observation_frame_sequence_ >= 1200 &&
         observation_frame_sequence_ % 600 == 0 &&
         fh1_scene_binding_records_ < 4096 &&
@@ -3323,7 +3479,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                        .count());
     }
     ObserveFh1GpuPassTimingDraw(fh1_key,
-                                prepared_observation.frame_sequence);
+                                prepared_observation.frame_sequence,
+                                prepared_observation.fh1_prepare_cpu_time_ns);
     if (!pipeline_cache_->IsFh1PrewarmManifestLoaded()) {
       prepared_observation.fh1_fallback_reason =
           system::GraphicsFh1FallbackReason::kManifestUnavailable;
@@ -3452,10 +3609,29 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
 
   // Update the textures - this may bind pipelines.
-  if (root_signature_fh1_layered_ && root_signature == root_signature_fh1_layered_) {
+  // Qualified at 1x/2x; unsupported texture layouts retain the normal load path.
+  const bool fh1_video_textures = pixel_shader &&
+      (texture_cache_->draw_resolution_scale_x() == 1 ||
+       texture_cache_->draw_resolution_scale_x() == 2) &&
+      texture_cache_->draw_resolution_scale_y() == texture_cache_->draw_resolution_scale_x() &&
+      vertex_shader->ucode_data_hash() == 0x7156CE05C6365E51ull &&
+      pixel_shader->ucode_data_hash() == 0x31511D87CC0C94B9ull;
+  const bool time_texture_request = Fh1GpuCorpusEnabled() &&
+      observation_frame_sequence_ % 60 == 0;
+  const auto texture_request_start = time_texture_request
+      ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  if (fh1_video_textures) {
+    texture_cache_->RequestFh1VideoTextures(used_texture_mask);
+  } else if (root_signature_fh1_layered_ && root_signature == root_signature_fh1_layered_) {
     texture_cache_->RequestFh1Textures(used_texture_mask);
   } else {
     texture_cache_->RequestTextures(used_texture_mask);
+  }
+  if (time_texture_request) {
+    PERF_counter_add(kTextureRequestCpuTimeNs,
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - texture_request_start).count());
+    PERF_counter_inc(kTextureRequestTimingSamples);
   }
   if (fh1_velocity_dilate_source &&
       texture_cache_->GetActiveTextureSwizzledSigns(3) != 0) {
@@ -3647,7 +3823,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   D3D12_GPU_VIRTUAL_ADDRESS depth_index_address = 0;
   // Blended/lit use fixed materials; shadow/packed world retain pixel tables.
-  const auto fh1_mesh_root = fh1_scene_stride == 16 || fh1_scene_stride == 20
+  const auto fh1_mesh_root = fh1_scene_stride == 32 ? root_signature_fh1_skinned_ :
+      fh1_scene_stride == 16 || fh1_scene_stride == 20
       ? root_signature_fh1_layered_ : root_signature_fh1_depth_;
   if (fh1_depth_indices && (fh1_depth_stride ||
           (fh1_scene_stride && fh1_mesh_root && root_signature == fh1_mesh_root) ||
@@ -3720,6 +3897,34 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (fh1_scene_stride && !geometry_address) depth_index_address = 0;
 
   std::array<D3D12_GPU_VIRTUAL_ADDRESS, 2> terrain_addresses{};
+  const bool fh1_skinned = root_signature_fh1_skinned_ && root_signature == root_signature_fh1_skinned_;
+  if (fh1_skinned && geometry_address && depth_index_address) {
+    float offset;
+    std::memcpy(&offset, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 156 * 4], sizeof(offset));
+    const auto palette = skinned_transform_range(offset,
+        regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 188],
+        regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 189]);
+    const uint32_t width = primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16 ? 2 : 4;
+    const uint32_t bytes = primitive_processing_result.host_draw_vertex_count * width;
+    uint32_t system[8];
+    std::memcpy(system, &system_constants_, sizeof(system));
+    const auto primary_range = [&]() {
+      return GetFh1DepthGeometryRange(primitive_processing_result.guest_index_base, bytes,
+          system, width, 32, regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 190],
+          regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 191],
+          primitive_processing_result.host_primitive_reset_enabled, 32);
+    };
+    const auto before = primary_range();
+    if (palette && before) {
+      const uint64_t imports_before = fh1_geometry_imports_;
+      terrain_addresses[0] = GetFh1OwnedGeometry(palette->first, palette->second);
+      // An aliased import can refresh the immutable index snapshot.
+      if (terrain_addresses[0] && fh1_geometry_imports_ != imports_before &&
+          primary_range() != before) terrain_addresses[0] = 0;
+    }
+    if (!terrain_addresses[0]) geometry_address = depth_index_address = 0;
+  }
+
   if (fh1_terrain_depth && depth_index_address && root_signature_fh1_terrain_ &&
       root_signature == root_signature_fh1_terrain_) {
     const auto& map = vertex_shader->constant_register_map();
@@ -3813,7 +4018,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       }
       // The native layered root reads fetch 95 from the owned buffer.
       if (geometry_address && (vfetch_index == 95 ||
-          (terrain_addresses[1] && (vfetch_index == 89 || vfetch_index == 90)))) continue;
+          (terrain_addresses[1] && (vfetch_index == 89 || vfetch_index == 90)) ||
+          (fh1_skinned && terrain_addresses[0] && vfetch_index == 94))) continue;
       VertexBufferState& state = vertex_buffer_states_[vfetch_index];
       if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
@@ -4059,6 +4265,9 @@ bool D3D12CommandProcessor::IssueCopy() {
       written_length);
 
   auto copy_observer = graphics_system_->copy_observer();
+  if (!Fh1ObserveCorpusFrame(observation_frame_sequence_)) {
+    copy_observer = nullptr;
+  }
   if (copy_observer) {
     system::GraphicsCopyObservation observation;
     observation.frame_sequence = observation_frame_sequence_;
@@ -5100,6 +5309,22 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
   const bool native_terrain = root_signature_fh1_terrain_ &&
                               root_signature == root_signature_fh1_terrain_;
 
+  const bool native_skinned = root_signature_fh1_skinned_ && root_signature == root_signature_fh1_skinned_;
+  uint32_t skinned_origin = 0;
+  if (native_skinned && terrain_addresses[0]) {
+    float offset;
+    std::memcpy(&offset, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 156 * 4], sizeof(offset));
+    const auto range = skinned_transform_range(offset,
+        regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 188],
+        regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 189]);
+    if (!range) return false;
+    skinned_origin = range->first & ~15u;
+  }
+  if (current_fh1_skinned_origin_ != skinned_origin) {
+    current_fh1_skinned_origin_ = skinned_origin;
+    cbuffer_binding_fetch_.up_to_date = false;
+  }
+
   // Set the new root signature.
   if (current_graphics_root_signature_ != root_signature) {
     current_graphics_root_signature_ = root_signature;
@@ -5288,8 +5513,9 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     }
     for (uint32_t i = 0; i < 2; ++i) {
       if (!terrain_addresses[i]) continue;
-      const uint32_t fetch = i == 0 ? 90 : 89;
-      const uint32_t rebased = regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch * 2] & 15u;
+      const uint32_t fetch = native_skinned ? 94 : (i == 0 ? 90 : 89);
+      const uint32_t original = regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch * 2];
+      const uint32_t rebased = native_skinned ? original - skinned_origin : original & 15u;
       std::memcpy(fetch_constants + fetch * 2 * sizeof(uint32_t), &rebased, sizeof(rebased));
     }
     cbuffer_binding_fetch_.up_to_date = true;
@@ -5820,7 +6046,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
   if (!(current_graphics_root_up_to_date_ &
         (1u << root_parameter_shared_memory_and_bindful_edram))) {
     if (current_graphics_root_signature_ == root_signature_fh1_layered_ ||
-        current_graphics_root_signature_ == root_signature_fh1_depth_ || native_terrain) {
+        current_graphics_root_signature_ == root_signature_fh1_depth_ || native_terrain || native_skinned) {
       assert_false(shared_memory_is_uav);
       deferred_command_list_.D3DSetGraphicsRootShaderResourceView(
           root_parameter_shared_memory_and_bindful_edram,
@@ -5866,7 +6092,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     }
     if (!native_layered && !(current_graphics_root_up_to_date_ &
           (1u << kRootParameter_Bindless_DescriptorIndicesVertex))) {
-      if (native_terrain) {
+      if (native_terrain || native_skinned) {
         deferred_command_list_.D3DSetGraphicsRootShaderResourceView(
             kRootParameter_Bindless_DescriptorIndicesVertex,
             terrain_addresses[0] ? terrain_addresses[0] : shared_memory_->GetGPUAddress());
@@ -5940,6 +6166,10 @@ bool D3D12CommandProcessor::InitializeNativeGuestOutputGpuTiming() {
   fh1_gpu_pass_timing_aggregates_.clear();
   fh1_gpu_pass_family_timing_aggregates_.clear();
   fh1_gpu_pass_timing_drops_ = 0;
+  fh1_gpu_pass_timing_busy_drops_ = 0;
+  fh1_gpu_pass_timing_capacity_drops_ = 0;
+  fh1_gpu_pass_timing_interrupted_drops_ = 0;
+  fh1_gpu_pass_timing_invalid_drops_ = 0;
   fh1_gpu_pass_timing_last_log_frame_ = 0;
 
   ID3D12Device* device = GetD3D12Provider().GetDevice();
@@ -6034,6 +6264,14 @@ void D3D12CommandProcessor::LogFh1GpuPassTimings() {
   if (!ranked.empty() || fh1_gpu_pass_timing_drops_) {
     REXGPU_INFO("FH1 V4 pass timing signatures {}, dropped samples {}",
                 ranked.size(), fh1_gpu_pass_timing_drops_);
+    // Counts are loss events, not unique samples: interrupted endpoints may
+    // subsequently retire as invalid records.
+    REXGPU_INFO("FH1 timing loss reasons {{\"busy\":{},\"capacity\":{},"
+                "\"interrupted\":{},\"invalid\":{}}}",
+                fh1_gpu_pass_timing_busy_drops_,
+                fh1_gpu_pass_timing_capacity_drops_,
+                fh1_gpu_pass_timing_interrupted_drops_,
+                fh1_gpu_pass_timing_invalid_drops_);
   }
   std::vector<std::pair<uint64_t, Fh1GpuPassTimingAggregate>> ranked_families(
       fh1_gpu_pass_family_timing_aggregates_.begin(),
@@ -6091,6 +6329,7 @@ void D3D12CommandProcessor::BeginNativeGuestOutputGpuTimingFrame() {
     fh1_gpu_pass_timing_active_ = {};
   } else {
     ++fh1_gpu_pass_timing_drops_;
+    ++fh1_gpu_pass_timing_busy_drops_;
   }
   if (!native_guest_output_gpu_timing_active_) {
     return;
@@ -6130,8 +6369,88 @@ void D3D12CommandProcessor::EndNativeGuestOutputGpuTimingFrame() {
   slot.submission = submission_current_;
 }
 
+bool D3D12CommandProcessor::IsFh1GpuWorkTimingSampleFrame() const {
+  return Fh1GpuCorpusEnabled() && native_guest_output_gpu_query_heap_ &&
+         !(observation_frame_sequence_ % 60);
+}
+
+D3D12CommandProcessor::Fh1GpuWorkTiming
+D3D12CommandProcessor::BeginFh1TextureLoadTiming(const D3D12TextureCache::TextureKey& key) {
+  if (!IsFh1GpuWorkTimingSampleFrame()) {
+    return {};
+  }
+  auto& slot = fh1_gpu_pass_timing_slots_[frame_current_ % kQueueFrames];
+  if (slot.submission || slot.record_count >= kFh1GpuPassTimingCapacity) {
+    ++fh1_gpu_pass_timing_drops_;
+    if (slot.submission) {
+      ++fh1_gpu_pass_timing_busy_drops_;
+    } else {
+      ++fh1_gpu_pass_timing_capacity_drops_;
+    }
+    return {};
+  }
+  const uint32_t index = slot.record_count++;
+  auto& record = slot.records[index];
+  record = {};
+  record.texture_key = key;
+  record.frame = observation_frame_sequence_;
+  record.query_offset = kNativeGuestOutputGpuQueriesPerFrame + index * 3;
+  // Initialize every query, including endpoints of any interrupted sample.
+  // Normal completion overwrites the two endpoints before the slot is resolved.
+  for (uint32_t point = 0; point < 3; ++point) {
+    deferred_command_list_.D3DEndQuery(native_guest_output_gpu_query_heap_.Get(),
+        D3D12_QUERY_TYPE_TIMESTAMP,
+        uint32_t(frame_current_ % kQueueFrames) * kGpuTimingQueriesPerFrame +
+            record.query_offset + point);
+  }
+  return {frame_current_, submission_current_, index};
+}
+
+D3D12CommandProcessor::Fh1GpuWorkTiming
+D3D12CommandProcessor::BeginFh1RenderTargetTransferTiming(uint32_t transfer_count,
+                                                       bool resolve_clear) {
+  if (!transfer_count && !resolve_clear) {
+    return {};
+  }
+  auto timing = BeginFh1TextureLoadTiming({});
+  if (timing.record != UINT32_MAX) {
+    auto& record = fh1_gpu_pass_timing_slots_[timing.frame % kQueueFrames].records[timing.record];
+    record.render_target_transfer = true;
+    record.transfer_count = transfer_count;
+    record.resolve_clear = resolve_clear;
+  }
+  return timing;
+}
+
+void D3D12CommandProcessor::FinishFh1RenderTargetTransferTiming(
+    const Fh1GpuWorkTiming& timing) {
+  AdvanceFh1GpuWorkTiming(timing, false);
+  AdvanceFh1GpuWorkTiming(timing, true);
+}
+
+void D3D12CommandProcessor::AdvanceFh1GpuWorkTiming(
+    const Fh1GpuWorkTiming& timing, bool finish) {
+  if (timing.record == UINT32_MAX) {
+    return;
+  }
+  auto& slot = fh1_gpu_pass_timing_slots_[frame_current_ % kQueueFrames];
+  if (timing.frame != frame_current_ || timing.submission != submission_current_ ||
+      slot.submission || timing.record >= slot.record_count) {
+    ++fh1_gpu_pass_timing_drops_;
+    ++fh1_gpu_pass_timing_interrupted_drops_;
+    return;
+  }
+  auto& record = slot.records[timing.record];
+  deferred_command_list_.D3DEndQuery(native_guest_output_gpu_query_heap_.Get(),
+      D3D12_QUERY_TYPE_TIMESTAMP,
+      uint32_t(frame_current_ % kQueueFrames) * kGpuTimingQueriesPerFrame +
+          record.query_offset + (finish ? 2 : 1));
+  record.work_complete = finish;
+}
+
 void D3D12CommandProcessor::ObserveFh1GpuPassTimingDraw(
-    const system::GraphicsFh1ExecutionKey& key, uint64_t frame) {
+    const system::GraphicsFh1ExecutionKey& key, uint64_t frame,
+    uint64_t prepare_cpu_time_ns) {
   if (!Fh1GpuCorpusEnabled() ||
       !native_guest_output_gpu_query_heap_ ||
       key.kind != system::GraphicsFh1ExecutionKind::kDraw || frame % 60) {
@@ -6169,6 +6488,10 @@ void D3D12CommandProcessor::ObserveFh1GpuPassTimingDraw(
       record.query_offset = kNativeGuestOutputGpuQueriesPerFrame +
                             record_index * 3;
       fh1_gpu_pass_timing_active_.record_index = record_index;
+      record.begin_submission = submission_current_;
+      record.recording_start_ns = uint64_t(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count());
       deferred_command_list_.D3DEndQuery(
           native_guest_output_gpu_query_heap_.Get(),
           D3D12_QUERY_TYPE_TIMESTAMP,
@@ -6177,10 +6500,16 @@ void D3D12CommandProcessor::ObserveFh1GpuPassTimingDraw(
               record.query_offset);
     } else {
       ++fh1_gpu_pass_timing_drops_;
+      if (slot.submission) {
+        ++fh1_gpu_pass_timing_busy_drops_;
+      } else {
+        ++fh1_gpu_pass_timing_capacity_drops_;
+      }
     }
   }
   fh1_gpu_pass_timing_active_.running_signature = HashFh1ExecutionValue(
       fh1_gpu_pass_timing_active_.running_signature, draw_family);
+  fh1_gpu_pass_timing_active_.prepare_cpu_time_ns += prepare_cpu_time_ns;
   ++fh1_gpu_pass_timing_active_.draw_count;
   fh1_gpu_pass_timing_active_.hazard_flags |= key.hazard_flags;
 }
@@ -6250,6 +6579,8 @@ void D3D12CommandProcessor::FinishFh1GpuPassTiming(
     if (!record.family) {
       record.family = 1;
     }
+    record.prepare_cpu_time_ns = fh1_gpu_pass_timing_active_.prepare_cpu_time_ns;
+    record.frame = fh1_gpu_pass_timing_active_.frame;
     record.attachment_state = fh1_gpu_pass_timing_active_.attachment_state;
     record.first_draw_family =
         fh1_gpu_pass_timing_active_.first_draw_family;
@@ -6257,6 +6588,11 @@ void D3D12CommandProcessor::FinishFh1GpuPassTiming(
         fh1_gpu_pass_timing_active_.first_draw_identity;
     record.terminal_copy_state = terminal_copy_state;
     record.draw_count = fh1_gpu_pass_timing_active_.draw_count;
+    record.end_submission = submission_current_;
+    record.recording_wall_ns = uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count()) -
+        record.recording_start_ns;
     if (!record.copy_started) {
       deferred_command_list_.D3DEndQuery(
           native_guest_output_gpu_query_heap_.Get(),
@@ -6344,13 +6680,56 @@ void D3D12CommandProcessor::RetireNativeGuestOutputGpuTimings() {
       const uint64_t start = timestamps[record.query_offset];
       const uint64_t copy_start = timestamps[record.query_offset + 1];
       const uint64_t end = timestamps[record.query_offset + 2];
+      if (record.render_target_transfer) {
+        if (record.work_complete && start <= copy_start && copy_start <= end) {
+          REXGPU_INFO("FH1 render target transfer sample {{\"frame\":{},"
+                      "\"submission\":{},\"record\":{},\"transfers\":{},"
+                      "\"resolve_clear\":{},\"total_ns\":{}}}",
+                      record.frame, slot.submission, record_index,
+                      record.transfer_count, record.resolve_clear,
+                      ticks_to_ns(end - start));
+        } else {
+          ++fh1_gpu_pass_timing_drops_;
+          ++fh1_gpu_pass_timing_invalid_drops_;
+        }
+        continue;
+      }
+      if (record.texture_key.is_valid) {
+        if (record.work_complete && start <= copy_start && copy_start <= end) {
+          const auto& key = record.texture_key;
+          REXGPU_INFO(
+              "FH1 texture load sample {{\"frame\":{},\"submission\":{},\"record\":{},"
+              "\"base\":\"{:08X}\",\"width\":{},\"height\":{},\"format\":{},"
+              "\"pitch\":{},\"packed\":{},\"endian\":{},\"signed\":{},"
+              "\"conversion_ns\":{},\"copy_ns\":{}}}",
+              record.frame, slot.submission, record_index, uint32_t(key.base_page << 12),
+              key.GetWidth(), key.GetHeight(), uint32_t(key.format), uint32_t(key.pitch << 5),
+              uint32_t(key.packed_mips), uint32_t(key.endianness), uint32_t(key.signed_separate),
+              ticks_to_ns(copy_start - start), ticks_to_ns(end - copy_start));
+        } else {
+          ++fh1_gpu_pass_timing_drops_;
+          ++fh1_gpu_pass_timing_invalid_drops_;
+        }
+        continue;
+      }
       if (!record.family || copy_start < start || end < copy_start) {
+        ++fh1_gpu_pass_timing_drops_;
+        ++fh1_gpu_pass_timing_invalid_drops_;
         continue;
       }
       const uint64_t duration_ns = uint64_t(ticks_to_ns(end - start));
       const uint64_t draw_ns = uint64_t(ticks_to_ns(copy_start - start));
       const uint64_t resolve_ns =
           record.copy_started ? uint64_t(ticks_to_ns(end - copy_start)) : 0;
+      REXGPU_INFO(
+          "FH1 V5 pass sample {{\"frame\":{},\"submission\":{},\"record\":{},"
+          "\"family\":\"{:016X}\",\"first_draw\":\"{:016X}\",\"draws\":{},"
+          "\"total_ns\":{},\"draw_ns\":{},\"resolve_ns\":{},\"prepare_cpu_ns\":{},"
+          "\"recording_wall_ns\":{},\"begin_submission\":{},\"end_submission\":{}}}",
+          record.frame, slot.submission, record_index, record.family,
+          record.first_draw_identity, record.draw_count, duration_ns, draw_ns,
+          resolve_ns, record.prepare_cpu_time_ns, record.recording_wall_ns,
+          record.begin_submission, record.end_submission);
       if (record.signature) {
         auto& aggregate = fh1_gpu_pass_timing_aggregates_[record.signature];
         ++aggregate.samples;

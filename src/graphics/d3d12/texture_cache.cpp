@@ -43,6 +43,7 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/texture_load_16bpb_scaled_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_32bpb_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_32bpb_scaled_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_scaled_32bpp_2x_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_64bpb_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_64bpb_scaled_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_8bpb_cs.h"
@@ -592,6 +593,16 @@ bool D3D12TextureCache::Initialize() {
     }
   }
 
+  if (draw_resolution_scale_x() == 2 && draw_resolution_scale_y() == 2) {
+    *load_pipeline_fh1_scaled_32_.ReleaseAndGetAddressOf() =
+        ui::d3d12::util::CreateComputePipeline(
+            device, shaders::fh1_scaled_32bpp_2x_cs,
+            sizeof(shaders::fh1_scaled_32bpp_2x_cs), load_root_signature_.Get());
+    if (load_pipeline_fh1_scaled_32_) {
+      load_pipeline_fh1_scaled_32_->SetName(L"FH1 Scaled 32bpp 2x");
+    }
+  }
+
   srv_descriptor_cache_allocated_ = 0;
 
   // Create a heap with null SRV descriptors, since it's faster to copy a
@@ -702,6 +713,12 @@ void D3D12TextureCache::RequestFh1Textures(uint32_t used_texture_mask) {
   request_fh1_bc3_ = true;
   RequestTextures(used_texture_mask);
   request_fh1_bc3_ = false;
+}
+
+void D3D12TextureCache::RequestFh1VideoTextures(uint32_t used_texture_mask) {
+  request_fh1_video_ = true;
+  RequestTextures(used_texture_mask);
+  request_fh1_video_ = false;
 }
 
 void D3D12TextureCache::RequestTextures(uint32_t used_texture_mask) {
@@ -1568,6 +1585,49 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
 }
 
 bool D3D12TextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_base, bool load_mips) {
+  // BEGIN FH1 LINEAR VIDEO UPLOAD
+  if (request_fh1_video_) {
+    const TextureKey key = texture.key();
+    if (!load_base || load_mips || key.mip_max_level || key.scaled_resolve ||
+        key.tiled || texture.force_load_3d_tiling() || !key.base_page ||
+        key.dimension != xenos::DataDimension::k2DOrStacked ||
+        key.GetDepthOrArraySize() != 1 || key.format != xenos::TextureFormat::k_8 ||
+        key.endianness != xenos::Endian::kNone) return false;
+    auto& target = static_cast<D3D12Texture&>(texture);
+    auto* resource = target.resource();
+    const auto desc = resource->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT64 size = 0;
+    command_processor_.GetD3D12Provider().GetDevice()->GetCopyableFootprints(
+        &desc, 0, 1, 0, &footprint, nullptr, nullptr, &size);
+    const auto& guest = texture.guest_layout().base;
+    if (guest.row_pitch_bytes != footprint.Footprint.RowPitch ||
+        !guest.level_data_extent_bytes || guest.level_data_extent_bytes > size ||
+        footprint.Offset != 0) return false;
+    ID3D12Resource* upload = nullptr;
+    size_t offset = 0;
+    auto* mapping = command_processor_.GetConstantBufferPool().Request(
+        command_processor_.GetCurrentFrame(), size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT,
+        &upload, &offset, nullptr);
+    // CopyCpuRange refuses GPU-written pages. The texture load lifecycle armed
+    // its watch before this call, so writes racing the copy remain dirty.
+    if (!mapping || !shared_memory().CopyCpuRange(key.base_page << 12,
+          {mapping, guest.level_data_extent_bytes})) return false;
+    target.MarkAsUsed();
+    command_processor_.PushTransitionBarrier(resource,
+        target.SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST), D3D12_RESOURCE_STATE_COPY_DEST);
+    command_processor_.SubmitBarriers();
+    D3D12_TEXTURE_COPY_LOCATION source{}, dest{};
+    source.pResource = upload;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.PlacedFootprint = footprint;
+    source.PlacedFootprint.Offset += offset;
+    dest.pResource = resource;
+    dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(&dest, 0, 0, 0, &source, nullptr);
+    return true;
+  }
+  // END FH1 LINEAR VIDEO UPLOAD
   if (!request_fh1_bc3_) return false;
   const TextureKey key = texture.key();
   if (key.scaled_resolve || texture.force_load_3d_tiling() ||
@@ -1667,6 +1727,20 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   ID3D12PipelineState* pipeline = texture_resolution_scaled
                                       ? load_pipelines_scaled_[load_shader].Get()
                                       : load_pipelines_[load_shader].Get();
+  // Captured base-only R10G10B10A2 contract; optional PSO failure uses the generic load.
+  const bool fh1_scaled_32 = load_base && !load_mips &&
+      texture_resolution_scaled && draw_resolution_scale_x() == 2 &&
+      draw_resolution_scale_y() == 2 && load_shader == kLoadShaderIndex32bpb &&
+      texture_key.dimension == xenos::DataDimension::k2DOrStacked &&
+      texture_key.GetDepthOrArraySize() == 1 && texture_key.tiled &&
+      !texture_key.packed_mips && !texture_key.mip_max_level &&
+      !texture_key.signed_separate && uint32_t(texture_key.endianness) == 2 &&
+      uint32_t(texture_key.format) == 7 && texture_key.GetWidth() == 1280 &&
+      texture_key.GetHeight() == 720 && texture_key.pitch == 40 &&
+      !d3d12_texture.force_load_3d_tiling();
+  if (fh1_scaled_32 && load_pipeline_fh1_scaled_32_) {
+    pipeline = load_pipeline_fh1_scaled_32_.Get();
+  }
   if (pipeline == nullptr) {
     return false;
   }
@@ -1858,6 +1932,7 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   // available through buffers, and to create a descriptor, the buffer start
   // address is required - which may be different for base and mips.
   bool scaled_mips_source_set_up = false;
+  D3D12CommandProcessor::Fh1GpuWorkTiming texture_timing;
   uint32_t guest_x_blocks_per_group_log2 = load_shader_info.GetGuestXBlocksPerGroupLog2();
   for (uint32_t loop_level = loop_level_first; loop_level <= loop_level_last; ++loop_level) {
     bool is_base = loop_level == 0;
@@ -1874,6 +1949,12 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
                                          load_shader_info.source_bpe_log2)) {
         command_processor_.ReleaseScratchGPUBuffer(copy_buffer, copy_buffer_state);
         return false;
+      }
+      // Base-only 2D conversions have no later fallible allocations or source
+      // changes. Sample dispatch and scratch-copy cost using the existing heap.
+      if (is_base && !load_mips && !texture_key.mip_max_level &&
+          dimension == xenos::DataDimension::k2DOrStacked && array_size == 1) {
+        texture_timing = command_processor_.BeginFh1TextureLoadTiming(texture_key);
       }
       TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
       assert_true(descriptor_write_index < descriptor_count);
@@ -1973,6 +2054,7 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   d3d12_texture.MarkAsUsed();
 
   // Submit copying from the copy buffer to the host texture.
+  command_processor_.AdvanceFh1GpuWorkTiming(texture_timing, false);
   ID3D12Resource* texture_resource = d3d12_texture.resource();
   command_processor_.PushTransitionBarrier(
       texture_resource, d3d12_texture.SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST),
@@ -2025,6 +2107,7 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
 
   command_processor_.ReleaseScratchGPUBuffer(copy_buffer, copy_buffer_state);
 
+  command_processor_.AdvanceFh1GpuWorkTiming(texture_timing, true);
   return true;
 }
 

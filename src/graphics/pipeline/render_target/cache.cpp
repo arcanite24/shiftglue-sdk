@@ -1171,6 +1171,41 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(Rend
   return render_target;
 }
 
+RenderTargetCache::RenderTarget* RenderTargetCache::GetFullyOwnedRenderTarget(
+    RenderTargetKey key) const {
+  // ponytail: whole-EDRAM ownership gate covers this chain; admit per-row
+  // ownership only when a measured clear needs mixed current owners.
+  if (key.IsEmpty() || ownership_ranges_.empty()) return nullptr;
+  for (const auto& [start, range] : ownership_ranges_) {
+    if (range.render_target != key) return nullptr;
+  }
+  const auto it = render_targets_.find(key);
+  return it == render_targets_.end() ? nullptr : it->second;
+}
+
+RenderTargetCache::RenderTarget* RenderTargetCache::PrepareFh1FullTileDepthClear(
+    RenderTargetKey key, std::span<const std::array<uint32_t, 4>> tile_bounds) {
+  if (GetPath() != Path::kHostRenderTargets || tile_bounds.empty() || tile_bounds.size() > 2 ||
+      !key.is_depth || key.base_tiles || key.GetPitchTiles() != 16 ||
+      key.msaa_samples != xenos::MsaaSamples::k4X ||
+      key.GetDepthFormat() != xenos::DepthRenderTargetFormat::kD24S8 ||
+      IsHostDepthEncodingDifferent(key.GetDepthFormat())) return nullptr;
+  const uint32_t pitch = key.GetPitchTiles();
+  for (const auto& r : tile_bounds) {
+    if (r[0] >= r[2] || r[1] >= r[3] || r[2] > pitch ||
+        uint64_t(r[3] - 1) * pitch + r[2] > xenos::kEdramTileCount) return nullptr;
+  }
+  RenderTarget* target = GetOrCreateRenderTarget(key);
+  if (!target) return nullptr;
+  // Each row is completely overwritten. Keep padding, other rows and both
+  // independent host-depth histories with their existing owners.
+  for (const auto& r : tile_bounds)
+    for (uint32_t y = r[1]; y < r[3]; ++y)
+      ChangeOwnership(key, y * pitch + r[0], r[2] - r[0], nullptr);
+  ResetAccumulatedRenderTargets();
+  return target;
+}
+
 bool RenderTargetCache::WouldOwnershipChangeRequireTransfers(RenderTargetKey dest,
                                                              uint32_t start_tiles_base_relative,
                                                              uint32_t length_tiles) const {

@@ -35,6 +35,7 @@ class D3D12CommandProcessor;
 
 class D3D12TextureCache final : public TextureCache {
  public:
+  using TextureCache::TextureKey;
   // Keys that can be stored for checking validity whether descriptors for host
   // shader bindings are up to date.
   struct TextureSRVKey {
@@ -97,6 +98,7 @@ class D3D12TextureCache final : public TextureCache {
   // binding the actual drawing pipeline.
   void RequestTextures(uint32_t used_texture_mask) override;
   void RequestFh1Textures(uint32_t used_texture_mask);
+  void RequestFh1VideoTextures(uint32_t used_texture_mask);
 
   // Returns whether texture SRV keys stored externally are still valid for the
   // current bindings and host shader binding layout. Both keys and
@@ -288,6 +290,7 @@ class D3D12TextureCache final : public TextureCache {
 
   bool TryLoadTextureDataFromCpu(Texture& texture, bool load_base, bool load_mips) override;
   bool request_fh1_bc3_ = false;
+  bool request_fh1_video_ = false;
 
   static constexpr uint32_t kSRVDescriptorCachePageSize = 65536;
 
@@ -470,6 +473,7 @@ class D3D12TextureCache final : public TextureCache {
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kLoadShaderCount> load_pipelines_;
   // Load pipelines for resolution-scaled resolve targets.
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kLoadShaderCount> load_pipelines_scaled_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> load_pipeline_fh1_scaled_32_;
 
   std::vector<SRVDescriptorCachePage> srv_descriptor_cache_;
   uint32_t srv_descriptor_cache_allocated_;

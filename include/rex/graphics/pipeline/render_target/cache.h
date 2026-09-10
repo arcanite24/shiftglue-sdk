@@ -10,10 +10,12 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <span>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -547,6 +549,12 @@ class RenderTargetCache {
   // To be called by the implementation when interlocked writes to all of the
   // EDRAM memory are committed with a memory barrier.
   void PixelShaderInterlockFullEdramBarrierPlaced();
+
+  RenderTarget* GetFullyOwnedRenderTarget(RenderTargetKey key) const;
+
+  // Caller must overwrite both depth and stencil in every claimed tile.
+  RenderTarget* PrepareFh1FullTileDepthClear(
+      RenderTargetKey key, std::span<const std::array<uint32_t, 4>> tile_bounds);
 
  private:
   const RegisterFile& register_file_;

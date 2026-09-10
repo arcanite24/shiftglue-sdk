@@ -61,6 +61,9 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
 
+  bool ClearFh1OwnedDepth(std::span<const Fh1ClearRectangle> rectangles);
+  bool ClearFh1OwnedDepthTiles(std::span<const Fh1ClearRectangle> rectangles);
+
   // Called only after Update has established ownership and transferred contents.
   bool ClearFh1Rectangles(std::span<const Fh1ClearRectangle> rectangles,
                          std::span<const std::array<float, 4>> colors,

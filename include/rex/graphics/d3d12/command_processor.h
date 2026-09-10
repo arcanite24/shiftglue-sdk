@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <deque>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -97,6 +98,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Finds or creates root signature for a pipeline.
   ID3D12RootSignature* GetRootSignature(const DxbcShader* vertex_shader,
                                         const DxbcShader* pixel_shader, bool tessellated);
+  ID3D12RootSignature* GetFh1SkinnedRootSignature() const { return root_signature_fh1_skinned_; }
   ID3D12RootSignature* GetFh1TerrainRootSignature() const { return root_signature_fh1_terrain_; }
   ID3D12RootSignature* GetFh1DepthRootSignature() const { return root_signature_fh1_depth_; }
   ID3D12RootSignature* GetFh1LayeredRootSignature() const {
@@ -104,6 +106,18 @@ class D3D12CommandProcessor : public CommandProcessor {
   }
 
   ui::d3d12::D3D12UploadBufferPool& GetConstantBufferPool() const { return *constant_buffer_pool_; }
+
+  struct Fh1GpuWorkTiming {
+    uint64_t frame = 0;
+    uint64_t submission = 0;
+    uint32_t record = UINT32_MAX;
+  };
+  Fh1GpuWorkTiming BeginFh1TextureLoadTiming(const D3D12TextureCache::TextureKey& key);
+  void AdvanceFh1GpuWorkTiming(const Fh1GpuWorkTiming& timing, bool finish);
+  bool IsFh1GpuWorkTimingSampleFrame() const;
+  Fh1GpuWorkTiming BeginFh1RenderTargetTransferTiming(uint32_t transfer_count,
+                                                    bool resolve_clear);
+  void FinishFh1RenderTargetTransferTiming(const Fh1GpuWorkTiming& timing);
 
   D3D12_CPU_DESCRIPTOR_HANDLE GetViewBindlessHeapCPUStart() const {
     assert_true(bindless_resources_used_);
@@ -388,7 +402,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   void BeginNativeGuestOutputGpuTimingFrame();
   void EndNativeGuestOutputGpuTimingFrame();
   void ObserveFh1GpuPassTimingDraw(
-      const system::GraphicsFh1ExecutionKey& key, uint64_t frame);
+      const system::GraphicsFh1ExecutionKey& key, uint64_t frame,
+      uint64_t prepare_cpu_time_ns);
   void BeginFh1GpuPassTimingCopy();
   void ObserveFh1GpuPassTimingCopy(
       const system::GraphicsFh1ExecutionKey& key, uint64_t frame);
@@ -550,6 +565,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   ID3D12RootSignature* root_signature_bindless_vs_ = nullptr;
   ID3D12RootSignature* root_signature_fh1_layered_ = nullptr;
   ID3D12RootSignature* root_signature_fh1_depth_ = nullptr;
+  ID3D12RootSignature* root_signature_fh1_skinned_ = nullptr;
+  uint32_t current_fh1_skinned_origin_ = 0;
   ID3D12RootSignature* root_signature_fh1_terrain_ = nullptr;
   ID3D12RootSignature* root_signature_bindless_ds_ = nullptr;
 
@@ -632,6 +649,7 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t next_terrain_bound = 0;
   };
   D3D12_GPU_VIRTUAL_ADDRESS GetFh1OwnedGeometry(uint32_t address, uint32_t size, bool keep_cpu_snapshot = false);
+  std::map<uint64_t, Fh1Geometry>::iterator FindFh1OwnedGeometry(uint32_t base, uint32_t size);
   std::span<const uint8_t> GetFh1OwnedGeometryCpuRange(uint32_t address, uint32_t size);
   std::optional<std::pair<uint32_t, uint32_t>> GetFh1DepthGeometryRange(
       uint32_t address, uint32_t size, std::span<const uint32_t, 8> system,
@@ -642,10 +660,14 @@ class D3D12CommandProcessor : public CommandProcessor {
       uint32_t width, bool primitive_reset, std::span<const float, 44> constants,
       std::span<const uint32_t, 6> fetches);
   void ClearFh1OwnedGeometry();  // GPU queue must be idle.
-  std::unordered_map<uint64_t, Fh1Geometry> fh1_geometry_;
+  std::map<uint64_t, Fh1Geometry> fh1_geometry_;
   uint64_t fh1_geometry_bytes_ = 0;
   uint64_t fh1_geometry_imports_ = 0;
   uint64_t fh1_geometry_cpu_imports_ = 0;
+  uint64_t fh1_geometry_allocations_ = 0;
+  uint64_t fh1_geometry_recycles_ = 0;
+  uint64_t fh1_geometry_contained_uses_ = 0;
+  uint64_t fh1_geometry_import_bytes_ = 0;
   uint64_t fh1_geometry_hits_ = 0;
   D3D12_GPU_VIRTUAL_ADDRESS current_fh1_geometry_address_ = 0;
   std::array<D3D12_GPU_VIRTUAL_ADDRESS, 2> current_fh1_terrain_addresses_{};
@@ -662,7 +684,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::unordered_set<uint64_t> fh1_scene_command_snapshots_;
 
   static constexpr uint32_t kNativeGuestOutputGpuQueriesPerFrame = 5;
-  static constexpr uint32_t kFh1GpuPassTimingCapacity = 256;
+  // Sampled gameplay exceeds 256 mixed pass/texture records. Keep a bounded
+  // buffer and report overflow rather than silently treating a prefix as complete.
+  static constexpr uint32_t kFh1GpuPassTimingCapacity = 512;
   static constexpr uint32_t kGpuTimingQueriesPerFrame =
       kNativeGuestOutputGpuQueriesPerFrame +
       kFh1GpuPassTimingCapacity * 3;
@@ -683,6 +707,13 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool native_guest_output_gpu_timing_active_ = false;
 
   struct Fh1GpuPassTimingRecord {
+    D3D12TextureCache::TextureKey texture_key;
+    bool work_complete = false;
+    bool render_target_transfer = false;
+    bool resolve_clear = false;
+    uint32_t transfer_count = 0;
+    uint64_t frame = 0;
+    uint64_t prepare_cpu_time_ns = 0;
     uint64_t signature = 0;
     uint64_t family = 0;
     uint64_t attachment_state = 0;
@@ -692,6 +723,10 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t draw_count = 0;
     uint32_t query_offset = 0;
     bool copy_started = false;
+    uint64_t recording_start_ns = 0;
+    uint64_t recording_wall_ns = 0;
+    uint64_t begin_submission = 0;
+    uint64_t end_submission = 0;
   };
   struct Fh1GpuPassTimingSlot {
     uint64_t submission = 0;
@@ -700,6 +735,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   };
   struct Fh1GpuPassTimingActive {
     uint64_t frame = 0;
+    uint64_t prepare_cpu_time_ns = 0;
     uint64_t attachment_state = 0;
     uint64_t first_draw_family = 0;
     uint64_t first_draw_identity = 0;
@@ -732,6 +768,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::unordered_map<uint64_t, Fh1GpuPassTimingAggregate>
       fh1_gpu_pass_family_timing_aggregates_;
   uint64_t fh1_gpu_pass_timing_drops_ = 0;
+  uint64_t fh1_gpu_pass_timing_busy_drops_ = 0;
+  uint64_t fh1_gpu_pass_timing_capacity_drops_ = 0;
+  uint64_t fh1_gpu_pass_timing_interrupted_drops_ = 0;
+  uint64_t fh1_gpu_pass_timing_invalid_drops_ = 0;
   uint64_t fh1_gpu_pass_timing_last_log_frame_ = 0;
 
   // PWL gamma ramp can result in values with more precision than 10bpc. Though

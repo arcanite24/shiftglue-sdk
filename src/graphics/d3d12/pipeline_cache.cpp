@@ -310,6 +310,11 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/fh1_blended_lit_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_blended_scene_vs.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_lit_scene_vs.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_skinned_scene_vs.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_skinned_scene_owned_vs.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_video_color_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_postprocess_center_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_rms_downsample_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_lit_scene_owned_vs.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_blended_scene_owned_vs.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_lit_scene_ps.h"
@@ -1782,6 +1787,11 @@ bool PipelineCache::IsFh1NativeShadowVertex(uint64_t hash, uint64_t modification
 
 bool PipelineCache::IsFh1NativeStandaloneVertex(uint64_t hash, uint64_t modification) const {
   return IsFh1NativeShadowVertex(hash, modification) ||
+      (hash == 0xB8489164D5A86043ull && modification == 0x1Full &&
+       bindless_resources_used_ &&
+       render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
+       render_target_cache_.draw_resolution_scale_x() == 2 &&
+       render_target_cache_.draw_resolution_scale_y() == 2) ||
       (hash == 0x1E6883FCCDE1F688ull && modification <= 1ull &&
        bindless_resources_used_ &&
        render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
@@ -3930,6 +3940,36 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
       description.vertex_shader_hash, description.vertex_shader_modification);
   const bool fh1_position_vertex = fh1_standalone_vertex &&
       description.vertex_shader_hash == 0x1E6883FCCDE1F688ull;
+  // Qualified title/video pixel variant; preserve the original vertex bindings.
+  const bool fh1_video_pixel = bindless_resources_used_ &&
+      description.vertex_shader_hash == 0x7156CE05C6365E51ull &&
+      description.vertex_shader_modification == 1ull &&
+      description.pixel_shader_hash == 0x31511D87CC0C94B9ull &&
+      description.pixel_shader_modification == 1ull &&
+      render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
+      (render_target_cache_.draw_resolution_scale_x() == 1 ||
+       render_target_cache_.draw_resolution_scale_x() == 2) &&
+      render_target_cache_.draw_resolution_scale_y() == render_target_cache_.draw_resolution_scale_x();
+  // Experimental blur reduction; disabled until live motion/performance checks.
+  const bool fh1_postprocess_center = false && bindless_resources_used_ &&
+      description.vertex_shader_hash == 0x20A41D46F34D238Eull &&
+      description.vertex_shader_modification == 7ull &&
+      description.pixel_shader_hash == 0x614588022744BF6Bull &&
+      description.pixel_shader_modification == 0x0000400000000007ull &&
+      render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
+      render_target_cache_.draw_resolution_scale_x() == 2 &&
+      render_target_cache_.draw_resolution_scale_y() == 2;
+  // Byte-exact RMS reference with live binding and 1x/2x non-regression checks.
+  const bool fh1_rms_downsample = bindless_resources_used_ &&
+      description.vertex_shader_hash == 0x2C53E1A563484076ull &&
+      description.vertex_shader_modification == 1ull &&
+      description.pixel_shader_hash == 0xE17BECBE8BE65806ull &&
+      description.pixel_shader_modification == 0x0000400000000001ull &&
+      render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
+      (render_target_cache_.draw_resolution_scale_x() == 1 ||
+       render_target_cache_.draw_resolution_scale_x() == 2) &&
+      render_target_cache_.draw_resolution_scale_y() ==
+          render_target_cache_.draw_resolution_scale_x();
   const bool fh1_shadow_geometry = fh1_shadow_vertex &&
       !runtime_description.vertex_shader->shader().memexport_eM_written() &&
       (!runtime_description.pixel_shader ||
@@ -3986,8 +4026,17 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
   const bool fh1_native_scene_geometry = fh1_native_scene &&
       (fh1_vertex_shader_hash == 0xAD2C355A6BE1EE87ull ||
        fh1_vertex_shader_hash == 0x8D8A197476841A9Aull);
+  // Disabled: the 2026-09-07 ownership ABBA regressed frame and CPU time.
+  // Keep the qualified native vertex program on its original shared bindings.
+  const bool fh1_skinned_geometry = false && fh1_standalone_vertex &&
+      fh1_vertex_shader_hash == 0xB8489164D5A86043ull &&
+      description.pixel_shader_hash == 0x68150A8E959006CDull &&
+      !runtime_description.vertex_shader->shader().memexport_eM_written() &&
+      runtime_description.pixel_shader && !runtime_description.pixel_shader->shader().memexport_eM_written() &&
+      command_processor_.GetFh1SkinnedRootSignature();
   // Root signature.
   state_desc.pRootSignature = runtime_description.root_signature;
+  if (fh1_skinned_geometry) state_desc.pRootSignature = command_processor_.GetFh1SkinnedRootSignature();
   if (fh1_native_terrain) state_desc.pRootSignature = command_processor_.GetFh1TerrainRootSignature();
   if (fh1_native_depth || fh1_packed_world_geometry || fh1_shadow_geometry) state_desc.pRootSignature = command_processor_.GetFh1DepthRootSignature();
   if (fh1_native_scene_geometry) state_desc.pRootSignature = command_processor_.GetFh1LayeredRootSignature();
@@ -4108,6 +4157,10 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
       state_desc.VS = description.vertex_shader_modification == 0
           ? D3D12_SHADER_BYTECODE{shaders::fh1_position_only_vs, sizeof(shaders::fh1_position_only_vs)}
           : D3D12_SHADER_BYTECODE{shaders::fh1_position_color_vs, sizeof(shaders::fh1_position_color_vs)};
+    } else if (fh1_standalone_vertex && fh1_vertex_shader_hash == 0xB8489164D5A86043ull) {
+      state_desc.VS = fh1_skinned_geometry
+          ? D3D12_SHADER_BYTECODE{shaders::fh1_skinned_scene_owned_vs, sizeof(shaders::fh1_skinned_scene_owned_vs)}
+          : D3D12_SHADER_BYTECODE{shaders::fh1_skinned_scene_vs, sizeof(shaders::fh1_skinned_scene_vs)};
     } else if (fh1_shadow_vertex) {
       state_desc.VS = fh1_shadow_geometry
           ? D3D12_SHADER_BYTECODE{shaders::fh1_shadow_mask_owned_vs, sizeof(shaders::fh1_shadow_mask_owned_vs)}
@@ -4199,6 +4252,15 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
         runtime_description.pixel_shader->translated_binary().data();
     state_desc.PS.BytecodeLength =
         runtime_description.pixel_shader->translated_binary().size();
+    if (fh1_video_pixel) {
+      state_desc.PS = {shaders::fh1_video_color_ps, sizeof(shaders::fh1_video_color_ps)};
+    }
+    if (fh1_postprocess_center) {
+      state_desc.PS = {shaders::fh1_postprocess_center_ps, sizeof(shaders::fh1_postprocess_center_ps)};
+    }
+    if (fh1_rms_downsample) {
+      state_desc.PS = {shaders::fh1_rms_downsample_ps, sizeof(shaders::fh1_rms_downsample_ps)};
+    }
     if (IsFh1NativePositionPipeline(description)) {
       state_desc.PS = description.pixel_shader_modification == 0x0000400000010001ull
           ? D3D12_SHADER_BYTECODE{shaders::fh1_passthrough_early_centroid_ps, sizeof(shaders::fh1_passthrough_early_centroid_ps)}
@@ -4488,7 +4550,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
        (fh1_native_terrain && !command_processor_.GetFh1TerrainRootSignature()))
           ? E_FAIL
           : device->CreateGraphicsPipelineState(&state_desc, IID_PPV_ARGS(&state));
-  if (FAILED(create_result) && (fh1_standalone_vertex || fh1_shadow_mask_pixel || fh1_packed_world_vertex || fh1_world_lit_vertex ||
+  if (FAILED(create_result) && (fh1_video_pixel || fh1_postprocess_center || fh1_rms_downsample || fh1_standalone_vertex || fh1_shadow_mask_pixel || fh1_packed_world_vertex || fh1_world_lit_vertex ||
                                 fh1_world_lit_uv2_vertex ||
                                 fh1_depth_mesh_vertex || fh1_native_scene)) {
     if (fh1_world_lit_vertex) {

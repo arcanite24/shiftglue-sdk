@@ -18,9 +18,14 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#if REX_PLATFORM_WIN32
+#include <share.h>
+#endif
 
 REXCVAR_DEFINE_STRING(perf_log_csv, "", "Perf",
                       "Path to write per-frame CSV log (empty = disabled)");
+REXCVAR_DEFINE_INT32(perf_log_max_mb, 0, "Perf",
+                    "Stop CSV recording at this size (0 = unlimited)");
 
 namespace rex::perf {
 
@@ -100,6 +105,9 @@ constexpr const char* kCounterNames[] = {
     "present_deadline_misses",
     "duplicate_present_count",
     "dropped_present_count",
+    "texture_request_cpu_time_ns",
+    "texture_request_timing_samples",
+    "texture_dirty_load_attempts",
 };
 static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
 
@@ -173,6 +181,9 @@ constexpr bool kIsGauge[] = {
     false,  // kPresentDeadlineMisses
     false,  // kDuplicatePresentCount
     false,  // kDroppedPresentCount
+    false,  // kTextureRequestCpuTimeNs
+    false,  // kTextureRequestTimingSamples
+    false,  // kTextureDirtyLoadAttempts
 };
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 
@@ -246,7 +257,12 @@ void SetCsvLogPath(const std::string& path) {
   if (path.empty())
     return;
 
+#if REX_PLATFORM_WIN32
+  // A discovery recorder may tail the CSV while the game is running.
+  g_csv_file = _wfsopen(rex::to_path(path).c_str(), L"w", _SH_DENYWR);
+#else
   g_csv_file = rex::filesystem::OpenFile(rex::to_path(path), "w");
+#endif
   if (!g_csv_file) {
     REXLOG_WARN("perf: failed to open CSV log: {}", path);
     g_csv_path.clear();
@@ -276,6 +292,11 @@ void WriteCsvFrame() {
 
   if (++g_csv_frame_count % 60 == 0) {
     std::fflush(g_csv_file);
+    const auto limit_mb = REXCVAR_GET(perf_log_max_mb);
+    if (limit_mb > 0 && rex::filesystem::Tell(g_csv_file) >= int64_t(limit_mb) * 1024 * 1024) {
+      REXLOG_WARN("perf: CSV recording size limit reached; game continues");
+      FlushCsv();
+    }
   }
 }
 
