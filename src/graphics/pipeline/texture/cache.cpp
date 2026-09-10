@@ -1057,7 +1057,8 @@ void TextureCache::UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t sub
       uint32_t((textures_total_host_memory_usage_ + ((UINT32_C(1) << 20) - 1)) >> 20));
 }
 
-bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
+bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled,
+                                         bool require_all) {
   if (!IsDrawResolutionScaled()) {
     return false;
   }
@@ -1079,6 +1080,16 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
   uint32_t l2_block_first = block_first >> 6;
   uint32_t l2_block_last = block_last >> 6;
   auto global_lock = global_critical_region_.Acquire();
+  if (require_all) {
+    for (uint32_t block = block_first; block <= block_last; ++block) {
+      const uint32_t first_bit = block == block_first ? page_first & 31 : 0;
+      const uint32_t last_bit = block == block_last ? page_last & 31 : 31;
+      const uint32_t mask = (UINT32_MAX << first_bit) & (UINT32_MAX >> (31 - last_bit));
+      if ((scaled_resolve_pages_[block] & mask) != mask)
+        return false;
+    }
+    return true;
+  }
   for (uint32_t i = l2_block_first; i <= l2_block_last; ++i) {
     uint64_t l2_block = scaled_resolve_pages_l2_[i];
     if (i == l2_block_first) {

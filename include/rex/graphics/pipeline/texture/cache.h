@@ -564,6 +564,10 @@ class TextureCache {
   // implementation to update the internal dependencies of the binding.
   virtual void UpdateTextureBindingsImpl(uint32_t /*fetch_constant_mask*/) {}
 
+  // By default checks any page; require_all checks every page under the same lock.
+  bool IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled,
+                             bool require_all = false);
+
  private:
   struct PendingTextureLoad {
     Texture* texture = nullptr;
@@ -585,9 +589,6 @@ class TextureCache {
   static void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
                             void* context, void* data, uint64_t argument, bool invalidated_by_gpu);
 
-  // Checks if there are any pages that contain scaled resolve data within the
-  // range.
-  bool IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled);
   // Global shared memory invalidation callback for invalidating scaled resolved
   // texture data.
   static void ScaledResolveGlobalWatchCallbackThunk(

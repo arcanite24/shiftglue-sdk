@@ -25,6 +25,7 @@
 #include <rex/graphics/d3d12/fh1_geometry.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/fh1_mip_contract.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
@@ -34,6 +35,10 @@
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+REXCVAR_DEFINE_BOOL(fh1_native_reflection_mips, true, "GPU/D3D12",
+                    "Use experimental native reflection mips at symmetric 1x/2x; "
+                    "fall back when the current command/input contract does not match")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_owned_depth_clear, true, "GPU/D3D12",
                     "Native owned depth clear at 1x; scaled rendering keeps compatibility transfers");
 REXCVAR_DEFINE_BOOL(fh1_owned_depth_tile_clear, false, "GPU/D3D12",
@@ -2531,6 +2536,15 @@ bool D3D12CommandProcessor::DrawFh1VelocityDilate(
 
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
+  if (observation_frame_sequence_ % 600 == 0) {
+    REXGPU_INFO(
+        "FH1 native reflection mips enabled={} candidates={} native_faces={} fallback_lists={} "
+        "replaced_draws={} replaced_copies={}",
+        REXCVAR_GET(fh1_native_reflection_mips), fh1_mip_candidates_, fh1_mip_native_faces_,
+        fh1_mip_candidates_ - fh1_mip_native_faces_, fh1_mip_native_faces_ * 8,
+        fh1_mip_native_faces_ * 8);
+  }
+
   SCOPE_profile_cpu_f("gpu");
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
@@ -2948,6 +2962,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
     return finish_draw(IssueCopy());
+  }
+
+  if (fh1_mip_replacement_active_) {
+    ++fh1_mip_skipped_draws_;
+    return true;
   }
 
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
@@ -4261,6 +4280,66 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   return finish_draw(true);
 }
 
+void D3D12CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
+  const auto fallback = [&] { CommandProcessor::ExecuteIndirectBuffer(ptr, count); };
+  if (!REXCVAR_GET(fh1_native_reflection_mips) || count != Fh1MipChain::kCommandBytes / 4 ||
+      !Fh1MipPhysicalRange(ptr, Fh1MipChain::kCommandBytes)) {
+    fallback();
+    return;
+  }
+  ++fh1_mip_candidates_;
+  if (fh1_mip_replacement_active_ || active_occlusion_query_.valid ||
+      !Fh1MipInheritedState(register_file_->values[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_TL],
+                            register_file_->values[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR],
+                            register_file_->values[XE_GPU_REG_VGT_MIN_VTX_INDX],
+                            register_file_->values[XE_GPU_REG_VGT_MAX_VTX_INDX],
+                            register_file_->values[XE_GPU_REG_SQ_VS_CONST],
+                            register_file_->values[XE_GPU_REG_SQ_PS_CONST]) ||
+      modern_occlusion_query_active_index_ != UINT32_MAX ||
+      modern_occlusion_query_active_report_ != ZPDLifecycle::kInvalidReportHandle ||
+      !(bin_select_ & bin_mask_) ||
+      register_file_->Get<reg::RB_MODECONTROL>().edram_mode != xenos::EdramMode::kColorDepth ||
+      render_target_cache_->GetPath() != RenderTargetCache::Path::kHostRenderTargets) {
+    fallback();
+    return;
+  }
+  // Re-read current allocation contents; no pointer/handle is a cache identity.
+  std::array<unsigned char, Fh1MipChain::kCommandBytes> commands;
+  Fh1MipChain chain;
+  const auto copy = [&](uint32_t address, std::span<uint8_t> bytes) {
+    return shared_memory_->CopyCpuSnapshot(address, bytes);
+  };
+  if (!copy(ptr, commands) || !ParseFh1MipChain(commands, chain) ||
+      !(ptr + commands.size() <= chain.base || ptr >= chain.base + Fh1MipChain::kTotalBytes) ||
+      !CheckFh1MipInputs(chain, copy)) {
+    fallback();
+    return;
+  }
+  const uint32_t face = chain.face;
+  if (!BeginSubmission(true) || !texture_cache_->GenerateFh1ReflectionMips(chain.base, face)) {
+    fallback();
+    return;
+  }
+  fh1_mip_skipped_draws_ = fh1_mip_skipped_copies_ = 0;
+  fh1_mip_replacement_active_ = true;
+  memory::RingBuffer reader(commands.data(), commands.size());
+  reader.set_write_offset(commands.size());
+  bool succeeded = true;
+  do {
+    if (!ExecutePacket(&reader)) {
+      succeeded = false;
+      break;
+    }
+  } while (reader.read_count());
+  fh1_mip_replacement_active_ = false;
+  if (!succeeded || fh1_mip_skipped_draws_ != 8 || fh1_mip_skipped_copies_ != 8) {
+    REXGPU_ERROR("FH1 native reflection mip contract execution failed");
+    assert_always();
+  } else {
+    ++fh1_mip_native_faces_;
+  }
+}
+
 bool D3D12CommandProcessor::IssueCopy() {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
@@ -4271,9 +4350,11 @@ bool D3D12CommandProcessor::IssueCopy() {
   uint32_t written_address = 0;
   uint32_t written_length = 0;
   BeginFh1GpuPassTimingCopy();
-  const bool copy_succeeded = render_target_cache_->Resolve(
-      *memory_, *shared_memory_, *texture_cache_, written_address,
-      written_length);
+  const bool copy_succeeded =
+      render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, written_address,
+                                    written_length, fh1_mip_replacement_active_);
+  if (fh1_mip_replacement_active_ && copy_succeeded)
+    ++fh1_mip_skipped_copies_;
 
   auto copy_observer = graphics_system_->copy_observer();
   if (!Fh1ObserveCorpusFrame(observation_frame_sequence_)) {

@@ -236,6 +236,11 @@ class D3D12CommandProcessor : public CommandProcessor {
                  uint32_t frontbuffer_height) override;
 
   void OnPrimaryBufferEnd() override;
+  void ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) override;
+  // Scoped to one fully validated list; state packets and scratch clears still execute.
+  bool fh1_mip_replacement_active_ = false;
+  uint64_t fh1_mip_candidates_ = 0, fh1_mip_native_faces_ = 0;
+  uint32_t fh1_mip_skipped_draws_ = 0, fh1_mip_skipped_copies_ = 0;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;

@@ -1239,8 +1239,8 @@ void D3D12RenderTargetCache::WriteEdramUintPow2UAVDescriptor(D3D12_CPU_DESCRIPTO
 
 bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMemory& shared_memory,
                                      D3D12TextureCache& texture_cache,
-                                     uint32_t& written_address_out,
-                                     uint32_t& written_length_out) {
+                                     uint32_t& written_address_out, uint32_t& written_length_out,
+                                     bool native_mip_copy) {
   written_address_out = 0;
   written_length_out = 0;
   copy_observation_resolve_info_valid_ = false;
@@ -1266,7 +1266,9 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
   // Copying.
   bool copied = false;
-  if (resolve_info.copy_dest_extent_length) {
+  // The validated native reflection list already published these mip pixels.
+  // Keep the common clear path below, including ownership transfers.
+  if (resolve_info.copy_dest_extent_length && !native_mip_copy) {
     draw_util::ResolveCopyShaderConstants copy_shader_constants;
     uint32_t copy_group_count_x, copy_group_count_y;
     draw_util::ResolveCopyShaderIndex copy_shader =

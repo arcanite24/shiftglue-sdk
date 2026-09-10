@@ -99,6 +99,7 @@ class D3D12TextureCache final : public TextureCache {
   void RequestTextures(uint32_t used_texture_mask) override;
   void RequestFh1Textures(uint32_t used_texture_mask);
   void RequestFh1VideoTextures(uint32_t used_texture_mask);
+  bool GenerateFh1ReflectionMips(uint32_t base_address, uint32_t face);
 
   // Returns whether texture SRV keys stored externally are still valid for the
   // current bindings and host shader binding layout. Both keys and
@@ -474,6 +475,9 @@ class D3D12TextureCache final : public TextureCache {
   // Load pipelines for resolution-scaled resolve targets.
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kLoadShaderCount> load_pipelines_scaled_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> load_pipeline_fh1_scaled_32_;
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> fh1_mip_root_signature_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> fh1_mip_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> fh1_mip_pipeline_1x_;
 
   std::vector<SRVDescriptorCachePage> srv_descriptor_cache_;
   uint32_t srv_descriptor_cache_allocated_;

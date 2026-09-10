@@ -37,6 +37,8 @@ namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
 namespace shaders {
+#include "../shaders/bytecode/d3d12_5_1/fh1_reflection_mip_1x_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_reflection_mip_2x_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_128bpb_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_128bpb_scaled_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_16bpb_cs.h"
@@ -1387,6 +1389,98 @@ void D3D12TextureCache::CreateCurrentScaledResolveRangeUintPow2UAV(
       uint32_t(scaled_resolve_current_range_length_scaled_ >> element_size_bytes_pow2),
       (scaled_resolve_current_range_start_scaled_ - (uint64_t(buffer_index) << 30)) >>
           element_size_bytes_pow2);
+}
+
+bool D3D12TextureCache::GenerateFh1ReflectionMips(uint32_t base_address, uint32_t face) {
+  constexpr uint32_t base_bytes = 6 * 256 * 256 * 4;
+  constexpr uint32_t mip_bytes = 6 * (128 * 128 + 64 * 64 + 6 * 32 * 32) * 4;
+  constexpr uint32_t total_bytes = base_bytes + mip_bytes;
+  const uint32_t scale = draw_resolution_scale_x();
+  const bool unscaled = scale == 1;
+  const uint32_t area_scale = scale * scale;
+  if ((scale != 1 && scale != 2) || draw_resolution_scale_y() != scale || (base_address & 4095) ||
+      base_address > 0x20000000 - total_bytes || face >= 6)
+    return false;
+  // Every source page must have authoritative scaled contents.
+  if (!unscaled && !IsRangeScaledResolved(base_address, base_bytes, true))
+    return false;
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  if (!fh1_mip_root_signature_) {
+    D3D12_ROOT_PARAMETER parameters[2] = {};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[1].Constants.Num32BitValues = 6;
+    D3D12_ROOT_SIGNATURE_DESC desc = {2, parameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    Microsoft::WRL::ComPtr<ID3DBlob> serialized, errors;
+    if (FAILED(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized,
+                                           &errors)) ||
+        FAILED(device->CreateRootSignature(0, serialized->GetBufferPointer(),
+                                           serialized->GetBufferSize(),
+                                           IID_PPV_ARGS(&fh1_mip_root_signature_))))
+      return false;
+  }
+  auto& pipeline = unscaled ? fh1_mip_pipeline_1x_ : fh1_mip_pipeline_;
+  if (!pipeline) {
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
+    desc.pRootSignature = fh1_mip_root_signature_.Get();
+    desc.CS = unscaled ? D3D12_SHADER_BYTECODE{shaders::fh1_native_mip_1x_cs,
+                                               sizeof(shaders::fh1_native_mip_1x_cs)}
+                       : D3D12_SHADER_BYTECODE{shaders::fh1_native_mip_cs,
+                                               sizeof(shaders::fh1_native_mip_cs)};
+    if (FAILED(device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline))))
+      return false;
+    pipeline->SetName(L"FH1 native reflection mips");
+  }
+  // Preserve residency, aliasing, UAV ordering and invalidation through existing managers.
+  auto& shared = static_cast<D3D12SharedMemory&>(shared_memory());
+  ID3D12Resource* resource;
+  uint64_t relative;
+  if (unscaled) {
+    if (!shared.RequestRange(base_address, total_bytes))
+      return false;
+    shared.UseForWriting();
+    resource = shared.GetBuffer();
+    relative = base_address;
+  } else {
+    if (!EnsureScaledResolveMemoryCommitted(base_address, total_bytes, 4) ||
+        !MakeScaledResolveRangeCurrent(base_address, total_bytes, 4))
+      return false;
+    resource = GetCurrentScaledResolveBufferResource();
+    relative = uint64_t(base_address) * 4 - (uint64_t(GetCurrentScaledResolveBufferIndex()) << 30);
+    TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  }
+  command_processor_.PushUAVBarrier(resource);
+  auto& commands = command_processor_.GetDeferredCommandList();
+  commands.BeginDebugMarker("FH1 native reflection mips");
+  command_processor_.SetExternalPipeline(pipeline.Get());
+  commands.D3DSetComputeRootSignature(fh1_mip_root_signature_.Get());
+  commands.D3DSetComputeRootUnorderedAccessView(0, resource->GetGPUVirtualAddress() + relative);
+  uint32_t source_offset = 0, destination_offset = base_bytes * area_scale;
+  for (uint32_t side = 256 * scale; side > scale; side >>= 1) {
+    uint32_t source_pitch = std::max(32u, side / scale),
+             destination_pitch = std::max(32u, side / (scale * 2));
+    uint32_t constants[6] = {source_offset,
+                             destination_offset,
+                             side,
+                             side >> 1,
+                             source_pitch * source_pitch * 4 * area_scale,
+                             destination_pitch * destination_pitch * 4 * area_scale};
+    constants[0] += face * constants[4];
+    constants[1] += face * constants[5];
+    commands.D3DSetComputeRoot32BitConstants(1, 6, constants, 0);
+    command_processor_.SubmitBarriers();
+    commands.D3DDispatch(((side >> 1) + 7) / 8, ((side >> 1) + 7) / 8, 1);
+    MarkRangeAsResolved(base_address + constants[1] / area_scale, constants[5] / area_scale);
+    command_processor_.PushUAVBarrier(resource);
+    source_offset = destination_offset;
+    destination_offset += 6 * destination_pitch * destination_pitch * 4 * area_scale;
+  }
+  commands.EndDebugMarker();
+  if (unscaled)
+    shared.MarkUAVWritesCommitNeeded();
+  else
+    MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
+  return true;
 }
 
 ID3D12Resource* D3D12TextureCache::RequestSwapTexture(D3D12_SHADER_RESOURCE_VIEW_DESC& srv_desc_out,
