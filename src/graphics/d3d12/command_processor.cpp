@@ -39,7 +39,7 @@ REXCVAR_DEFINE_BOOL(fh1_owned_depth_clear, true, "GPU/D3D12",
 REXCVAR_DEFINE_BOOL(fh1_owned_depth_tile_clear, false, "GPU/D3D12",
                     "Experimental full-tile base-0 depth/stencil clear ownership");
 REXCVAR_DEFINE_BOOL(fh1_recycle_geometry_buffers, false, "GPU/D3D12",
-                    "Reuse completed same-sized geometry eviction buffers");
+                    "Reuse the oldest completed same-sized geometry buffer under cache pressure");
 REXCVAR_DEFINE_BOOL(fh1_contain_geometry_windows, false, "GPU/D3D12",
                     "Reuse the smallest same-base geometry window containing the request")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -1003,6 +1003,17 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12CommandProcessor::GetFh1OwnedGeometry(
     while (fh1_geometry_.size() >= 512 || fh1_geometry_bytes_ + allocation > kBudget) {
       auto oldest = std::min_element(fh1_geometry_.begin(), fh1_geometry_.end(),
           [](const auto& a, const auto& b) { return a.second.last_submission < b.second.last_submission; });
+      if (REXCVAR_GET(fh1_recycle_geometry_buffers) && !entry.buffer.Get()) {
+        auto fitting = fh1_geometry_.end();
+        for (auto it = fh1_geometry_.begin(); it != fh1_geometry_.end(); ++it) {
+          const auto& candidate = it->second;
+          if (candidate.last_submission > submission_completed_ || uint32_t(it->first) != size ||
+              candidate.allocation_bytes != allocation) continue;
+          if (fitting == fh1_geometry_.end() ||
+              candidate.last_submission < fitting->second.last_submission) fitting = it;
+        }
+        if (fitting != fh1_geometry_.end()) oldest = fitting;
+      }
       if (oldest == fh1_geometry_.end() || oldest->second.last_submission > submission_completed_) {
         return 0;
       }
@@ -1010,8 +1021,8 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12CommandProcessor::GetFh1OwnedGeometry(
         auto lock = thread::global_critical_region::AcquireDirect();
         if (oldest->second.watch) shared_memory_->UnwatchMemoryRange(oldest->second.watch);
       }
-      // The existing fence/victim policy stays authoritative. Reuse only an
-      // identical allocation; the normal full-window import replaces all bytes.
+      // Prefer matching completed storage without retaining oversized capacity.
+      // The normal full-window import replaces all bytes and ownership metadata.
       if (REXCVAR_GET(fh1_recycle_geometry_buffers) && !entry.buffer.Get() &&
           uint32_t(oldest->first) == size && oldest->second.allocation_bytes == allocation) {
         entry.buffer = std::move(oldest->second.buffer);
