@@ -1162,6 +1162,13 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // internally before the failure according to Jesse Natalie from the DirectX
   // Discord server.
   paint_context_.present_submission_tracker.NextSubmission();
+  if (present_result == DXGI_ERROR_DEVICE_REMOVED || present_result == DXGI_ERROR_DEVICE_RESET) {
+    REXLOG_ERROR("D3D12 present failed: HRESULT 0x{:08X}, device removal reason 0x{:08X}",
+                 static_cast<unsigned>(present_result),
+                 static_cast<unsigned>(provider_.GetDevice()->GetDeviceRemovedReason()));
+    // Presentation may report the loss before the command processor can log it.
+    rex::FlushLogging();
+  }
   switch (present_result) {
     case DXGI_ERROR_DEVICE_REMOVED:
       return PaintResult::kGpuLostExternally;
