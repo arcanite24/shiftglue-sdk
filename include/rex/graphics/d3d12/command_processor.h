@@ -637,6 +637,7 @@ class D3D12CommandProcessor : public CommandProcessor {
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
     uint64_t allocation_bytes = 0;
     uint64_t last_submission = 0;
+    uint64_t last_frame = 0;
     bool keep_cpu_snapshot = false;
     std::vector<uint8_t> cpu_snapshot;
     struct DepthBounds {

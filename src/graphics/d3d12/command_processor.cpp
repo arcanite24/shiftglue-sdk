@@ -1022,6 +1022,12 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12CommandProcessor::GetFh1OwnedGeometry(
       if (oldest == fh1_geometry_.end() || oldest->second.last_submission > submission_completed_) {
         return 0;
       }
+      // A scene larger than the cache must not recreate its working set every
+      // frame. Keep recently used owners and use the shared-memory fallback.
+      if (frame_current_ <= oldest->second.last_frame ||
+          frame_current_ - oldest->second.last_frame <= 1) {
+        return 0;
+      }
       {
         auto lock = thread::global_critical_region::AcquireDirect();
         if (oldest->second.watch) shared_memory_->UnwatchMemoryRange(oldest->second.watch);
@@ -1131,6 +1137,7 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12CommandProcessor::GetFh1OwnedGeometry(
     }
   }
   entry.last_submission = submission_current_;
+  entry.last_frame = frame_current_;
   return entry.buffer->GetGPUVirtualAddress() + view_offset;
 }
 
