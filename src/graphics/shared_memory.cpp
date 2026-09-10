@@ -15,10 +15,15 @@
 
 #include <rex/assert.h>
 #include <rex/bit.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/shared_memory.h>
 #include <rex/math.h>
 #include <rex/memory.h>
+
+REXCVAR_DEFINE_BOOL(fh1_narrow_cpu_invalidation, false, "GPU/D3D12",
+                    "Limit speculative CPU invalidation to 64 KiB windows")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics {
 
@@ -576,6 +581,13 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
       gpu_written_end &= ~((uint64_t(1) << ((page_last & 63) + 1)) - 1);
       page_last =
           (page_last & ~uint32_t(63)) + (std::max(rex::tzcnt(gpu_written_end), uint8_t(1)) - 1);
+    }
+    if (REXCVAR_GET(fh1_narrow_cpu_invalidation)) {
+      // Keep the actual write and existing GPU-history guards. Only reduce the
+      // speculative excess, so neighboring geometry windows stay protected.
+      const uint32_t mask = (uint32_t(1) << (16 - std::min(page_size_log2_, uint32_t(16)))) - 1;
+      page_first = std::max(page_first, (physical_address_start >> page_size_log2_) & ~mask);
+      page_last = std::min(page_last, (physical_address_last >> page_size_log2_) | mask);
     }
   }
 
