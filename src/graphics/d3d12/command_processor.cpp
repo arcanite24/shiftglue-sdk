@@ -2099,7 +2099,8 @@ bool D3D12CommandProcessor::SetupContext() {
 }
 
 void D3D12CommandProcessor::ShutdownContext() {
-  AwaitAllQueueOperationsCompletion();
+  // Shutdown must drain submitted GPU work even after the worker is cancelled.
+  AwaitAllQueueOperationsCompletion(true);
   InvalidateAllVertexBufferResidency();
   ShutdownNativeGuestOutputGpuTiming();
   ShutdownOcclusionQueryResources();
@@ -4460,53 +4461,92 @@ bool D3D12CommandProcessor::IssueCopy() {
   return copy_succeeded;
 }
 
-void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+bool D3D12CommandProcessor::AwaitFence(ID3D12Fence* fence, uint64_t value,
+                                       bool allow_shutdown) {
+  if (!allow_shutdown && IsShutdownRequested()) {
+    return false;
+  }
+  const HRESULT event_result = fence->SetEventOnCompletion(value, fence_completion_event_);
+  if (FAILED(event_result)) {
+    REXGPU_ERROR("Failed to register Direct3D 12 fence completion: 0x{:08X}",
+                 static_cast<unsigned>(event_result));
+    return false;
+  }
+  PROFILE_CMD_BUFFER_STALL();
+  for (;;) {
+    const uint64_t completed = fence->GetCompletedValue();
+    const HRESULT removal_reason = GetD3D12Provider().GetDevice()->GetDeviceRemovedReason();
+    if (completed == UINT64_MAX || FAILED(removal_reason)) {
+      device_removed_ = true;
+      LogDeviceRemovalDiagnostics(GetD3D12Provider().GetDevice(),
+                                  FAILED(removal_reason) ? removal_reason : DXGI_ERROR_DEVICE_REMOVED);
+      return false;
+    }
+    if (!allow_shutdown && IsShutdownRequested()) {
+      return false;
+    }
+    if (completed >= value) {
+      return true;
+    }
+    // Events can be stale after an interrupted wait. Only the fence proves completion.
+    const DWORD wait_result = WaitForSingleObject(fence_completion_event_, 100);
+    if (wait_result != WAIT_OBJECT_0 && wait_result != WAIT_TIMEOUT) {
+      const DWORD error = wait_result == WAIT_FAILED ? GetLastError() : ERROR_INVALID_FUNCTION;
+      REXGPU_ERROR("Failed to wait for Direct3D 12 fence: result {}, error {}", wait_result, error);
+      return false;
+    }
+  }
+}
+
+bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission,
+                                                 bool allow_shutdown) {
+  if (device_removed_ || (!allow_shutdown && IsShutdownRequested())) {
+    return false;
+  }
   if (await_submission >= submission_current_) {
-    if (submission_open_) {
-      EndSubmission(false);
+    if (submission_open_ && !EndSubmission(false)) {
+      return false;
     }
-    // Ending an open submission should result in queue operations done directly
-    // (like UpdateTileMappings) to be tracked within the scope of that
-    // submission, but just in case of a failure, or queue operations being done
-    // outside of a submission, await explicitly.
+    // Include operations such as UpdateTileMappings made outside a submission.
     if (queue_operations_done_since_submission_signal_) {
-      UINT64 fence_value = ++queue_operations_since_submission_fence_last_;
-      ID3D12CommandQueue* direct_queue = GetD3D12Provider().GetDirectQueue();
-      if (SUCCEEDED(direct_queue->Signal(queue_operations_since_submission_fence_, fence_value) &&
-                    SUCCEEDED(queue_operations_since_submission_fence_->SetEventOnCompletion(
-                        fence_value, fence_completion_event_)))) {
-        PROFILE_CMD_BUFFER_STALL();
-        WaitForSingleObject(fence_completion_event_, INFINITE);
-        queue_operations_done_since_submission_signal_ = false;
-      } else {
-        REXGPU_ERROR(
-            "Failed to await an out-of-submission queue operation completion "
-            "Direct3D 12 fence");
+      const UINT64 fence_value = ++queue_operations_since_submission_fence_last_;
+      const HRESULT signal_result = GetD3D12Provider().GetDirectQueue()->Signal(
+          queue_operations_since_submission_fence_, fence_value);
+      if (FAILED(signal_result)) {
+        REXGPU_ERROR("Failed to signal out-of-submission Direct3D 12 fence: 0x{:08X}",
+                     static_cast<unsigned>(signal_result));
+        return false;
       }
+      if (!AwaitFence(queue_operations_since_submission_fence_, fence_value, allow_shutdown)) {
+        return false;
+      }
+      queue_operations_done_since_submission_signal_ = false;
     }
-    // A submission won't be ended if it hasn't been started, or if ending
-    // has failed - clamp the index.
     await_submission = submission_current_ - 1;
   }
 
-  uint64_t submission_completed_before = submission_completed_;
-  submission_completed_ = submission_fence_->GetCompletedValue();
-  if (submission_completed_ < await_submission) {
-    if (SUCCEEDED(
-            submission_fence_->SetEventOnCompletion(await_submission, fence_completion_event_))) {
-      PROFILE_CMD_BUFFER_STALL();
-      WaitForSingleObject(fence_completion_event_, INFINITE);
-      submission_completed_ = submission_fence_->GetCompletedValue();
+  const uint64_t submission_completed_before = submission_completed_;
+  uint64_t completed = submission_fence_->GetCompletedValue();
+  if (completed == UINT64_MAX) {
+    device_removed_ = true;
+    LogDeviceRemovalDiagnostics(GetD3D12Provider().GetDevice(), DXGI_ERROR_DEVICE_REMOVED);
+    return false;
+  }
+  if (completed < await_submission) {
+    if (!AwaitFence(submission_fence_, await_submission, allow_shutdown)) {
+      return false;
+    }
+    completed = submission_fence_->GetCompletedValue();
+    if (completed == UINT64_MAX || completed < await_submission) {
+      return false;
     }
   }
-  if (submission_completed_ < await_submission) {
-    REXGPU_ERROR("Failed to await a submission completion Direct3D 12 fence");
-  }
+  submission_completed_ = completed;
   RetireModernZPDQueries();
   RetireNativeGuestOutputGpuTimings();
   if (submission_completed_ <= submission_completed_before) {
     // Not updated - no need to reclaim or download things.
-    return;
+    return true;
   }
 
   // Reclaim command allocators.
@@ -4552,6 +4592,7 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   primitive_processor_->CompletedSubmissionUpdated();
 
   texture_cache_->CompletedSubmissionUpdated(submission_completed_);
+  return true;
 }
 
 void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason) {
@@ -4640,11 +4681,11 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   // Check the fence - needed for all kinds of submissions (to reclaim transient
   // resources early) and specifically for frames (not to queue too many), and
   // await the availability of the current frame.
-  CheckSubmissionFence(is_opening_frame ? closed_frame_submissions_[frame_current_ % kQueueFrames]
-                                        : 0);
-  // TODO(Triang3l): If failed to await (completed submission < awaited frame
-  // submission), do something like dropping the draw command that wanted to
-  // open the frame.
+  if (!CheckSubmissionFence(is_opening_frame
+                                ? closed_frame_submissions_[frame_current_ % kQueueFrames]
+                                : 0)) {
+    return false;
+  }
   if (is_opening_frame) {
     // Update the completed frame index, also obtaining the actual completed
     // frame number (since the CPU may be actually less than 3 frames behind)
@@ -7034,8 +7075,7 @@ bool D3D12CommandProcessor::EndGuestOcclusionQuery(
   }
 
   uint64_t query_submission = submission_current_ ? submission_current_ - 1 : 0;
-  CheckSubmissionFence(query_submission);
-  if (submission_completed_ < query_submission) {
+  if (!CheckSubmissionFence(query_submission)) {
     return false;
   }
   if (!occlusion_query_readback_mapping_) {

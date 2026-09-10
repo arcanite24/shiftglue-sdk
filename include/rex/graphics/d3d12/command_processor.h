@@ -74,6 +74,8 @@ class D3D12CommandProcessor : public CommandProcessor {
     return deferred_command_list_;
   }
 
+  bool IsShutdownRequested() const { return !worker_running_.load(); }
+
   uint64_t GetCurrentSubmission() const { return submission_current_; }
   uint64_t GetCompletedSubmission() const { return submission_completed_; }
 
@@ -337,10 +339,13 @@ class D3D12CommandProcessor : public CommandProcessor {
   // aliasing barriers, and also result in common resource state promotion and
   // decay.
 
+  // Waits are cancellable except for the final shutdown drain.
+  bool AwaitFence(ID3D12Fence* fence, uint64_t value, bool allow_shutdown);
   // Rechecks submission number and reclaims per-submission resources. Pass 0 as
   // the submission to await to simply check status, or pass submission_current_
-  // to wait for all queue operations to be completed.
-  void CheckSubmissionFence(uint64_t await_submission);
+  // to wait for all queue operations to be completed. Returns false on failure
+  // without promoting pending work to successful completion.
+  bool CheckSubmissionFence(uint64_t await_submission, bool allow_shutdown = false);
   // If is_guest_command is true, a new full frame - with full cleanup of
   // resources and, if needed, starting capturing - is opened if pending (as
   // opposed to simply resuming after mid-frame synchronization). Returns
@@ -355,9 +360,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   // as when there are unfinished graphics pipeline creation requests that would
   // need to be fulfilled before actually submitting the command list.
   bool CanEndSubmissionImmediately() const;
-  bool AwaitAllQueueOperationsCompletion() {
-    CheckSubmissionFence(submission_current_);
-    return submission_completed_ + 1 >= submission_current_;
+  bool AwaitAllQueueOperationsCompletion(bool allow_shutdown = false) {
+    return CheckSubmissionFence(submission_current_, allow_shutdown);
   }
   void LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason);
 
