@@ -1111,7 +1111,8 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
           0x00004000002B007F, 0x000040000040007F, 0x00004000005B007F,
           0x00000000000700FF, 0x00000000001600FF, 0x0000000000B300FF,
           0x0000000000EB00FF, 0x0000400000B300FF, 0x0000400000EB00FF,
-          0x00004011000000FF, 0x0000400001DB01FF, 0x0000400003B303FF};
+          0x00004011000000FF, 0x0000400001DB01FF, 0x0000400003B303FF,
+          0x00004000001B007F, 0x00004000003B00FF, 0x00004000007301FF};
       for (uint64_t modification : kFh1VertexModifications) {
         const uint32_t interpolator_mask = uint32_t(modification) & 0xFFFF;
         modifications[size_t(xenos::ShaderType::kVertex)]
@@ -1223,6 +1224,25 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
           {0x81EF4F2E5B5DDBD1, 0x00004000000D003F},
           {0xA81FE6B4247E184B, 0x00004000001B007F},
           {0xD445FABAE890A455, 0x00004000007301FF},
+          // Additional retail material pairings with fewer live interpolators
+          // than the maximum declared in their shared asset program.
+          {0x2399AF5C1A9D6197, 0x000000000000003F},
+          {0x32E185F90FED70B1, 0x000000000000003F},
+          {0x4018C345028228A2, 0x000000000000007F},
+          {0x5808EEF89DBCB2EB, 0x000000000000007F},
+          {0x6A9D9846410BB101, 0x000000000000003F},
+          {0x74ADCE29056221E0, 0x000000000000003F},
+          {0x8107C6FD3171A834, 0x000000000000007F},
+          {0x8D8A197476841A9A, 0x0000000000000000},
+          {0x9B50C4B2B1CCE0C8, 0x000000000000003F},
+          {0xAD2C355A6BE1EE87, 0x0000000000000000},
+          {0xD71402231C6EC270, 0x000000000000003F},
+          {0xFEA060C603F44C7D, 0x000000000000003F},
+          {0x2A69134D6AB961F7, 0x000000000016003F},
+          {0x94A6380F93364C93, 0x000000000016007F},
+          {0xA4E5DE05DCAF605B, 0x000000000016003F},
+          {0xD0EFA731CCB32A71, 0x000000000016003F},
+          {0xF6D833A391B89839, 0x000000000016007F},
       };
       for (const auto& [hash, modification] : kFh1RuntimeVariants) {
         auto shader_it = shaders_.find(hash);

@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 
@@ -183,7 +184,10 @@ bool WindowSDL::OpenImpl() {
   // desired state so a reopened window comes back with the state it had.
   ApplyTextInputActiveNow();
   ApplyCursorVisibilityNow();
-  SDL_ShowWindow(sdl_window_);
+  const char* hidden = std::getenv("REX_WINDOW_HIDDEN");
+  if (!hidden || std::strcmp(hidden, "1") != 0) {
+    SDL_ShowWindow(sdl_window_);
+  }
 
   // Actualize state for the common Window code. Listener dispatch is handled
   // by Window::Open after OpenImpl returns; these only record initial state.
