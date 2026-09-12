@@ -455,6 +455,9 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
         }
 
         emit_print(out, "{}(", hookIt->second.name);
+        if (hookIt->second.context) {
+          emit_print(out, "PPCContext& ctx, uint8_t* base");
+        }
         for (auto& reg : hookIt->second.registers) {
           if (out.back() != '(')
             out += ", ";

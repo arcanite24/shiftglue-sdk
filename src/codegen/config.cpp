@@ -360,6 +360,7 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
       }
 
       midAsmHook.afterInstruction = (*table)["after_instruction"].value_or(false);
+      midAsmHook.context = (*table)["context"].value_or(false);
 
       auto it = cfg.midAsmHooks.find(*address_opt);
       if (it != cfg.midAsmHooks.end()) {

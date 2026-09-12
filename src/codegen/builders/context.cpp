@@ -407,6 +407,9 @@ void BuilderContext::emit_mid_asm_hook() {
 
   // Build call -- no ctx/base prefix, just register arguments resolved through accessors
   print("{}(", midAsmHook->second.name);
+  if (midAsmHook->second.context) {
+    out += "ctx, base";
+  }
   for (auto& reg : midAsmHook->second.registers) {
     if (out.back() != '(')
       out += ", ";

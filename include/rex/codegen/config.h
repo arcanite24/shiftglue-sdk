@@ -38,6 +38,11 @@ struct MidAsmHook {
   uint32_t jumpAddressOnFalse = 0;
 
   bool afterInstruction = false;
+
+  // Pass the live guest execution context to the host hook as the leading
+  // arguments (`ctx, base`). A hook that needs to call recompiled guest code,
+  // or read registers the hook configuration does not name, requires this.
+  bool context = false;
 };
 
 // Unified function/chunk configuration
