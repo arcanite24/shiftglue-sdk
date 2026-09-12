@@ -27,18 +27,25 @@
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/xenos.h>
+#include <rex/cvar.h>
 #include <rex/logging.h>
-#include <rex/perf/counter.h>
 #include <rex/math.h>
+#include <rex/perf/counter.h>
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
 namespace rex::graphics::d3d12 {
 
+// Diagnostic for the resolution-scaled reflection cube: reports why a mip chain
+// was not published natively. Off by default, read-only.
+REXCVAR_DEFINE_BOOL(fh1_glow_probe, false, "GPU/D3D12",
+                    "Log FH1 reflection mip publication admission decisions and range state");
+
 // Generated with `xb buildshaders`.
 namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/fh1_reflection_mip_1x_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_reflection_mip_2x_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_reflection_mip_3x_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_128bpb_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_128bpb_scaled_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_16bpb_cs.h"
@@ -1398,12 +1405,23 @@ bool D3D12TextureCache::GenerateFh1ReflectionMips(uint32_t base_address, uint32_
   const uint32_t scale = draw_resolution_scale_x();
   const bool unscaled = scale == 1;
   const uint32_t area_scale = scale * scale;
-  if ((scale != 1 && scale != 2) || draw_resolution_scale_y() != scale || (base_address & 4095) ||
-      base_address > 0x20000000 - total_bytes || face >= 6)
+  // Diagnostic (default off): every rejection below is one of the reasons the
+  // resolution-scaled reflection cube falls back to the original mip draws.
+  const bool probe = REXCVAR_GET(fh1_glow_probe);
+  const auto reject = [&](const char* reason) {
+    if (probe) {
+      REXGPU_INFO(
+          "FH1 glow probe: base={:08X} face={} scale={}x{} extent={} mip_bytes={} -> {}",
+          base_address, face, scale, draw_resolution_scale_y(), base_bytes, mip_bytes, reason);
+    }
     return false;
+  };
+  if (scale < 1 || scale > 3 || draw_resolution_scale_y() != scale || (base_address & 4095) ||
+      base_address > 0x20000000 - total_bytes || face >= 6)
+    return reject("unsupported geometry");
   // Every source page must have authoritative scaled contents.
   if (!unscaled && !IsRangeScaledResolved(base_address, base_bytes, true))
-    return false;
+    return reject("base range not fully scaled-resolved");
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
   if (!fh1_mip_root_signature_) {
     D3D12_ROOT_PARAMETER parameters[2] = {};
@@ -1419,14 +1437,19 @@ bool D3D12TextureCache::GenerateFh1ReflectionMips(uint32_t base_address, uint32_
                                            IID_PPV_ARGS(&fh1_mip_root_signature_))))
       return false;
   }
-  auto& pipeline = unscaled ? fh1_mip_pipeline_1x_ : fh1_mip_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState>& pipeline =
+      unscaled ? fh1_mip_pipeline_1x_
+               : (scale == 3 ? fh1_mip_pipeline_3x_ : fh1_mip_pipeline_);
   if (!pipeline) {
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
     desc.pRootSignature = fh1_mip_root_signature_.Get();
     desc.CS = unscaled ? D3D12_SHADER_BYTECODE{shaders::fh1_native_mip_1x_cs,
                                                sizeof(shaders::fh1_native_mip_1x_cs)}
-                       : D3D12_SHADER_BYTECODE{shaders::fh1_native_mip_cs,
-                                               sizeof(shaders::fh1_native_mip_cs)};
+                       : (scale == 3
+                              ? D3D12_SHADER_BYTECODE{shaders::fh1_native_mip_3x_cs,
+                                                      sizeof(shaders::fh1_native_mip_3x_cs)}
+                              : D3D12_SHADER_BYTECODE{shaders::fh1_native_mip_cs,
+                                                      sizeof(shaders::fh1_native_mip_cs)});
     if (FAILED(device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline))))
       return false;
     pipeline->SetName(L"FH1 native reflection mips");
@@ -1446,7 +1469,8 @@ bool D3D12TextureCache::GenerateFh1ReflectionMips(uint32_t base_address, uint32_
         !MakeScaledResolveRangeCurrent(base_address, total_bytes, 4))
       return false;
     resource = GetCurrentScaledResolveBufferResource();
-    relative = uint64_t(base_address) * 4 - (uint64_t(GetCurrentScaledResolveBufferIndex()) << 30);
+    relative = uint64_t(base_address) * area_scale -
+               (uint64_t(GetCurrentScaledResolveBufferIndex()) << 30);
     TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   }
   command_processor_.PushUAVBarrier(resource);

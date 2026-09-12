@@ -478,6 +478,7 @@ class D3D12TextureCache final : public TextureCache {
   Microsoft::WRL::ComPtr<ID3D12RootSignature> fh1_mip_root_signature_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fh1_mip_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fh1_mip_pipeline_1x_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> fh1_mip_pipeline_3x_;
 
   std::vector<SRVDescriptorCachePage> srv_descriptor_cache_;
   uint32_t srv_descriptor_cache_allocated_;

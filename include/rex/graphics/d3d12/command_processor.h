@@ -242,6 +242,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Scoped to one fully validated list; state packets and scratch clears still execute.
   bool fh1_mip_replacement_active_ = false;
   uint64_t fh1_mip_candidates_ = 0, fh1_mip_native_faces_ = 0;
+  // Rejection breakdown of fh1_mip_candidates_: guard, inherited state, command
+  // contract, native publication.
+  uint64_t fh1_mip_rejections_[4] = {};
   uint32_t fh1_mip_skipped_draws_ = 0, fh1_mip_skipped_copies_ = 0;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,

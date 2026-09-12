@@ -2547,10 +2547,11 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   if (observation_frame_sequence_ % 600 == 0) {
     REXGPU_INFO(
         "FH1 native reflection mips enabled={} candidates={} native_faces={} fallback_lists={} "
-        "replaced_draws={} replaced_copies={}",
+        "replaced_draws={} replaced_copies={} rejected_guard/state/contract/publication={}/{}/{}/{}",
         REXCVAR_GET(fh1_native_reflection_mips), fh1_mip_candidates_, fh1_mip_native_faces_,
         fh1_mip_candidates_ - fh1_mip_native_faces_, fh1_mip_native_faces_ * 8,
-        fh1_mip_native_faces_ * 8);
+        fh1_mip_native_faces_ * 8, fh1_mip_rejections_[0], fh1_mip_rejections_[1],
+        fh1_mip_rejections_[2], fh1_mip_rejections_[3]);
   }
 
   SCOPE_profile_cpu_f("gpu");
@@ -4308,6 +4309,7 @@ void D3D12CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) 
       !(bin_select_ & bin_mask_) ||
       register_file_->Get<reg::RB_MODECONTROL>().edram_mode != xenos::EdramMode::kColorDepth ||
       render_target_cache_->GetPath() != RenderTargetCache::Path::kHostRenderTargets) {
+    ++fh1_mip_rejections_[1];
     fallback();
     return;
   }
@@ -4320,11 +4322,13 @@ void D3D12CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) 
   if (!copy(ptr, commands) || !ParseFh1MipChain(commands, chain) ||
       !(ptr + commands.size() <= chain.base || ptr >= chain.base + Fh1MipChain::kTotalBytes) ||
       !CheckFh1MipInputs(chain, copy)) {
+    ++fh1_mip_rejections_[2];
     fallback();
     return;
   }
   const uint32_t face = chain.face;
   if (!BeginSubmission(true) || !texture_cache_->GenerateFh1ReflectionMips(chain.base, face)) {
+    ++fh1_mip_rejections_[3];
     fallback();
     return;
   }
