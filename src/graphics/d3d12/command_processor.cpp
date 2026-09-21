@@ -4656,6 +4656,9 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission,
     // Not updated - no need to reclaim or download things.
     return true;
   }
+  perf::TraceCriticalPath("gpu_completion",
+                          perf::GetTotalCounter(perf::CounterId::kSourceFrameCount),
+                          int64_t(submission_completed_));
 
   // Reclaim command allocators.
   while (command_allocator_submitted_first_) {
@@ -4950,6 +4953,10 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         command_allocator_writable_first_->command_allocator;
     command_allocator->Reset();
     command_list_->Reset(command_allocator, nullptr);
+    const uint64_t traced_submission = submission_current_;
+    perf::TraceCriticalPath("submission_begin",
+                            perf::GetTotalCounter(perf::CounterId::kSourceFrameCount),
+                            int64_t(traced_submission), is_closing_frame ? 1 : 0);
     deferred_command_list_.Execute(command_list_, command_list_1_);
     command_list_->Close();
     ID3D12CommandList* execute_command_lists[] = {command_list_};
@@ -4968,6 +4975,9 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     }
 
     direct_queue->Signal(submission_fence_, submission_current_++);
+    perf::TraceCriticalPath("submission_end",
+                            perf::GetTotalCounter(perf::CounterId::kSourceFrameCount),
+                            int64_t(traced_submission), is_closing_frame ? 1 : 0);
 
     submission_open_ = false;
 

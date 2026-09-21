@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 #ifdef REXGLUE_ENABLE_PROFILING
 #include <tracy/Tracy.hpp>
@@ -145,6 +146,13 @@ void Init();
 void SetCsvLogPath(const std::string& path);
 void WriteCsvFrame();
 void FlushCsv();
+
+// Opt-in event trace for joining title, command processor, GPU, and presenter
+// work by source-frame and submission identity.
+bool CriticalPathTraceEnabled();
+void TraceCriticalPath(std::string_view event, int64_t source_frame,
+                       int64_t value0 = 0, int64_t value1 = 0,
+                       int64_t value2 = 0);
 
 // Profiler -- coordinates Tracy frame marks and counter snapshots.
 // Moved here from rex::debug to consolidate all perf code under rex::perf.

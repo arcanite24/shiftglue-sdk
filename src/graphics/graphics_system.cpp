@@ -18,6 +18,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <utility>
 
 #include <rex/cvar.h>
@@ -45,6 +46,9 @@ REXCVAR_DEFINE_UINT32(
     pinyon_shift_fh1_render_fps_limit, 0, "Pinyon Shift",
     "FH1 source-render FPS limit (0 follows the host display)")
     .range(0, 240)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(pinyon_shift_fh1_vblank_deadline_wait, true, "Pinyon Shift",
+                    "Deliver FH1 guest vblanks from deadlines instead of 1 ms polling")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace {
@@ -184,13 +188,42 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
-          uint64_t interval_ticks =
-              REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
+          const bool vsync_enabled = REXCVAR_GET(vsync);
+          uint64_t interval_ticks = vsync_enabled ? vsync_interval_ticks : no_vsync_interval_ticks;
           while (current_time - last_frame_time >= interval_ticks) {
+            if (perf::CriticalPathTraceEnabled()) {
+              const uint64_t late_ticks = current_time - last_frame_time - interval_ticks;
+              perf::TraceCriticalPath(
+                  "guest_vblank_deadline",
+                  perf::GetTotalCounter(perf::CounterId::kSourceFrameCount),
+                  int64_t(double(late_ticks) * 1000000000.0 /
+                          double(guest_tick_frequency)),
+                  int64_t(double(interval_ticks) * 1000000000.0 /
+                          double(guest_tick_frequency)));
+            }
             MarkVblank();
             last_frame_time += interval_ticks;
           }
-          rex::thread::Sleep(std::chrono::milliseconds(1));
+          if (!vsync_enabled ||
+              !REXCVAR_GET(pinyon_shift_fh1_vblank_deadline_wait)) {
+            rex::thread::Sleep(std::chrono::milliseconds(1));
+            continue;
+          }
+
+          constexpr auto kVblankSpinTime = std::chrono::microseconds(500);
+          const uint64_t deadline_ticks = last_frame_time + interval_ticks;
+          const uint64_t remaining_ticks = deadline_ticks - current_time;
+          const double guest_time_scalar = std::max(0.001, chrono::Clock::guest_time_scalar());
+          const auto remaining_time = std::chrono::nanoseconds(std::max<int64_t>(
+              1, int64_t(double(remaining_ticks) * 1000000000.0 /
+                         (double(guest_tick_frequency) * guest_time_scalar))));
+          if (remaining_time > kVblankSpinTime) {
+            std::this_thread::sleep_for(remaining_time - kVblankSpinTime);
+          }
+          while (vsync_worker_running_ &&
+                 chrono::Clock::QueryGuestTickCount() < deadline_ticks) {
+            std::this_thread::yield();
+          }
         }
         return 0;
       }));
@@ -355,6 +388,9 @@ void GraphicsSystem::MarkVblank() {
     PROFILE_GUEST_VBLANK_DELTA_NS(now_ns - previous_ns);
   }
 
+  const auto dispatch_begin = perf::CriticalPathTraceEnabled()
+                                  ? VblankClock::now()
+                                  : VblankClock::time_point{};
   // Increment vblank counter (so the game sees us making progress).
   if (command_processor_) {
     command_processor_->increment_counter();
@@ -364,6 +400,14 @@ void GraphicsSystem::MarkVblank() {
   //     something wrong and the CP will block waiting for code that
   //     needs to be run in the interrupt.
   DispatchInterruptCallback(0, 2);
+  if (perf::CriticalPathTraceEnabled()) {
+    perf::TraceCriticalPath(
+        "guest_vblank_dispatch",
+        perf::GetTotalCounter(perf::CounterId::kSourceFrameCount),
+        std::chrono::duration_cast<std::chrono::nanoseconds>(VblankClock::now() -
+                                                             dispatch_begin)
+            .count());
+  }
 }
 
 void GraphicsSystem::ClearCaches() {

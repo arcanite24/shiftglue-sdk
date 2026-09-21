@@ -686,6 +686,7 @@ class DeferredCommandList {
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
   std::vector<uintmax_t> command_stream_;
+  uint64_t command_count_ = 0;
 };
 
 }  // namespace rex::graphics::d3d12

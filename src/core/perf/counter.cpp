@@ -16,8 +16,11 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <thread>
 #if REX_PLATFORM_WIN32
 #include <share.h>
 #endif
@@ -26,6 +29,9 @@ REXCVAR_DEFINE_STRING(perf_log_csv, "", "Perf",
                       "Path to write per-frame CSV log (empty = disabled)");
 REXCVAR_DEFINE_INT32(perf_log_max_mb, 0, "Perf",
                     "Stop CSV recording at this size (0 = unlimited)");
+REXCVAR_DEFINE_BOOL(perf_critical_path_trace, false, "Perf",
+                    "Log source-frame critical-path events")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::perf {
 
@@ -234,6 +240,26 @@ void ResetFrameCounters() {
 
 int64_t GetSnapshotCounter(CounterId id) {
   return g_snapshot[static_cast<size_t>(id)].load(std::memory_order_relaxed);
+}
+
+bool CriticalPathTraceEnabled() {
+  static const bool enabled = REXCVAR_GET(perf_critical_path_trace);
+  return enabled;
+}
+
+void TraceCriticalPath(std::string_view event, int64_t source_frame,
+                       int64_t value0, int64_t value1, int64_t value2) {
+  if (!CriticalPathTraceEnabled()) {
+    return;
+  }
+  const int64_t time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+  REXLOG_INFO(
+      "CRITICAL_PATH {{\"event\":\"{}\",\"time_ns\":{},\"thread\":{},"
+      "\"source_frame\":{},\"value0\":{},\"value1\":{},\"value2\":{}}}",
+      event, time_ns, std::hash<std::thread::id>{}(std::this_thread::get_id()),
+      source_frame, value0, value1, value2);
 }
 
 void Init() {

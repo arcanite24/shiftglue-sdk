@@ -15,6 +15,9 @@
 #include <rex/graphics/d3d12/deferred_command_list.h>
 #include <rex/graphics/flags.h>
 #include <rex/math.h>
+#include <rex/perf/counter.h>
+
+#include <chrono>
 
 namespace rex::graphics::d3d12 {
 
@@ -26,6 +29,7 @@ DeferredCommandList::DeferredCommandList(const D3D12CommandProcessor& command_pr
 
 void DeferredCommandList::Reset() {
   command_stream_.clear();
+  command_count_ = 0;
 }
 
 void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
@@ -33,6 +37,10 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+  const bool trace = perf::CriticalPathTraceEnabled();
+  const auto trace_begin = trace ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
+  const size_t stream_bytes = command_stream_.size() * sizeof(uintmax_t);
   const uintmax_t* stream = command_stream_.data();
   size_t stream_remaining = command_stream_.size();
   ID3D12PipelineState* current_pipeline_state = nullptr;
@@ -290,6 +298,14 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
     stream += header.arguments_size_elements;
     stream_remaining -= header.arguments_size_elements;
   }
+  if (trace) {
+    const auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - trace_begin)
+                                .count();
+    perf::TraceCriticalPath(
+        "command_tape", perf::GetTotalCounter(perf::CounterId::kSourceFrameCount),
+        elapsed_ns, int64_t(stream_bytes), int64_t(command_count_));
+  }
 }
 
 void* DeferredCommandList::WriteCommand(Command command, size_t arguments_size_bytes) {
@@ -300,6 +316,7 @@ void* DeferredCommandList::WriteCommand(Command command, size_t arguments_size_b
   CommandHeader& header = *reinterpret_cast<CommandHeader*>(command_stream_.data() + offset);
   header.command = command;
   header.arguments_size_elements = uint32_t(arguments_size_elements);
+  ++command_count_;
   return command_stream_.data() + (offset + kCommandHeaderSizeElements);
 }
 

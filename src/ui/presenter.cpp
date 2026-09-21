@@ -1554,6 +1554,9 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
             PresentationClock::now().time_since_epoch())
             .count();
     PROFILE_PRESENT();
+    perf::TraceCriticalPath(
+        "present", perf::GetTotalCounter(perf::CounterId::kSourceFrameCount),
+        int64_t(refresh_sequence));
     if (last_present_time_ns_) {
       PROFILE_PRESENT_DELTA_NS(present_time_ns - last_present_time_ns_);
     }
