@@ -1243,6 +1243,11 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
           {0xA4E5DE05DCAF605B, 0x000000000016003F},
           {0xD0EFA731CCB32A71, 0x000000000016003F},
           {0xF6D833A391B89839, 0x000000000016007F},
+          // Save-backed Recaro Rush route variants absent from the legacy PSO cache.
+          {0x18AB2AE508FD82EB, 0x000000000000007F},
+          {0xE67462AC487FB369, 0x0000000000000001},
+          {0xD606035F41900757, 0x000000000000003F},
+          {0xEC8B8A5D5D0171BE, 0x00000000000000FF},
       };
       for (const auto& [hash, modification] : kFh1RuntimeVariants) {
         auto shader_it = shaders_.find(hash);
