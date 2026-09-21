@@ -38,6 +38,9 @@
 REXCVAR_DEFINE_BOOL(fh1_post_chain_probe, false, "GPU/D3D12",
                     "Log resolve publications and their texture consumers")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_mip_decode_probe, false, "GPU/D3D12",
+                    "Measure reflection mip contract and packet replay CPU time")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(fh1_native_reflection_mips, true, "GPU/D3D12",
                     "Use experimental native reflection mips at symmetric 1x/2x; "
@@ -2601,6 +2604,13 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         fh1_mip_rejections_[2], fh1_mip_rejections_[3], reflection_imports.loads,
         reflection_imports.direct_loads, reflection_imports.subresource_copies,
         reflection_imports.guest_bytes, reflection_imports.upload_bytes);
+    if (REXCVAR_GET(fh1_mip_decode_probe) && fh1_mip_probe_faces_) {
+      REXGPU_INFO(
+          "FH1 mip decode probe {{\"faces\":{},\"contract_ns\":{},"
+          "\"native_ns\":{},\"replay_ns\":{}}}",
+          fh1_mip_probe_faces_, fh1_mip_probe_contract_ns_, fh1_mip_probe_native_ns_,
+          fh1_mip_probe_replay_ns_);
+    }
   }
 
   SCOPE_profile_cpu_f("gpu");
@@ -4363,6 +4373,9 @@ void D3D12CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) 
     return;
   }
   // Re-read current allocation contents; no pointer/handle is a cache identity.
+  const bool probe = REXCVAR_GET(fh1_mip_decode_probe);
+  const auto contract_start = probe ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
   std::array<unsigned char, Fh1MipChain::kCommandBytes> commands;
   Fh1MipChain chain;
   const auto copy = [&](uint32_t address, std::span<uint8_t> bytes) {
@@ -4375,12 +4388,16 @@ void D3D12CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) 
     fallback();
     return;
   }
+  const auto native_start = probe ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
   const uint32_t face = chain.face;
   if (!BeginSubmission(true) || !texture_cache_->GenerateFh1ReflectionMips(chain.base, face)) {
     ++fh1_mip_rejections_[3];
     fallback();
     return;
   }
+  const auto replay_start = probe ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
   fh1_mip_skipped_draws_ = fh1_mip_skipped_copies_ = 0;
   fh1_mip_replacement_active_ = true;
   memory::RingBuffer reader(commands.data(), commands.size());
@@ -4398,6 +4415,16 @@ void D3D12CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) 
     assert_always();
   } else {
     ++fh1_mip_native_faces_;
+    if (probe) {
+      const auto end = std::chrono::steady_clock::now();
+      ++fh1_mip_probe_faces_;
+      fh1_mip_probe_contract_ns_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          native_start - contract_start).count());
+      fh1_mip_probe_native_ns_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          replay_start - native_start).count());
+      fh1_mip_probe_replay_ns_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          end - replay_start).count());
+    }
   }
 }
 

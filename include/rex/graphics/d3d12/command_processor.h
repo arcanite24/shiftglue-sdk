@@ -248,6 +248,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   // contract, native publication.
   uint64_t fh1_mip_rejections_[4] = {};
   uint32_t fh1_mip_skipped_draws_ = 0, fh1_mip_skipped_copies_ = 0;
+  uint64_t fh1_mip_probe_faces_ = 0;
+  uint64_t fh1_mip_probe_contract_ns_ = 0;
+  uint64_t fh1_mip_probe_native_ns_ = 0;
+  uint64_t fh1_mip_probe_replay_ns_ = 0;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
