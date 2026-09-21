@@ -23,6 +23,7 @@
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/graphics/d3d12/texture_cache.h>
+#include <rex/graphics/fh1_mip_contract.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -1832,6 +1833,13 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
                                                               bool load_mips) {
   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
   TextureKey texture_key = d3d12_texture.key();
+  const bool fh1_reflection_cube =
+      texture_key.dimension == xenos::DataDimension::kCube && texture_key.GetWidth() == 256 &&
+      texture_key.GetHeight() == 256 && texture_key.GetDepthOrArraySize() == 6 &&
+      texture_key.mip_max_level == 8 && uint32_t(texture_key.format) == 7 && texture_key.tiled &&
+      !texture_key.packed_mips &&
+      (uint32_t(texture_key.mip_page) << 12) ==
+          (uint32_t(texture_key.base_page) << 12) + Fh1MipChain::kBaseBytes;
 
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
@@ -2224,6 +2232,17 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   }
 
   command_processor_.ReleaseScratchGPUBuffer(copy_buffer, copy_buffer_state);
+
+  if (fh1_reflection_cube) {
+    auto& stats = fh1_reflection_import_stats_;
+    ++stats.loads;
+    stats.subresource_copies +=
+        uint64_t(array_size) * (uint64_t(level_last) - level_first + 1);
+    stats.guest_bytes +=
+        (load_base ? d3d12_texture.GetGuestBaseSize() : 0) +
+        (load_mips ? d3d12_texture.GetGuestMipsSize() : 0);
+    stats.upload_bytes += copy_buffer_size;
+  }
 
   command_processor_.AdvanceFh1GpuWorkTiming(texture_timing, true);
   return true;

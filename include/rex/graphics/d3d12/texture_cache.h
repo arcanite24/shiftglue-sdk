@@ -101,6 +101,16 @@ class D3D12TextureCache final : public TextureCache {
   void RequestFh1VideoTextures(uint32_t used_texture_mask);
   bool GenerateFh1ReflectionMips(uint32_t base_address, uint32_t face);
 
+  struct Fh1ReflectionImportStats {
+    uint64_t loads = 0;
+    uint64_t subresource_copies = 0;
+    uint64_t guest_bytes = 0;
+    uint64_t upload_bytes = 0;
+  };
+  const Fh1ReflectionImportStats& GetFh1ReflectionImportStats() const {
+    return fh1_reflection_import_stats_;
+  }
+
   // Returns whether texture SRV keys stored externally are still valid for the
   // current bindings and host shader binding layout. Both keys and
   // host_shader_bindings must have host_shader_binding_count elements
@@ -479,6 +489,7 @@ class D3D12TextureCache final : public TextureCache {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fh1_mip_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fh1_mip_pipeline_1x_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fh1_mip_pipeline_3x_;
+  Fh1ReflectionImportStats fh1_reflection_import_stats_;
 
   std::vector<SRVDescriptorCachePage> srv_descriptor_cache_;
   uint32_t srv_descriptor_cache_allocated_;
