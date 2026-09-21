@@ -969,7 +969,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 
   // FH1's VdSwap packet ordinal pairs with its ordered title source markers.
   rex::perf::TraceCriticalPath("consumed_swap",
-                               int64_t(observation_frame_sequence_ + 1),
+                               int64_t(observation_frame_sequence_),
                                int64_t(frontbuffer_ptr));
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
