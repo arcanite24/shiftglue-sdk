@@ -35,6 +35,10 @@
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+REXCVAR_DEFINE_BOOL(fh1_post_chain_probe, false, "GPU/D3D12",
+                    "Log resolve publications and their texture consumers")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(fh1_native_reflection_mips, true, "GPU/D3D12",
                     "Use experimental native reflection mips at symmetric 1x/2x; "
                     "fall back when the current command/input contract does not match")
@@ -4410,6 +4414,17 @@ bool D3D12CommandProcessor::IssueCopy() {
   const bool copy_succeeded =
       render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, written_address,
                                     written_length, fh1_mip_replacement_active_);
+  if (copy_succeeded && REXCVAR_GET(fh1_post_chain_probe)) {
+    REXGPU_INFO(
+        "FH1 resolve publication {{\"frame\":{},\"address\":\"{:08X}\","
+        "\"length\":{},\"copy_control\":{},\"dest_info\":{},"
+        "\"dest_pitch\":{},\"surface_info\":{}}}",
+        observation_frame_sequence_, written_address, written_length,
+        register_file_->Get<reg::RB_COPY_CONTROL>().value,
+        register_file_->Get<reg::RB_COPY_DEST_INFO>().value,
+        register_file_->Get<reg::RB_COPY_DEST_PITCH>().value,
+        register_file_->Get<reg::RB_SURFACE_INFO>().value);
+  }
   if (fh1_mip_replacement_active_ && copy_succeeded)
     ++fh1_mip_skipped_copies_;
 
@@ -4508,6 +4523,23 @@ bool D3D12CommandProcessor::IssueCopy() {
     }
   }
   return copy_succeeded;
+}
+
+void D3D12CommandProcessor::LogFh1TextureReloadConsumer(
+    const D3D12TextureCache::TextureKey& key) const {
+  if (!REXCVAR_GET(fh1_post_chain_probe)) {
+    return;
+  }
+  const auto* vertex_shader = static_cast<const D3D12Shader*>(active_vertex_shader());
+  const auto* pixel_shader = static_cast<const D3D12Shader*>(active_pixel_shader());
+  REXGPU_INFO(
+      "FH1 texture reload consumer {{\"frame\":{},\"base\":\"{:08X}\","
+      "\"width\":{},\"height\":{},\"format\":{},\"vs\":\"{:016X}\","
+      "\"ps\":\"{:016X}\"}}",
+      observation_frame_sequence_, uint32_t(key.base_page << 12), key.GetWidth(),
+      key.GetHeight(), uint32_t(key.format),
+      vertex_shader ? vertex_shader->ucode_data_hash() : 0,
+      pixel_shader ? pixel_shader->ucode_data_hash() : 0);
 }
 
 bool D3D12CommandProcessor::AwaitFence(ID3D12Fence* fence, uint64_t value,

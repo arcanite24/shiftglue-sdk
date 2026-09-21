@@ -116,6 +116,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   };
   Fh1GpuWorkTiming BeginFh1TextureLoadTiming(const D3D12TextureCache::TextureKey& key,
                                              bool force_sample = false);
+  void LogFh1TextureReloadConsumer(const D3D12TextureCache::TextureKey& key) const;
   void AdvanceFh1GpuWorkTiming(const Fh1GpuWorkTiming& timing, bool finish);
   bool IsFh1GpuWorkTimingSampleFrame() const;
   Fh1GpuWorkTiming BeginFh1RenderTargetTransferTiming(uint32_t transfer_count,

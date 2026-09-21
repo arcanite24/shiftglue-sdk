@@ -1857,6 +1857,7 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
                                                               bool load_mips) {
   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
   TextureKey texture_key = d3d12_texture.key();
+  command_processor_.LogFh1TextureReloadConsumer(texture_key);
   const bool fh1_reflection_cube = IsFh1ReflectionCube(texture_key);
 
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
