@@ -48,10 +48,6 @@ REXCVAR_DEFINE_INT32(log_flush_interval, 0, "Log", "Periodic flush interval in s
     .range(0, 60)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
-REXCVAR_DEFINE_BOOL(log_batch_info_flush, false, "Log",
-                    "Batch INFO flushes; WARN and above still flush immediately")
-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-
 REXCVAR_DEFINE_INT32(log_max_file_size_mb, 5, "Log", "Max log file size in MB before rotation")
     .range(1, 100)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -184,13 +180,11 @@ void InitLogging(const LogConfig& config) {
 
   if (g_initialized) {
     g_config = config;
-    if (REXCVAR_GET(log_batch_info_flush) && g_config.flush_level < spdlog::level::warn)
-      g_config.flush_level = spdlog::level::warn;
     for (auto& entry : g_registry) {
       if (!entry.logger)
         continue;
       entry.logger->set_level(ResolveCategoryLevel(entry.name));
-      entry.logger->flush_on(g_config.flush_level);
+      entry.logger->flush_on(config.flush_level);
       if (g_config.category_levels.count(entry.name))
         entry.has_explicit_level = true;
     }
@@ -198,8 +192,6 @@ void InitLogging(const LogConfig& config) {
   }
 
   g_config = config;
-  if (REXCVAR_GET(log_batch_info_flush) && g_config.flush_level < spdlog::level::warn)
-    g_config.flush_level = spdlog::level::warn;
 
   // Early sink handling:
   //   Windows: the early msvc_sink is the persistent debug channel for GUI
@@ -266,8 +258,6 @@ void InitLogging(const LogConfig& config) {
 
   // Periodic flush
   int flush_interval = REXCVAR_GET(log_flush_interval);
-  if (REXCVAR_GET(log_batch_info_flush) && flush_interval == 0)
-    flush_interval = 1;
   if (flush_interval > 0)
     spdlog::flush_every(std::chrono::seconds(flush_interval));
 }
