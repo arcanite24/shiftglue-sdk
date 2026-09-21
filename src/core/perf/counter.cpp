@@ -23,6 +23,8 @@
 #include <thread>
 #if REX_PLATFORM_WIN32
 #include <share.h>
+#include <windows.h>
+#include <TraceLoggingProvider.h>
 #endif
 
 REXCVAR_DEFINE_STRING(perf_log_csv, "", "Perf",
@@ -36,6 +38,30 @@ REXCVAR_DEFINE_BOOL(perf_critical_path_trace, false, "Perf",
 namespace rex::perf {
 
 namespace {
+
+#if REX_PLATFORM_WIN32
+TRACELOGGING_DEFINE_PROVIDER(
+    g_critical_path_provider, "PinyonShift-CriticalPath",
+    (0xf36ab1a6, 0x80bb, 0x4482, 0xb1, 0xb9, 0x92, 0xa6, 0xec, 0x87, 0x02,
+     0x58));
+
+struct CriticalPathProviderRegistration {
+  CriticalPathProviderRegistration() {
+    TraceLoggingRegister(g_critical_path_provider);
+  }
+  ~CriticalPathProviderRegistration() {
+    TraceLoggingUnregister(g_critical_path_provider);
+  }
+};
+
+CriticalPathProviderRegistration g_critical_path_provider_registration;
+
+bool CriticalPathEtwEnabled() {
+  return TraceLoggingProviderEnabled(g_critical_path_provider, 0, 0) != FALSE;
+}
+#else
+constexpr bool CriticalPathEtwEnabled() { return false; }
+#endif
 
 constexpr size_t kNumCounters = static_cast<size_t>(CounterId::kCount);
 
@@ -243,13 +269,26 @@ int64_t GetSnapshotCounter(CounterId id) {
 }
 
 bool CriticalPathTraceEnabled() {
-  static const bool enabled = REXCVAR_GET(perf_critical_path_trace);
-  return enabled;
+  static const bool log_enabled = REXCVAR_GET(perf_critical_path_trace);
+  return log_enabled || CriticalPathEtwEnabled();
 }
 
 void TraceCriticalPath(std::string_view event, int64_t source_frame,
                        int64_t value0, int64_t value1, int64_t value2) {
   if (!CriticalPathTraceEnabled()) {
+    return;
+  }
+#if REX_PLATFORM_WIN32
+  TraceLoggingWrite(
+      g_critical_path_provider, "CriticalPath",
+      TraceLoggingCountedUtf8String(event.data(), event.size(), "Event"),
+      TraceLoggingInt64(source_frame, "SourceFrame"),
+      TraceLoggingInt64(value0, "Value0"),
+      TraceLoggingInt64(value1, "Value1"),
+      TraceLoggingInt64(value2, "Value2"));
+#endif
+  static const bool log_enabled = REXCVAR_GET(perf_critical_path_trace);
+  if (!log_enabled) {
     return;
   }
   const int64_t time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(

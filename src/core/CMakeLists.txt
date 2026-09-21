@@ -99,7 +99,7 @@ target_include_directories(rexcore PRIVATE
 )
 
 if(WIN32)
-    target_link_libraries(rexcore PUBLIC ws2_32)
+    target_link_libraries(rexcore PUBLIC ws2_32 advapi32)
 elseif(APPLE)
     target_link_libraries(rexcore PRIVATE pthread)
 elseif(UNIX)
