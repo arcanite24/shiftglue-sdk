@@ -283,6 +283,14 @@ void TraceCriticalPath(std::string_view event, int64_t source_frame,
     TraceLoggingWrite(g_critical_path_provider, "SourceFrame",
                       TraceLoggingInt64(source_frame, "SourceFrame"));
   }
+  TraceLoggingWrite(g_critical_path_provider, "CriticalPath",
+                    TraceLoggingCountedUtf8String(event.data(),
+                                                  static_cast<ULONG>(event.size()),
+                                                  "Event"),
+                    TraceLoggingInt64(source_frame, "SourceFrame"),
+                    TraceLoggingInt64(value0, "Value0"),
+                    TraceLoggingInt64(value1, "Value1"),
+                    TraceLoggingInt64(value2, "Value2"));
 #endif
   static const bool log_enabled = REXCVAR_GET(perf_critical_path_trace);
   if (!log_enabled) {
