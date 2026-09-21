@@ -114,7 +114,8 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint64_t submission = 0;
     uint32_t record = UINT32_MAX;
   };
-  Fh1GpuWorkTiming BeginFh1TextureLoadTiming(const D3D12TextureCache::TextureKey& key);
+  Fh1GpuWorkTiming BeginFh1TextureLoadTiming(const D3D12TextureCache::TextureKey& key,
+                                             bool force_sample = false);
   void AdvanceFh1GpuWorkTiming(const Fh1GpuWorkTiming& timing, bool finish);
   bool IsFh1GpuWorkTimingSampleFrame() const;
   Fh1GpuWorkTiming BeginFh1RenderTargetTransferTiming(uint32_t transfer_count,

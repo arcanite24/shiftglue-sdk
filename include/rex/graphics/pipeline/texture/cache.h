@@ -594,6 +594,9 @@ class TextureCache {
   static void ScaledResolveGlobalWatchCallbackThunk(
       const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
       uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu);
+  static void ReloadProbeGlobalWatchCallback(
+      const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
+      uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu);
   void ScaledResolveGlobalWatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
                                         uint32_t address_first, uint32_t address_last,
                                         bool invalidated_by_gpu);
@@ -617,6 +620,7 @@ class TextureCache {
 
   // Global watch for scaled resolve data invalidation.
   SharedMemory::GlobalWatchHandle scaled_resolve_global_watch_handle_ = nullptr;
+  SharedMemory::GlobalWatchHandle reload_probe_global_watch_handle_ = nullptr;
 
   uint64_t current_submission_index_ = 0;
   uint64_t current_submission_time_ = 0;

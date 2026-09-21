@@ -35,6 +35,8 @@
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+REXCVAR_DECLARE(bool, fh1_texture_reload_probe);
+
 namespace rex::graphics::d3d12 {
 
 // Diagnostic for the resolution-scaled reflection cube: reports why a mip chain
@@ -2159,6 +2161,13 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   // address is required - which may be different for base and mips.
   bool scaled_mips_source_set_up = false;
   D3D12CommandProcessor::Fh1GpuWorkTiming texture_timing;
+  const bool time_base_only_2d =
+      level_first == 0 && level_last == 0 && !texture_key.mip_max_level &&
+      dimension == xenos::DataDimension::k2DOrStacked && array_size == 1;
+  if (!texture_resolution_scaled && time_base_only_2d) {
+    texture_timing = command_processor_.BeginFh1TextureLoadTiming(
+        texture_key, REXCVAR_GET(fh1_texture_reload_probe));
+  }
   uint32_t guest_x_blocks_per_group_log2 = load_shader_info.GetGuestXBlocksPerGroupLog2();
   for (uint32_t loop_level = loop_level_first; loop_level <= loop_level_last; ++loop_level) {
     bool is_base = loop_level == 0;
@@ -2178,9 +2187,9 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
       }
       // Base-only 2D conversions have no later fallible allocations or source
       // changes. Sample dispatch and scratch-copy cost using the existing heap.
-      if (is_base && !load_mips && !texture_key.mip_max_level &&
-          dimension == xenos::DataDimension::k2DOrStacked && array_size == 1) {
-        texture_timing = command_processor_.BeginFh1TextureLoadTiming(texture_key);
+      if (is_base && time_base_only_2d) {
+        texture_timing = command_processor_.BeginFh1TextureLoadTiming(
+            texture_key, REXCVAR_GET(fh1_texture_reload_probe));
       }
       TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
       assert_true(descriptor_write_index < descriptor_count);

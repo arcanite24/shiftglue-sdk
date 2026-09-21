@@ -50,6 +50,10 @@ REXCVAR_DEFINE_BOOL(gpu_3d_to_2d_texture, true, "GPU",
                     "Sample problematic 3D textures through 2D-compatible wrappers")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(fh1_texture_reload_probe, false, "GPU",
+                    "Log FH1 texture invalidation ranges and reload attempts")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_INT32(anisotropic_override, 3, "GPU",
                      "Forces anisotropic filtering for eligible textures.\n"
                      "Higher values keep textures sharper at oblique angles, but increase texture "
@@ -224,6 +228,10 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
     scaled_resolve_global_watch_handle_ =
         shared_memory.RegisterGlobalWatch(ScaledResolveGlobalWatchCallbackThunk, this);
   }
+  if (REXCVAR_GET(fh1_texture_reload_probe)) {
+    reload_probe_global_watch_handle_ =
+        shared_memory.RegisterGlobalWatch(ReloadProbeGlobalWatchCallback, this);
+  }
 }
 
 TextureCache::~TextureCache() {
@@ -231,6 +239,9 @@ TextureCache::~TextureCache() {
 
   if (scaled_resolve_global_watch_handle_) {
     shared_memory().UnregisterGlobalWatch(scaled_resolve_global_watch_handle_);
+  }
+  if (reload_probe_global_watch_handle_) {
+    shared_memory().UnregisterGlobalWatch(reload_probe_global_watch_handle_);
   }
 }
 
@@ -393,6 +404,17 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
   }
 
   PERF_counter_inc(kTextureDirtyLoadAttempts);
+  if (REXCVAR_GET(fh1_texture_reload_probe)) {
+    const TextureKey& key = texture.key();
+    REXGPU_INFO(
+        "FH1 texture reload attempt {{\"base\":\"{:08X}\",\"mips\":\"{:08X}\","
+        "\"width\":{},\"height\":{},\"depth\":{},\"format\":{},\"base_dirty\":{},"
+        "\"mips_dirty\":{},\"base_bytes\":{},\"mips_bytes\":{},\"scaled\":{}}}",
+        uint32_t(key.base_page << 12), uint32_t(key.mip_page << 12), key.GetWidth(),
+        key.GetHeight(), key.GetDepthOrArraySize(), uint32_t(key.format), base_outdated,
+        mips_outdated, texture.GetGuestBaseSize(), texture.GetGuestMipsSize(),
+        uint32_t(key.scaled_resolve));
+  }
   if (TryLoadTextureDataFromCpu(texture, base_outdated, mips_outdated)) {
     texture.CompleteLoad(global_critical_region_.Acquire(), base_outdated, mips_outdated);
     texture.LogAction("Loaded from CPU");
@@ -793,6 +815,15 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
                                  void* context, void* data, uint64_t argument,
                                  bool invalidated_by_gpu) {
   Texture& texture = *static_cast<Texture*>(context);
+  if (REXCVAR_GET(fh1_texture_reload_probe)) {
+    const TextureKey& key = texture.key();
+    REXGPU_INFO(
+        "FH1 texture invalidated {{\"base\":\"{:08X}\",\"mips\":\"{:08X}\","
+        "\"width\":{},\"height\":{},\"format\":{},\"part\":\"{}\",\"gpu\":{}}}",
+        uint32_t(key.base_page << 12), uint32_t(key.mip_page << 12), key.GetWidth(),
+        key.GetHeight(), uint32_t(key.format), argument ? "mips" : "base",
+        invalidated_by_gpu);
+  }
   texture.WatchCallback(global_lock, argument != 0);
   texture.texture_cache().texture_became_outdated_.store(true, std::memory_order_release);
 }
@@ -1123,6 +1154,16 @@ void TextureCache::ScaledResolveGlobalWatchCallbackThunk(
   TextureCache* texture_cache = reinterpret_cast<TextureCache*>(context);
   texture_cache->ScaledResolveGlobalWatchCallback(global_lock, address_first, address_last,
                                                   invalidated_by_gpu);
+}
+
+void TextureCache::ReloadProbeGlobalWatchCallback(
+    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock,
+    [[maybe_unused]] void* context,
+    uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu) {
+  REXGPU_INFO(
+      "FH1 texture invalidation range {{\"first\":\"{:08X}\",\"last\":\"{:08X}\","
+      "\"gpu\":{}}}",
+      address_first, address_last, invalidated_by_gpu);
 }
 
 void TextureCache::ScaledResolveGlobalWatchCallback(

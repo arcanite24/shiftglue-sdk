@@ -6564,8 +6564,10 @@ bool D3D12CommandProcessor::IsFh1GpuWorkTimingSampleFrame() const {
 }
 
 D3D12CommandProcessor::Fh1GpuWorkTiming
-D3D12CommandProcessor::BeginFh1TextureLoadTiming(const D3D12TextureCache::TextureKey& key) {
-  if (!IsFh1GpuWorkTimingSampleFrame()) {
+D3D12CommandProcessor::BeginFh1TextureLoadTiming(
+    const D3D12TextureCache::TextureKey& key, bool force_sample) {
+  if (!(force_sample && Fh1GpuCorpusEnabled() && native_guest_output_gpu_query_heap_) &&
+      !IsFh1GpuWorkTimingSampleFrame()) {
     return {};
   }
   auto& slot = fh1_gpu_pass_timing_slots_[frame_current_ % kQueueFrames];
