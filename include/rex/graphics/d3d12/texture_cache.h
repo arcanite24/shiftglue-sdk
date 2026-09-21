@@ -103,6 +103,7 @@ class D3D12TextureCache final : public TextureCache {
 
   struct Fh1ReflectionImportStats {
     uint64_t loads = 0;
+    uint64_t direct_loads = 0;
     uint64_t subresource_copies = 0;
     uint64_t guest_bytes = 0;
     uint64_t upload_bytes = 0;
@@ -485,6 +486,7 @@ class D3D12TextureCache final : public TextureCache {
   // Load pipelines for resolution-scaled resolve targets.
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kLoadShaderCount> load_pipelines_scaled_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> load_pipeline_fh1_scaled_32_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> fh1_reflection_cube_import_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> fh1_mip_root_signature_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fh1_mip_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fh1_mip_pipeline_1x_;

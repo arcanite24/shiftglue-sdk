@@ -2589,13 +2589,14 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     REXGPU_INFO(
         "FH1 native reflection mips enabled={} candidates={} native_faces={} fallback_lists={} "
         "replaced_draws={} replaced_copies={} rejected_guard/state/contract/publication={}/{}/{}/{} "
-        "cube_imports={} cube_subresource_copies={} cube_guest_bytes={} cube_upload_bytes={}",
+        "cube_imports={} cube_direct_imports={} cube_subresource_copies={} cube_guest_bytes={} "
+        "cube_upload_bytes={}",
         REXCVAR_GET(fh1_native_reflection_mips), fh1_mip_candidates_, fh1_mip_native_faces_,
         fh1_mip_candidates_ - fh1_mip_native_faces_, fh1_mip_native_faces_ * 8,
         fh1_mip_native_faces_ * 8, fh1_mip_rejections_[0], fh1_mip_rejections_[1],
         fh1_mip_rejections_[2], fh1_mip_rejections_[3], reflection_imports.loads,
-        reflection_imports.subresource_copies, reflection_imports.guest_bytes,
-        reflection_imports.upload_bytes);
+        reflection_imports.direct_loads, reflection_imports.subresource_copies,
+        reflection_imports.guest_bytes, reflection_imports.upload_bytes);
   }
 
   SCOPE_profile_cpu_f("gpu");

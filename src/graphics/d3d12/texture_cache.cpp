@@ -41,12 +41,15 @@ namespace rex::graphics::d3d12 {
 // was not published natively. Off by default, read-only.
 REXCVAR_DEFINE_BOOL(fh1_glow_probe, false, "GPU/D3D12",
                     "Log FH1 reflection mip publication admission decisions and range state");
+REXCVAR_DEFINE_BOOL(fh1_direct_reflection_cube_import, true, "GPU/D3D12",
+                    "Import FH1 reflection cubes directly into their host texture");
 
 // Generated with `xb buildshaders`.
 namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/fh1_reflection_mip_1x_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_reflection_mip_2x_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_reflection_mip_3x_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_reflection_cube_import_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_128bpb_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_128bpb_scaled_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_16bpb_cs.h"
@@ -91,6 +94,14 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/texture_load_r5g6b5_b5g6r5_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_r5g6b5_b5g6r5_scaled_cs.h"
 }  // namespace shaders
+
+static bool IsFh1ReflectionCube(D3D12TextureCache::TextureKey key) {
+  return key.dimension == xenos::DataDimension::kCube && key.GetWidth() == 256 &&
+         key.GetHeight() == 256 && key.GetDepthOrArraySize() == 6 && key.mip_max_level == 8 &&
+         uint32_t(key.format) == 7 && key.tiled && !key.packed_mips &&
+         (uint32_t(key.mip_page) << 12) ==
+             (uint32_t(key.base_page) << 12) + Fh1MipChain::kBaseBytes;
+}
 
 const D3D12TextureCache::HostFormat D3D12TextureCache::host_formats_[64] = {
     // k_1_REVERSE
@@ -612,6 +623,16 @@ bool D3D12TextureCache::Initialize() {
       load_pipeline_fh1_scaled_32_->SetName(L"FH1 Scaled 32bpp 2x");
     }
   }
+
+  *fh1_reflection_cube_import_pipeline_.ReleaseAndGetAddressOf() =
+      ui::d3d12::util::CreateComputePipeline(
+          device, shaders::fh1_reflection_cube_import_cs,
+          sizeof(shaders::fh1_reflection_cube_import_cs), load_root_signature_.Get());
+  if (!fh1_reflection_cube_import_pipeline_) {
+    REXGPU_ERROR("D3D12TextureCache: Failed to create the FH1 reflection cube import pipeline");
+    return false;
+  }
+  fh1_reflection_cube_import_pipeline_->SetName(L"FH1 direct reflection cube import");
 
   srv_descriptor_cache_allocated_ = 0;
 
@@ -1689,7 +1710,8 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
   desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
   // Untiling through a buffer instead of using unordered access because copying
   // is not done that often.
-  desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+  desc.Flags = IsFh1ReflectionCube(key) ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                                        : D3D12_RESOURCE_FLAG_NONE;
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
   // Assuming untiling will be the next operation.
@@ -1833,13 +1855,7 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
                                                               bool load_mips) {
   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
   TextureKey texture_key = d3d12_texture.key();
-  const bool fh1_reflection_cube =
-      texture_key.dimension == xenos::DataDimension::kCube && texture_key.GetWidth() == 256 &&
-      texture_key.GetHeight() == 256 && texture_key.GetDepthOrArraySize() == 6 &&
-      texture_key.mip_max_level == 8 && uint32_t(texture_key.format) == 7 && texture_key.tiled &&
-      !texture_key.packed_mips &&
-      (uint32_t(texture_key.mip_page) << 12) ==
-          (uint32_t(texture_key.base_page) << 12) + Fh1MipChain::kBaseBytes;
+  const bool fh1_reflection_cube = IsFh1ReflectionCube(texture_key);
 
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
@@ -1895,6 +1911,90 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   uint32_t level_stored_last = std::min(level_last, level_packed);
   uint32_t texture_resolution_scale_x = texture_resolution_scaled ? draw_resolution_scale_x() : 1;
   uint32_t texture_resolution_scale_y = texture_resolution_scaled ? draw_resolution_scale_y() : 1;
+
+  if (REXCVAR_GET(fh1_direct_reflection_cube_import) && fh1_reflection_cube && load_base &&
+      load_mips && texture_resolution_scale_x == texture_resolution_scale_y &&
+      texture_resolution_scale_x <= 3 &&
+      fh1_reflection_cube_import_pipeline_ && !d3d12_texture.force_load_3d_tiling()) {
+    constexpr uint32_t kMipCount = 9;
+    const uint32_t descriptor_count = kMipCount + uint32_t(texture_resolution_scaled ||
+                                                            !bindless_resources_used_);
+    std::array<ui::d3d12::util::DescriptorCpuGpuHandlePair, kMipCount + 1> descriptors;
+    if (command_processor_.RequestOneUseSingleViewDescriptors(descriptor_count,
+                                                               descriptors.data())) {
+      uint32_t descriptor_index = 0;
+      ui::d3d12::util::DescriptorCpuGpuHandlePair source_descriptor;
+      if (texture_resolution_scaled) {
+        const uint32_t base_address = uint32_t(texture_key.base_page) << 12;
+        const uint32_t total_size = d3d12_texture.GetGuestBaseSize() +
+                                    d3d12_texture.GetGuestMipsSize();
+        if (!MakeScaledResolveRangeCurrent(base_address, total_size, 4)) {
+          return false;
+        }
+        TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        source_descriptor = descriptors[descriptor_index++];
+        CreateCurrentScaledResolveRangeUintPow2SRV(source_descriptor.first, 4);
+      } else {
+        D3D12SharedMemory& d3d12_shared_memory =
+            static_cast<D3D12SharedMemory&>(shared_memory());
+        d3d12_shared_memory.UseForReading();
+        if (bindless_resources_used_) {
+          source_descriptor = command_processor_.GetSharedMemoryUintPow2BindlessSRVHandlePair(4);
+        } else {
+          source_descriptor = descriptors[descriptor_index++];
+          d3d12_shared_memory.WriteUintPow2SRVDescriptor(source_descriptor.first, 4);
+        }
+      }
+
+      ID3D12Resource* texture_resource = d3d12_texture.resource();
+      command_processor_.PushTransitionBarrier(
+          texture_resource, d3d12_texture.SetResourceState(D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      command_processor_.SetExternalPipeline(fh1_reflection_cube_import_pipeline_.Get());
+      command_list.D3DSetComputeRootSignature(load_root_signature_.Get());
+      command_list.D3DSetComputeRootDescriptorTable(1, source_descriptor.second);
+
+      LoadConstants constants = {};
+      const uint32_t scale = texture_resolution_scale_x;
+      constants.is_tiled_3d_endian_scale = 1 | (2 << 2) | (scale << 4) | (scale << 7);
+      for (uint32_t level = 0; level < kMipCount; ++level) {
+        const texture_util::TextureGuestLayout::Level& level_layout =
+            level ? guest_layout.mips[level] : guest_layout.base;
+        const uint32_t level_address = level
+            ? (uint32_t(texture_key.mip_page) << 12) + guest_layout.mip_offsets_bytes[level]
+            : uint32_t(texture_key.base_page) << 12;
+        constants.guest_offset = texture_resolution_scaled
+            ? (level_address - (uint32_t(texture_key.base_page) << 12)) * scale * scale
+            : level_address;
+        constants.guest_pitch_aligned = level_layout.row_pitch_bytes / bytes_per_block;
+        constants.size_blocks[0] = std::max(width >> level, uint32_t(1)) * scale;
+        constants.size_blocks[1] = std::max(height >> level, uint32_t(1)) * scale;
+        constants.size_blocks[2] = 6;
+        constants.host_offset = level_layout.array_slice_stride_bytes * scale * scale;
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
+        uav_desc.Format = DXGI_FORMAT_R10G10B10A2_UINT;
+        uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+        uav_desc.Texture2DArray.MipSlice = level;
+        uav_desc.Texture2DArray.ArraySize = 6;
+        auto destination_descriptor = descriptors[descriptor_index++];
+        device->CreateUnorderedAccessView(texture_resource, nullptr, &uav_desc,
+                                          destination_descriptor.first);
+        command_list.D3DSetComputeRootDescriptorTable(2, destination_descriptor.second);
+        command_list.D3DSetComputeRoot32BitConstants(
+            0, sizeof(constants) / sizeof(uint32_t), &constants, 0);
+        command_processor_.SubmitBarriers();
+        command_list.D3DDispatch((constants.size_blocks[0] + 7) / 8,
+                                 (constants.size_blocks[1] + 7) / 8, 6);
+      }
+      d3d12_texture.MarkAsUsed();
+      ++fh1_reflection_import_stats_.loads;
+      ++fh1_reflection_import_stats_.direct_loads;
+      fh1_reflection_import_stats_.guest_bytes += d3d12_texture.GetGuestBaseSize() +
+                                                  d3d12_texture.GetGuestMipsSize();
+      return true;
+    }
+  }
 
   // The loop counter can mean two things depending on whether the packed mip
   // tail is stored as mip 0, because in this case, it would be ambiguous since
