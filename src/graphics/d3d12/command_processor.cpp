@@ -56,7 +56,7 @@ REXCVAR_DEFINE_INT32(fh1_geometry_cache_mb, 32, "GPU/D3D12",
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
+REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, false, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
