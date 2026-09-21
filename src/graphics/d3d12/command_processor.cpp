@@ -48,6 +48,10 @@ REXCVAR_DEFINE_BOOL(fh1_recycle_geometry_buffers, false, "GPU/D3D12",
 REXCVAR_DEFINE_BOOL(fh1_contain_geometry_windows, false, "GPU/D3D12",
                     "Reuse the smallest same-base geometry window containing the request")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_cache_geometry_rejections, false, "GPU/D3D12",
+                    "Skip repeated owned-geometry admission work until cache state changes");
+REXCVAR_DEFINE_INT32(fh1_geometry_cache_mb, 32, "GPU/D3D12",
+                     "Owned-geometry cache budget in MiB (8-128)");
 
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -981,7 +985,7 @@ auto D3D12CommandProcessor::FindFh1OwnedGeometry(uint32_t base, uint32_t size)
 
 D3D12_GPU_VIRTUAL_ADDRESS D3D12CommandProcessor::GetFh1OwnedGeometry(
     uint32_t address, uint32_t size, bool keep_cpu_snapshot) {
-  constexpr uint64_t kBudget = 32 * 1024 * 1024;
+  const uint64_t budget = uint64_t(std::clamp(REXCVAR_GET(fh1_geometry_cache_mb), 8, 128)) << 20;
   if (!size || address >= SharedMemory::kBufferSize || size > SharedMemory::kBufferSize - address) {
     return 0;
   }
@@ -994,18 +998,35 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12CommandProcessor::GetFh1OwnedGeometry(
   const uint64_t key = (uint64_t(address) << 32) | size;
   auto found = FindFh1OwnedGeometry(address, size);
   if (found == fh1_geometry_.end()) {
+    ++fh1_geometry_admission_attempts_;
+    auto& rejection = fh1_geometry_rejections_[(key ^ (key >> 32)) % fh1_geometry_rejections_.size()];
+    if (REXCVAR_GET(fh1_cache_geometry_rejections) && rejection.reason && rejection.key == key &&
+        rejection.frame == frame_current_ &&
+        rejection.completed_submission == submission_completed_ &&
+        rejection.cache_generation == fh1_geometry_cache_generation_) {
+      ++fh1_geometry_rejection_hits_;
+      return 0;
+    }
+    auto reject = [&](uint8_t reason) {
+      rejection = {key, frame_current_, submission_completed_, fh1_geometry_cache_generation_, reason};
+      if (reason == 1) ++fh1_geometry_rejected_in_flight_;
+      else ++fh1_geometry_rejected_recent_;
+      return D3D12_GPU_VIRTUAL_ADDRESS(0);
+    };
     D3D12_RESOURCE_DESC desc;
     ui::d3d12::util::FillBufferResourceDesc(desc, size, D3D12_RESOURCE_FLAG_NONE);
     const auto& provider = GetD3D12Provider();
     auto* device = provider.GetDevice();
+    ++fh1_geometry_allocation_info_calls_;
     const uint64_t allocation = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
-    if (allocation > kBudget) {
+    if (allocation > budget) {
       return 0;
     }
     Fh1Geometry entry;
     // ponytail: linear eviction is bounded to 512 entries; no in-flight retirement
     // queue, so churn cannot exceed the geometry allocation budget.
-    while (fh1_geometry_.size() >= 512 || fh1_geometry_bytes_ + allocation > kBudget) {
+    while (fh1_geometry_.size() >= 512 || fh1_geometry_bytes_ + allocation > budget) {
+      ++fh1_geometry_eviction_scans_;
       auto oldest = std::min_element(fh1_geometry_.begin(), fh1_geometry_.end(),
           [](const auto& a, const auto& b) { return a.second.last_submission < b.second.last_submission; });
       if (REXCVAR_GET(fh1_recycle_geometry_buffers) && !entry.buffer.Get()) {
@@ -1020,13 +1041,13 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12CommandProcessor::GetFh1OwnedGeometry(
         if (fitting != fh1_geometry_.end()) oldest = fitting;
       }
       if (oldest == fh1_geometry_.end() || oldest->second.last_submission > submission_completed_) {
-        return 0;
+        return reject(1);
       }
       // A scene larger than the cache must not recreate its working set every
       // frame. Keep recently used owners and use the shared-memory fallback.
       if (frame_current_ <= oldest->second.last_frame ||
           frame_current_ - oldest->second.last_frame <= 1) {
-        return 0;
+        return reject(2);
       }
       {
         auto lock = thread::global_critical_region::AcquireDirect();
@@ -1042,6 +1063,7 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12CommandProcessor::GetFh1OwnedGeometry(
       }
       fh1_geometry_bytes_ -= oldest->second.allocation_bytes;
       fh1_geometry_.erase(oldest);
+      ++fh1_geometry_cache_generation_;
     }
     if (!entry.buffer.Get()) {
       if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
@@ -1056,6 +1078,8 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12CommandProcessor::GetFh1OwnedGeometry(
     entry.allocation_bytes = allocation;
     found = fh1_geometry_.emplace(key, std::move(entry)).first;
     fh1_geometry_bytes_ += allocation;
+    ++fh1_geometry_cache_generation_;
+    fh1_geometry_peak_bytes_ = std::max(fh1_geometry_peak_bytes_, fh1_geometry_bytes_);
   }
   if (found->first != key) ++fh1_geometry_contained_uses_;
   // Watch, snapshot and import the entire selected owner, including bytes
@@ -1134,6 +1158,13 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12CommandProcessor::GetFh1OwnedGeometry(
                   fh1_geometry_allocations_, fh1_geometry_recycles_);
       REXGPU_INFO("FH1 geometry containment uses {}, import bytes {}",
                   fh1_geometry_contained_uses_, fh1_geometry_import_bytes_);
+      REXGPU_INFO(
+          "FH1 geometry admission attempts {}, allocation queries {}, eviction scans {}, "
+          "rejection hits {}, in-flight rejects {}, recent rejects {}, peak bytes {}",
+          fh1_geometry_admission_attempts_, fh1_geometry_allocation_info_calls_,
+          fh1_geometry_eviction_scans_, fh1_geometry_rejection_hits_,
+          fh1_geometry_rejected_in_flight_, fh1_geometry_rejected_recent_,
+          fh1_geometry_peak_bytes_);
     }
   }
   entry.last_submission = submission_current_;
@@ -1236,6 +1267,8 @@ void D3D12CommandProcessor::ClearFh1OwnedGeometry() {
   }
   fh1_geometry_.clear();
   fh1_geometry_bytes_ = 0;
+  ++fh1_geometry_cache_generation_;
+  fh1_geometry_rejections_ = {};
 }
 // END FH1 OWNED GEOMETRY CACHE
 
@@ -2106,6 +2139,13 @@ void D3D12CommandProcessor::ShutdownContext() {
   ShutdownOcclusionQueryResources();
   ClearFh1OwnedGeometry();
   REXGPU_INFO("FH1 owned geometry imports {}, cache hits {}", fh1_geometry_imports_, fh1_geometry_hits_);
+  REXGPU_INFO(
+      "FH1 geometry admission attempts {}, allocation queries {}, eviction scans {}, "
+      "rejection hits {}, in-flight rejects {}, recent rejects {}, peak bytes {}",
+      fh1_geometry_admission_attempts_, fh1_geometry_allocation_info_calls_,
+      fh1_geometry_eviction_scans_, fh1_geometry_rejection_hits_,
+      fh1_geometry_rejected_in_flight_, fh1_geometry_rejected_recent_,
+      fh1_geometry_peak_bytes_);
 
   ui::d3d12::util::ReleaseAndNull(scratch_buffer_);
   scratch_buffer_size_ = 0;

@@ -661,6 +661,13 @@ class D3D12CommandProcessor : public CommandProcessor {
     std::vector<TerrainBounds> terrain_bounds;
     uint32_t next_terrain_bound = 0;
   };
+  struct Fh1GeometryRejection {
+    uint64_t key = 0;
+    uint64_t frame = 0;
+    uint64_t completed_submission = 0;
+    uint64_t cache_generation = 0;
+    uint8_t reason = 0;
+  };
   D3D12_GPU_VIRTUAL_ADDRESS GetFh1OwnedGeometry(uint32_t address, uint32_t size, bool keep_cpu_snapshot = false);
   std::map<uint64_t, Fh1Geometry>::iterator FindFh1OwnedGeometry(uint32_t base, uint32_t size);
   std::span<const uint8_t> GetFh1OwnedGeometryCpuRange(uint32_t address, uint32_t size);
@@ -682,6 +689,15 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t fh1_geometry_contained_uses_ = 0;
   uint64_t fh1_geometry_import_bytes_ = 0;
   uint64_t fh1_geometry_hits_ = 0;
+  std::array<Fh1GeometryRejection, 64> fh1_geometry_rejections_{};
+  uint64_t fh1_geometry_cache_generation_ = 0;
+  uint64_t fh1_geometry_admission_attempts_ = 0;
+  uint64_t fh1_geometry_allocation_info_calls_ = 0;
+  uint64_t fh1_geometry_eviction_scans_ = 0;
+  uint64_t fh1_geometry_rejected_in_flight_ = 0;
+  uint64_t fh1_geometry_rejected_recent_ = 0;
+  uint64_t fh1_geometry_rejection_hits_ = 0;
+  uint64_t fh1_geometry_peak_bytes_ = 0;
   D3D12_GPU_VIRTUAL_ADDRESS current_fh1_geometry_address_ = 0;
   std::array<D3D12_GPU_VIRTUAL_ADDRESS, 2> current_fh1_terrain_addresses_{};
 
