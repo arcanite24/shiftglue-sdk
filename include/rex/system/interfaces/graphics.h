@@ -308,6 +308,18 @@ struct GraphicsPreparedDrawVertexFetch {
   uint64_t source_execution_1 = 0;
 };
 
+struct GraphicsPreparedDrawTextureFetch {
+  uint32_t fetch_constant = 0;
+  uint32_t type = 0;
+  uint32_t base_address = 0;
+  uint32_t mip_address = 0;
+  uint32_t format = 0;
+  uint32_t dimension = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t stack_depth = 0;
+};
+
 struct GraphicsPreparedDrawObservation {
   GraphicsFh1ExecutionKey fh1_execution_key;
   GraphicsFh1ExecutionMode fh1_execution_mode =
@@ -344,6 +356,8 @@ struct GraphicsPreparedDrawObservation {
   const GraphicsPreparedDrawVertexFetch* vertex_fetches = nullptr;
   uint32_t vertex_fetch_count = 0;
   uint32_t vertex_fetch_capacity = 0;
+  const GraphicsPreparedDrawTextureFetch* texture_fetches = nullptr;
+  uint32_t texture_fetch_count = 0;
   uint32_t normalized_depth_control = 0;
   uint32_t normalized_color_mask = 0;
   uint32_t bound_render_target_bits = 0;

@@ -3630,6 +3630,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         pipeline_cache_->GetFh1RuntimeSyncPipelineCreationCount();
     if (prepared_draw_observer) {
       std::array<system::GraphicsPreparedDrawVertexFetch, 8> vertex_fetches;
+      std::array<system::GraphicsPreparedDrawTextureFetch, 32> texture_fetches;
       for (const auto& binding : vertex_shader->vertex_bindings()) {
         if (prepared_observation.vertex_fetch_count < vertex_fetches.size()) {
           const auto fetch = regs.GetVertexFetch(binding.fetch_constant);
@@ -3647,6 +3648,22 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       }
       prepared_observation.vertex_fetches = vertex_fetches.data();
       prepared_observation.vertex_fetch_capacity = uint32_t(vertex_fetches.size());
+      for (uint32_t i = 0; i < 32; ++i) {
+        if (!(used_texture_mask & (uint32_t(1) << i))) {
+          continue;
+        }
+        const auto fetch = regs.GetTextureFetch(i);
+        const bool size_2d = fetch.dimension == xenos::DataDimension::k2DOrStacked ||
+                             fetch.dimension == xenos::DataDimension::kCube;
+        texture_fetches[prepared_observation.texture_fetch_count++] = {
+            i, uint32_t(fetch.type), uint32_t(fetch.base_address) << 12,
+            uint32_t(fetch.mip_address) << 12, uint32_t(fetch.format),
+            uint32_t(fetch.dimension),
+            size_2d ? uint32_t(fetch.size_2d.width) + 1 : 0,
+            size_2d ? uint32_t(fetch.size_2d.height) + 1 : 0,
+            size_2d ? uint32_t(fetch.size_2d.stack_depth) + 1 : 0};
+      }
+      prepared_observation.texture_fetches = texture_fetches.data();
       prepared_draw_observer(prepared_observation);
     }
   }
