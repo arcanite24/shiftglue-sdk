@@ -1014,6 +1014,14 @@ bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* re
       ++observation_indirect_buffer_sequence_;
   observation_indirect_dispatch_packet_physical_address_ =
       dispatch_packet_physical_address;
+  if (auto observer = graphics_system_->indirect_buffer_observer()) {
+    observer({observation_frame_sequence_,
+              observation_indirect_buffer_execution_id_,
+              observation_indirect_buffer_parent_execution_id_,
+              dispatch_packet_physical_address,
+              target_physical_address,
+              uint32_t(list_length * sizeof(uint32_t))});
+  }
   ExecuteIndirectBuffer(target_physical_address, list_length);
   observation_indirect_buffer_execution_id_ = previous_execution_id;
   observation_indirect_buffer_parent_execution_id_ = previous_parent_id;

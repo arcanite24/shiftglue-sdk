@@ -337,6 +337,18 @@ struct GraphicsPreparedDrawObservation {
 using GraphicsPreparedDrawObserver = void (*)(
     const GraphicsPreparedDrawObservation& observation);
 
+struct GraphicsIndirectBufferObservation {
+  uint64_t frame_sequence = 0;
+  uint64_t execution_id = 0;
+  uint64_t parent_execution_id = 0;
+  uint32_t dispatch_packet_physical_address = 0;
+  uint32_t command_buffer_physical_address = 0;
+  uint32_t command_buffer_bytes = 0;
+};
+
+using GraphicsIndirectBufferObserver = void (*)(
+    const GraphicsIndirectBufferObservation& observation);
+
 class IGraphicsSystem {
  public:
   virtual ~IGraphicsSystem() = default;
@@ -373,6 +385,10 @@ class IGraphicsSystem {
     (void)observer;
   }
   virtual void SetPreparedDrawObserver(GraphicsPreparedDrawObserver observer) {
+    (void)observer;
+  }
+  virtual void SetIndirectBufferObserver(
+      GraphicsIndirectBufferObserver observer) {
     (void)observer;
   }
   virtual void SetNativeGuestOutputRenderer(NativeGuestOutputRenderer renderer) {
