@@ -302,6 +302,10 @@ struct GraphicsPreparedDrawVertexFetch {
   uint32_t guest_base = 0;
   uint32_t length = 0;
   uint32_t type = 0;
+  uint32_t source_packet_physical_0 = 0;
+  uint32_t source_packet_physical_1 = 0;
+  uint64_t source_execution_0 = 0;
+  uint64_t source_execution_1 = 0;
 };
 
 struct GraphicsPreparedDrawObservation {

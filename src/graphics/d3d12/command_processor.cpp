@@ -2364,6 +2364,12 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
     memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    if (graphics_system_->prepared_draw_observer()) {
+      for (uint32_t index = start_index; index <= end_index; ++index) {
+        observation_fetch_origins_[index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0] = {
+            observation_current_packet_address_, observation_indirect_buffer_execution_id_};
+      }
+    }
     cbuffer_binding_fetch_.up_to_date = false;
     uint32_t first_fetch_dword = start_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
     uint32_t last_fetch_dword = end_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
@@ -3621,10 +3627,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       for (const auto& binding : vertex_shader->vertex_bindings()) {
         if (prepared_observation.vertex_fetch_count < vertex_fetches.size()) {
           const auto fetch = regs.GetVertexFetch(binding.fetch_constant);
+          const uint32_t origin_index = binding.fetch_constant * 2;
+          const auto& source_0 = observation_fetch_origins_[origin_index];
+          const auto& source_1 = observation_fetch_origins_[origin_index + 1];
           vertex_fetches[prepared_observation.vertex_fetch_count] = {
               binding.fetch_constant, binding.stride_words,
               uint32_t(fetch.address) << 2, uint32_t(fetch.size) << 2,
-              uint32_t(fetch.type)};
+              uint32_t(fetch.type), source_0.packet_physical,
+              source_1.packet_physical, source_0.execution_id,
+              source_1.execution_id};
         }
         ++prepared_observation.vertex_fetch_count;
       }

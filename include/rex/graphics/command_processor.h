@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <functional>
@@ -285,6 +286,12 @@ class CommandProcessor {
   uint32_t observation_draw_buffer_bytes_ = 0;
   uint32_t observation_draw_buffer_end_offset_ = 0;
   uint32_t observation_draw_packet_address_ = 0;
+  struct ObservationFetchOrigin {
+    uint32_t packet_physical = 0;
+    uint64_t execution_id = 0;
+  };
+  uint32_t observation_current_packet_address_ = 0;
+  std::array<ObservationFetchOrigin, 192> observation_fetch_origins_{};
   bool paused_ = false;
 
   // By default (such as for tools), post-processing is disabled.

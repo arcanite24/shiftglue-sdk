@@ -362,6 +362,14 @@ uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
 
 void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   RegisterFile& regs = *register_file_;
+  constexpr uint32_t kVertexFetchBase = XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+  if (index >= kVertexFetchBase &&
+      index - kVertexFetchBase < observation_fetch_origins_.size() &&
+      graphics_system_->prepared_draw_observer()) {
+    observation_fetch_origins_[index - kVertexFetchBase] = {
+        observation_current_packet_address_,
+        observation_indirect_buffer_execution_id_};
+  }
   if (index >= RegisterFile::kRegisterCount) {
     auto [it, inserted] = extended_register_values_.insert_or_assign(index, value);
     (void)it;
@@ -684,6 +692,7 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
 }
 
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+  const uint32_t packet_offset = reader->read_offset();
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
   if (packet == 0) {
@@ -694,19 +703,34 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
     REXGPU_WARN("GPU packet is CDCDCDCD - probably read uninitialized memory!");
   }
 
+  const bool observing = graphics_system_->prepared_draw_observer() != nullptr;
+  const uint32_t previous_packet_address = observation_current_packet_address_;
+  if (observing) {
+    observation_current_packet_address_ =
+        uint32_t(reader->buffer() - memory_->physical_membase()) + packet_offset;
+  }
+  bool result = false;
   switch (packet_type) {
     case 0x00:
-      return ExecutePacketType0(reader, packet);
+      result = ExecutePacketType0(reader, packet);
+      break;
     case 0x01:
-      return ExecutePacketType1(reader, packet);
+      result = ExecutePacketType1(reader, packet);
+      break;
     case 0x02:
-      return ExecutePacketType2(reader, packet);
+      result = ExecutePacketType2(reader, packet);
+      break;
     case 0x03:
-      return ExecutePacketType3(reader, packet);
+      result = ExecutePacketType3(reader, packet);
+      break;
     default:
       assert_unhandled_case(packet_type);
-      return false;
+      break;
   }
+  if (observing) {
+    observation_current_packet_address_ = previous_packet_address;
+  }
+  return result;
 }
 
 bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet) {
