@@ -348,6 +348,9 @@ struct GraphicsPreparedDrawObservation {
   uint32_t normalized_color_mask = 0;
   uint32_t bound_render_target_bits = 0;
   uint32_t bound_render_target_formats[5] = {};
+  uint32_t surface_info = 0;
+  uint32_t color_info[4] = {};
+  uint32_t depth_info = 0;
   uint32_t flags = 0;
 };
 

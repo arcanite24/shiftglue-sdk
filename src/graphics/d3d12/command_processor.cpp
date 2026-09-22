@@ -3386,6 +3386,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     prepared_observation.normalized_color_mask = normalized_color_mask;
     prepared_observation.bound_render_target_bits =
         bound_depth_and_color_render_target_bits;
+    prepared_observation.surface_info = regs.Get<reg::RB_SURFACE_INFO>().value;
+    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+      prepared_observation.color_info[i] =
+          regs[reg::RB_COLOR_INFO::rt_register_indices[i]];
+    }
+    prepared_observation.depth_info = regs.Get<reg::RB_DEPTH_INFO>().value;
     std::memcpy(prepared_observation.bound_render_target_formats,
                 bound_depth_and_color_render_target_formats,
                 sizeof(prepared_observation.bound_render_target_formats));
