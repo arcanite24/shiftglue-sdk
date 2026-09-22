@@ -992,12 +992,33 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* reader,
                                                           uint32_t packet, uint32_t count) {
   // indirect buffer dispatch
+  const uint32_t dispatch_header_offset = reader->read_offset()
+                                              ? reader->read_offset() - sizeof(uint32_t)
+                                              : reader->capacity() - sizeof(uint32_t);
+  const uint32_t dispatch_packet_physical_address =
+      uint32_t(reader->buffer() - memory_->physical_membase()) +
+      dispatch_header_offset;
   uint32_t list_ptr = CpuToGpu(reader->ReadAndSwap<uint32_t>());
   uint32_t list_length = reader->ReadAndSwap<uint32_t>();
   assert_zero(list_length & ~0xFFFFF);
   list_length &= 0xFFFFF;
   const uint32_t target_physical_address = GpuToCpu(list_ptr);
+  const uint64_t previous_execution_id =
+      observation_indirect_buffer_execution_id_;
+  const uint64_t previous_parent_id =
+      observation_indirect_buffer_parent_execution_id_;
+  const uint32_t previous_dispatch_packet_physical_address =
+      observation_indirect_dispatch_packet_physical_address_;
+  observation_indirect_buffer_parent_execution_id_ = previous_execution_id;
+  observation_indirect_buffer_execution_id_ =
+      ++observation_indirect_buffer_sequence_;
+  observation_indirect_dispatch_packet_physical_address_ =
+      dispatch_packet_physical_address;
   ExecuteIndirectBuffer(target_physical_address, list_length);
+  observation_indirect_buffer_execution_id_ = previous_execution_id;
+  observation_indirect_buffer_parent_execution_id_ = previous_parent_id;
+  observation_indirect_dispatch_packet_physical_address_ =
+      previous_dispatch_packet_physical_address;
   return true;
 }
 

@@ -277,6 +277,10 @@ class CommandProcessor {
   Shader* active_pixel_shader_ = nullptr;
   uint64_t observation_frame_sequence_ = 1;
   uint64_t observation_copy_sequence_ = 0;
+  uint64_t observation_indirect_buffer_sequence_ = 0;
+  uint64_t observation_indirect_buffer_execution_id_ = 0;
+  uint64_t observation_indirect_buffer_parent_execution_id_ = 0;
+  uint32_t observation_indirect_dispatch_packet_physical_address_ = 0;
   uint32_t observation_draw_buffer_base_ = 0;
   uint32_t observation_draw_buffer_bytes_ = 0;
   uint32_t observation_draw_buffer_end_offset_ = 0;

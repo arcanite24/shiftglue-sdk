@@ -3334,6 +3334,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   };
   if (prepared_draw_observer || fh1_native_draw_candidate) {
     prepared_observation.frame_sequence = observation_frame_sequence_;
+    prepared_observation.indirect_buffer_execution_id =
+        observation_indirect_buffer_execution_id_;
+    prepared_observation.indirect_buffer_parent_execution_id =
+        observation_indirect_buffer_parent_execution_id_;
+    prepared_observation.indirect_dispatch_packet_physical_address =
+        observation_indirect_dispatch_packet_physical_address_;
     prepared_observation.draw_packet_physical_address =
         observation_draw_packet_address_;
     prepared_observation.command_buffer_physical_address =
