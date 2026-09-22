@@ -758,6 +758,15 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   uint32_t opcode = (packet >> 8) & 0x7F;
   uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
   auto data_start_offset = reader->read_offset();
+  if ((opcode == PM4_DRAW_INDX || opcode == PM4_DRAW_INDX_2) &&
+      graphics_system_->prepared_draw_observer()) {
+    const uint32_t header_offset = data_start_offset
+                                       ? data_start_offset - sizeof(uint32_t)
+                                       : reader->capacity() - sizeof(uint32_t);
+    observation_draw_packet_address_ =
+        uint32_t(reader->buffer() - memory_->physical_membase()) +
+        header_offset;
+  }
 
   if (reader->read_count() < count * sizeof(uint32_t)) {
     REXGPU_ERROR("ExecutePacketType3 overflow (read count {:08X}, packet count {:08X})",

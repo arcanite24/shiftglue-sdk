@@ -3334,6 +3334,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   };
   if (prepared_draw_observer || fh1_native_draw_candidate) {
     prepared_observation.frame_sequence = observation_frame_sequence_;
+    prepared_observation.draw_packet_physical_address =
+        observation_draw_packet_address_;
+    prepared_observation.command_buffer_physical_address =
+        observation_draw_buffer_base_;
+    prepared_observation.command_buffer_bytes =
+        observation_draw_buffer_bytes_;
+    prepared_observation.command_buffer_end_offset =
+        observation_draw_buffer_end_offset_;
     prepared_observation.vertex_shader_hash = fh1_vertex_hash;
     prepared_observation.pixel_shader_hash = fh1_pixel_hash;
     prepared_observation.vertex_specialization_mask =

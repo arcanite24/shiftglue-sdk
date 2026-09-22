@@ -280,6 +280,7 @@ class CommandProcessor {
   uint32_t observation_draw_buffer_base_ = 0;
   uint32_t observation_draw_buffer_bytes_ = 0;
   uint32_t observation_draw_buffer_end_offset_ = 0;
+  uint32_t observation_draw_packet_address_ = 0;
   bool paused_ = false;
 
   // By default (such as for tools), post-processing is disabled.

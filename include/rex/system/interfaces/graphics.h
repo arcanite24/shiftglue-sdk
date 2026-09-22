@@ -306,6 +306,10 @@ struct GraphicsPreparedDrawObservation {
   uint64_t fh1_runtime_sync_pipeline_creations = 0;
   uint64_t fh1_prepare_cpu_time_ns = 0;
   uint64_t frame_sequence = 0;
+  uint32_t draw_packet_physical_address = 0;
+  uint32_t command_buffer_physical_address = 0;
+  uint32_t command_buffer_bytes = 0;
+  uint32_t command_buffer_end_offset = 0;
   uint64_t vertex_shader_hash = 0;
   uint64_t pixel_shader_hash = 0;
   uint64_t vertex_specialization_mask = 0;
