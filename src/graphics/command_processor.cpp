@@ -38,6 +38,10 @@
 #include <rex/system/user_module.h>
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+REXCVAR_DEFINE_INT32(snr_m02_host_trace_source_frame, 0, "GPU",
+                    "Trace selected guest-memory writes near one source frame");
+REXCVAR_DEFINE_INT32(snr_m02_host_trace_physical_address, 0, "GPU",
+                    "Physical address to trace for title counter writes");
 
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
@@ -105,6 +109,24 @@ namespace rex::graphics {
 using namespace rex::graphics::xenos;
 
 namespace {
+
+void TraceSnrM02Store(const char* path, uint32_t address, uint32_t value) {
+  const int32_t target = REXCVAR_GET(snr_m02_host_trace_source_frame);
+  if (target <= 0 || address !=
+          uint32_t(REXCVAR_GET(snr_m02_host_trace_physical_address))) {
+    return;
+  }
+  const auto frame = perf::GetTotalCounter(perf::CounterId::kSourceFrameCount);
+  if (frame + 1 < target || frame > int64_t(target) + 1) {
+    return;
+  }
+  const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+  REXGPU_INFO("FH1 SNRM02 host_store {{\"frame\":{},\"path\":\"{}\","
+              "\"physical\":{},\"value\":{},\"time_ns\":{}}}",
+              frame, path, address, value, now_ns);
+}
 
 ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
   if (value == "fast") {
@@ -264,6 +286,7 @@ void CommandProcessor::WorkerThreadMain() {
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.
     if (read_ptr_writeback_ptr_) {
+      TraceSnrM02Store("ring_read_pointer", read_ptr_writeback_ptr_, read_ptr_index_);
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
                                        read_ptr_index_);
     }
@@ -394,6 +417,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       // Enabled - write to address.
       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
+      TraceSnrM02Store("scratch", mem_addr, value);
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
     }
   } else {
@@ -1173,6 +1197,7 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
   auto endianness = static_cast<xenos::Endian>(mem_addr & 0x3);
   mem_addr &= ~0x3;
   reg_val = GpuSwap(reg_val, endianness);
+  TraceSnrM02Store("reg_to_mem", mem_addr, reg_val);
   memory::store(memory_->TranslatePhysical(mem_addr), reg_val);
 
   return true;
@@ -1187,6 +1212,7 @@ bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, 
     auto endianness = static_cast<xenos::Endian>(write_addr & 0x3);
     auto addr = write_addr & ~0x3;
     write_data = GpuSwap(write_data, endianness);
+    TraceSnrM02Store("mem_write", addr, write_data);
     memory::store(memory_->TranslatePhysical(addr), write_data);
     write_addr += 4;
   }
@@ -1248,6 +1274,7 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
       auto endianness = static_cast<xenos::Endian>(write_reg_addr & 0x3);
       write_reg_addr &= ~0x3;
       write_data = GpuSwap(write_data, endianness);
+      TraceSnrM02Store("cond_write", write_reg_addr, write_data);
       memory::store(memory_->TranslatePhysical(write_reg_addr), write_data);
     } else {
       // Register.
@@ -1293,6 +1320,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
+  TraceSnrM02Store("event_write_shd", address, data_value);
   memory::store(memory_->TranslatePhysical(address), data_value);
   return true;
 }
