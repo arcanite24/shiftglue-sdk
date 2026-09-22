@@ -3617,6 +3617,19 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     prepared_observation.fh1_runtime_sync_pipeline_creations =
         pipeline_cache_->GetFh1RuntimeSyncPipelineCreationCount();
     if (prepared_draw_observer) {
+      std::array<system::GraphicsPreparedDrawVertexFetch, 8> vertex_fetches;
+      for (const auto& binding : vertex_shader->vertex_bindings()) {
+        if (prepared_observation.vertex_fetch_count < vertex_fetches.size()) {
+          const auto fetch = regs.GetVertexFetch(binding.fetch_constant);
+          vertex_fetches[prepared_observation.vertex_fetch_count] = {
+              binding.fetch_constant, binding.stride_words,
+              uint32_t(fetch.address) << 2, uint32_t(fetch.size) << 2,
+              uint32_t(fetch.type)};
+        }
+        ++prepared_observation.vertex_fetch_count;
+      }
+      prepared_observation.vertex_fetches = vertex_fetches.data();
+      prepared_observation.vertex_fetch_capacity = uint32_t(vertex_fetches.size());
       prepared_draw_observer(prepared_observation);
     }
   }

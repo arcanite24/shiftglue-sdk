@@ -296,6 +296,14 @@ enum class GraphicsFh1FallbackReason : uint32_t {
   kPipelineNotPrewarmed = 4,
 };
 
+struct GraphicsPreparedDrawVertexFetch {
+  uint32_t fetch_constant = 0;
+  uint32_t stride_words = 0;
+  uint32_t guest_base = 0;
+  uint32_t length = 0;
+  uint32_t type = 0;
+};
+
 struct GraphicsPreparedDrawObservation {
   GraphicsFh1ExecutionKey fh1_execution_key;
   GraphicsFh1ExecutionMode fh1_execution_mode =
@@ -327,6 +335,11 @@ struct GraphicsPreparedDrawObservation {
   uint32_t index_count = 0;
   uint32_t index_buffer_guest_base = 0;
   uint32_t index_buffer_length = 0;
+  // Borrowed for the duration of the callback; count may exceed the
+  // diagnostic array capacity, in which case only the first entries exist.
+  const GraphicsPreparedDrawVertexFetch* vertex_fetches = nullptr;
+  uint32_t vertex_fetch_count = 0;
+  uint32_t vertex_fetch_capacity = 0;
   uint32_t normalized_depth_control = 0;
   uint32_t normalized_color_mask = 0;
   uint32_t bound_render_target_bits = 0;
