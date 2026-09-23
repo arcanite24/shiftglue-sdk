@@ -359,6 +359,8 @@ struct GraphicsPreparedDrawObservation {
   uint32_t index_buffer_guest_base = 0;
   uint32_t index_buffer_length = 0;
   uint32_t index_buffer_guest_endianness = 0;
+  uint32_t host_shader_index_endianness = 0;
+  uint32_t guest_primitive_reset_index = 0;
   // Borrowed until the prepared-draw observer returns; diagnostic only.
   uint32_t index_cpu_snapshot_status = 0;
   uint64_t index_cpu_snapshot_hash = 0;

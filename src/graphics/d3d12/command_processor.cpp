@@ -3423,6 +3423,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         uint32_t(primitive_processing_result.host_index_format);
     prepared_observation.host_primitive_reset_enabled =
         primitive_processing_result.host_primitive_reset_enabled;
+    prepared_observation.host_shader_index_endianness =
+        uint32_t(primitive_processing_result.host_shader_index_endian);
+    prepared_observation.guest_primitive_reset_index =
+        regs.Get<reg::VGT_MULTI_PRIM_IB_RESET_INDX>().reset_indx;
     prepared_observation.index_count = index_count;
     if (index_buffer_info) {
       prepared_observation.index_buffer_guest_base =
