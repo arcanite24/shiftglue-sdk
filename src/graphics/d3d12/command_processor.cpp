@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <utility>
@@ -3631,6 +3632,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     if (prepared_draw_observer) {
       std::array<system::GraphicsPreparedDrawVertexFetch, 8> vertex_fetches;
       std::array<system::GraphicsPreparedDrawTextureFetch, 32> texture_fetches;
+      std::array<std::vector<uint8_t>, 8> vertex_fetch_snapshot_bytes;
       for (const auto& binding : vertex_shader->vertex_bindings()) {
         if (prepared_observation.vertex_fetch_count < vertex_fetches.size()) {
           const auto fetch = regs.GetVertexFetch(binding.fetch_constant);
@@ -3643,6 +3645,40 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
               uint32_t(fetch.type), source_0.packet_physical,
               source_1.packet_physical, source_0.execution_id,
               source_1.execution_id};
+          static const uint64_t snr03_frame = std::strtoull(
+              rex::cvar::GetFlagByName("pinyon_shift_snr03_probe_frame").c_str(),
+              nullptr, 10);
+          if (snr03_frame &&
+              prepared_observation.frame_sequence == snr03_frame + 1 &&
+              binding.fetch_constant == 95 && binding.stride_words == 4) {
+            auto& observed = vertex_fetches[prepared_observation.vertex_fetch_count];
+            static thread_local uint64_t budget_frame = 0;
+            static thread_local uint32_t budget_bytes = 0;
+            if (budget_frame != prepared_observation.frame_sequence) {
+              budget_frame = prepared_observation.frame_sequence;
+              budget_bytes = 0;
+            }
+            if (observed.length > 32768) {
+              observed.cpu_snapshot_status = 3;
+            } else if (observed.length > 2 * 1024 * 1024 - budget_bytes) {
+              observed.cpu_snapshot_status = 4;
+            } else {
+              budget_bytes += observed.length;
+              auto& bytes = vertex_fetch_snapshot_bytes[prepared_observation.vertex_fetch_count];
+              bytes.resize(observed.length);
+              if (shared_memory_->CopyCpuSnapshot(observed.guest_base, bytes)) {
+                observed.cpu_snapshot_status = 1;
+                observed.cpu_snapshot_bytes = bytes.data();
+                uint64_t hash = 14695981039346656037ull;
+                for (uint8_t byte : bytes) {
+                  hash = (hash ^ byte) * 1099511628211ull;
+                }
+                observed.cpu_snapshot_hash = hash;
+              } else {
+                observed.cpu_snapshot_status = 2;
+              }
+            }
+          }
         }
         ++prepared_observation.vertex_fetch_count;
       }

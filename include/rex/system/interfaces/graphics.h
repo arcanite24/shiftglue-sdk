@@ -306,6 +306,12 @@ struct GraphicsPreparedDrawVertexFetch {
   uint32_t source_packet_physical_1 = 0;
   uint64_t source_execution_0 = 0;
   uint64_t source_execution_1 = 0;
+  // SNR03 probe: 0=not attempted, 1=CPU snapshot, 2=non-CPU/rejected,
+  // 3=per-range limit, 4=per-frame limit.
+  uint32_t cpu_snapshot_status = 0;
+  uint64_t cpu_snapshot_hash = 0;
+  // Borrowed until the prepared-draw observer returns; valid only on success.
+  const uint8_t* cpu_snapshot_bytes = nullptr;
 };
 
 struct GraphicsPreparedDrawTextureFetch {
