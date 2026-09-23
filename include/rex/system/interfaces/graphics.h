@@ -362,6 +362,8 @@ struct GraphicsPreparedDrawObservation {
   const GraphicsPreparedDrawVertexFetch* vertex_fetches = nullptr;
   uint32_t vertex_fetch_count = 0;
   uint32_t vertex_fetch_capacity = 0;
+  // First of 512 float4 registers, borrowed until the observer returns.
+  const uint32_t* vertex_float_constant_words = nullptr;
   const GraphicsPreparedDrawTextureFetch* texture_fetches = nullptr;
   uint32_t texture_fetch_count = 0;
   uint32_t normalized_depth_control = 0;

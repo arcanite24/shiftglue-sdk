@@ -90,6 +90,13 @@ static bool Fh1SceneDumpEnabled() {
   return enabled;
 }
 
+static uint64_t Fh1Snr03ProbeFrame() {
+  static const uint64_t frame = std::strtoull(
+      rex::cvar::GetFlagByName("pinyon_shift_snr03_probe_frame").c_str(),
+      nullptr, 10);
+  return frame;
+}
+
 static uint64_t HashFh1ExecutionValue(uint64_t hash, uint64_t value) {
   for (uint32_t byte = 0; byte < 8; ++byte) {
     hash ^= uint8_t(value >> (byte * 8));
@@ -3493,14 +3500,20 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     fh1_key.identity = fh1_key.ComputeIdentity();
     // Diagnostic snapshots retain addresses and constants deliberately omitted
     // from prewarm identities. They are evidence, never batching admission.
+    const bool snr03_vegetation_binding =
+        Fh1Snr03ProbeFrame() &&
+        observation_frame_sequence_ == Fh1Snr03ProbeFrame() + 1 &&
+        (fh1_vertex_hash == 0xC62548CAA393B216ull ||
+         fh1_vertex_hash == 0x5834939992FFC765ull);
     if (prepared_draw_observer && Fh1GpuCorpusEnabled() && Fh1SceneDumpEnabled() &&
-        observation_frame_sequence_ >= 1200 &&
-        observation_frame_sequence_ % 600 == 0 &&
         fh1_scene_binding_records_ < 4096 &&
-        ((fh1_vertex_hash == 0xAD2C355A6BE1EE87ull &&
-          fh1_pixel_hash == 0x2F2137BF953DA7AFull &&
-          fh1_key.attachment_state == 0x7336ADFF531DCC00ull) ||
-         fh1_scene_draw_sequence_ == fh1_scene_followup_sequence_)) {
+        (snr03_vegetation_binding ||
+         (observation_frame_sequence_ >= 1200 &&
+          observation_frame_sequence_ % 600 == 0 &&
+          ((fh1_vertex_hash == 0xAD2C355A6BE1EE87ull &&
+            fh1_pixel_hash == 0x2F2137BF953DA7AFull &&
+            fh1_key.attachment_state == 0x7336ADFF531DCC00ull) ||
+           fh1_scene_draw_sequence_ == fh1_scene_followup_sequence_)))) {
       fh1_scene_followup_sequence_ =
           fh1_scene_draw_sequence_ == fh1_scene_followup_sequence_
               ? 0 : fh1_scene_draw_sequence_ + 1;
@@ -3572,6 +3585,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                                regs[XE_GPU_REG_SQ_PS_CONST]);
       REXGPU_INFO(
           "FH1 scene binding {{\"frame\":{},\"sequence\":{},"
+          "\"packet_physical\":{},"
           "\"command_buffer\":{},\"command_bytes\":{},\"draw_end_offset\":{},"
           "\"command_hash\":\"{:016X}\","
           "\"scratch_mask\":{},\"scratch_address\":{},"
@@ -3583,6 +3597,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           "\"index_base\":{},\"index_count\":{},\"index_length\":{},"
           "\"textures\":\"{}\",\"vertices\":\"{}\",\"constants\":\"{}\"}}",
           observation_frame_sequence_, fh1_scene_draw_sequence_,
+          observation_draw_packet_address_,
           observation_draw_buffer_base_, observation_draw_buffer_bytes_,
           observation_draw_buffer_end_offset_,
           command_hash,
@@ -3645,11 +3660,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
               uint32_t(fetch.type), source_0.packet_physical,
               source_1.packet_physical, source_0.execution_id,
               source_1.execution_id};
-          static const uint64_t snr03_frame = std::strtoull(
-              rex::cvar::GetFlagByName("pinyon_shift_snr03_probe_frame").c_str(),
-              nullptr, 10);
-          if (snr03_frame &&
-              prepared_observation.frame_sequence == snr03_frame + 1 &&
+          if (Fh1Snr03ProbeFrame() &&
+              prepared_observation.frame_sequence == Fh1Snr03ProbeFrame() + 1 &&
               binding.fetch_constant == 95 && binding.stride_words == 4) {
             auto& observed = vertex_fetches[prepared_observation.vertex_fetch_count];
             static thread_local uint64_t budget_frame = 0;
@@ -3684,6 +3696,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       }
       prepared_observation.vertex_fetches = vertex_fetches.data();
       prepared_observation.vertex_fetch_capacity = uint32_t(vertex_fetches.size());
+      prepared_observation.vertex_float_constant_words =
+          regs.values + XE_GPU_REG_SHADER_CONSTANT_000_X;
       for (uint32_t i = 0; i < 32; ++i) {
         if (!(used_texture_mask & (uint32_t(1) << i))) {
           continue;
