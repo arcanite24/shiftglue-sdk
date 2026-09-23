@@ -3938,6 +3938,19 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                              primitive_processing_result.line_loop_closing_index,
                              primitive_processing_result.host_shader_index_endian, viewport_info,
                              used_texture_mask, normalized_depth_control, normalized_color_mask);
+  if (Fh1Snr03ProbeFrame() &&
+      observation_frame_sequence_ == Fh1Snr03ProbeFrame() + 1 &&
+      fh1_vertex_hash == 0x5834939992FFC765ull) {
+    if (auto observer = graphics_system_->final_draw_state_observer()) {
+      std::array<uint32_t, 40> system_words;
+      static_assert(sizeof(system_constants_) >= sizeof(system_words));
+      std::memcpy(system_words.data(), &system_constants_, sizeof(system_words));
+      observer({observation_frame_sequence_, observation_draw_packet_address_,
+                prepared_observation.fh1_execution_key.dynamic_state,
+                system_words.data(), uint32_t(system_words.size()),
+                regs.values + XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 47 * 4});
+    }
+  }
 
   // A qualified clear replaces rasterization, not render-target ownership or
   // transfer preparation. Reject query draws and non-CPU-authoritative input.

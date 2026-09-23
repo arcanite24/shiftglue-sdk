@@ -89,6 +89,12 @@ class GraphicsSystem : public system::IGraphicsSystem {
   system::GraphicsPreparedDrawObserver prepared_draw_observer() const {
     return prepared_draw_observer_.load(std::memory_order_acquire);
   }
+  void SetFinalDrawStateObserver(system::GraphicsFinalDrawStateObserver observer) override {
+    final_draw_state_observer_.store(observer, std::memory_order_release);
+  }
+  system::GraphicsFinalDrawStateObserver final_draw_state_observer() const {
+    return final_draw_state_observer_.load(std::memory_order_acquire);
+  }
   void SetIndirectBufferObserver(
       system::GraphicsIndirectBufferObserver observer) override {
     indirect_buffer_observer_.store(observer, std::memory_order_release);
@@ -170,6 +176,8 @@ class GraphicsSystem : public system::IGraphicsSystem {
   std::atomic<system::GraphicsShaderTranslationObserver>
       shader_translation_observer_{nullptr};
   std::atomic<system::GraphicsPreparedDrawObserver> prepared_draw_observer_{
+      nullptr};
+  std::atomic<system::GraphicsFinalDrawStateObserver> final_draw_state_observer_{
       nullptr};
   std::atomic<system::GraphicsIndirectBufferObserver> indirect_buffer_observer_{
       nullptr};
