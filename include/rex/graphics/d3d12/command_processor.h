@@ -593,6 +593,14 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::unique_ptr<PipelineCache> pipeline_cache_;
 
   std::unique_ptr<D3D12TextureCache> texture_cache_;
+  struct Snr04Bc3Readback {
+    uint64_t frame;
+    uint64_t submission;
+    uint32_t descriptor;
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+  };
+  std::vector<Snr04Bc3Readback> snr04_bc3_readbacks_;
+  void FlushSnr04Bc3Readbacks(uint64_t submission);
 
   // Bytes 0x0...0x3FF - 256-entry gamma ramp table with B10G10R10X2 data (read
   // as R10G10B10X2 with swizzle).

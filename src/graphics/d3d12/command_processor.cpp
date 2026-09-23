@@ -14,6 +14,8 @@
 #include <cstdarg>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <sstream>
 #include <utility>
 
@@ -95,6 +97,20 @@ static uint64_t Fh1Snr03ProbeFrame() {
       rex::cvar::GetFlagByName("pinyon_shift_snr03_probe_frame").c_str(),
       nullptr, 10);
   return frame;
+}
+
+static const std::string& Fh1Snr04Bc3OutputDir() {
+  static const std::string directory = [] {
+    char* value = nullptr;
+    size_t length = 0;
+    if (_dupenv_s(&value, &length, "PINYON_SHIFT_SNR04_BC3_DIR") || !value) {
+      return std::string{};
+    }
+    std::string result(value);
+    std::free(value);
+    return result;
+  }();
+  return directory;
 }
 
 static uint64_t HashFh1ExecutionValue(uint64_t hash, uint64_t value) {
@@ -5021,6 +5037,54 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   return true;
 }
 
+void D3D12CommandProcessor::FlushSnr04Bc3Readbacks(uint64_t submission) {
+  if (snr04_bc3_readbacks_.empty()) {
+    return;
+  }
+  std::vector<Snr04Bc3Readback> readbacks;
+  readbacks.swap(snr04_bc3_readbacks_);
+  if (!AwaitFence(submission_fence_, submission, true)) {
+    REXGPU_ERROR("FH1 SNR04 BC3 guest submission {} did not complete", submission);
+    return;
+  }
+  const auto& output_dir = Fh1Snr04Bc3OutputDir();
+  if (output_dir.empty()) {
+    REXGPU_ERROR("FH1 SNR04 BC3 output directory disappeared");
+    return;
+  }
+  std::error_code error;
+  std::filesystem::create_directories(output_dir, error);
+  if (error) {
+    REXGPU_ERROR("FH1 SNR04 BC3 output directory failed: {}", error.message());
+    return;
+  }
+  for (auto& entry : readbacks) {
+    if (entry.submission != submission) {
+      REXGPU_ERROR("FH1 SNR04 BC3 submission mismatch");
+      continue;
+    }
+    D3D12_RANGE range{0, 65536};
+    void* mapped = nullptr;
+    if (FAILED(entry.buffer->Map(0, &range, &mapped))) {
+      REXGPU_ERROR("FH1 SNR04 BC3 readback map failed srv={}", entry.descriptor);
+      continue;
+    }
+    std::ostringstream name;
+    name << "snr04-bc3-frame" << entry.frame << "-submission"
+         << submission << "-srv" << entry.descriptor << ".bc3";
+    const auto path = std::filesystem::path(output_dir) / name.str();
+    std::ofstream file(path, std::ios::binary);
+    file.write(static_cast<const char*>(mapped), 65536);
+    file.close();
+    const bool written = file.good();
+    D3D12_RANGE no_write{0, 0};
+    entry.buffer->Unmap(0, &no_write);
+    REXGPU_INFO("FH1 SNR04 BC3 readback frame={} submission={} srv={} "
+                "written={} path={}", entry.frame, submission, entry.descriptor,
+                written, path.string());
+  }
+}
+
 bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
 
@@ -5106,6 +5170,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     }
 
     direct_queue->Signal(submission_fence_, submission_current_++);
+    FlushSnr04Bc3Readbacks(traced_submission);
     perf::TraceCriticalPath("submission_end",
                             perf::GetTotalCounter(perf::CounterId::kSourceFrameCount),
                             int64_t(traced_submission), is_closing_frame ? 1 : 0);
@@ -6215,6 +6280,54 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
                     texture.fetch_constant, texture.is_signed,
                     texture.bindless_descriptor_index, absolute,
                     absolute - uint32_t(SystemBindlessView::kUnboundedSRVsStart));
+        if (Fh1Snr04Bc3OutputDir().empty() || texture.fetch_constant != 0 ||
+            texture.is_signed || absolute ==
+                uint32_t(SystemBindlessView::kUnboundedSRVsStart) ||
+            std::any_of(snr04_bc3_readbacks_.begin(), snr04_bc3_readbacks_.end(),
+                        [this, absolute](const Snr04Bc3Readback& entry) {
+                          return entry.submission == submission_current_ &&
+                                 entry.descriptor == absolute;
+                        })) {
+          continue;
+        }
+        if (snr04_bc3_readbacks_.size() >= 8) {
+          REXGPU_ERROR("FH1 SNR04 BC3 capture exceeded eight resources");
+          continue;
+        }
+        D3D12_RESOURCE_DESC texture_desc{};
+        texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texture_desc.Width = texture_desc.Height = 256;
+        texture_desc.DepthOrArraySize = 1;
+        texture_desc.MipLevels = 1;
+        texture_desc.Format = DXGI_FORMAT_BC3_UNORM;
+        texture_desc.SampleDesc.Count = 1;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+        UINT64 bytes = 0;
+        GetD3D12Provider().GetDevice()->GetCopyableFootprints(
+            &texture_desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
+        if (bytes != 65536 || footprint.Footprint.RowPitch != 1024) {
+          REXGPU_ERROR("FH1 SNR04 BC3 unexpected copy footprint");
+          continue;
+        }
+        D3D12_RESOURCE_DESC buffer_desc;
+        ui::d3d12::util::FillBufferResourceDesc(buffer_desc, bytes,
+                                                D3D12_RESOURCE_FLAG_NONE);
+        Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+        if (FAILED(GetD3D12Provider().GetDevice()->CreateCommittedResource(
+                &ui::d3d12::util::kHeapPropertiesReadback,
+                GetD3D12Provider().GetHeapFlagCreateNotZeroed(),
+                &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(&readback))) ||
+            !texture_cache_->CopyFh1Snr04Bc3Base(
+                texture.fetch_constant, readback.Get(), footprint)) {
+          REXGPU_ERROR("FH1 SNR04 BC3 copy rejected frame={} packet={} srv={}",
+                       observation_frame_sequence_, observation_draw_packet_address_,
+                       absolute);
+          continue;
+        }
+        snr04_bc3_readbacks_.push_back({observation_frame_sequence_,
+                                       submission_current_, absolute,
+                                       std::move(readback)});
       }
     }
   } else {

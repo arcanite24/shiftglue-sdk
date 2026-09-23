@@ -934,6 +934,44 @@ void D3D12TextureCache::WriteActiveTextureBindfulSRV(
   }
 }
 
+bool D3D12TextureCache::CopyFh1Snr04Bc3Base(
+    uint32_t fetch_constant, ID3D12Resource* readback,
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint) {
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant);
+  if (!binding || !binding->texture || binding->key.GetWidth() != 256 ||
+      binding->key.GetHeight() != 256 ||
+      binding->key.format != xenos::TextureFormat::k_DXT4_5) {
+    return false;
+  }
+  auto* texture = static_cast<D3D12Texture*>(binding->texture);
+  ID3D12Resource* source_resource = texture->resource();
+  const D3D12_RESOURCE_DESC description = source_resource->GetDesc();
+  if (description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+      description.Format != DXGI_FORMAT_BC3_UNORM ||
+      description.Width != 256 || description.Height != 256 ||
+      description.DepthOrArraySize != 1 || !description.MipLevels) {
+    return false;
+  }
+  texture->MarkAsUsed();
+  const D3D12_RESOURCE_STATES old_state =
+      texture->SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.PushTransitionBarrier(source_resource, old_state,
+                                           D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.SubmitBarriers();
+  D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
+  source.pResource = source_resource;
+  source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  destination.pResource = readback;
+  destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  destination.PlacedFootprint = footprint;
+  command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(
+      &destination, 0, 0, 0, &source, nullptr);
+  command_processor_.PushTransitionBarrier(
+      source_resource, texture->SetResourceState(old_state), old_state);
+  command_processor_.SubmitBarriers();
+  return true;
+}
+
 uint32_t D3D12TextureCache::GetActiveTextureBindlessSRVIndex(
     const D3D12Shader::TextureBinding& host_shader_binding) {
   assert_true(bindless_resources_used_);
