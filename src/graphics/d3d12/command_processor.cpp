@@ -3762,11 +3762,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
               }
             } else {
               static thread_local uint64_t budget_frame = 0;
-              static thread_local uint32_t budget_bytes = 0;
+              static thread_local uint32_t vegetation_budget_bytes = 0;
+              static thread_local uint32_t item_budget_bytes = 0;
               if (budget_frame != prepared_observation.frame_sequence) {
                 budget_frame = prepared_observation.frame_sequence;
-                budget_bytes = 0;
+                vegetation_budget_bytes = 0;
+                item_budget_bytes = 0;
               }
+              uint32_t& budget_bytes = snr02_item_vertex
+                  ? item_budget_bytes : vegetation_budget_bytes;
               const uint32_t budget_limit =
                   snr02_item_vertex ? 8 * 1024 * 1024 : 2 * 1024 * 1024;
               if (observed.length > (snr02_item_vertex ? 256 * 1024 : 32768)) {
