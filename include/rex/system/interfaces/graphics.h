@@ -365,6 +365,9 @@ struct GraphicsPreparedDrawObservation {
   uint32_t vertex_fetch_capacity = 0;
   // First of 512 float4 registers, borrowed until the observer returns.
   const uint32_t* vertex_float_constant_words = nullptr;
+  // Vertex shader's 256-register bitmap, borrowed until the observer returns.
+  const uint64_t* vertex_float_constant_bitmap = nullptr;
+  uint32_t vertex_float_constant_count = 0;
   // Pixel shader's 256-register bitmap; indexes address the second half of
   // vertex_float_constant_words. Borrowed until the observer returns.
   const uint64_t* pixel_float_constant_bitmap = nullptr;

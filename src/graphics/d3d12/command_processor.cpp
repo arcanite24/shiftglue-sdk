@@ -3742,6 +3742,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       prepared_observation.vertex_fetch_capacity = uint32_t(vertex_fetches.size());
       prepared_observation.vertex_float_constant_words =
           regs.values + XE_GPU_REG_SHADER_CONSTANT_000_X;
+      const auto& vertex_constants = vertex_shader->constant_register_map();
+      prepared_observation.vertex_float_constant_bitmap =
+          vertex_constants.float_bitmap;
+      prepared_observation.vertex_float_constant_count =
+          vertex_constants.float_count;
       if (pixel_shader) {
         const auto& pixel_constants = pixel_shader->constant_register_map();
         prepared_observation.pixel_float_constant_bitmap =
