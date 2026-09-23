@@ -128,8 +128,9 @@ class D3D12TextureCache final : public TextureCache {
   void WriteActiveTextureBindfulSRV(const D3D12Shader::TextureBinding& host_shader_binding,
                                     D3D12_CPU_DESCRIPTOR_HANDLE handle);
   uint32_t GetActiveTextureBindlessSRVIndex(const D3D12Shader::TextureBinding& host_shader_binding);
-  bool CopyFh1Snr04Bc3Base(uint32_t fetch_constant, ID3D12Resource* readback,
-                           const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint);
+  bool CopyFh1Snr04Bc3Mips(
+      uint32_t fetch_constant, ID3D12Resource* readback,
+      const std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 9>& footprints);
 
   SamplerParameters GetSamplerParameters(const D3D12Shader::SamplerBinding& binding) const;
   void WriteSampler(SamplerParameters parameters, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;

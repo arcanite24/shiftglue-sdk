@@ -5064,7 +5064,7 @@ void D3D12CommandProcessor::FlushSnr04Bc3Readbacks(uint64_t submission) {
       REXGPU_ERROR("FH1 SNR04 BC3 submission mismatch");
       continue;
     }
-    D3D12_RANGE range{0, 65536};
+    D3D12_RANGE range{0, static_cast<SIZE_T>(entry.bytes)};
     void* mapped = nullptr;
     if (FAILED(entry.buffer->Map(0, &range, &mapped))) {
       REXGPU_ERROR("FH1 SNR04 BC3 readback map failed srv={}", entry.descriptor);
@@ -5078,11 +5078,30 @@ void D3D12CommandProcessor::FlushSnr04Bc3Readbacks(uint64_t submission) {
     file.write(static_cast<const char*>(mapped), 65536);
     file.close();
     const bool written = file.good();
+    auto mip_path = path;
+    mip_path.replace_extension(".bc3mips");
+    std::ofstream mip_file(mip_path, std::ios::binary);
+    for (uint32_t mip = 0; mip < entry.footprints.size(); ++mip) {
+      const uint32_t size = std::max(1u, 256u >> mip);
+      const uint32_t row_bytes = ((size + 3) / 4) * 16;
+      const uint32_t rows = (size + 3) / 4;
+      const auto& footprint = entry.footprints[mip];
+      for (uint32_t row = 0; row < rows; ++row) {
+        mip_file.write(static_cast<const char*>(mapped) + footprint.Offset +
+                           row * footprint.Footprint.RowPitch,
+                       row_bytes);
+      }
+    }
+    mip_file.close();
+    const bool mips_written = mip_file.good();
     D3D12_RANGE no_write{0, 0};
     entry.buffer->Unmap(0, &no_write);
     REXGPU_INFO("FH1 SNR04 BC3 readback frame={} submission={} srv={} "
                 "written={} path={}", entry.frame, submission, entry.descriptor,
                 written, path.string());
+    REXGPU_INFO("FH1 SNR04 BC3 mip chain frame={} submission={} srv={} "
+                "written={} path={}", entry.frame, submission, entry.descriptor,
+                mips_written, mip_path.string());
   }
 }
 
@@ -6299,14 +6318,15 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
         texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         texture_desc.Width = texture_desc.Height = 256;
         texture_desc.DepthOrArraySize = 1;
-        texture_desc.MipLevels = 1;
+        texture_desc.MipLevels = 9;
         texture_desc.Format = DXGI_FORMAT_BC3_UNORM;
         texture_desc.SampleDesc.Count = 1;
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+        std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 9> footprints{};
         UINT64 bytes = 0;
         GetD3D12Provider().GetDevice()->GetCopyableFootprints(
-            &texture_desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
-        if (bytes != 65536 || footprint.Footprint.RowPitch != 1024) {
+            &texture_desc, 0, 9, 0, footprints.data(), nullptr, nullptr, &bytes);
+        if (bytes > 131072 || footprints[0].Offset != 0 ||
+            footprints[0].Footprint.RowPitch != 1024) {
           REXGPU_ERROR("FH1 SNR04 BC3 unexpected copy footprint");
           continue;
         }
@@ -6319,8 +6339,8 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
                 GetD3D12Provider().GetHeapFlagCreateNotZeroed(),
                 &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                 IID_PPV_ARGS(&readback))) ||
-            !texture_cache_->CopyFh1Snr04Bc3Base(
-                texture.fetch_constant, readback.Get(), footprint)) {
+            !texture_cache_->CopyFh1Snr04Bc3Mips(
+                texture.fetch_constant, readback.Get(), footprints)) {
           REXGPU_ERROR("FH1 SNR04 BC3 copy rejected frame={} packet={} srv={}",
                        observation_frame_sequence_, observation_draw_packet_address_,
                        absolute);
@@ -6328,7 +6348,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
         }
         snr04_bc3_readbacks_.push_back({observation_frame_sequence_,
                                        submission_current_, absolute,
-                                       std::move(readback)});
+                                       std::move(readback), footprints, bytes});
       }
     }
   } else {

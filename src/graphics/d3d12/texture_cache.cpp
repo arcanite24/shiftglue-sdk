@@ -934,9 +934,9 @@ void D3D12TextureCache::WriteActiveTextureBindfulSRV(
   }
 }
 
-bool D3D12TextureCache::CopyFh1Snr04Bc3Base(
+bool D3D12TextureCache::CopyFh1Snr04Bc3Mips(
     uint32_t fetch_constant, ID3D12Resource* readback,
-    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint) {
+    const std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 9>& footprints) {
   const TextureBinding* binding = GetValidTextureBinding(fetch_constant);
   if (!binding || !binding->texture || binding->key.GetWidth() != 256 ||
       binding->key.GetHeight() != 256 ||
@@ -949,7 +949,7 @@ bool D3D12TextureCache::CopyFh1Snr04Bc3Base(
   if (description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
       description.Format != DXGI_FORMAT_BC3_UNORM ||
       description.Width != 256 || description.Height != 256 ||
-      description.DepthOrArraySize != 1 || !description.MipLevels) {
+      description.DepthOrArraySize != 1 || description.MipLevels != 9) {
     return false;
   }
   texture->MarkAsUsed();
@@ -963,9 +963,12 @@ bool D3D12TextureCache::CopyFh1Snr04Bc3Base(
   source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
   destination.pResource = readback;
   destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  destination.PlacedFootprint = footprint;
-  command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(
-      &destination, 0, 0, 0, &source, nullptr);
+  for (uint32_t mip = 0; mip < footprints.size(); ++mip) {
+    source.SubresourceIndex = mip;
+    destination.PlacedFootprint = footprints[mip];
+    command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(
+        &destination, 0, 0, 0, &source, nullptr);
+  }
   command_processor_.PushTransitionBarrier(
       source_resource, texture->SetResourceState(old_state), old_state);
   command_processor_.SubmitBarriers();

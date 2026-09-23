@@ -598,6 +598,8 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint64_t submission;
     uint32_t descriptor;
     Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 9> footprints;
+    uint64_t bytes;
   };
   std::vector<Snr04Bc3Readback> snr04_bc3_readbacks_;
   void FlushSnr04Bc3Readbacks(uint64_t submission);
