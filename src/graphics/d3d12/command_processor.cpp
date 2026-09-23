@@ -4456,7 +4456,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                 regs.Get<reg::PA_SU_SC_MODE_CNTL>().value,
                 regs.Get<reg::PA_CL_CLIP_CNTL>().value,
                 normalized_depth_control.value,
-                viewport.data(), scissor.data()});
+                viewport.data(), scissor.data(),
+                regs.values + XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0, 192});
     }
   }
 
@@ -6102,7 +6103,9 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
         float_constants += 4 * sizeof(float);
       }
     }
-    if (Fh1Snr02ItemProbeFrame() || Fh1Snr02TrackProbeEnabled()) {
+    if (Fh1Snr02ItemProbeFrame() || Fh1Snr02TrackProbeEnabled() ||
+        (Fh1Snr03ProbeFrame() &&
+         observation_frame_sequence_ == Fh1Snr03ProbeFrame() + 1)) {
       snr02_bound_vertex_constant_count_ = float_constant_count_vertex;
       std::memcpy(snr02_bound_vertex_constants_.data(), float_constants_begin,
                   float_constant_count_vertex * 4 * sizeof(uint32_t));

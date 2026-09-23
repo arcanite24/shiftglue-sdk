@@ -413,6 +413,9 @@ struct GraphicsFinalDrawStateObservation {
   // Borrowed until the observer returns: XYWH, min/max depth, then LTRB.
   const float* viewport = nullptr;
   const int32_t* scissor = nullptr;
+  // Borrowed until the observer returns: 48 packed fetch constants (192 words).
+  const uint32_t* fetch_constant_words = nullptr;
+  uint32_t fetch_constant_word_count = 0;
 };
 using GraphicsFinalDrawStateObserver = void (*)(
     const GraphicsFinalDrawStateObservation& observation);
