@@ -4381,6 +4381,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
        Fh1Snr02ItemShader(fh1_vertex_hash))) {
     if (auto observer = graphics_system_->final_draw_state_observer()) {
       std::array<uint32_t, 64> system_words;
+      const std::array<float, 6> viewport{
+          ff_viewport_.TopLeftX, ff_viewport_.TopLeftY,
+          ff_viewport_.Width, ff_viewport_.Height,
+          ff_viewport_.MinDepth, ff_viewport_.MaxDepth};
+      const std::array<int32_t, 4> scissor{
+          ff_scissor_.left, ff_scissor_.top,
+          ff_scissor_.right, ff_scissor_.bottom};
       static_assert(sizeof(system_constants_) >= sizeof(system_words));
       std::memcpy(system_words.data(), &system_constants_, sizeof(system_words));
       observer({observation_frame_sequence_, fh1_scene_draw_sequence_,
@@ -4390,7 +4397,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                 regs.values + XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 47 * 4,
                 regs.values + XE_GPU_REG_SHADER_CONSTANT_000_X,
                 snr02_bound_vertex_constants_.data(),
-                snr02_bound_vertex_constant_count_});
+                snr02_bound_vertex_constant_count_,
+                regs.Get<reg::PA_SU_SC_MODE_CNTL>().value,
+                regs.Get<reg::PA_CL_CLIP_CNTL>().value,
+                normalized_depth_control.value,
+                viewport.data(), scissor.data()});
     }
   }
 

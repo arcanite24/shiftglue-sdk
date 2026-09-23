@@ -407,6 +407,12 @@ struct GraphicsFinalDrawStateObservation {
   const uint32_t* vertex_float_constant_words = nullptr;
   const uint32_t* bound_vertex_float_constant_words = nullptr;
   uint32_t bound_vertex_float_constant_count = 0;
+  uint32_t raster_mode_control = 0;
+  uint32_t clip_control = 0;
+  uint32_t normalized_depth_control = 0;
+  // Borrowed until the observer returns: XYWH, min/max depth, then LTRB.
+  const float* viewport = nullptr;
+  const int32_t* scissor = nullptr;
 };
 using GraphicsFinalDrawStateObserver = void (*)(
     const GraphicsFinalDrawStateObservation& observation);
