@@ -6200,6 +6200,23 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
         current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_DescriptorIndicesPixel);
       }
     }
+    if (Fh1Snr03ProbeFrame() &&
+        observation_frame_sequence_ == Fh1Snr03ProbeFrame() + 1 &&
+        vertex_shader->ucode_data_hash() == 0x5834939992FFC765ull &&
+        pixel_shader &&
+        pixel_shader->ucode_data_hash() == 0xC2F1242C2535A57Eull) {
+      for (const auto& texture : *textures_pixel) {
+        const uint32_t absolute =
+            texture_cache_->GetActiveTextureBindlessSRVIndex(texture);
+        REXGPU_INFO("FH1 SNR04 bound pixel {{\"frame\":{},\"packet\":{},"
+                    "\"fetch\":{},\"signed\":{},\"binding\":{},"
+                    "\"absolute\":{},\"relative\":{}}}",
+                    observation_frame_sequence_, observation_draw_packet_address_,
+                    texture.fetch_constant, texture.is_signed,
+                    texture.bindless_descriptor_index, absolute,
+                    absolute - uint32_t(SystemBindlessView::kUnboundedSRVsStart));
+      }
+    }
   } else {
     //
     // Bindful descriptors path.
