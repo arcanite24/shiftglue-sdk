@@ -387,8 +387,8 @@ struct GraphicsPreparedDrawObservation {
 using GraphicsPreparedDrawObserver = void (*)(
     const GraphicsPreparedDrawObservation& observation);
 
-// Borrowed only during the callback, after the draw's system constants have
-// reached their final values and before their GPU upload.
+// Borrowed only during the callback, after the draw's constant buffers have
+// been bound and before the draw command is recorded.
 struct GraphicsFinalDrawStateObservation {
   uint64_t frame_sequence = 0;
   uint64_t draw_sequence = 0;
@@ -397,6 +397,9 @@ struct GraphicsFinalDrawStateObservation {
   const uint32_t* system_constant_words = nullptr;
   uint32_t system_constant_word_count = 0;
   const uint32_t* fetch_47_words = nullptr;
+  const uint32_t* vertex_float_constant_words = nullptr;
+  const uint32_t* bound_vertex_float_constant_words = nullptr;
+  uint32_t bound_vertex_float_constant_count = 0;
 };
 using GraphicsFinalDrawStateObserver = void (*)(
     const GraphicsFinalDrawStateObservation& observation);

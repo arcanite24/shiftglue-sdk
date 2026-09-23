@@ -916,6 +916,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   };
   ConstantBufferBinding cbuffer_binding_system_;
   ConstantBufferBinding cbuffer_binding_float_vertex_;
+  // Diagnostic shadow of the actual packed vertex CBV bytes.
+  std::array<uint32_t, 1024> snr02_bound_vertex_constants_{};
+  uint32_t snr02_bound_vertex_constant_count_ = 0;
   ConstantBufferBinding cbuffer_binding_float_pixel_;
   ConstantBufferBinding cbuffer_binding_bool_loop_;
   ConstantBufferBinding cbuffer_binding_fetch_;

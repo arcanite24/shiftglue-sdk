@@ -3994,24 +3994,6 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                              primitive_processing_result.line_loop_closing_index,
                              primitive_processing_result.host_shader_index_endian, viewport_info,
                              used_texture_mask, normalized_depth_control, normalized_color_mask);
-  if ((Fh1Snr03ProbeFrame() &&
-       observation_frame_sequence_ == Fh1Snr03ProbeFrame() + 1 &&
-       fh1_vertex_hash == 0x5834939992FFC765ull) ||
-      (Fh1Snr02ItemProbeFrame() &&
-       observation_frame_sequence_ == Fh1Snr02ItemProbeFrame() + 1 &&
-       Fh1Snr02ItemShader(fh1_vertex_hash))) {
-    if (auto observer = graphics_system_->final_draw_state_observer()) {
-      std::array<uint32_t, 64> system_words;
-      static_assert(sizeof(system_constants_) >= sizeof(system_words));
-      std::memcpy(system_words.data(), &system_constants_, sizeof(system_words));
-      observer({observation_frame_sequence_, fh1_scene_draw_sequence_,
-                observation_draw_packet_address_,
-                prepared_observation.fh1_execution_key.dynamic_state,
-                system_words.data(), uint32_t(system_words.size()),
-                regs.values + XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 47 * 4});
-    }
-  }
-
   // A qualified clear replaces rasterization, not render-target ownership or
   // transfer preparation. Reject query draws and non-CPU-authoritative input.
   if (fh1_vertex_hash == 0x1E6883FCCDE1F688ull && !memexport_used &&
@@ -4324,6 +4306,27 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used, geometry_address, terrain_addresses)) {
     return finish_draw(false);
   }
+  if ((Fh1Snr03ProbeFrame() &&
+       observation_frame_sequence_ == Fh1Snr03ProbeFrame() + 1 &&
+       fh1_vertex_hash == 0x5834939992FFC765ull) ||
+      (Fh1Snr02ItemProbeFrame() &&
+       observation_frame_sequence_ == Fh1Snr02ItemProbeFrame() + 1 &&
+       Fh1Snr02ItemShader(fh1_vertex_hash))) {
+    if (auto observer = graphics_system_->final_draw_state_observer()) {
+      std::array<uint32_t, 64> system_words;
+      static_assert(sizeof(system_constants_) >= sizeof(system_words));
+      std::memcpy(system_words.data(), &system_constants_, sizeof(system_words));
+      observer({observation_frame_sequence_, fh1_scene_draw_sequence_,
+                observation_draw_packet_address_,
+                prepared_observation.fh1_execution_key.dynamic_state,
+                system_words.data(), uint32_t(system_words.size()),
+                regs.values + XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 47 * 4,
+                regs.values + XE_GPU_REG_SHADER_CONSTANT_000_X,
+                snr02_bound_vertex_constants_.data(),
+                snr02_bound_vertex_constant_count_});
+    }
+  }
+
   // Must not call anything that can change the descriptor heap from now on!
 
   // Gather memexport ranges and ensure the heaps for them are resident, and
@@ -5953,6 +5956,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     if (float_constants == nullptr) {
       return false;
     }
+    uint8_t* const float_constants_begin = float_constants;
     for (uint32_t i = 0; i < 4; ++i) {
       uint64_t float_constant_map_entry = float_constant_map_vertex.float_bitmap[i];
       uint32_t float_constant_index;
@@ -5964,6 +5968,11 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
             4 * sizeof(float));
         float_constants += 4 * sizeof(float);
       }
+    }
+    if (Fh1Snr02ItemProbeFrame()) {
+      snr02_bound_vertex_constant_count_ = float_constant_count_vertex;
+      std::memcpy(snr02_bound_vertex_constants_.data(), float_constants_begin,
+                  float_constant_count_vertex * 4 * sizeof(uint32_t));
     }
     cbuffer_binding_float_vertex_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_float_constants_vertex);
