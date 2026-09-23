@@ -109,6 +109,12 @@ static uint64_t Fh1Snr02ItemProbeFrame() {
   return frame;
 }
 
+static bool Fh1Snr02TrackProbeEnabled() {
+  static const bool enabled =
+      rex::cvar::GetFlagByName("pinyon_shift_snr02_track_payload_probe") == "true";
+  return enabled;
+}
+
 static bool Fh1Snr02ItemShader(uint64_t hash) {
   return hash == 0x3BC346726C1C2535ull ||
          hash == 0xBDFD2AD68464101Aull ||
@@ -3362,6 +3368,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     prepared_draw_observer = nullptr;
   }
   system::GraphicsPreparedDrawObservation prepared_observation;
+  bool snr02_track_draw = false;
   const auto get_fh1_attachment_state = [&]() {
     uint64_t state = 0xCBF29CE484222325ull;
     state = HashFh1ExecutionValue(
@@ -3684,7 +3691,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       std::array<std::vector<uint8_t>, 8> vertex_fetch_snapshot_bytes;
       std::vector<uint8_t> index_snapshot_bytes;
       const auto snapshot_selector = graphics_system_->prepared_draw_snapshot_selector();
-      const bool snr02_track_draw = snapshot_selector && snapshot_selector(
+      snr02_track_draw = snapshot_selector && snapshot_selector(
           prepared_observation.frame_sequence,
           prepared_observation.command_buffer_physical_address);
       static thread_local uint32_t track_snapshot_budget_bytes = 0;
@@ -4363,7 +4370,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used, geometry_address, terrain_addresses)) {
     return finish_draw(false);
   }
-  if ((Fh1Snr03ProbeFrame() &&
+  if (snr02_track_draw ||
+      (Fh1Snr03ProbeFrame() &&
        observation_frame_sequence_ == Fh1Snr03ProbeFrame() + 1 &&
        fh1_vertex_hash == 0x5834939992FFC765ull) ||
       (Fh1Snr02ItemProbeFrame() &&
@@ -6026,7 +6034,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
         float_constants += 4 * sizeof(float);
       }
     }
-    if (Fh1Snr02ItemProbeFrame()) {
+    if (Fh1Snr02ItemProbeFrame() || Fh1Snr02TrackProbeEnabled()) {
       snr02_bound_vertex_constant_count_ = float_constant_count_vertex;
       std::memcpy(snr02_bound_vertex_constants_.data(), float_constants_begin,
                   float_constant_count_vertex * 4 * sizeof(uint32_t));
