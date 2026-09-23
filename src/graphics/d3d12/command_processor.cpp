@@ -4379,7 +4379,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (snr02_track_draw ||
       (Fh1Snr03ProbeFrame() &&
        observation_frame_sequence_ == Fh1Snr03ProbeFrame() + 1 &&
-       fh1_vertex_hash == 0x5834939992FFC765ull) ||
+       (fh1_vertex_hash == 0x5834939992FFC765ull ||
+        fh1_vertex_hash == 0xAC345DADF2F24AE4ull)) ||
       (Fh1Snr02ItemProbeFrame() &&
        observation_frame_sequence_ == Fh1Snr02ItemProbeFrame() + 1 &&
        Fh1Snr02ItemShader(fh1_vertex_hash))) {
