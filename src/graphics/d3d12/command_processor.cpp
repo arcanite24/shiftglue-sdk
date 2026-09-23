@@ -3429,6 +3429,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           index_buffer_info->guest_base;
       prepared_observation.index_buffer_length =
           uint32_t(index_buffer_info->length);
+      prepared_observation.index_buffer_guest_endianness =
+          uint32_t(index_buffer_info->endianness);
     }
     prepared_observation.normalized_depth_control =
         normalized_depth_control.value;
