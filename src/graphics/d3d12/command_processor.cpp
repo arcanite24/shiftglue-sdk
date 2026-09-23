@@ -3682,6 +3682,40 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       std::array<system::GraphicsPreparedDrawVertexFetch, 8> vertex_fetches;
       std::array<system::GraphicsPreparedDrawTextureFetch, 32> texture_fetches;
       std::array<std::vector<uint8_t>, 8> vertex_fetch_snapshot_bytes;
+      std::vector<uint8_t> index_snapshot_bytes;
+      const auto snapshot_selector = graphics_system_->prepared_draw_snapshot_selector();
+      const bool snr02_track_draw = snapshot_selector && snapshot_selector(
+          prepared_observation.frame_sequence,
+          prepared_observation.command_buffer_physical_address);
+      static thread_local uint32_t track_snapshot_budget_bytes = 0;
+      static thread_local uint64_t track_snapshot_budget_frame = 0;
+      if (track_snapshot_budget_frame != prepared_observation.frame_sequence) {
+        track_snapshot_budget_frame = prepared_observation.frame_sequence;
+        track_snapshot_budget_bytes = 0;
+      }
+      const auto copy_track_snapshot = [&](uint32_t address, uint32_t length,
+                                           uint32_t limit, std::vector<uint8_t>& bytes,
+                                           uint32_t& status, uint64_t& hash) {
+        constexpr uint32_t kBudget = 64 * 1024 * 1024;
+        if (!length || length > limit) {
+          status = 3;
+        } else if (track_snapshot_budget_bytes > kBudget ||
+                   length > kBudget - track_snapshot_budget_bytes) {
+          status = 4;
+        } else {
+          track_snapshot_budget_bytes += length;
+          bytes.resize(length);
+          if (!shared_memory_->CopyCpuSnapshot(address, bytes)) {
+            status = 2;
+          } else {
+            status = 1;
+            hash = 14695981039346656037ull;
+            for (uint8_t byte : bytes) {
+              hash = (hash ^ byte) * 1099511628211ull;
+            }
+          }
+        }
+      };
       for (const auto& binding : vertex_shader->vertex_bindings()) {
         if (prepared_observation.vertex_fetch_count < vertex_fetches.size()) {
           const auto fetch = regs.GetVertexFetch(binding.fetch_constant);
@@ -3703,35 +3737,48 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
               prepared_observation.frame_sequence == Fh1Snr02ItemProbeFrame() + 1 &&
               binding.fetch_constant == 95 && binding.stride_words == 10 &&
               Fh1Snr02ItemShader(fh1_vertex_hash);
-          if (snr03_vertex || snr02_item_vertex) {
+          const bool snr02_track_vertex = snr02_track_draw &&
+              binding.fetch_constant == 95 &&
+              binding.stride_words >= 4 && binding.stride_words <= 9;
+          if (snr03_vertex || snr02_item_vertex || snr02_track_vertex) {
             auto& observed = vertex_fetches[prepared_observation.vertex_fetch_count];
-            static thread_local uint64_t budget_frame = 0;
-            static thread_local uint32_t budget_bytes = 0;
-            if (budget_frame != prepared_observation.frame_sequence) {
-              budget_frame = prepared_observation.frame_sequence;
-              budget_bytes = 0;
-            }
-            const uint32_t budget_limit =
-                snr02_item_vertex ? 8 * 1024 * 1024 : 2 * 1024 * 1024;
-            if (observed.length > (snr02_item_vertex ? 256 * 1024 : 32768)) {
-              observed.cpu_snapshot_status = 3;
-            } else if (budget_bytes > budget_limit ||
-                       observed.length > budget_limit - budget_bytes) {
-              observed.cpu_snapshot_status = 4;
-            } else {
-              budget_bytes += observed.length;
-              auto& bytes = vertex_fetch_snapshot_bytes[prepared_observation.vertex_fetch_count];
-              bytes.resize(observed.length);
-              if (shared_memory_->CopyCpuSnapshot(observed.guest_base, bytes)) {
-                observed.cpu_snapshot_status = 1;
+            auto& bytes = vertex_fetch_snapshot_bytes[prepared_observation.vertex_fetch_count];
+            if (snr02_track_vertex) {
+              copy_track_snapshot(observed.guest_base, observed.length,
+                                  512 * 1024, bytes,
+                                  observed.cpu_snapshot_status,
+                                  observed.cpu_snapshot_hash);
+              if (observed.cpu_snapshot_status == 1) {
                 observed.cpu_snapshot_bytes = bytes.data();
-                uint64_t hash = 14695981039346656037ull;
-                for (uint8_t byte : bytes) {
-                  hash = (hash ^ byte) * 1099511628211ull;
-                }
-                observed.cpu_snapshot_hash = hash;
+              }
+            } else {
+              static thread_local uint64_t budget_frame = 0;
+              static thread_local uint32_t budget_bytes = 0;
+              if (budget_frame != prepared_observation.frame_sequence) {
+                budget_frame = prepared_observation.frame_sequence;
+                budget_bytes = 0;
+              }
+              const uint32_t budget_limit =
+                  snr02_item_vertex ? 8 * 1024 * 1024 : 2 * 1024 * 1024;
+              if (observed.length > (snr02_item_vertex ? 256 * 1024 : 32768)) {
+                observed.cpu_snapshot_status = 3;
+              } else if (budget_bytes > budget_limit ||
+                         observed.length > budget_limit - budget_bytes) {
+                observed.cpu_snapshot_status = 4;
               } else {
-                observed.cpu_snapshot_status = 2;
+                budget_bytes += observed.length;
+                bytes.resize(observed.length);
+                if (shared_memory_->CopyCpuSnapshot(observed.guest_base, bytes)) {
+                  observed.cpu_snapshot_status = 1;
+                  observed.cpu_snapshot_bytes = bytes.data();
+                  uint64_t hash = 14695981039346656037ull;
+                  for (uint8_t byte : bytes) {
+                    hash = (hash ^ byte) * 1099511628211ull;
+                  }
+                  observed.cpu_snapshot_hash = hash;
+                } else {
+                  observed.cpu_snapshot_status = 2;
+                }
               }
             }
           }
@@ -3740,6 +3787,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       }
       prepared_observation.vertex_fetches = vertex_fetches.data();
       prepared_observation.vertex_fetch_capacity = uint32_t(vertex_fetches.size());
+      if (snr02_track_draw && prepared_observation.index_buffer_type == 1) {
+        copy_track_snapshot(prepared_observation.index_buffer_guest_base,
+                            prepared_observation.index_buffer_length,
+                            64 * 1024, index_snapshot_bytes,
+                            prepared_observation.index_cpu_snapshot_status,
+                            prepared_observation.index_cpu_snapshot_hash);
+        if (prepared_observation.index_cpu_snapshot_status == 1) {
+          prepared_observation.index_cpu_snapshot_bytes = index_snapshot_bytes.data();
+        }
+      }
       prepared_observation.vertex_float_constant_words =
           regs.values + XE_GPU_REG_SHADER_CONSTANT_000_X;
       const auto& vertex_constants = vertex_shader->constant_register_map();

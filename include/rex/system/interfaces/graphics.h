@@ -358,6 +358,10 @@ struct GraphicsPreparedDrawObservation {
   uint32_t index_count = 0;
   uint32_t index_buffer_guest_base = 0;
   uint32_t index_buffer_length = 0;
+  // Borrowed until the prepared-draw observer returns; diagnostic only.
+  uint32_t index_cpu_snapshot_status = 0;
+  uint64_t index_cpu_snapshot_hash = 0;
+  const uint8_t* index_cpu_snapshot_bytes = nullptr;
   // Borrowed for the duration of the callback; count may exceed the
   // diagnostic array capacity, in which case only the first entries exist.
   const GraphicsPreparedDrawVertexFetch* vertex_fetches = nullptr;
@@ -386,6 +390,8 @@ struct GraphicsPreparedDrawObservation {
 
 using GraphicsPreparedDrawObserver = void (*)(
     const GraphicsPreparedDrawObservation& observation);
+using GraphicsPreparedDrawSnapshotSelector = bool (*)(
+    uint64_t frame_sequence, uint32_t command_buffer_physical_address);
 
 // Borrowed only during the callback, after the draw's constant buffers have
 // been bound and before the draw command is recorded.
@@ -453,6 +459,10 @@ class IGraphicsSystem {
   }
   virtual void SetPreparedDrawObserver(GraphicsPreparedDrawObserver observer) {
     (void)observer;
+  }
+  virtual void SetPreparedDrawSnapshotSelector(
+      GraphicsPreparedDrawSnapshotSelector selector) {
+    (void)selector;
   }
   virtual void SetFinalDrawStateObserver(GraphicsFinalDrawStateObserver observer) {
     (void)observer;
