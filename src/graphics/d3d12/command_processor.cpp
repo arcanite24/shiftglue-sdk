@@ -109,6 +109,13 @@ static uint64_t Fh1Snr02ItemProbeFrame() {
   return frame;
 }
 
+static bool Fh1Snr02ItemShader(uint64_t hash) {
+  return hash == 0x3BC346726C1C2535ull ||
+         hash == 0xBDFD2AD68464101Aull ||
+         hash == 0xCB8AC98467C0C283ull ||
+         hash == 0xA715C815EDB8EEE8ull;
+}
+
 static const std::string& Fh1Snr04Bc3OutputDir() {
   static const std::string directory = [] {
     char* value = nullptr;
@@ -3374,6 +3381,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   };
   if (prepared_draw_observer || fh1_native_draw_candidate) {
     prepared_observation.frame_sequence = observation_frame_sequence_;
+    prepared_observation.draw_sequence = fh1_scene_draw_sequence_;
     prepared_observation.indirect_buffer_execution_id =
         observation_indirect_buffer_execution_id_;
     prepared_observation.indirect_buffer_parent_execution_id =
@@ -3694,10 +3702,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
               Fh1Snr02ItemProbeFrame() &&
               prepared_observation.frame_sequence == Fh1Snr02ItemProbeFrame() + 1 &&
               binding.fetch_constant == 95 && binding.stride_words == 10 &&
-              (fh1_vertex_hash == 0x3BC346726C1C2535ull ||
-               fh1_vertex_hash == 0xBDFD2AD68464101Aull ||
-               fh1_vertex_hash == 0xCB8AC98467C0C283ull ||
-               fh1_vertex_hash == 0xA715C815EDB8EEE8ull);
+              Fh1Snr02ItemShader(fh1_vertex_hash);
           if (snr03_vertex || snr02_item_vertex) {
             auto& observed = vertex_fetches[prepared_observation.vertex_fetch_count];
             static thread_local uint64_t budget_frame = 0;
@@ -3984,9 +3989,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                              primitive_processing_result.line_loop_closing_index,
                              primitive_processing_result.host_shader_index_endian, viewport_info,
                              used_texture_mask, normalized_depth_control, normalized_color_mask);
-  if (Fh1Snr03ProbeFrame() &&
-      observation_frame_sequence_ == Fh1Snr03ProbeFrame() + 1 &&
-      fh1_vertex_hash == 0x5834939992FFC765ull) {
+  if ((Fh1Snr03ProbeFrame() &&
+       observation_frame_sequence_ == Fh1Snr03ProbeFrame() + 1 &&
+       fh1_vertex_hash == 0x5834939992FFC765ull) ||
+      (Fh1Snr02ItemProbeFrame() &&
+       observation_frame_sequence_ == Fh1Snr02ItemProbeFrame() + 1 &&
+       Fh1Snr02ItemShader(fh1_vertex_hash))) {
     if (auto observer = graphics_system_->final_draw_state_observer()) {
       std::array<uint32_t, 64> system_words;
       static_assert(sizeof(system_constants_) >= sizeof(system_words));

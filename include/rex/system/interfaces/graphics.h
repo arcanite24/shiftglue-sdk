@@ -336,6 +336,7 @@ struct GraphicsPreparedDrawObservation {
   uint64_t fh1_runtime_sync_pipeline_creations = 0;
   uint64_t fh1_prepare_cpu_time_ns = 0;
   uint64_t frame_sequence = 0;
+  uint64_t draw_sequence = 0;
   uint64_t indirect_buffer_execution_id = 0;
   uint64_t indirect_buffer_parent_execution_id = 0;
   uint32_t indirect_dispatch_packet_physical_address = 0;
