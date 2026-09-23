@@ -99,6 +99,16 @@ static uint64_t Fh1Snr03ProbeFrame() {
   return frame;
 }
 
+static uint64_t Fh1Snr02ItemProbeFrame() {
+  static const uint64_t frame =
+      rex::cvar::GetFlagByName("pinyon_shift_snr02_item_payload_probe") == "true"
+          ? std::strtoull(rex::cvar::GetFlagByName(
+                             "pinyon_shift_snr01_trace_source_frame").c_str(),
+                         nullptr, 10)
+          : 0;
+  return frame;
+}
+
 static const std::string& Fh1Snr04Bc3OutputDir() {
   static const std::string directory = [] {
     char* value = nullptr;
@@ -3676,9 +3686,19 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
               uint32_t(fetch.type), source_0.packet_physical,
               source_1.packet_physical, source_0.execution_id,
               source_1.execution_id};
-          if (Fh1Snr03ProbeFrame() &&
+          const bool snr03_vertex =
+              Fh1Snr03ProbeFrame() &&
               prepared_observation.frame_sequence == Fh1Snr03ProbeFrame() + 1 &&
-              binding.fetch_constant == 95 && binding.stride_words == 4) {
+              binding.fetch_constant == 95 && binding.stride_words == 4;
+          const bool snr02_item_vertex =
+              Fh1Snr02ItemProbeFrame() &&
+              prepared_observation.frame_sequence == Fh1Snr02ItemProbeFrame() + 1 &&
+              binding.fetch_constant == 95 && binding.stride_words == 10 &&
+              (fh1_vertex_hash == 0x3BC346726C1C2535ull ||
+               fh1_vertex_hash == 0xBDFD2AD68464101Aull ||
+               fh1_vertex_hash == 0xCB8AC98467C0C283ull ||
+               fh1_vertex_hash == 0xA715C815EDB8EEE8ull);
+          if (snr03_vertex || snr02_item_vertex) {
             auto& observed = vertex_fetches[prepared_observation.vertex_fetch_count];
             static thread_local uint64_t budget_frame = 0;
             static thread_local uint32_t budget_bytes = 0;
@@ -3686,9 +3706,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
               budget_frame = prepared_observation.frame_sequence;
               budget_bytes = 0;
             }
-            if (observed.length > 32768) {
+            const uint32_t budget_limit =
+                snr02_item_vertex ? 8 * 1024 * 1024 : 2 * 1024 * 1024;
+            if (observed.length > (snr02_item_vertex ? 256 * 1024 : 32768)) {
               observed.cpu_snapshot_status = 3;
-            } else if (observed.length > 2 * 1024 * 1024 - budget_bytes) {
+            } else if (budget_bytes > budget_limit ||
+                       observed.length > budget_limit - budget_bytes) {
               observed.cpu_snapshot_status = 4;
             } else {
               budget_bytes += observed.length;
