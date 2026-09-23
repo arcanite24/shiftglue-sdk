@@ -3696,23 +3696,26 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       snr02_track_draw = snapshot_selector && snapshot_selector(
           prepared_observation.frame_sequence,
           prepared_observation.command_buffer_physical_address);
-      static thread_local uint32_t track_snapshot_budget_bytes = 0;
-      static thread_local uint64_t track_snapshot_budget_frame = 0;
-      if (track_snapshot_budget_frame != prepared_observation.frame_sequence) {
-        track_snapshot_budget_frame = prepared_observation.frame_sequence;
+      static thread_local uint64_t track_snapshot_budget_bytes = 0;
+      static thread_local uint64_t manager_snapshot_budget_bytes = 0;
+      static thread_local uint64_t snapshot_budget_frame = 0;
+      if (snapshot_budget_frame != prepared_observation.frame_sequence) {
+        snapshot_budget_frame = prepared_observation.frame_sequence;
         track_snapshot_budget_bytes = 0;
+        manager_snapshot_budget_bytes = 0;
       }
-      const auto copy_track_snapshot = [&](uint32_t address, uint32_t length,
-                                           uint32_t limit, std::vector<uint8_t>& bytes,
-                                           uint32_t& status, uint64_t& hash) {
-        constexpr uint32_t kBudget = 64 * 1024 * 1024;
+      const auto copy_bounded_snapshot = [&](uint32_t address, uint32_t length,
+                                             uint32_t limit, uint64_t& budget_bytes,
+                                             uint64_t budget_limit,
+                                             std::vector<uint8_t>& bytes,
+                                             uint32_t& status, uint64_t& hash) {
         if (!length || length > limit) {
           status = 3;
-        } else if (track_snapshot_budget_bytes > kBudget ||
-                   length > kBudget - track_snapshot_budget_bytes) {
+        } else if (budget_bytes > budget_limit ||
+                   length > budget_limit - budget_bytes) {
           status = 4;
         } else {
-          track_snapshot_budget_bytes += length;
+          budget_bytes += length;
           bytes.resize(length);
           if (!shared_memory_->CopyCpuSnapshot(address, bytes)) {
             status = 2;
@@ -3749,14 +3752,31 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           const bool snr02_track_vertex = snr02_track_draw &&
               binding.fetch_constant == 95 &&
               binding.stride_words >= 4 && binding.stride_words <= 9;
-          if (snr03_vertex || snr02_item_vertex || snr02_track_vertex) {
+          const bool snr03_manager_vertex =
+              Fh1Snr03ProbeFrame() &&
+              prepared_observation.frame_sequence == Fh1Snr03ProbeFrame() + 1 &&
+              fh1_vertex_hash == 0xB8489164D5A86043ull &&
+              ((binding.fetch_constant == 95 && binding.stride_words == 8) ||
+               (binding.fetch_constant == 94 && binding.stride_words == 3));
+          if (snr03_vertex || snr02_item_vertex || snr02_track_vertex ||
+              snr03_manager_vertex) {
             auto& observed = vertex_fetches[prepared_observation.vertex_fetch_count];
             auto& bytes = vertex_fetch_snapshot_bytes[prepared_observation.vertex_fetch_count];
             if (snr02_track_vertex) {
-              copy_track_snapshot(observed.guest_base, observed.length,
-                                  512 * 1024, bytes,
-                                  observed.cpu_snapshot_status,
-                                  observed.cpu_snapshot_hash);
+              copy_bounded_snapshot(observed.guest_base, observed.length,
+                                    512 * 1024, track_snapshot_budget_bytes,
+                                    64ull * 1024 * 1024, bytes,
+                                    observed.cpu_snapshot_status,
+                                    observed.cpu_snapshot_hash);
+              if (observed.cpu_snapshot_status == 1) {
+                observed.cpu_snapshot_bytes = bytes.data();
+              }
+            } else if (snr03_manager_vertex) {
+              copy_bounded_snapshot(observed.guest_base, observed.length,
+                                    3 * 1024 * 1024, manager_snapshot_budget_bytes,
+                                    1280ull * 1024 * 1024, bytes,
+                                    observed.cpu_snapshot_status,
+                                    observed.cpu_snapshot_hash);
               if (observed.cpu_snapshot_status == 1) {
                 observed.cpu_snapshot_bytes = bytes.data();
               }
@@ -3800,12 +3820,21 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       }
       prepared_observation.vertex_fetches = vertex_fetches.data();
       prepared_observation.vertex_fetch_capacity = uint32_t(vertex_fetches.size());
-      if (snr02_track_draw && prepared_observation.index_buffer_type == 1) {
-        copy_track_snapshot(prepared_observation.index_buffer_guest_base,
-                            prepared_observation.index_buffer_length,
-                            64 * 1024, index_snapshot_bytes,
-                            prepared_observation.index_cpu_snapshot_status,
-                            prepared_observation.index_cpu_snapshot_hash);
+      const bool snr03_manager_draw = Fh1Snr03ProbeFrame() &&
+          prepared_observation.frame_sequence == Fh1Snr03ProbeFrame() + 1 &&
+          fh1_vertex_hash == 0xB8489164D5A86043ull;
+      if ((snr02_track_draw || snr03_manager_draw) &&
+          prepared_observation.index_buffer_type == 1) {
+        copy_bounded_snapshot(prepared_observation.index_buffer_guest_base,
+                              prepared_observation.index_buffer_length,
+                              64 * 1024,
+                              snr02_track_draw ? track_snapshot_budget_bytes
+                                               : manager_snapshot_budget_bytes,
+                              snr02_track_draw ? 64ull * 1024 * 1024
+                                               : 1280ull * 1024 * 1024,
+                              index_snapshot_bytes,
+                              prepared_observation.index_cpu_snapshot_status,
+                              prepared_observation.index_cpu_snapshot_hash);
         if (prepared_observation.index_cpu_snapshot_status == 1) {
           prepared_observation.index_cpu_snapshot_bytes = index_snapshot_bytes.data();
         }
@@ -4380,7 +4409,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       (Fh1Snr03ProbeFrame() &&
        observation_frame_sequence_ == Fh1Snr03ProbeFrame() + 1 &&
        (fh1_vertex_hash == 0x5834939992FFC765ull ||
-        fh1_vertex_hash == 0xAC345DADF2F24AE4ull)) ||
+        fh1_vertex_hash == 0xAC345DADF2F24AE4ull ||
+        fh1_vertex_hash == 0xB8489164D5A86043ull)) ||
       (Fh1Snr02ItemProbeFrame() &&
        observation_frame_sequence_ == Fh1Snr02ItemProbeFrame() + 1 &&
        Fh1Snr02ItemShader(fh1_vertex_hash))) {
