@@ -3968,7 +3968,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       std::array<uint32_t, 64> system_words;
       static_assert(sizeof(system_constants_) >= sizeof(system_words));
       std::memcpy(system_words.data(), &system_constants_, sizeof(system_words));
-      observer({observation_frame_sequence_, observation_draw_packet_address_,
+      observer({observation_frame_sequence_, fh1_scene_draw_sequence_,
+                observation_draw_packet_address_,
                 prepared_observation.fh1_execution_key.dynamic_state,
                 system_words.data(), uint32_t(system_words.size()),
                 regs.values + XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 47 * 4});

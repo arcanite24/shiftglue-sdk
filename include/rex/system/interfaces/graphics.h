@@ -387,6 +387,7 @@ using GraphicsPreparedDrawObserver = void (*)(
 // reached their final values and before their GPU upload.
 struct GraphicsFinalDrawStateObservation {
   uint64_t frame_sequence = 0;
+  uint64_t draw_sequence = 0;
   uint32_t draw_packet_physical_address = 0;
   uint64_t dynamic_state = 0;
   const uint32_t* system_constant_words = nullptr;
