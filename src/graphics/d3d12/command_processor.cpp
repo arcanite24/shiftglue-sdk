@@ -101,6 +101,15 @@ static uint64_t Fh1Snr03ProbeFrame() {
   return frame;
 }
 
+static bool Fh1SnrProbeOutputFrame(uint64_t source_frame,
+                                  uint64_t output_frame) {
+  static const bool following = rex::cvar::GetFlagByName(
+      "pinyon_shift_snr03_probe_following_frame") == "true";
+  return source_frame &&
+         (output_frame == source_frame + 1 ||
+          (following && output_frame == source_frame + 2));
+}
+
 static uint64_t Fh1Snr04Bc3RebindFrame() {
   static const uint64_t frame = std::strtoull(
       rex::cvar::GetFlagByName("pinyon_shift_snr01_trace_source_frame").c_str(),
@@ -3579,8 +3588,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // Diagnostic snapshots retain addresses and constants deliberately omitted
     // from prewarm identities. They are evidence, never batching admission.
     const bool snr03_vegetation_binding =
-        Fh1Snr03ProbeFrame() &&
-        observation_frame_sequence_ == Fh1Snr03ProbeFrame() + 1 &&
+        Fh1SnrProbeOutputFrame(Fh1Snr03ProbeFrame(),
+                               observation_frame_sequence_) &&
         (fh1_vertex_hash == 0xC62548CAA393B216ull ||
          fh1_vertex_hash == 0x5834939992FFC765ull);
     if (prepared_draw_observer && Fh1GpuCorpusEnabled() && Fh1SceneDumpEnabled() &&
@@ -3741,8 +3750,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         manager_snapshot_budget_bytes = 0;
         remaining_snapshot_budget_bytes = 0;
       }
-      const bool snr03_probe_draw = Fh1Snr03ProbeFrame() &&
-          prepared_observation.frame_sequence == Fh1Snr03ProbeFrame() + 1 &&
+      const bool snr03_probe_draw = Fh1SnrProbeOutputFrame(
+          Fh1Snr03ProbeFrame(), prepared_observation.frame_sequence) &&
           prepared_observation.surface_info == 0x14020500 &&
           (prepared_observation.color_info[0] == 0x00030000 ||
            prepared_observation.color_info[0] == 0x000C0000) &&
@@ -3785,20 +3794,20 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
               source_1.packet_physical, source_0.execution_id,
               source_1.execution_id};
           const bool snr03_vertex =
-              Fh1Snr03ProbeFrame() &&
-              prepared_observation.frame_sequence == Fh1Snr03ProbeFrame() + 1 &&
+              Fh1SnrProbeOutputFrame(Fh1Snr03ProbeFrame(),
+                                     prepared_observation.frame_sequence) &&
               binding.fetch_constant == 95 && binding.stride_words == 4;
           const bool snr02_item_vertex =
-              Fh1Snr02ItemProbeFrame() &&
-              prepared_observation.frame_sequence == Fh1Snr02ItemProbeFrame() + 1 &&
+              Fh1SnrProbeOutputFrame(Fh1Snr02ItemProbeFrame(),
+                                     prepared_observation.frame_sequence) &&
               binding.fetch_constant == 95 && binding.stride_words == 10 &&
               Fh1Snr02ItemShader(fh1_vertex_hash);
           const bool snr02_track_vertex = snr02_track_draw &&
               binding.fetch_constant == 95 &&
               binding.stride_words >= 4 && binding.stride_words <= 9;
           const bool snr03_manager_vertex =
-              Fh1Snr03ProbeFrame() &&
-              prepared_observation.frame_sequence == Fh1Snr03ProbeFrame() + 1 &&
+              Fh1SnrProbeOutputFrame(Fh1Snr03ProbeFrame(),
+                                     prepared_observation.frame_sequence) &&
               fh1_vertex_hash == 0xB8489164D5A86043ull &&
               ((binding.fetch_constant == 95 && binding.stride_words == 8) ||
                (binding.fetch_constant == 94 && binding.stride_words == 3));
@@ -3873,8 +3882,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       }
       prepared_observation.vertex_fetches = vertex_fetches.data();
       prepared_observation.vertex_fetch_capacity = uint32_t(vertex_fetches.size());
-      const bool snr03_manager_draw = Fh1Snr03ProbeFrame() &&
-          prepared_observation.frame_sequence == Fh1Snr03ProbeFrame() + 1 &&
+      const bool snr03_manager_draw = Fh1SnrProbeOutputFrame(
+          Fh1Snr03ProbeFrame(), prepared_observation.frame_sequence) &&
           fh1_vertex_hash == 0xB8489164D5A86043ull;
       if (((snr02_track_draw || snr03_manager_draw) &&
            prepared_observation.index_buffer_type == 1) ||
@@ -4464,10 +4473,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     return finish_draw(false);
   }
   if (snr02_track_draw ||
-      (Fh1Snr03ProbeFrame() &&
-       observation_frame_sequence_ == Fh1Snr03ProbeFrame() + 1) ||
-      (Fh1Snr02ItemProbeFrame() &&
-       observation_frame_sequence_ == Fh1Snr02ItemProbeFrame() + 1 &&
+      Fh1SnrProbeOutputFrame(Fh1Snr03ProbeFrame(),
+                             observation_frame_sequence_) ||
+      (Fh1SnrProbeOutputFrame(Fh1Snr02ItemProbeFrame(),
+                              observation_frame_sequence_) &&
        Fh1Snr02ItemShader(fh1_vertex_hash))) {
     if (auto observer = graphics_system_->final_draw_state_observer()) {
       std::array<uint32_t, 64> system_words;
@@ -6154,8 +6163,8 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       }
     }
     if (Fh1Snr02ItemProbeFrame() || Fh1Snr02TrackProbeEnabled() ||
-        (Fh1Snr03ProbeFrame() &&
-         observation_frame_sequence_ == Fh1Snr03ProbeFrame() + 1)) {
+        Fh1SnrProbeOutputFrame(Fh1Snr03ProbeFrame(),
+                               observation_frame_sequence_)) {
       snr02_bound_vertex_constant_count_ = float_constant_count_vertex;
       std::memcpy(snr02_bound_vertex_constants_.data(), float_constants_begin,
                   float_constant_count_vertex * 4 * sizeof(uint32_t));
@@ -6517,7 +6526,8 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       }
     }
     if (Fh1Snr03ProbeFrame() &&
-        (observation_frame_sequence_ == Fh1Snr03ProbeFrame() + 1 ||
+        (Fh1SnrProbeOutputFrame(Fh1Snr03ProbeFrame(),
+                                observation_frame_sequence_) ||
          (Fh1Snr04Bc3RebindFrame() &&
           observation_frame_sequence_ == Fh1Snr04Bc3RebindFrame() + 1)) &&
         vertex_shader->ucode_data_hash() == 0x5834939992FFC765ull &&
