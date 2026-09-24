@@ -2822,6 +2822,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         auto renderer = graphics_system_->native_guest_output_renderer().Get();
         system::NativeGuestOutputRenderContext native_context;
         if (renderer) {
+          SubmitBarriers();
           native_context.backend = system::NativeGuestOutputBackend::kD3D12;
           native_context.phase = system::NativeGuestOutputPhase::kNativeAttempt;
           native_context.guest_output_width = guest_output_width;
@@ -2832,8 +2833,12 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
               uint32_t(ui::d3d12::D3D12Presenter::kGuestOutputFormat);
           native_context.device = device;
           native_context.command_context = this;
+          native_context.deferred_command_list = &deferred_command_list_;
           native_context.guest_output = guest_output_resource;
+          native_context.guest_output_state =
+              uint32_t(ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
           native_context.submission = submission_current_;
+          native_context.completed_submission = submission_completed_;
           native_context.frame_sequence = observation_frame_sequence_ - 1;
           native_context.clear_color = &ClearNativeGuestOutput;
           if (renderer(native_context)) {
@@ -2841,6 +2846,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             SubmitBarriers();
             native_context.phase = system::NativeGuestOutputPhase::kPresented;
             native_context.clear_color = nullptr;
+            native_context.deferred_command_list = nullptr;
             renderer(native_context);
             SubmitBarriers();
             EndSubmission(true);
@@ -3102,6 +3108,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         if (renderer) {
           native_context.phase = system::NativeGuestOutputPhase::kPresented;
           native_context.clear_color = nullptr;
+          native_context.deferred_command_list = nullptr;
           native_context.use_pwl_gamma_ramp = use_pwl_gamma_ramp;
           native_context.xenos_fxaa_applied = use_fxaa;
           renderer(native_context);

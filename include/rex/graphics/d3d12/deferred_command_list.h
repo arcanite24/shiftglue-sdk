@@ -680,6 +680,9 @@ class DeferredCommandList {
     // Followed by null-terminated label string.
   };
 
+#if defined(_WIN32) && defined(rexgpu_fh1_EXPORTS)
+  __declspec(dllexport)
+#endif
   void* WriteCommand(Command command, size_t arguments_size_bytes);
 
   const D3D12CommandProcessor& command_processor_;

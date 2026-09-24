@@ -518,7 +518,8 @@ bool D3D12Presenter::RefreshGuestOutputImpl(
     guest_output_resource_new_desc.SampleDesc.Count = 1;
     guest_output_resource_new_desc.SampleDesc.Quality = 0;
     guest_output_resource_new_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    guest_output_resource_new_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    guest_output_resource_new_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+                                           D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     if (FAILED(device->CreateCommittedResource(
             &util::kHeapPropertiesDefault, provider_.GetHeapFlagCreateNotZeroed(),
             &guest_output_resource_new_desc, kGuestOutputInternalState, nullptr,

@@ -60,8 +60,14 @@ struct NativeGuestOutputRenderContext {
   uint32_t output_format = 0;
   void* device = nullptr;
   void* command_context = nullptr;
+  // D3D12 DeferredCommandList during kNativeAttempt only. Native draws must
+  // restore guest_output_state and retain referenced resources until the
+  // submission completes.
+  void* deferred_command_list = nullptr;
   void* guest_output = nullptr;
+  uint32_t guest_output_state = 0;
   uint64_t submission = 0;
+  uint64_t completed_submission = 0;
   uint64_t frame_sequence = 0;
   bool use_pwl_gamma_ramp = false;
   bool xenos_fxaa_applied = false;
