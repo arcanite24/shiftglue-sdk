@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -37,6 +38,7 @@
 #include <rex/memory/utils.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+#include <rex/ui/renderdoc_api.h>
 
 REXCVAR_DEFINE_BOOL(fh1_post_chain_probe, false, "GPU/D3D12",
                     "Log resolve publications and their texture consumers")
@@ -3047,6 +3049,28 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
   EndSubmission(true);
+
+  static std::unique_ptr<rex::ui::RenderDocAPI> snr04_renderdoc;
+  static bool snr04_capture_started = false;
+  const uint64_t snr04_source_frame = Fh1Snr03ProbeFrame();
+  if (snr04_source_frame && observation_frame_sequence_ == snr04_source_frame) {
+    snr04_renderdoc = rex::ui::RenderDocAPI::CreateIfConnected();
+    if (snr04_renderdoc && !snr04_renderdoc->api_1_0_0()->IsFrameCapturing()) {
+      snr04_renderdoc->api_1_0_0()->StartFrameCapture(GetD3D12Provider().GetDevice(), nullptr);
+      snr04_capture_started = snr04_renderdoc->api_1_0_0()->IsFrameCapturing();
+      REXGPU_INFO("SNR04 RenderDoc capture start next_output_frame={} started={}",
+                  observation_frame_sequence_ + 1, snr04_capture_started);
+    }
+  } else if (snr04_source_frame &&
+             observation_frame_sequence_ == snr04_source_frame + 1 &&
+             snr04_capture_started) {
+    const bool saved = snr04_renderdoc->api_1_0_0()->EndFrameCapture(
+        GetD3D12Provider().GetDevice(), nullptr);
+    REXGPU_INFO("SNR04 RenderDoc capture end output_frame={} saved={}",
+                observation_frame_sequence_, saved);
+    snr04_capture_started = false;
+    snr04_renderdoc.reset();
+  }
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
@@ -4560,6 +4584,17 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   SetPrimitiveTopology(primitive_topology);
   // Must not call anything that may change the primitive topology from now on!
 
+  const uint64_t snr03_probe_frame = Fh1Snr03ProbeFrame();
+  const bool snr04_mark_foliage =
+      snr03_probe_frame && debug_markers_enabled_ &&
+      fh1_vertex_hash == 0x5834939992FFC765ull;
+  char marker[96];
+  if (snr04_mark_foliage) {
+    std::snprintf(marker, sizeof(marker), "SNR04 foliage output=%llu draw=%llu",
+                  static_cast<unsigned long long>(observation_frame_sequence_),
+                  static_cast<unsigned long long>(fh1_scene_draw_sequence_));
+  }
+
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
       PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
@@ -4573,8 +4608,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     bind_prepared_guest_pipeline();
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+    if (snr04_mark_foliage) deferred_command_list_.BeginDebugMarker(marker);
     deferred_command_list_.D3DDrawInstanced(
         primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
+    if (snr04_mark_foliage) deferred_command_list_.EndDebugMarker();
   } else {
     D3D12_INDEX_BUFFER_VIEW index_buffer_view;
     index_buffer_view.SizeInBytes = primitive_processing_result.host_draw_vertex_count;
@@ -4642,8 +4679,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     bind_prepared_guest_pipeline();
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+    if (snr04_mark_foliage) deferred_command_list_.BeginDebugMarker(marker);
     deferred_command_list_.D3DDrawIndexedInstanced(
         primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
+    if (snr04_mark_foliage) deferred_command_list_.EndDebugMarker();
     if (scratch_index_buffer != nullptr) {
       ReleaseScratchGPUBuffer(scratch_index_buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
     }
