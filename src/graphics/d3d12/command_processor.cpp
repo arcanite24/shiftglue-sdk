@@ -101,6 +101,13 @@ static uint64_t Fh1Snr03ProbeFrame() {
   return frame;
 }
 
+static uint64_t Fh1Snr04Bc3RebindFrame() {
+  static const uint64_t frame = std::strtoull(
+      rex::cvar::GetFlagByName("pinyon_shift_snr01_trace_source_frame").c_str(),
+      nullptr, 10);
+  return frame;
+}
+
 static uint64_t Fh1Snr02ItemProbeFrame() {
   static const uint64_t frame =
       rex::cvar::GetFlagByName("pinyon_shift_snr02_item_payload_probe") == "true"
@@ -6510,7 +6517,9 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       }
     }
     if (Fh1Snr03ProbeFrame() &&
-        observation_frame_sequence_ == Fh1Snr03ProbeFrame() + 1 &&
+        (observation_frame_sequence_ == Fh1Snr03ProbeFrame() + 1 ||
+         (Fh1Snr04Bc3RebindFrame() &&
+          observation_frame_sequence_ == Fh1Snr04Bc3RebindFrame() + 1)) &&
         vertex_shader->ucode_data_hash() == 0x5834939992FFC765ull &&
         pixel_shader &&
         pixel_shader->ucode_data_hash() == 0xC2F1242C2535A57Eull) {
