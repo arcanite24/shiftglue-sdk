@@ -3802,7 +3802,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             if (snr02_track_vertex) {
               copy_bounded_snapshot(observed.guest_base, observed.length,
                                     512 * 1024, track_snapshot_budget_bytes,
-                                    64ull * 1024 * 1024, bytes,
+                                    128ull * 1024 * 1024, bytes,
                                     observed.cpu_snapshot_status,
                                     observed.cpu_snapshot_hash);
               if (observed.cpu_snapshot_status == 1) {
@@ -3880,7 +3880,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                               snr02_track_draw ? track_snapshot_budget_bytes
                                   : snr03_manager_draw ? manager_snapshot_budget_bytes
                                                        : remaining_snapshot_budget_bytes,
-                              snr02_track_draw ? 64ull * 1024 * 1024
+                              snr02_track_draw ? 128ull * 1024 * 1024
                                   : snr03_manager_draw ? 1280ull * 1024 * 1024
                                                        : 512ull * 1024 * 1024,
                               index_snapshot_bytes,
