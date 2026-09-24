@@ -117,6 +117,20 @@ static uint64_t Fh1Snr03ProbeFrame() {
       ? Fh1NativeRaceCaptureStartFrame() : frame;
 }
 
+static uint64_t Fh1Snr04RenderDocFrame(uint64_t current_frame) {
+  // A render-test capture file appears after its output; capture the next frame.
+  static uint64_t trigger_frame = 0;
+  const char* trigger = std::getenv("PINYON_SHIFT_SNR04_RENDERDOC_TRIGGER_FILE");
+  if (trigger && *trigger) {
+    std::error_code error;
+    if (!trigger_frame && std::filesystem::exists(trigger, error)) {
+      trigger_frame = current_frame;
+    }
+    return trigger_frame;
+  }
+  return Fh1Snr03ProbeFrame();
+}
+
 static bool Fh1SnrProbeOutputFrame(uint64_t source_frame,
                                   uint64_t output_frame) {
   static const bool following = rex::cvar::GetFlagByName(
@@ -3161,7 +3175,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
 
   static std::unique_ptr<rex::ui::RenderDocAPI> snr04_renderdoc;
   static bool snr04_capture_started = false;
-  const uint64_t snr04_source_frame = Fh1Snr03ProbeFrame();
+  const uint64_t snr04_source_frame =
+      Fh1Snr04RenderDocFrame(observation_frame_sequence_);
   const uint64_t snr04_capture_end_frame = snr04_source_frame +
       (rex::cvar::GetFlagByName(
            "pinyon_shift_snr03_probe_following_frame") == "true" ? 2 : 1);
