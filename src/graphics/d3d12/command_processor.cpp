@@ -2666,6 +2666,32 @@ bool D3D12CommandProcessor::DrawFh1VelocityDilate(
   return true;
 }
 
+static bool ClearNativeGuestOutput(
+    const system::NativeGuestOutputRenderContext& context,
+    const float color[4]) {
+  auto* processor = static_cast<D3D12CommandProcessor*>(context.command_context);
+  auto* resource = static_cast<ID3D12Resource*>(context.guest_output);
+  auto* device = static_cast<ID3D12Device*>(context.device);
+  if (!processor || !resource || !device || !color) return false;
+  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor;
+  if (!processor->RequestOneUseSingleViewDescriptors(1, &descriptor))
+    return false;
+  D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+  view.Format = ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+  view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+  device->CreateUnorderedAccessView(resource, nullptr, &view, descriptor.first);
+  processor->PushTransitionBarrier(
+      resource, ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  processor->SubmitBarriers();
+  processor->GetDeferredCommandList().D3DClearUnorderedAccessViewFloat(
+      descriptor.second, descriptor.first, resource, color, 0, nullptr);
+  processor->PushTransitionBarrier(
+      resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
+  return true;
+}
+
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   if (observation_frame_sequence_ % 600 == 0) {
@@ -2790,6 +2816,38 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
         ID3D12Device* device = provider.GetDevice();
 
+        auto* guest_output_resource =
+            static_cast<ui::d3d12::D3D12Presenter::D3D12GuestOutputRefreshContext&>(context)
+                .resource_uav_capable();
+        auto renderer = graphics_system_->native_guest_output_renderer().Get();
+        system::NativeGuestOutputRenderContext native_context;
+        if (renderer) {
+          native_context.backend = system::NativeGuestOutputBackend::kD3D12;
+          native_context.phase = system::NativeGuestOutputPhase::kNativeAttempt;
+          native_context.guest_output_width = guest_output_width;
+          native_context.guest_output_height = guest_output_height;
+          native_context.display_width = display_width;
+          native_context.display_height = display_height;
+          native_context.output_format =
+              uint32_t(ui::d3d12::D3D12Presenter::kGuestOutputFormat);
+          native_context.device = device;
+          native_context.command_context = this;
+          native_context.guest_output = guest_output_resource;
+          native_context.submission = submission_current_;
+          native_context.frame_sequence = observation_frame_sequence_ - 1;
+          native_context.clear_color = &ClearNativeGuestOutput;
+          if (renderer(native_context)) {
+            context.SetIs8bpc(false);
+            SubmitBarriers();
+            native_context.phase = system::NativeGuestOutputPhase::kPresented;
+            native_context.clear_color = nullptr;
+            renderer(native_context);
+            SubmitBarriers();
+            EndSubmission(true);
+            return true;
+          }
+        }
+
         SwapPostEffect swap_post_effect = GetActualSwapPostEffect();
         bool use_fxaa = swap_post_effect == SwapPostEffect::kFxaa ||
                         swap_post_effect == SwapPostEffect::kFxaaExtreme;
@@ -2903,10 +2961,6 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           apply_gamma_descriptor_gamma_ramp = apply_gamma_descriptors[2];
           WriteGammaRampSRV(use_pwl_gamma_ramp, apply_gamma_descriptor_gamma_ramp.first);
         }
-
-        ID3D12Resource* guest_output_resource =
-            static_cast<ui::d3d12::D3D12Presenter::D3D12GuestOutputRefreshContext&>(context)
-                .resource_uav_capable();
 
         if (use_fxaa) {
           fxaa_source_texture_submission_ = submission_current_;
@@ -3045,20 +3099,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         // presenter so it can submit its own commands for displaying it to the
         // queue.
         SubmitBarriers();
-        if (auto renderer = graphics_system_->native_guest_output_renderer().Get()) {
-          system::NativeGuestOutputRenderContext native_context;
-          native_context.backend = system::NativeGuestOutputBackend::kD3D12;
-          native_context.guest_output_width = guest_output_width;
-          native_context.guest_output_height = guest_output_height;
-          native_context.display_width = display_width;
-          native_context.display_height = display_height;
-          native_context.output_format =
-              uint32_t(ui::d3d12::D3D12Presenter::kGuestOutputFormat);
-          native_context.device = device;
-          native_context.command_context = this;
-          native_context.guest_output = guest_output_resource;
-          native_context.submission = submission_current_;
-          native_context.frame_sequence = observation_frame_sequence_ - 1;
+        if (renderer) {
+          native_context.phase = system::NativeGuestOutputPhase::kPresented;
+          native_context.clear_color = nullptr;
           native_context.use_pwl_gamma_ramp = use_pwl_gamma_ramp;
           native_context.xenos_fxaa_applied = use_fxaa;
           renderer(native_context);

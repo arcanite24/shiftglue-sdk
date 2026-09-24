@@ -42,8 +42,17 @@ enum class NativeGuestOutputBackend : uint32_t {
   kVulkan = 2,
 };
 
+enum class NativeGuestOutputPhase : uint32_t {
+  kNativeAttempt = 0,
+  kPresented = 1,
+};
+
+using NativeGuestOutputClearColor = bool (*)(
+    const NativeGuestOutputRenderContext& context, const float color[4]);
+
 struct NativeGuestOutputRenderContext {
   NativeGuestOutputBackend backend = NativeGuestOutputBackend::kUnsupported;
+  NativeGuestOutputPhase phase = NativeGuestOutputPhase::kPresented;
   uint32_t guest_output_width = 0;
   uint32_t guest_output_height = 0;
   uint32_t display_width = 0;
@@ -56,6 +65,7 @@ struct NativeGuestOutputRenderContext {
   uint64_t frame_sequence = 0;
   bool use_pwl_gamma_ramp = false;
   bool xenos_fxaa_applied = false;
+  NativeGuestOutputClearColor clear_color = nullptr;
 };
 
 // Returning false yields without modifying guest output. A callback that has
