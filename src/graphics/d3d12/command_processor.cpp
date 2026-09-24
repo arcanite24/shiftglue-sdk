@@ -2847,11 +2847,28 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           native_context.completed_submission = submission_completed_;
           native_context.frame_sequence = observation_frame_sequence_ - 1;
           native_context.clear_color = &ClearNativeGuestOutput;
+          native_context.shader = +[](
+              const system::NativeGuestOutputRenderContext& context,
+              uint32_t stage, uint64_t guest_hash, uint64_t modification,
+              const uint8_t** bytecode, size_t* bytecode_size) {
+            if (!context.command_context || !bytecode || !bytecode_size ||
+                stage > 1) return false;
+            const auto* processor = static_cast<const D3D12CommandProcessor*>(
+                context.command_context);
+            if (!processor->pipeline_cache_) return false;
+            const auto* entry = processor->pipeline_cache_->FindFh1ShaderPackEntry(
+                xenos::ShaderType(stage), guest_hash, modification);
+            if (!entry) return false;
+            *bytecode = entry->bytecode.data();
+            *bytecode_size = entry->bytecode.size();
+            return true;
+          };
           if (renderer(native_context)) {
             context.SetIs8bpc(false);
             SubmitBarriers();
             native_context.phase = system::NativeGuestOutputPhase::kPresented;
             native_context.clear_color = nullptr;
+            native_context.shader = nullptr;
             native_context.deferred_command_list = nullptr;
             renderer(native_context);
             SubmitBarriers();
@@ -3114,6 +3131,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         if (renderer) {
           native_context.phase = system::NativeGuestOutputPhase::kPresented;
           native_context.clear_color = nullptr;
+          native_context.shader = nullptr;
           native_context.deferred_command_list = nullptr;
           native_context.use_pwl_gamma_ramp = use_pwl_gamma_ramp;
           native_context.xenos_fxaa_applied = use_fxaa;

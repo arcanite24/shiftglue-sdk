@@ -35,6 +35,11 @@ class DeferredCommandList {
   void Reset();
   void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1);
 
+  void ReserveAdditionalBytes(size_t bytes) {
+    command_stream_.reserve(command_stream_.size() +
+                            (bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t));
+  }
+
   D3D12_RECT* ClearDepthStencilViewAllocatedRects(D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_view,
                                                   D3D12_CLEAR_FLAGS clear_flags, FLOAT depth,
                                                   UINT8 stencil, UINT num_rects) {

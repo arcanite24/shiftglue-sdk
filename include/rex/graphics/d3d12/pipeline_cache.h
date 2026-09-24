@@ -122,6 +122,11 @@ class PipelineCache {
   bool IsFh1PipelinePrewarmed(uint64_t description_hash) const {
     return fh1_prewarmed_pipeline_allowlist_.contains(description_hash);
   }
+  const Fh1ShaderPack::Entry* FindFh1ShaderPackEntry(
+      xenos::ShaderType stage, uint64_t guest_hash,
+      uint64_t modification) const {
+    return fh1_shader_pack_.Find(stage, guest_hash, modification);
+  }
   uint64_t GetFh1RuntimeShaderTranslationCount() const {
     return fh1_runtime_shader_translations_.load(std::memory_order_relaxed);
   }

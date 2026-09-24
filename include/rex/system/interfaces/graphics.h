@@ -49,6 +49,10 @@ enum class NativeGuestOutputPhase : uint32_t {
 
 using NativeGuestOutputClearColor = bool (*)(
     const NativeGuestOutputRenderContext& context, const float color[4]);
+using NativeGuestOutputShader = bool (*)(
+    const NativeGuestOutputRenderContext& context, uint32_t stage,
+    uint64_t guest_hash, uint64_t modification,
+    const uint8_t** bytecode, size_t* bytecode_size);
 
 struct NativeGuestOutputRenderContext {
   NativeGuestOutputBackend backend = NativeGuestOutputBackend::kUnsupported;
@@ -72,6 +76,8 @@ struct NativeGuestOutputRenderContext {
   bool use_pwl_gamma_ramp = false;
   bool xenos_fxaa_applied = false;
   NativeGuestOutputClearColor clear_color = nullptr;
+  // Valid only during kNativeAttempt; stage 0 is vertex, 1 is pixel.
+  NativeGuestOutputShader shader = nullptr;
 };
 
 // Returning false yields without modifying guest output. A callback that has
