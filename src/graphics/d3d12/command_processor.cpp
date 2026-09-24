@@ -111,9 +111,13 @@ static bool Fh1SnrProbeOutputFrame(uint64_t source_frame,
                                   uint64_t output_frame) {
   static const bool following = rex::cvar::GetFlagByName(
       "pinyon_shift_snr03_probe_following_frame") == "true";
+  static const bool continuous = Fh1Snr04LiveHandoffEnabled() &&
+      rex::cvar::GetFlagByName("pinyon_shift_snr04_live_continuous") == "true" &&
+      rex::cvar::GetFlagByName("pinyon_shift_snr04_live_worker") == "false";
   return source_frame &&
-         (output_frame == source_frame + 1 ||
-          (following && output_frame == source_frame + 2));
+      (output_frame == source_frame + 1 ||
+          (following && output_frame == source_frame + 2) ||
+          (continuous && output_frame > source_frame));
 }
 
 static uint64_t Fh1Snr04Bc3RebindFrame() {
@@ -127,7 +131,9 @@ static uint64_t Fh1Snr02ItemProbeFrame() {
   static const uint64_t frame =
       rex::cvar::GetFlagByName("pinyon_shift_snr02_item_payload_probe") == "true"
           ? std::strtoull(rex::cvar::GetFlagByName(
-                             "pinyon_shift_snr01_trace_source_frame").c_str(),
+                             Fh1Snr04LiveHandoffEnabled()
+                                 ? "pinyon_shift_snr04_live_source_frame"
+                                 : "pinyon_shift_snr01_trace_source_frame").c_str(),
                          nullptr, 10)
           : 0;
   return frame;
