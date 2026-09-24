@@ -407,10 +407,11 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
   if (REXCVAR_GET(fh1_texture_reload_probe)) {
     const TextureKey& key = texture.key();
     REXGPU_INFO(
-        "FH1 texture reload attempt {{\"base\":\"{:08X}\",\"mips\":\"{:08X}\","
+        "FH1 texture reload attempt {{\"texture\":{},\"base\":\"{:08X}\",\"mips\":\"{:08X}\","
         "\"width\":{},\"height\":{},\"depth\":{},\"format\":{},\"base_dirty\":{},"
         "\"mips_dirty\":{},\"base_bytes\":{},\"mips_bytes\":{},\"scaled\":{}}}",
-        uint32_t(key.base_page << 12), uint32_t(key.mip_page << 12), key.GetWidth(),
+        reinterpret_cast<uintptr_t>(&texture), uint32_t(key.base_page << 12),
+        uint32_t(key.mip_page << 12), key.GetWidth(),
         key.GetHeight(), key.GetDepthOrArraySize(), uint32_t(key.format), base_outdated,
         mips_outdated, texture.GetGuestBaseSize(), texture.GetGuestMipsSize(),
         uint32_t(key.scaled_resolve));
@@ -767,6 +768,13 @@ void TextureCache::Texture::CompleteLoad(
     mips_outdated_ = false;
     outdated_mask_.fetch_and(~kOutdatedBitMips, std::memory_order_release);
   }
+  if (REXCVAR_GET(fh1_texture_reload_probe)) {
+    REXGPU_INFO("FH1 texture reload complete {{\"texture\":{},\"base\":\"{:08X}\","
+                "\"mips\":\"{:08X}\",\"load_base\":{},\"load_mips\":{},"
+                "\"outdated\":{}}}",
+                reinterpret_cast<uintptr_t>(this), uint32_t(key().base_page << 12),
+                uint32_t(key().mip_page << 12), load_base, load_mips, outdated_mask());
+  }
 }
 
 void TextureCache::Texture::MarkAsUsed() {
@@ -818,9 +826,10 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
   if (REXCVAR_GET(fh1_texture_reload_probe)) {
     const TextureKey& key = texture.key();
     REXGPU_INFO(
-        "FH1 texture invalidated {{\"base\":\"{:08X}\",\"mips\":\"{:08X}\","
+        "FH1 texture invalidated {{\"texture\":{},\"base\":\"{:08X}\",\"mips\":\"{:08X}\","
         "\"width\":{},\"height\":{},\"format\":{},\"part\":\"{}\",\"gpu\":{}}}",
-        uint32_t(key.base_page << 12), uint32_t(key.mip_page << 12), key.GetWidth(),
+        reinterpret_cast<uintptr_t>(&texture), uint32_t(key.base_page << 12),
+        uint32_t(key.mip_page << 12), key.GetWidth(),
         key.GetHeight(), uint32_t(key.format), argument ? "mips" : "base",
         invalidated_by_gpu);
   }
