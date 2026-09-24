@@ -952,6 +952,15 @@ bool D3D12TextureCache::CopyFh1Snr04Bc3Mips(
       description.DepthOrArraySize != 1 || description.MipLevels != 9) {
     return false;
   }
+  REXGPU_INFO("FH1 SNR04 BC3 source {{\"fetch\":{},\"texture\":{},"
+              "\"resource\":{},\"base\":{},\"mips\":{},"
+              "\"base_bytes\":{},\"mips_bytes\":{},\"outdated\":{}}}",
+              fetch_constant, reinterpret_cast<uintptr_t>(texture),
+              reinterpret_cast<uintptr_t>(source_resource),
+              uint32_t(binding->key.base_page << 12),
+              uint32_t(binding->key.mip_page << 12),
+              texture->GetGuestBaseSize(), texture->GetGuestMipsSize(),
+              texture->outdated_mask());
   texture->MarkAsUsed();
   const D3D12_RESOURCE_STATES old_state =
       texture->SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE);
