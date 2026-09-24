@@ -88,6 +88,12 @@ static bool Fh1GpuCorpusEnabled() {
   return enabled;
 }
 
+static bool Fh1Snr04LiveHandoffEnabled() {
+  static const bool enabled =
+      rex::cvar::GetFlagByName("pinyon_shift_snr04_live_handoff") == "true";
+  return enabled;
+}
+
 static bool Fh1SceneDumpEnabled() {
   static const bool enabled =
       rex::cvar::GetFlagByName("pinyon_shift_fh1_scene_dump") == "true";
@@ -3114,7 +3120,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   const auto fh1_prepare_start =
       Fh1GpuCorpusEnabled() && Fh1ObserveCorpusFrame(observation_frame_sequence_) ? std::chrono::steady_clock::now()
                             : std::chrono::steady_clock::time_point{};
-  if (Fh1GpuCorpusEnabled()) {
+  if (Fh1GpuCorpusEnabled() || Fh1Snr04LiveHandoffEnabled()) {
     ++fh1_scene_draw_sequence_;
   }
 
