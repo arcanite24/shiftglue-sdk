@@ -226,6 +226,10 @@ class TextureCache {
     static constexpr uint32_t kOutdatedBitBase = UINT32_C(1) << 0;
     static constexpr uint32_t kOutdatedBitMips = UINT32_C(1) << 1;
     uint32_t outdated_mask() const { return outdated_mask_.load(std::memory_order_acquire); }
+    uint64_t allocation_id() const { return allocation_id_; }
+    uint64_t payload_generation() const {
+      return payload_generation_.load(std::memory_order_acquire);
+    }
 
     bool base_outdated(const std::unique_lock<std::recursive_mutex>& global_lock) const {
       return base_outdated_;
@@ -261,6 +265,8 @@ class TextureCache {
     TextureCache& texture_cache_;
 
     TextureKey key_;
+    uint64_t allocation_id_;
+    std::atomic<uint64_t> payload_generation_{0};
 
     texture_util::TextureGuestLayout guest_layout_;
 

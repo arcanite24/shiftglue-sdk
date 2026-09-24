@@ -54,6 +54,8 @@ REXCVAR_DEFINE_BOOL(fh1_texture_reload_probe, false, "GPU",
                     "Log FH1 texture invalidation ranges and reload attempts")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+static std::atomic<uint64_t> fh1_texture_allocation_id{1};
+
 REXCVAR_DEFINE_INT32(anisotropic_override, 3, "GPU",
                      "Forces anisotropic filtering for eligible textures.\n"
                      "Higher values keep textures sharper at oblique angles, but increase texture "
@@ -409,12 +411,13 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
     REXGPU_INFO(
         "FH1 texture reload attempt {{\"texture\":{},\"base\":\"{:08X}\",\"mips\":\"{:08X}\","
         "\"width\":{},\"height\":{},\"depth\":{},\"format\":{},\"base_dirty\":{},"
-        "\"mips_dirty\":{},\"base_bytes\":{},\"mips_bytes\":{},\"scaled\":{}}}",
+        "\"mips_dirty\":{},\"base_bytes\":{},\"mips_bytes\":{},\"scaled\":{},"
+        "\"allocation_id\":{},\"payload_generation\":{}}}",
         reinterpret_cast<uintptr_t>(&texture), uint32_t(key.base_page << 12),
         uint32_t(key.mip_page << 12), key.GetWidth(),
         key.GetHeight(), key.GetDepthOrArraySize(), uint32_t(key.format), base_outdated,
         mips_outdated, texture.GetGuestBaseSize(), texture.GetGuestMipsSize(),
-        uint32_t(key.scaled_resolve));
+        uint32_t(key.scaled_resolve), texture.allocation_id(), texture.payload_generation());
   }
   if (TryLoadTextureDataFromCpu(texture, base_outdated, mips_outdated)) {
     texture.CompleteLoad(global_critical_region_.Acquire(), base_outdated, mips_outdated);
@@ -696,6 +699,7 @@ void TextureCache::Texture::LogAction(const char* action) const {
 TextureCache::Texture::Texture(TextureCache& texture_cache, const TextureKey& key, bool track_usage)
     : texture_cache_(texture_cache),
       key_(key),
+      allocation_id_(fh1_texture_allocation_id.fetch_add(1, std::memory_order_relaxed)),
       guest_layout_(key.GetGuestLayout()),
       last_usage_submission_index_(texture_cache.current_submission_index_),
       last_usage_time_(texture_cache.current_submission_time_),
@@ -760,20 +764,27 @@ void TextureCache::Texture::WatchPendingLoad(
 
 void TextureCache::Texture::CompleteLoad(
     const std::unique_lock<std::recursive_mutex>& global_lock, bool load_base, bool load_mips) {
+  bool loaded = false;
   if (load_base && base_watch_handle_) {
     base_outdated_ = false;
     outdated_mask_.fetch_and(~kOutdatedBitBase, std::memory_order_release);
+    loaded = true;
   }
   if (load_mips && mips_watch_handle_) {
     mips_outdated_ = false;
     outdated_mask_.fetch_and(~kOutdatedBitMips, std::memory_order_release);
+    loaded = true;
+  }
+  if (loaded) {
+    payload_generation_.fetch_add(1, std::memory_order_release);
   }
   if (REXCVAR_GET(fh1_texture_reload_probe)) {
     REXGPU_INFO("FH1 texture reload complete {{\"texture\":{},\"base\":\"{:08X}\","
                 "\"mips\":\"{:08X}\",\"load_base\":{},\"load_mips\":{},"
-                "\"outdated\":{}}}",
+                "\"outdated\":{},\"allocation_id\":{},\"payload_generation\":{}}}",
                 reinterpret_cast<uintptr_t>(this), uint32_t(key().base_page << 12),
-                uint32_t(key().mip_page << 12), load_base, load_mips, outdated_mask());
+                uint32_t(key().mip_page << 12), load_base, load_mips, outdated_mask(),
+                allocation_id(), payload_generation());
   }
 }
 
@@ -827,11 +838,12 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
     const TextureKey& key = texture.key();
     REXGPU_INFO(
         "FH1 texture invalidated {{\"texture\":{},\"base\":\"{:08X}\",\"mips\":\"{:08X}\","
-        "\"width\":{},\"height\":{},\"format\":{},\"part\":\"{}\",\"gpu\":{}}}",
+        "\"width\":{},\"height\":{},\"format\":{},\"part\":\"{}\",\"gpu\":{},"
+        "\"allocation_id\":{},\"payload_generation\":{}}}",
         reinterpret_cast<uintptr_t>(&texture), uint32_t(key.base_page << 12),
         uint32_t(key.mip_page << 12), key.GetWidth(),
         key.GetHeight(), uint32_t(key.format), argument ? "mips" : "base",
-        invalidated_by_gpu);
+        invalidated_by_gpu, texture.allocation_id(), texture.payload_generation());
   }
   texture.WatchCallback(global_lock, argument != 0);
   texture.texture_cache().texture_became_outdated_.store(true, std::memory_order_release);
