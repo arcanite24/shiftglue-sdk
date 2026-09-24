@@ -3069,6 +3069,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   static std::unique_ptr<rex::ui::RenderDocAPI> snr04_renderdoc;
   static bool snr04_capture_started = false;
   const uint64_t snr04_source_frame = Fh1Snr03ProbeFrame();
+  const uint64_t snr04_capture_end_frame = snr04_source_frame +
+      (rex::cvar::GetFlagByName(
+           "pinyon_shift_snr03_probe_following_frame") == "true" ? 2 : 1);
   if (snr04_source_frame && observation_frame_sequence_ == snr04_source_frame) {
     snr04_renderdoc = rex::ui::RenderDocAPI::CreateIfConnected();
     if (snr04_renderdoc && !snr04_renderdoc->api_1_0_0()->IsFrameCapturing()) {
@@ -3078,7 +3081,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                   observation_frame_sequence_ + 1, snr04_capture_started);
     }
   } else if (snr04_source_frame &&
-             observation_frame_sequence_ == snr04_source_frame + 1 &&
+             observation_frame_sequence_ == snr04_capture_end_frame &&
              snr04_capture_started) {
     const bool saved = snr04_renderdoc->api_1_0_0()->EndFrameCapture(
         GetD3D12Provider().GetDevice(), nullptr);
