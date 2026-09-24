@@ -88,8 +88,17 @@ static bool Fh1GpuCorpusEnabled() {
   return enabled;
 }
 
+static uint64_t Fh1NativeRaceCaptureStartFrame() {
+  static const int64_t frame = std::strtoll(
+      rex::cvar::GetFlagByName(
+          "pinyon_shift_native_race_capture_start_frame").c_str(),
+      nullptr, 10);
+  return frame > 0 ? uint64_t(frame) : 0;
+}
+
 static bool Fh1Snr04LiveHandoffEnabled() {
   static const bool enabled =
+      Fh1NativeRaceCaptureStartFrame() ||
       rex::cvar::GetFlagByName("pinyon_shift_snr04_live_handoff") == "true";
   return enabled;
 }
@@ -104,16 +113,18 @@ static uint64_t Fh1Snr03ProbeFrame() {
   static const uint64_t frame = std::strtoull(
       rex::cvar::GetFlagByName("pinyon_shift_snr03_probe_frame").c_str(),
       nullptr, 10);
-  return frame;
+  return Fh1NativeRaceCaptureStartFrame()
+      ? Fh1NativeRaceCaptureStartFrame() : frame;
 }
 
 static bool Fh1SnrProbeOutputFrame(uint64_t source_frame,
                                   uint64_t output_frame) {
   static const bool following = rex::cvar::GetFlagByName(
       "pinyon_shift_snr03_probe_following_frame") == "true";
-  static const bool continuous = Fh1Snr04LiveHandoffEnabled() &&
-      rex::cvar::GetFlagByName("pinyon_shift_snr04_live_continuous") == "true" &&
-      rex::cvar::GetFlagByName("pinyon_shift_snr04_live_worker") == "false";
+  static const bool continuous = Fh1NativeRaceCaptureStartFrame() ||
+      (Fh1Snr04LiveHandoffEnabled() &&
+       rex::cvar::GetFlagByName("pinyon_shift_snr04_live_continuous") == "true" &&
+       rex::cvar::GetFlagByName("pinyon_shift_snr04_live_worker") == "false");
   return source_frame &&
       (output_frame == source_frame + 1 ||
           (following && output_frame == source_frame + 2) ||
@@ -128,7 +139,8 @@ static uint64_t Fh1Snr04Bc3RebindFrame() {
 }
 
 static uint64_t Fh1Snr02ItemProbeFrame() {
-  static const uint64_t frame =
+  static const uint64_t frame = Fh1NativeRaceCaptureStartFrame()
+      ? Fh1NativeRaceCaptureStartFrame() :
       rex::cvar::GetFlagByName("pinyon_shift_snr02_item_payload_probe") == "true"
           ? std::strtoull(rex::cvar::GetFlagByName(
                              Fh1Snr04LiveHandoffEnabled()
@@ -141,6 +153,7 @@ static uint64_t Fh1Snr02ItemProbeFrame() {
 
 static bool Fh1Snr02TrackProbeEnabled() {
   static const bool enabled =
+      Fh1NativeRaceCaptureStartFrame() ||
       rex::cvar::GetFlagByName("pinyon_shift_snr02_track_payload_probe") == "true";
   return enabled;
 }
