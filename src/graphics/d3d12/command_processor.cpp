@@ -3529,6 +3529,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (!Fh1ObserveCorpusFrame(observation_frame_sequence_)) {
     prepared_draw_observer = nullptr;
   }
+  if (prepared_draw_observer && Fh1NativeRaceCaptureStartFrame()) {
+    const auto select_frame = graphics_system_->prepared_draw_frame_selector();
+    if (!select_frame || !select_frame(observation_frame_sequence_))
+      prepared_draw_observer = nullptr;
+  }
   system::GraphicsPreparedDrawObservation prepared_observation;
   bool snr02_track_draw = false;
   const auto get_fh1_attachment_state = [&]() {

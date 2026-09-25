@@ -417,6 +417,7 @@ using GraphicsPreparedDrawObserver = void (*)(
     const GraphicsPreparedDrawObservation& observation);
 using GraphicsPreparedDrawSnapshotSelector = bool (*)(
     uint64_t frame_sequence, uint32_t command_buffer_physical_address);
+using GraphicsPreparedDrawFrameSelector = bool (*)(uint64_t frame_sequence);
 
 // Borrowed only during the callback, after the draw's constant buffers have
 // been bound and before the draw command is recorded.
@@ -496,6 +497,10 @@ class IGraphicsSystem {
   }
   virtual void SetPreparedDrawSnapshotSelector(
       GraphicsPreparedDrawSnapshotSelector selector) {
+    (void)selector;
+  }
+  virtual void SetPreparedDrawFrameSelector(
+      GraphicsPreparedDrawFrameSelector selector) {
     (void)selector;
   }
   virtual void SetFinalDrawStateObserver(GraphicsFinalDrawStateObserver observer) {

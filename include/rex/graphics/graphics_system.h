@@ -96,6 +96,13 @@ class GraphicsSystem : public system::IGraphicsSystem {
   system::GraphicsPreparedDrawSnapshotSelector prepared_draw_snapshot_selector() const {
     return prepared_draw_snapshot_selector_.load(std::memory_order_acquire);
   }
+  void SetPreparedDrawFrameSelector(
+      system::GraphicsPreparedDrawFrameSelector selector) override {
+    prepared_draw_frame_selector_.store(selector, std::memory_order_release);
+  }
+  system::GraphicsPreparedDrawFrameSelector prepared_draw_frame_selector() const {
+    return prepared_draw_frame_selector_.load(std::memory_order_acquire);
+  }
   void SetFinalDrawStateObserver(system::GraphicsFinalDrawStateObserver observer) override {
     final_draw_state_observer_.store(observer, std::memory_order_release);
   }
@@ -186,6 +193,8 @@ class GraphicsSystem : public system::IGraphicsSystem {
       nullptr};
   std::atomic<system::GraphicsPreparedDrawSnapshotSelector>
       prepared_draw_snapshot_selector_{nullptr};
+  std::atomic<system::GraphicsPreparedDrawFrameSelector>
+      prepared_draw_frame_selector_{nullptr};
   std::atomic<system::GraphicsFinalDrawStateObserver> final_draw_state_observer_{
       nullptr};
   std::atomic<system::GraphicsIndirectBufferObserver> indirect_buffer_observer_{
