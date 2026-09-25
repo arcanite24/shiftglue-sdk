@@ -4641,7 +4641,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       std::array<uint32_t, 64> system_words;
       std::array<system::GraphicsFinalDrawTextureIdentity, 32> textures;
       uint32_t texture_count = 0;
-      if (snr02_track_draw) {
+      if (snr02_track_draw ||
+          fh1_vertex_hash == 0x5834939992FFC765ull) {
         for (uint32_t fetch = 0; fetch < 32; ++fetch) {
           if (used_texture_mask & (uint32_t(1) << fetch))
             textures[texture_count++] =
