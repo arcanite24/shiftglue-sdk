@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -839,6 +840,16 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   // <Submission where requested, resource>, sorted by the submission number.
   std::deque<std::pair<uint64_t, ID3D12Resource*>> resources_for_deletion_;
+  struct Fh1NativeMaterial {
+    Microsoft::WRL::ComPtr<ID3D12Resource> source, snapshot;
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+  };
+  struct Fh1NativeMaterialFrame {
+    uint64_t bytes = 0;
+    std::map<std::tuple<std::array<uint32_t, 6>, uint64_t, uint64_t>,
+             Fh1NativeMaterial> materials;
+  };
+  std::map<uint64_t, Fh1NativeMaterialFrame> fh1_native_material_frames_;
 
   static constexpr uint32_t kScratchBufferSizeIncrement = 16 * 1024 * 1024;
   ID3D12Resource* scratch_buffer_ = nullptr;

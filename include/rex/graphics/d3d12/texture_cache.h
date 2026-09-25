@@ -130,6 +130,11 @@ class D3D12TextureCache final : public TextureCache {
   uint32_t GetActiveTextureBindlessSRVIndex(const D3D12Shader::TextureBinding& host_shader_binding);
   system::GraphicsFinalDrawTextureIdentity GetActiveNativeTextureIdentity(
       uint32_t fetch_constant) const;
+  bool SnapshotActiveNativeTexture(
+      uint32_t fetch_constant, uint64_t max_bytes,
+      Microsoft::WRL::ComPtr<ID3D12Resource>& source,
+      Microsoft::WRL::ComPtr<ID3D12Resource>& snapshot,
+      D3D12_SHADER_RESOURCE_VIEW_DESC& view, uint64_t& bytes);
   bool CopyFh1Snr04Bc3Mips(
       uint32_t fetch_constant, ID3D12Resource* readback,
       const std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 9>& footprints);

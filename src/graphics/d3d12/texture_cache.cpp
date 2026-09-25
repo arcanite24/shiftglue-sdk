@@ -952,6 +952,64 @@ D3D12TextureCache::GetActiveNativeTextureIdentity(
   return result;
 }
 
+bool D3D12TextureCache::SnapshotActiveNativeTexture(
+    uint32_t fetch_constant, uint64_t max_bytes,
+    Microsoft::WRL::ComPtr<ID3D12Resource>& source,
+    Microsoft::WRL::ComPtr<ID3D12Resource>& snapshot,
+    D3D12_SHADER_RESOURCE_VIEW_DESC& view, uint64_t& bytes) {
+  if (fetch_constant >= 32) return false;
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant);
+  if (!binding || !binding->texture || !binding->key.base_page ||
+      binding->texture->outdated_mask() ||
+      binding->key.dimension != xenos::DataDimension::k2DOrStacked)
+    return false;
+  auto* texture = static_cast<D3D12Texture*>(binding->texture);
+  ID3D12Resource* resource = texture->resource();
+  const DXGI_FORMAT view_format = GetDXGIUnormFormat(binding->key);
+  if (!resource || view_format == DXGI_FORMAT_UNKNOWN) return false;
+  const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+  if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+      desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1)
+    return false;
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  const uint64_t size = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+  if (size > max_bytes) return false;
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE,
+          &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+          IID_PPV_ARGS(&snapshot))))
+    return false;
+  source = resource;
+  const auto fetch = register_file().GetTextureFetch(fetch_constant);
+  view = {};
+  view.Format = view_format;
+  view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  view.Shader4ComponentMapping =
+      GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding->key)) |
+      D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
+  view.Texture2D.MipLevels = 1;
+
+  command_processor_.SubmitBarriers();
+  const D3D12_RESOURCE_STATES old_state =
+      texture->SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE);
+  if (!(old_state & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)) {
+    texture->SetResourceState(old_state);
+    return false;
+  }
+  command_processor_.PushTransitionBarrier(
+      resource, old_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.SubmitBarriers();
+  command_processor_.GetDeferredCommandList().D3DCopyResource(snapshot.Get(), resource);
+  command_processor_.PushTransitionBarrier(
+      resource, texture->SetResourceState(old_state), old_state);
+  command_processor_.PushTransitionBarrier(
+      snapshot.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+  command_processor_.SubmitBarriers();
+  bytes = size;
+  return true;
+}
+
 bool D3D12TextureCache::CopyFh1Snr04Bc3Mips(
     uint32_t fetch_constant, ID3D12Resource* readback,
     const std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 9>& footprints) {

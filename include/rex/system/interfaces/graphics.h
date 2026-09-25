@@ -55,10 +55,11 @@ using NativeGuestOutputShader = bool (*)(
     const uint8_t** bytecode, size_t* bytecode_size);
 // D3D12 only. The view output is a D3D12_SHADER_RESOURCE_VIEW_DESC; the
 // resource is borrowed until the callback returns unless retained by caller.
+// immutable is true when the resource is a pinned source-draw version.
 using NativeGuestOutputTexture = bool (*)(
     const NativeGuestOutputRenderContext& context, const uint32_t fetch[6],
     uint64_t allocation_id, uint64_t payload_generation,
-    void** resource, void* view);
+    void** resource, void* view, bool* immutable);
 
 struct NativeGuestOutputRenderContext {
   NativeGuestOutputBackend backend = NativeGuestOutputBackend::kUnsupported;

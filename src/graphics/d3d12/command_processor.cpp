@@ -2899,6 +2899,24 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           native_context.completed_submission = submission_completed_;
           native_context.frame_sequence = observation_frame_sequence_ - 1;
           native_context.clear_color = &ClearNativeGuestOutput;
+          for (auto it = fh1_native_material_frames_.begin();
+               it != fh1_native_material_frames_.end() &&
+               it->first < native_context.frame_sequence;) {
+            for (auto& item : it->second.materials) {
+              auto& material = item.second;
+              if (material.source) {
+                resources_for_deletion_.emplace_back(submission_current_,
+                                                     material.source.Get());
+                material.source.Detach();
+              }
+              if (material.snapshot) {
+                resources_for_deletion_.emplace_back(submission_current_,
+                                                     material.snapshot.Get());
+                material.snapshot.Detach();
+              }
+            }
+            it = fh1_native_material_frames_.erase(it);
+          }
           native_context.shader = +[](
               const system::NativeGuestOutputRenderContext& context,
               uint32_t stage, uint64_t guest_hash, uint64_t modification,
@@ -2918,12 +2936,39 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           native_context.texture = +[](
               const system::NativeGuestOutputRenderContext& context,
               const uint32_t fetch_words[6], uint64_t allocation_id,
-              uint64_t payload_generation, void** resource, void* view) {
+              uint64_t payload_generation, void** resource, void* view,
+              bool* immutable) {
             if (!context.command_context || !fetch_words || !resource || !view ||
+                !immutable ||
                 !allocation_id || !payload_generation) return false;
+            *immutable = false;
             auto* processor = static_cast<D3D12CommandProcessor*>(
                 context.command_context);
             if (!processor->texture_cache_) return false;
+            std::array<uint32_t, 6> words;
+            std::copy_n(fetch_words, words.size(), words.begin());
+            if (const auto frame = processor->fh1_native_material_frames_.find(
+                    context.frame_sequence);
+                frame != processor->fh1_native_material_frames_.end()) {
+              const auto found = frame->second.materials.find(
+                  {words, allocation_id, payload_generation});
+              if (found != frame->second.materials.end() &&
+                  found->second.snapshot) {
+                static thread_local bool reported_pinned_material = false;
+                if (!reported_pinned_material) {
+                  REXGPU_INFO("FH1 native source-pinned material frame={} "
+                              "allocation={} generation={}",
+                              context.frame_sequence, allocation_id,
+                              payload_generation);
+                  reported_pinned_material = true;
+                }
+                *resource = found->second.snapshot.Get();
+                *static_cast<D3D12_SHADER_RESOURCE_VIEW_DESC*>(view) =
+                    found->second.view;
+                *immutable = true;
+                return true;
+              }
+            }
             xenos::xe_gpu_texture_fetch_t fetch;
             static_assert(sizeof(fetch) == 6 * sizeof(uint32_t));
             std::memcpy(&fetch, fetch_words, sizeof(fetch));
@@ -4644,6 +4689,40 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // Update constant buffers, descriptors and root parameters.
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used, geometry_address, terrain_addresses)) {
     return finish_draw(false);
+  }
+  const bool fh1_sampled_native_material =
+      (snr02_track_draw &&
+       ((fh1_vertex_hash == 0x07425D208E8BD688ull &&
+         fh1_pixel_hash == 0x6F7CDE74CDACCB08ull &&
+         vertex_shader_modification.value == 0x7Full) ||
+        (fh1_vertex_hash == 0x1193B16753866698ull &&
+         fh1_pixel_hash == 0x93961AB9BDF347DDull &&
+         vertex_shader_modification.value == 0x3FFull))) ||
+      (fh1_vertex_hash == 0x5834939992FFC765ull &&
+       pixel_shader_modification.value == 0x1A001Full);
+  if (fh1_native_race_requested.load(std::memory_order_acquire) &&
+      prepared_draw_observer && fh1_sampled_native_material &&
+      (used_texture_mask & 1) && observation_frame_sequence_ > 1) {
+    const auto identity = texture_cache_->GetActiveNativeTextureIdentity(0);
+    if (identity.allocation_id && identity.payload_generation &&
+        !identity.outdated_mask) {
+      std::array<uint32_t, 6> fetch_words;
+      std::copy_n(identity.fetch_words, fetch_words.size(), fetch_words.begin());
+      auto& frame = fh1_native_material_frames_[observation_frame_sequence_ - 1];
+      const auto key = std::tuple{fetch_words, identity.allocation_id,
+                                  identity.payload_generation};
+      if (!frame.materials.contains(key) && frame.materials.size() < 128 &&
+          frame.bytes < 64 * 1024 * 1024) {
+        auto it = frame.materials.try_emplace(key).first;
+        uint64_t bytes = 0;
+        if (texture_cache_->SnapshotActiveNativeTexture(
+                0, 64 * 1024 * 1024 - frame.bytes,
+                it->second.source, it->second.snapshot, it->second.view, bytes))
+          frame.bytes += bytes;
+        else
+          frame.materials.erase(it);
+      }
+    }
   }
   if ((!Fh1NativeRaceCaptureStartFrame() || prepared_draw_observer) &&
       (snr02_track_draw ||
