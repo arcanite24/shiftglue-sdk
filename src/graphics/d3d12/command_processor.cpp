@@ -3670,30 +3670,32 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       const uint32_t color =
           regs[reg::RB_COLOR_INFO::rt_register_indices[0]];
       if (fh1_ui_boundary_frame_ != observation_frame_sequence_ &&
-          fh1_ui_previous_color_ == 0x00020000 && color == 0x000A0000 &&
+          color == 0x000A0000 &&
           regs.Get<reg::RB_SURFACE_INFO>().value == 0x14000500) {
         fh1_ui_boundary_frame_ = observation_frame_sequence_;
-        if (auto renderer = graphics_system_->native_guest_output_renderer().Get()) {
-          system::NativeGuestOutputRenderContext context;
-          context.backend = system::NativeGuestOutputBackend::kD3D12;
-          context.phase = system::NativeGuestOutputPhase::kBeforeUi;
-          context.frame_sequence = observation_frame_sequence_ - 1;
-          context.device = device;
-          context.command_context = this;
-          context.deferred_command_list = &deferred_command_list_;
-          context.guest_output =
-              render_target_cache_->GetFh1UiOutputTarget();
-          context.guest_output_width = 1280;
-          context.guest_output_height = 720;
-          context.guest_output_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
-          context.submission = submission_current_;
-          context.completed_submission = submission_completed_;
-          context.clear_color = &ClearNativeGuestUiOutput;
-          ConfigureFh1NativeContext(context);
-          const bool injected = renderer(context);
-          RestoreFh1AfterNativeUi();
-          if (injected) {
-            fh1_ui_injected_frame_ = context.frame_sequence;
+        if (fh1_ui_previous_color_ == 0x00020000) {
+          if (auto renderer = graphics_system_->native_guest_output_renderer().Get()) {
+            system::NativeGuestOutputRenderContext context;
+            context.backend = system::NativeGuestOutputBackend::kD3D12;
+            context.phase = system::NativeGuestOutputPhase::kBeforeUi;
+            context.frame_sequence = observation_frame_sequence_ - 1;
+            context.device = device;
+            context.command_context = this;
+            context.deferred_command_list = &deferred_command_list_;
+            context.guest_output =
+                render_target_cache_->GetFh1UiOutputTarget();
+            context.guest_output_width = 1280;
+            context.guest_output_height = 720;
+            context.guest_output_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            context.submission = submission_current_;
+            context.completed_submission = submission_completed_;
+            context.clear_color = &ClearNativeGuestUiOutput;
+            ConfigureFh1NativeContext(context);
+            const bool injected = renderer(context);
+            RestoreFh1AfterNativeUi();
+            if (injected) {
+              fh1_ui_injected_frame_ = context.frame_sequence;
+            }
           }
         }
       }
