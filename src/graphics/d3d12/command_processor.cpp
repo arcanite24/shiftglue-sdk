@@ -2995,7 +2995,15 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             *static_cast<D3D12_SHADER_RESOURCE_VIEW_DESC*>(view) = descriptor;
             return true;
           };
-          if (renderer(native_context)) {
+          const auto native_output_begin = Fh1NativeRaceCaptureStartFrame()
+              ? std::chrono::steady_clock::now()
+              : std::chrono::steady_clock::time_point{};
+          const bool native_output_ready = renderer(native_context);
+          if (native_output_begin != std::chrono::steady_clock::time_point{})
+            PERF_counter_add(kFh1NativeOutputCpuTimeNs,
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - native_output_begin).count());
+          if (native_output_ready) {
             context.SetIs8bpc(false);
             SubmitBarriers();
             native_context.phase = system::NativeGuestOutputPhase::kPresented;
@@ -4755,9 +4763,19 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           frame.bytes < 64 * 1024 * 1024) {
         auto it = frame.materials.try_emplace(key).first;
         uint64_t bytes = 0;
-        if (texture_cache_->SnapshotActiveNativeTexture(
+        const auto snapshot_begin = time_fh1_draw
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+        const bool snapshot_ready = texture_cache_->SnapshotActiveNativeTexture(
                 0, 64 * 1024 * 1024 - frame.bytes,
-                it->second.source, it->second.snapshot, it->second.view, bytes))
+                it->second.source, it->second.snapshot, it->second.view, bytes);
+        if (time_fh1_draw) {
+          PERF_counter_add(kFh1MaterialSnapshotCpuTimeNs,
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - snapshot_begin).count());
+          PERF_counter_inc(kFh1MaterialSnapshotCalls);
+        }
+        if (snapshot_ready)
           frame.bytes += bytes;
         else
           frame.materials.erase(it);

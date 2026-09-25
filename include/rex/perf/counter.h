@@ -119,6 +119,9 @@ enum class CounterId : uint16_t {
   kFh1PreparedObserverCpuTimeNs,
   kFh1BindingCpuTimeNs,
   kFh1IssueDrawCalls,
+  kFh1MaterialSnapshotCpuTimeNs,
+  kFh1MaterialSnapshotCalls,
+  kFh1NativeOutputCpuTimeNs,
 
   kCount  // sentinel -- must be last
 };

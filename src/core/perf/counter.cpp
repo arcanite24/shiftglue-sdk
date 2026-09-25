@@ -145,6 +145,9 @@ constexpr const char* kCounterNames[] = {
     "fh1_prepared_observer_cpu_time_ns",
     "fh1_binding_cpu_time_ns",
     "fh1_issue_draw_calls",
+    "fh1_material_snapshot_cpu_time_ns",
+    "fh1_material_snapshot_calls",
+    "fh1_native_output_cpu_time_ns",
 };
 static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
 
@@ -226,6 +229,9 @@ constexpr bool kIsGauge[] = {
     false,  // kFh1PreparedObserverCpuTimeNs
     false,  // kFh1BindingCpuTimeNs
     false,  // kFh1IssueDrawCalls
+    false,  // kFh1MaterialSnapshotCpuTimeNs
+    false,  // kFh1MaterialSnapshotCalls
+    false,  // kFh1NativeOutputCpuTimeNs
 };
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 
