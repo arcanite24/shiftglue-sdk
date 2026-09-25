@@ -49,6 +49,9 @@ REXCVAR_DEFINE_BOOL(fh1_post_chain_probe, false, "GPU/D3D12",
 REXCVAR_DEFINE_BOOL(fh1_mip_decode_probe, false, "GPU/D3D12",
                     "Measure reflection mip contract and packet replay CPU time")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_native_ui_boundary_probe, false, "GPU/D3D12",
+                    "Assemble the native race scene before guest UI draws")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(fh1_native_reflection_mips, true, "GPU/D3D12",
                     "Use experimental native reflection mips at symmetric 1x/2x; "
@@ -3620,6 +3623,32 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             bound_depth_and_color_render_target_formats);
   } else {
     bound_depth_and_color_render_target_bits = 0;
+  }
+  if (REXCVAR_GET(fh1_native_ui_boundary_probe) &&
+      Fh1NativeRaceCaptureStartFrame() <= observation_frame_sequence_ &&
+      fh1_native_race_requested.load(std::memory_order_acquire)) {
+    if (fh1_ui_last_frame_ != observation_frame_sequence_) {
+      fh1_ui_last_frame_ = observation_frame_sequence_;
+      fh1_ui_previous_color_ = 0;
+    }
+    if (bound_depth_and_color_render_target_bits == 2) {
+      const uint32_t color =
+          regs[reg::RB_COLOR_INFO::rt_register_indices[0]];
+      if (fh1_ui_boundary_frame_ != observation_frame_sequence_ &&
+          fh1_ui_previous_color_ == 0x00020000 && color == 0x000A0000 &&
+          regs.Get<reg::RB_SURFACE_INFO>().value == 0x14000500) {
+        fh1_ui_boundary_frame_ = observation_frame_sequence_;
+        if (auto renderer = graphics_system_->native_guest_output_renderer().Get()) {
+          system::NativeGuestOutputRenderContext context;
+          context.backend = system::NativeGuestOutputBackend::kD3D12;
+          context.phase = system::NativeGuestOutputPhase::kBeforeUi;
+          context.frame_sequence = observation_frame_sequence_;
+          context.device = device;
+          renderer(context);
+        }
+      }
+      fh1_ui_previous_color_ = color;
+    }
   }
   void* pipeline_handle = nullptr;
   ID3D12RootSignature* root_signature = nullptr;

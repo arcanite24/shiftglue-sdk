@@ -725,6 +725,9 @@ class D3D12CommandProcessor : public CommandProcessor {
       DXGI_FORMAT_UNKNOWN;
   uint64_t fh1_velocity_dilate_native_draws_ = 0;
   uint64_t fh1_scene_draw_sequence_ = 0;
+  uint64_t fh1_ui_boundary_frame_ = 0;
+  uint64_t fh1_ui_last_frame_ = 0;
+  uint32_t fh1_ui_previous_color_ = 0;
   uint64_t fh1_scene_followup_sequence_ = 0;
   uint32_t fh1_scene_binding_records_ = 0;
   std::unordered_set<uint64_t> fh1_scene_command_snapshots_;

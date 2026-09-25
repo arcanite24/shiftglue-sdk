@@ -45,6 +45,9 @@ enum class NativeGuestOutputBackend : uint32_t {
 enum class NativeGuestOutputPhase : uint32_t {
   kNativeAttempt = 0,
   kPresented = 1,
+  // Notification before the first validated guest UI draw; no output target
+  // is exposed and the callback must not record GPU commands.
+  kBeforeUi = 2,
 };
 
 using NativeGuestOutputClearColor = bool (*)(
