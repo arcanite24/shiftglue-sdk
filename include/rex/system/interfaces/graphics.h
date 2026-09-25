@@ -53,6 +53,12 @@ using NativeGuestOutputShader = bool (*)(
     const NativeGuestOutputRenderContext& context, uint32_t stage,
     uint64_t guest_hash, uint64_t modification,
     const uint8_t** bytecode, size_t* bytecode_size);
+// D3D12 only. The view output is a D3D12_SHADER_RESOURCE_VIEW_DESC; the
+// resource is borrowed until the callback returns unless retained by caller.
+using NativeGuestOutputTexture = bool (*)(
+    const NativeGuestOutputRenderContext& context, const uint32_t fetch[6],
+    uint64_t allocation_id, uint64_t payload_generation,
+    void** resource, void* view);
 
 struct NativeGuestOutputRenderContext {
   NativeGuestOutputBackend backend = NativeGuestOutputBackend::kUnsupported;
@@ -78,6 +84,7 @@ struct NativeGuestOutputRenderContext {
   NativeGuestOutputClearColor clear_color = nullptr;
   // Valid only during kNativeAttempt; stage 0 is vertex, 1 is pixel.
   NativeGuestOutputShader shader = nullptr;
+  NativeGuestOutputTexture texture = nullptr;
 };
 
 // Returning false yields without modifying guest output. A callback that has
@@ -348,6 +355,14 @@ struct GraphicsPreparedDrawTextureFetch {
   uint32_t stack_depth = 0;
 };
 
+struct GraphicsFinalDrawTextureIdentity {
+  uint32_t fetch_constant = 0;
+  uint32_t fetch_words[6] = {};
+  uint64_t allocation_id = 0;
+  uint64_t payload_generation = 0;
+  uint32_t outdated_mask = 0;
+};
+
 struct GraphicsPreparedDrawObservation {
   GraphicsFh1ExecutionKey fh1_execution_key;
   GraphicsFh1ExecutionMode fh1_execution_mode =
@@ -441,6 +456,9 @@ struct GraphicsFinalDrawStateObservation {
   // Borrowed until the observer returns: 48 packed fetch constants (192 words).
   const uint32_t* fetch_constant_words = nullptr;
   uint32_t fetch_constant_word_count = 0;
+  // Borrowed until the observer returns, after texture bindings are prepared.
+  const GraphicsFinalDrawTextureIdentity* textures = nullptr;
+  uint32_t texture_count = 0;
 };
 using GraphicsFinalDrawStateObserver = void (*)(
     const GraphicsFinalDrawStateObservation& observation);

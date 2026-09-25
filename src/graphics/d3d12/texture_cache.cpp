@@ -934,6 +934,24 @@ void D3D12TextureCache::WriteActiveTextureBindfulSRV(
   }
 }
 
+system::GraphicsFinalDrawTextureIdentity
+D3D12TextureCache::GetActiveNativeTextureIdentity(
+    uint32_t fetch_constant) const {
+  system::GraphicsFinalDrawTextureIdentity result;
+  result.fetch_constant = fetch_constant;
+  if (fetch_constant >= 32) return result;
+  const auto fetch = register_file().GetTextureFetch(fetch_constant);
+  static_assert(sizeof(fetch) == sizeof(result.fetch_words));
+  std::memcpy(result.fetch_words, &fetch, sizeof(fetch));
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant);
+  if (!binding || !binding->texture) return result;
+  const Texture* texture = binding->texture;
+  result.allocation_id = texture->allocation_id();
+  result.payload_generation = texture->payload_generation();
+  result.outdated_mask = texture->outdated_mask();
+  return result;
+}
+
 bool D3D12TextureCache::CopyFh1Snr04Bc3Mips(
     uint32_t fetch_constant, ID3D12Resource* readback,
     const std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 9>& footprints) {
@@ -1589,7 +1607,9 @@ ID3D12Resource* D3D12TextureCache::RequestSwapTexture(D3D12_SHADER_RESOURCE_VIEW
                                                       uint32_t* height_unscaled_out,
                                                       D3D12_RESOURCE_STATES state,
                                                       const xenos::xe_gpu_texture_fetch_t*
-                                                          fetch_override) {
+                                                          fetch_override,
+                                                      system::GraphicsFinalDrawTextureIdentity*
+                                                          identity_out) {
   const auto& regs = register_file();
   xenos::xe_gpu_texture_fetch_t fetch =
       fetch_override ? *fetch_override : regs.GetTextureFetch(0);
@@ -1603,6 +1623,11 @@ ID3D12Resource* D3D12TextureCache::RequestSwapTexture(D3D12_SHADER_RESOURCE_VIEW
     return nullptr;
   }
   texture->MarkAsUsed();
+  if (identity_out) {
+    identity_out->allocation_id = texture->allocation_id();
+    identity_out->payload_generation = texture->payload_generation();
+    identity_out->outdated_mask = texture->outdated_mask();
+  }
   // The swap texture is likely to be used only for the presentation compute
   // shader, and not during emulation, where it'd be NON_PIXEL_SHADER_RESOURCE |
   // PIXEL_SHADER_RESOURCE.

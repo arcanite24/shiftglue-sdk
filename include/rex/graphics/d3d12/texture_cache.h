@@ -128,6 +128,8 @@ class D3D12TextureCache final : public TextureCache {
   void WriteActiveTextureBindfulSRV(const D3D12Shader::TextureBinding& host_shader_binding,
                                     D3D12_CPU_DESCRIPTOR_HANDLE handle);
   uint32_t GetActiveTextureBindlessSRVIndex(const D3D12Shader::TextureBinding& host_shader_binding);
+  system::GraphicsFinalDrawTextureIdentity GetActiveNativeTextureIdentity(
+      uint32_t fetch_constant) const;
   bool CopyFh1Snr04Bc3Mips(
       uint32_t fetch_constant, ID3D12Resource* readback,
       const std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 9>& footprints);
@@ -183,7 +185,9 @@ class D3D12TextureCache final : public TextureCache {
                                      D3D12_RESOURCE_STATES state =
                                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                      const xenos::xe_gpu_texture_fetch_t*
-                                         fetch_override = nullptr);
+                                         fetch_override = nullptr,
+                                     system::GraphicsFinalDrawTextureIdentity*
+                                         identity_out = nullptr);
 
  protected:
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;

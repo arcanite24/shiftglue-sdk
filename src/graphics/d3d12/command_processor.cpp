@@ -2901,12 +2901,48 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             *bytecode_size = entry->bytecode.size();
             return true;
           };
+          native_context.texture = +[](
+              const system::NativeGuestOutputRenderContext& context,
+              const uint32_t fetch_words[6], uint64_t allocation_id,
+              uint64_t payload_generation, void** resource, void* view) {
+            if (!context.command_context || !fetch_words || !resource || !view ||
+                !allocation_id || !payload_generation) return false;
+            auto* processor = static_cast<D3D12CommandProcessor*>(
+                context.command_context);
+            if (!processor->texture_cache_) return false;
+            xenos::xe_gpu_texture_fetch_t fetch;
+            static_assert(sizeof(fetch) == 6 * sizeof(uint32_t));
+            std::memcpy(&fetch, fetch_words, sizeof(fetch));
+            D3D12_SHADER_RESOURCE_VIEW_DESC descriptor{};
+            xenos::TextureFormat format;
+            system::GraphicsFinalDrawTextureIdentity identity;
+            ID3D12Resource* texture = processor->texture_cache_->RequestSwapTexture(
+                descriptor, format, nullptr, nullptr,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &fetch, &identity);
+            processor->SubmitBarriers();
+            if (!texture || identity.allocation_id != allocation_id ||
+                identity.payload_generation != payload_generation ||
+                identity.outdated_mask ||
+                texture->GetDesc().DepthOrArraySize != 1) {
+              REXGPU_INFO("FH1 native texture rejected frame={} expected={}:{} "
+                          "actual={}:{} dirty={} resource={}",
+                          context.frame_sequence, allocation_id,
+                          payload_generation, identity.allocation_id,
+                          identity.payload_generation, identity.outdated_mask,
+                          bool(texture));
+              return false;
+            }
+            *resource = texture;
+            *static_cast<D3D12_SHADER_RESOURCE_VIEW_DESC*>(view) = descriptor;
+            return true;
+          };
           if (renderer(native_context)) {
             context.SetIs8bpc(false);
             SubmitBarriers();
             native_context.phase = system::NativeGuestOutputPhase::kPresented;
             native_context.clear_color = nullptr;
             native_context.shader = nullptr;
+            native_context.texture = nullptr;
             native_context.deferred_command_list = nullptr;
             renderer(native_context);
             SubmitBarriers();
@@ -4603,6 +4639,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
        Fh1Snr02ItemShader(fh1_vertex_hash))) {
     if (auto observer = graphics_system_->final_draw_state_observer()) {
       std::array<uint32_t, 64> system_words;
+      std::array<system::GraphicsFinalDrawTextureIdentity, 32> textures;
+      uint32_t texture_count = 0;
+      if (snr02_track_draw) {
+        for (uint32_t fetch = 0; fetch < 32; ++fetch) {
+          if (used_texture_mask & (uint32_t(1) << fetch))
+            textures[texture_count++] =
+                texture_cache_->GetActiveNativeTextureIdentity(fetch);
+        }
+      }
       const std::array<float, 6> viewport{
           ff_viewport_.TopLeftX, ff_viewport_.TopLeftY,
           ff_viewport_.Width, ff_viewport_.Height,
@@ -4624,7 +4669,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                 regs.Get<reg::PA_CL_CLIP_CNTL>().value,
                 normalized_depth_control.value,
                 viewport.data(), scissor.data(),
-                regs.values + XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0, 192});
+                regs.values + XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0, 192,
+                textures.data(), texture_count});
     }
   }
 
