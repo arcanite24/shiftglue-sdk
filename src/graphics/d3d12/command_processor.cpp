@@ -4737,6 +4737,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   const bool fh1_car_presentation_material =
       fh1_vertex_hash == 0x0DF9CA19A93A75D9ull &&
       fh1_pixel_hash == 0xE349204378CA1591ull;
+  const bool fh1_car_body_material =
+      fh1_vertex_hash == 0xD34A83D9E6B3A399ull &&
+      fh1_pixel_hash == 0xE9CD565D9C61D037ull &&
+      vertex_shader_modification.value == 0x3Full &&
+      pixel_shader_modification.value == 0x16003Full;
   const bool fh1_sampled_native_material =
       (snr02_track_draw &&
        ((fh1_vertex_hash == 0x07425D208E8BD688ull &&
@@ -4747,11 +4752,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
          vertex_shader_modification.value == 0x3FFull))) ||
       (fh1_vertex_hash == 0x5834939992FFC765ull &&
        pixel_shader_modification.value == 0x1A001Full) ||
-      fh1_car_presentation_material;
+      fh1_car_presentation_material || fh1_car_body_material;
   if (fh1_native_race_requested.load(std::memory_order_acquire) &&
       prepared_draw_observer && fh1_sampled_native_material &&
-      (used_texture_mask & 1) && observation_frame_sequence_ > 1) {
-    const auto identity = texture_cache_->GetActiveNativeTextureIdentity(0);
+      (used_texture_mask & (fh1_car_body_material ? 2u : 1u)) &&
+      observation_frame_sequence_ > 1) {
+    const uint32_t material_fetch = fh1_car_body_material ? 1u : 0u;
+    const auto identity = texture_cache_->GetActiveNativeTextureIdentity(material_fetch);
     if (identity.allocation_id && identity.payload_generation &&
         !identity.outdated_mask) {
       std::array<uint32_t, 6> fetch_words;
@@ -4767,7 +4774,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
         const bool snapshot_ready = texture_cache_->SnapshotActiveNativeTexture(
-                0, 64 * 1024 * 1024 - frame.bytes,
+                material_fetch, 64 * 1024 * 1024 - frame.bytes,
                 it->second.source, it->second.snapshot, it->second.view, bytes);
         if (time_fh1_draw) {
           PERF_counter_add(kFh1MaterialSnapshotCpuTimeNs,
@@ -4795,7 +4802,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       uint32_t texture_count = 0;
       if (snr02_track_draw ||
           fh1_vertex_hash == 0x5834939992FFC765ull ||
-          fh1_car_presentation_material) {
+          fh1_car_presentation_material || fh1_car_body_material) {
         for (uint32_t fetch = 0; fetch < 32; ++fetch) {
           if ((used_texture_mask & (uint32_t(1) << fetch)) &&
               (!fh1_car_presentation_material || !fetch))
