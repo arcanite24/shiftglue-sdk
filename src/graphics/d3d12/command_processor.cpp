@@ -20,6 +20,8 @@
 #include <sstream>
 #include <utility>
 
+#include <xxhash.h>
+
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
@@ -94,6 +96,15 @@ static uint64_t Fh1NativeRaceCaptureStartFrame() {
           "pinyon_shift_native_race_capture_start_frame").c_str(),
       nullptr, 10);
   return frame > 0 ? uint64_t(frame) : 0;
+}
+
+static uint64_t Fh1SnapshotHash(const std::vector<uint8_t>& bytes) {
+  if (Fh1NativeRaceCaptureStartFrame()) {
+    return XXH3_64bits(bytes.data(), bytes.size());
+  }
+  uint64_t hash = 14695981039346656037ull;
+  for (uint8_t byte : bytes) hash = (hash ^ byte) * 1099511628211ull;
+  return hash;
 }
 
 static bool Fh1Snr04LiveHandoffEnabled() {
@@ -3885,10 +3896,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             status = 2;
           } else {
             status = 1;
-            hash = 14695981039346656037ull;
-            for (uint8_t byte : bytes) {
-              hash = (hash ^ byte) * 1099511628211ull;
-            }
+            hash = Fh1SnapshotHash(bytes);
           }
         }
       };
@@ -3977,11 +3985,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                 if (shared_memory_->CopyCpuSnapshot(observed.guest_base, bytes)) {
                   observed.cpu_snapshot_status = 1;
                   observed.cpu_snapshot_bytes = bytes.data();
-                  uint64_t hash = 14695981039346656037ull;
-                  for (uint8_t byte : bytes) {
-                    hash = (hash ^ byte) * 1099511628211ull;
-                  }
-                  observed.cpu_snapshot_hash = hash;
+                  observed.cpu_snapshot_hash = Fh1SnapshotHash(bytes);
                 } else {
                   observed.cpu_snapshot_status = 2;
                 }
