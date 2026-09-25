@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -90,12 +91,26 @@ static bool Fh1GpuCorpusEnabled() {
   return enabled;
 }
 
+static std::atomic_bool fh1_native_race_requested{false};
+
 static uint64_t Fh1NativeRaceCaptureStartFrame() {
-  static const int64_t frame = std::strtoll(
+  static const bool callback_registered = [] {
+    fh1_native_race_requested.store(
+        rex::cvar::GetFlagByName("pinyon_shift_native_race") == "true",
+        std::memory_order_release);
+    rex::cvar::RegisterChangeCallback(
+        "pinyon_shift_native_race", [](std::string_view, std::string_view value) {
+          fh1_native_race_requested.store(value == "true", std::memory_order_release);
+        });
+    return true;
+  }();
+  (void)callback_registered;
+  static const int64_t configured_frame = std::strtoll(
       rex::cvar::GetFlagByName(
           "pinyon_shift_native_race_capture_start_frame").c_str(),
       nullptr, 10);
-  return frame > 0 ? uint64_t(frame) : 0;
+  return configured_frame > 0 ? uint64_t(configured_frame)
+      : fh1_native_race_requested.load(std::memory_order_acquire) ? 1 : 0;
 }
 
 static uint64_t Fh1SnapshotHash(const std::vector<uint8_t>& bytes) {
@@ -108,10 +123,9 @@ static uint64_t Fh1SnapshotHash(const std::vector<uint8_t>& bytes) {
 }
 
 static bool Fh1Snr04LiveHandoffEnabled() {
-  static const bool enabled =
-      Fh1NativeRaceCaptureStartFrame() ||
+  static const bool diagnostic =
       rex::cvar::GetFlagByName("pinyon_shift_snr04_live_handoff") == "true";
-  return enabled;
+  return Fh1NativeRaceCaptureStartFrame() || diagnostic;
 }
 
 static bool Fh1SceneDumpEnabled() {
@@ -121,11 +135,11 @@ static bool Fh1SceneDumpEnabled() {
 }
 
 static uint64_t Fh1Snr03ProbeFrame() {
-  static const uint64_t frame = std::strtoull(
+  static const uint64_t diagnostic = std::strtoull(
       rex::cvar::GetFlagByName("pinyon_shift_snr03_probe_frame").c_str(),
       nullptr, 10);
-  return Fh1NativeRaceCaptureStartFrame()
-      ? Fh1NativeRaceCaptureStartFrame() : frame;
+  const uint64_t native = Fh1NativeRaceCaptureStartFrame();
+  return native ? native : diagnostic;
 }
 
 static uint64_t Fh1Snr04RenderDocFrame(uint64_t current_frame) {
@@ -146,10 +160,11 @@ static bool Fh1SnrProbeOutputFrame(uint64_t source_frame,
                                   uint64_t output_frame) {
   static const bool following = rex::cvar::GetFlagByName(
       "pinyon_shift_snr03_probe_following_frame") == "true";
-  static const bool continuous = Fh1NativeRaceCaptureStartFrame() ||
-      (Fh1Snr04LiveHandoffEnabled() &&
+  static const bool diagnostic_continuous =
+      rex::cvar::GetFlagByName("pinyon_shift_snr04_live_handoff") == "true" &&
        rex::cvar::GetFlagByName("pinyon_shift_snr04_live_continuous") == "true" &&
-       rex::cvar::GetFlagByName("pinyon_shift_snr04_live_worker") == "false");
+       rex::cvar::GetFlagByName("pinyon_shift_snr04_live_worker") == "false";
+  const bool continuous = Fh1NativeRaceCaptureStartFrame() || diagnostic_continuous;
   return source_frame &&
       (output_frame == source_frame + 1 ||
           (following && output_frame == source_frame + 2) ||
@@ -164,23 +179,22 @@ static uint64_t Fh1Snr04Bc3RebindFrame() {
 }
 
 static uint64_t Fh1Snr02ItemProbeFrame() {
-  static const uint64_t frame = Fh1NativeRaceCaptureStartFrame()
-      ? Fh1NativeRaceCaptureStartFrame() :
+  static const uint64_t diagnostic =
       rex::cvar::GetFlagByName("pinyon_shift_snr02_item_payload_probe") == "true"
           ? std::strtoull(rex::cvar::GetFlagByName(
-                             Fh1Snr04LiveHandoffEnabled()
+                             rex::cvar::GetFlagByName("pinyon_shift_snr04_live_handoff") == "true"
                                  ? "pinyon_shift_snr04_live_source_frame"
                                  : "pinyon_shift_snr01_trace_source_frame").c_str(),
                          nullptr, 10)
           : 0;
-  return frame;
+  const uint64_t native = Fh1NativeRaceCaptureStartFrame();
+  return native ? native : diagnostic;
 }
 
 static bool Fh1Snr02TrackProbeEnabled() {
-  static const bool enabled =
-      Fh1NativeRaceCaptureStartFrame() ||
+  static const bool diagnostic =
       rex::cvar::GetFlagByName("pinyon_shift_snr02_track_payload_probe") == "true";
-  return enabled;
+  return Fh1NativeRaceCaptureStartFrame() || diagnostic;
 }
 
 static bool Fh1Snr02ItemShader(uint64_t hash) {
@@ -3565,9 +3579,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (!Fh1ObserveCorpusFrame(observation_frame_sequence_)) {
     prepared_draw_observer = nullptr;
   }
-  if (prepared_draw_observer && Fh1NativeRaceCaptureStartFrame()) {
+  if (prepared_draw_observer) {
     const auto select_frame = graphics_system_->prepared_draw_frame_selector();
-    if (!select_frame || !select_frame(observation_frame_sequence_))
+    if (select_frame && !select_frame(observation_frame_sequence_))
       prepared_draw_observer = nullptr;
   }
   system::GraphicsPreparedDrawObservation prepared_observation;
@@ -4631,12 +4645,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used, geometry_address, terrain_addresses)) {
     return finish_draw(false);
   }
-  if (snr02_track_draw ||
+  if ((!Fh1NativeRaceCaptureStartFrame() || prepared_draw_observer) &&
+      (snr02_track_draw ||
       Fh1SnrProbeOutputFrame(Fh1Snr03ProbeFrame(),
                              observation_frame_sequence_) ||
       (Fh1SnrProbeOutputFrame(Fh1Snr02ItemProbeFrame(),
                               observation_frame_sequence_) &&
-       Fh1Snr02ItemShader(fh1_vertex_hash))) {
+       Fh1Snr02ItemShader(fh1_vertex_hash)))) {
     if (auto observer = graphics_system_->final_draw_state_observer()) {
       std::array<uint32_t, 64> system_words;
       std::array<system::GraphicsFinalDrawTextureIdentity, 32> textures;
