@@ -3325,6 +3325,22 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  const bool time_fh1_draw = Fh1NativeRaceCaptureStartFrame() &&
+      fh1_native_race_requested.load(std::memory_order_acquire);
+  struct Fh1DrawClock {
+    bool active;
+    std::chrono::steady_clock::time_point begin;
+    ~Fh1DrawClock() {
+      if (!active) return;
+      PERF_counter_add(kFh1IssueDrawCpuTimeNs,
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - begin).count());
+      PERF_counter_inc(kFh1IssueDrawCalls);
+    }
+  } fh1_draw_clock{time_fh1_draw, time_fh1_draw
+      ? std::chrono::steady_clock::now()
+      : std::chrono::steady_clock::time_point{}};
+
   const auto fh1_prepare_start =
       Fh1GpuCorpusEnabled() && Fh1ObserveCorpusFrame(observation_frame_sequence_) ? std::chrono::steady_clock::now()
                             : std::chrono::steady_clock::time_point{};
@@ -3954,6 +3970,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     prepared_observation.fh1_runtime_sync_pipeline_creations =
         pipeline_cache_->GetFh1RuntimeSyncPipelineCreationCount();
     if (prepared_draw_observer) {
+      const auto snapshot_begin = time_fh1_draw
+          ? std::chrono::steady_clock::now()
+          : std::chrono::steady_clock::time_point{};
       std::array<system::GraphicsPreparedDrawVertexFetch, 8> vertex_fetches;
       std::array<system::GraphicsPreparedDrawTextureFetch, 32> texture_fetches;
       std::array<std::vector<uint8_t>, 8> vertex_fetch_snapshot_bytes;
@@ -4154,7 +4173,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             size_2d ? uint32_t(fetch.size_2d.stack_depth) + 1 : 0};
       }
       prepared_observation.texture_fetches = texture_fetches.data();
+      if (time_fh1_draw) PERF_counter_add(kFh1PreparedSnapshotCpuTimeNs,
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - snapshot_begin).count());
+      const auto observer_begin = time_fh1_draw
+          ? std::chrono::steady_clock::now()
+          : std::chrono::steady_clock::time_point{};
       prepared_draw_observer(prepared_observation);
+      if (time_fh1_draw) PERF_counter_add(kFh1PreparedObserverCpuTimeNs,
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - observer_begin).count());
     }
   }
 
@@ -4687,7 +4715,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
 
   // Update constant buffers, descriptors and root parameters.
-  if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used, geometry_address, terrain_addresses)) {
+  const auto binding_begin = time_fh1_draw
+      ? std::chrono::steady_clock::now()
+      : std::chrono::steady_clock::time_point{};
+  const bool bindings_ready = UpdateBindings(vertex_shader, pixel_shader,
+      root_signature, memexport_used, geometry_address, terrain_addresses);
+  if (time_fh1_draw) PERF_counter_add(kFh1BindingCpuTimeNs,
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - binding_begin).count());
+  if (!bindings_ready) {
     return finish_draw(false);
   }
   const bool fh1_car_presentation_material =

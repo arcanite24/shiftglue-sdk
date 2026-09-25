@@ -113,6 +113,13 @@ enum class CounterId : uint16_t {
   kTextureRequestTimingSamples,
   kTextureDirtyLoadAttempts,
 
+  // FH1 native-race CPU attribution; append to preserve existing IDs.
+  kFh1IssueDrawCpuTimeNs,
+  kFh1PreparedSnapshotCpuTimeNs,
+  kFh1PreparedObserverCpuTimeNs,
+  kFh1BindingCpuTimeNs,
+  kFh1IssueDrawCalls,
+
   kCount  // sentinel -- must be last
 };
 

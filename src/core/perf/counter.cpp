@@ -140,6 +140,11 @@ constexpr const char* kCounterNames[] = {
     "texture_request_cpu_time_ns",
     "texture_request_timing_samples",
     "texture_dirty_load_attempts",
+    "fh1_issue_draw_cpu_time_ns",
+    "fh1_prepared_snapshot_cpu_time_ns",
+    "fh1_prepared_observer_cpu_time_ns",
+    "fh1_binding_cpu_time_ns",
+    "fh1_issue_draw_calls",
 };
 static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
 
@@ -216,6 +221,11 @@ constexpr bool kIsGauge[] = {
     false,  // kTextureRequestCpuTimeNs
     false,  // kTextureRequestTimingSamples
     false,  // kTextureDirtyLoadAttempts
+    false,  // kFh1IssueDrawCpuTimeNs
+    false,  // kFh1PreparedSnapshotCpuTimeNs
+    false,  // kFh1PreparedObserverCpuTimeNs
+    false,  // kFh1BindingCpuTimeNs
+    false,  // kFh1IssueDrawCalls
 };
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 
