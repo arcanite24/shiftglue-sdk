@@ -4690,6 +4690,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used, geometry_address, terrain_addresses)) {
     return finish_draw(false);
   }
+  const bool fh1_car_presentation_material =
+      fh1_vertex_hash == 0x0DF9CA19A93A75D9ull &&
+      fh1_pixel_hash == 0xE349204378CA1591ull;
   const bool fh1_sampled_native_material =
       (snr02_track_draw &&
        ((fh1_vertex_hash == 0x07425D208E8BD688ull &&
@@ -4699,7 +4702,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
          fh1_pixel_hash == 0x93961AB9BDF347DDull &&
          vertex_shader_modification.value == 0x3FFull))) ||
       (fh1_vertex_hash == 0x5834939992FFC765ull &&
-       pixel_shader_modification.value == 0x1A001Full);
+       pixel_shader_modification.value == 0x1A001Full) ||
+      fh1_car_presentation_material;
   if (fh1_native_race_requested.load(std::memory_order_acquire) &&
       prepared_draw_observer && fh1_sampled_native_material &&
       (used_texture_mask & 1) && observation_frame_sequence_ > 1) {
@@ -4708,7 +4712,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         !identity.outdated_mask) {
       std::array<uint32_t, 6> fetch_words;
       std::copy_n(identity.fetch_words, fetch_words.size(), fetch_words.begin());
-      auto& frame = fh1_native_material_frames_[observation_frame_sequence_ - 1];
+      auto& frame = fh1_native_material_frames_[observation_frame_sequence_];
       const auto key = std::tuple{fetch_words, identity.allocation_id,
                                   identity.payload_generation};
       if (!frame.materials.contains(key) && frame.materials.size() < 128 &&
@@ -4736,9 +4740,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       std::array<system::GraphicsFinalDrawTextureIdentity, 32> textures;
       uint32_t texture_count = 0;
       if (snr02_track_draw ||
-          fh1_vertex_hash == 0x5834939992FFC765ull) {
+          fh1_vertex_hash == 0x5834939992FFC765ull ||
+          fh1_car_presentation_material) {
         for (uint32_t fetch = 0; fetch < 32; ++fetch) {
-          if (used_texture_mask & (uint32_t(1) << fetch))
+          if ((used_texture_mask & (uint32_t(1) << fetch)) &&
+              (!fh1_car_presentation_material || !fetch))
             textures[texture_count++] =
                 texture_cache_->GetActiveNativeTextureIdentity(fetch);
         }
