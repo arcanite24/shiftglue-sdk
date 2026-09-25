@@ -2753,6 +2753,15 @@ static bool ClearNativeGuestOutput(
   return true;
 }
 
+static bool ClearNativeGuestUiOutput(
+    const system::NativeGuestOutputRenderContext& context,
+    const float color[4]) {
+  if (context.phase != system::NativeGuestOutputPhase::kBeforeUi ||
+      !context.command_context) return false;
+  return static_cast<D3D12CommandProcessor*>(context.command_context)
+      ->ClearFh1UiOutput(color);
+}
+
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   static thread_local int64_t previous_cpu_ns = 0;
@@ -3010,7 +3019,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           const auto native_output_begin = Fh1NativeRaceCaptureStartFrame()
               ? std::chrono::steady_clock::now()
               : std::chrono::steady_clock::time_point{};
-          const bool native_output_ready = renderer(native_context);
+          const bool native_output_ready =
+              fh1_ui_injected_frame_ != native_context.frame_sequence &&
+              renderer(native_context);
           if (native_output_begin != std::chrono::steady_clock::time_point{})
             PERF_counter_add(kFh1NativeOutputCpuTimeNs,
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -3642,9 +3653,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           system::NativeGuestOutputRenderContext context;
           context.backend = system::NativeGuestOutputBackend::kD3D12;
           context.phase = system::NativeGuestOutputPhase::kBeforeUi;
-          context.frame_sequence = observation_frame_sequence_;
+          context.frame_sequence = observation_frame_sequence_ - 1;
           context.device = device;
-          renderer(context);
+          context.command_context = this;
+          context.clear_color = &ClearNativeGuestUiOutput;
+          if (renderer(context))
+            fh1_ui_injected_frame_ = context.frame_sequence;
         }
       }
       fh1_ui_previous_color_ = color;

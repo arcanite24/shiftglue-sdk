@@ -74,6 +74,9 @@ class D3D12CommandProcessor : public CommandProcessor {
     assert_true(submission_open_);
     return deferred_command_list_;
   }
+  bool ClearFh1UiOutput(const float color[4]) {
+    return render_target_cache_ && render_target_cache_->ClearFh1UiOutput(color);
+  }
 
   bool IsShutdownRequested() const { return !worker_running_.load(); }
 
@@ -726,6 +729,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t fh1_velocity_dilate_native_draws_ = 0;
   uint64_t fh1_scene_draw_sequence_ = 0;
   uint64_t fh1_ui_boundary_frame_ = 0;
+  uint64_t fh1_ui_injected_frame_ = 0;
   uint64_t fh1_ui_last_frame_ = 0;
   uint32_t fh1_ui_previous_color_ = 0;
   uint64_t fh1_scene_followup_sequence_ = 0;

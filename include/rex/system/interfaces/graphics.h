@@ -45,8 +45,8 @@ enum class NativeGuestOutputBackend : uint32_t {
 enum class NativeGuestOutputPhase : uint32_t {
   kNativeAttempt = 0,
   kPresented = 1,
-  // Notification before the first validated guest UI draw; no output target
-  // is exposed and the callback must not record GPU commands.
+  // Notification before the first validated guest UI draw. The bounded
+  // clear_color probe may write the target; no resource handle is exposed.
   kBeforeUi = 2,
 };
 

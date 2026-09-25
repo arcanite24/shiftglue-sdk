@@ -68,6 +68,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   bool ClearFh1Rectangles(std::span<const Fh1ClearRectangle> rectangles,
                          std::span<const std::array<float, 4>> colors,
                          bool color, bool depth, bool stencil, uint8_t reference);
+  bool ClearFh1UiOutput(const float color[4]);
 
   void InvalidateCommandListRenderTargets() {
     are_current_command_list_render_targets_valid_ = false;
@@ -242,6 +243,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       resource_state_ = new_state;
       return old_state;
     }
+    D3D12_RESOURCE_STATES resource_state() const { return resource_state_; }
 
     uint32_t temporary_srv_descriptor_index() const { return temporary_srv_descriptor_index_; }
     void SetTemporarySRVDescriptorIndex(uint32_t index) { temporary_srv_descriptor_index_ = index; }
