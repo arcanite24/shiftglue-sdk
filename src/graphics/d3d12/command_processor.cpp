@@ -3930,8 +3930,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
               fh1_vertex_hash == 0xB8489164D5A86043ull &&
               ((binding.fetch_constant == 95 && binding.stride_words == 8) ||
                (binding.fetch_constant == 94 && binding.stride_words == 3));
-          if (snr03_vertex || snr02_item_vertex || snr02_track_vertex ||
-              snr03_manager_vertex || snr03_probe_draw) {
+          // The live renderer does not consume the separate manager family.
+          if (!(Fh1NativeRaceCaptureStartFrame() && snr03_manager_vertex) &&
+              (snr03_vertex || snr02_item_vertex || snr02_track_vertex ||
+               snr03_manager_vertex || snr03_probe_draw)) {
             auto& observed = vertex_fetches[prepared_observation.vertex_fetch_count];
             auto& bytes = vertex_fetch_snapshot_bytes[prepared_observation.vertex_fetch_count];
             if (snr02_track_vertex) {
@@ -4000,11 +4002,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       const bool snr03_manager_draw = Fh1SnrProbeOutputFrame(
           Fh1Snr03ProbeFrame(), prepared_observation.frame_sequence) &&
           fh1_vertex_hash == 0xB8489164D5A86043ull;
-      if (((snr02_track_draw || snr03_manager_draw) &&
+      if (!(Fh1NativeRaceCaptureStartFrame() && snr03_manager_draw) &&
+          (((snr02_track_draw || snr03_manager_draw) &&
            prepared_observation.index_buffer_type == 1) ||
           (snr03_probe_draw &&
            (prepared_observation.index_buffer_type == 1 ||
-            prepared_observation.index_buffer_type == 2))) {
+            prepared_observation.index_buffer_type == 2)))) {
         copy_bounded_snapshot(prepared_observation.index_buffer_guest_base,
                               prepared_observation.index_buffer_length,
                               128 * 1024,
