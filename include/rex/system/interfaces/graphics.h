@@ -74,7 +74,7 @@ struct NativeGuestOutputRenderContext {
   uint32_t output_format = 0;
   void* device = nullptr;
   void* command_context = nullptr;
-  // D3D12 DeferredCommandList during kNativeAttempt only. Native draws must
+  // D3D12 DeferredCommandList during kNativeAttempt or kBeforeUi. Native draws must
   // restore guest_output_state and retain referenced resources until the
   // submission completes.
   void* deferred_command_list = nullptr;
@@ -86,7 +86,7 @@ struct NativeGuestOutputRenderContext {
   bool use_pwl_gamma_ramp = false;
   bool xenos_fxaa_applied = false;
   NativeGuestOutputClearColor clear_color = nullptr;
-  // Valid only during kNativeAttempt; stage 0 is vertex, 1 is pixel.
+  // Valid during kNativeAttempt or kBeforeUi; stage 0 is vertex, 1 is pixel.
   NativeGuestOutputShader shader = nullptr;
   NativeGuestOutputTexture texture = nullptr;
 };

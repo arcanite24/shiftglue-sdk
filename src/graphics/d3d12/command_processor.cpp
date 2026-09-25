@@ -2762,6 +2762,107 @@ static bool ClearNativeGuestUiOutput(
       ->ClearFh1UiOutput(color);
 }
 
+void D3D12CommandProcessor::ConfigureFh1NativeContext(
+    system::NativeGuestOutputRenderContext& native_context) {
+  native_context.shader = +[](
+      const system::NativeGuestOutputRenderContext& context,
+      uint32_t stage, uint64_t guest_hash, uint64_t modification,
+      const uint8_t** bytecode, size_t* bytecode_size) {
+    if (!context.command_context || !bytecode || !bytecode_size ||
+        stage > 1) return false;
+    const auto* processor = static_cast<const D3D12CommandProcessor*>(
+        context.command_context);
+    if (!processor->pipeline_cache_) return false;
+    const auto* entry = processor->pipeline_cache_->FindFh1ShaderPackEntry(
+        xenos::ShaderType(stage), guest_hash, modification);
+    if (!entry) return false;
+    *bytecode = entry->bytecode.data();
+    *bytecode_size = entry->bytecode.size();
+    return true;
+  };
+  native_context.texture = +[](
+      const system::NativeGuestOutputRenderContext& context,
+      const uint32_t fetch_words[6], uint64_t allocation_id,
+      uint64_t payload_generation, void** resource, void* view,
+      bool* immutable) {
+    if (!context.command_context || !fetch_words || !resource || !view ||
+        !immutable ||
+        !allocation_id || !payload_generation) return false;
+    *immutable = false;
+    auto* processor = static_cast<D3D12CommandProcessor*>(
+        context.command_context);
+    if (!processor->texture_cache_) return false;
+    std::array<uint32_t, 6> words;
+    std::copy_n(fetch_words, words.size(), words.begin());
+    if (const auto frame = processor->fh1_native_material_frames_.find(
+            context.frame_sequence);
+        frame != processor->fh1_native_material_frames_.end()) {
+      const auto found = frame->second.materials.find(
+          {words, allocation_id, payload_generation});
+      if (found != frame->second.materials.end() &&
+          found->second.snapshot) {
+        static thread_local bool reported_pinned_material = false;
+        if (!reported_pinned_material) {
+          REXGPU_INFO("FH1 native source-pinned material frame={} "
+                      "allocation={} generation={}",
+                      context.frame_sequence, allocation_id,
+                      payload_generation);
+          reported_pinned_material = true;
+        }
+        *resource = found->second.snapshot.Get();
+        *static_cast<D3D12_SHADER_RESOURCE_VIEW_DESC*>(view) =
+            found->second.view;
+        *immutable = true;
+        return true;
+      }
+    }
+    xenos::xe_gpu_texture_fetch_t fetch;
+    static_assert(sizeof(fetch) == 6 * sizeof(uint32_t));
+    std::memcpy(&fetch, fetch_words, sizeof(fetch));
+    D3D12_SHADER_RESOURCE_VIEW_DESC descriptor{};
+    xenos::TextureFormat format;
+    system::GraphicsFinalDrawTextureIdentity identity;
+    ID3D12Resource* texture = processor->texture_cache_->RequestSwapTexture(
+        descriptor, format, nullptr, nullptr,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &fetch, &identity);
+    processor->SubmitBarriers();
+    if (!texture || identity.allocation_id != allocation_id ||
+        identity.payload_generation != payload_generation ||
+        identity.outdated_mask ||
+        texture->GetDesc().DepthOrArraySize != 1) {
+      REXGPU_INFO("FH1 native texture rejected frame={} expected={}:{} "
+                  "actual={}:{} dirty={} resource={}",
+                  context.frame_sequence, allocation_id,
+                  payload_generation, identity.allocation_id,
+                  identity.payload_generation, identity.outdated_mask,
+                  bool(texture));
+      return false;
+    }
+    *resource = texture;
+    *static_cast<D3D12_SHADER_RESOURCE_VIEW_DESC*>(view) = descriptor;
+    return true;
+  };
+}
+
+void D3D12CommandProcessor::RestoreFh1AfterNativeUi() {
+  current_guest_pipeline_ = nullptr;
+  current_external_pipeline_ = nullptr;
+  current_graphics_root_signature_ = nullptr;
+  current_graphics_root_up_to_date_ = 0;
+  ff_viewport_update_needed_ = true;
+  ff_scissor_update_needed_ = true;
+  viewport_cache_valid_ = false;
+  primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  if (bindless_resources_used_) {
+    deferred_command_list_.SetDescriptorHeaps(view_bindless_heap_,
+                                              sampler_bindless_heap_current_);
+  } else {
+    deferred_command_list_.SetDescriptorHeaps(view_bindful_heap_current_,
+                                              sampler_bindful_heap_current_);
+  }
+  render_target_cache_->RestoreFh1UiOutputTargets();
+}
+
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   static thread_local int64_t previous_cpu_ns = 0;
@@ -2938,84 +3039,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             }
             it = fh1_native_material_frames_.erase(it);
           }
-          native_context.shader = +[](
-              const system::NativeGuestOutputRenderContext& context,
-              uint32_t stage, uint64_t guest_hash, uint64_t modification,
-              const uint8_t** bytecode, size_t* bytecode_size) {
-            if (!context.command_context || !bytecode || !bytecode_size ||
-                stage > 1) return false;
-            const auto* processor = static_cast<const D3D12CommandProcessor*>(
-                context.command_context);
-            if (!processor->pipeline_cache_) return false;
-            const auto* entry = processor->pipeline_cache_->FindFh1ShaderPackEntry(
-                xenos::ShaderType(stage), guest_hash, modification);
-            if (!entry) return false;
-            *bytecode = entry->bytecode.data();
-            *bytecode_size = entry->bytecode.size();
-            return true;
-          };
-          native_context.texture = +[](
-              const system::NativeGuestOutputRenderContext& context,
-              const uint32_t fetch_words[6], uint64_t allocation_id,
-              uint64_t payload_generation, void** resource, void* view,
-              bool* immutable) {
-            if (!context.command_context || !fetch_words || !resource || !view ||
-                !immutable ||
-                !allocation_id || !payload_generation) return false;
-            *immutable = false;
-            auto* processor = static_cast<D3D12CommandProcessor*>(
-                context.command_context);
-            if (!processor->texture_cache_) return false;
-            std::array<uint32_t, 6> words;
-            std::copy_n(fetch_words, words.size(), words.begin());
-            if (const auto frame = processor->fh1_native_material_frames_.find(
-                    context.frame_sequence);
-                frame != processor->fh1_native_material_frames_.end()) {
-              const auto found = frame->second.materials.find(
-                  {words, allocation_id, payload_generation});
-              if (found != frame->second.materials.end() &&
-                  found->second.snapshot) {
-                static thread_local bool reported_pinned_material = false;
-                if (!reported_pinned_material) {
-                  REXGPU_INFO("FH1 native source-pinned material frame={} "
-                              "allocation={} generation={}",
-                              context.frame_sequence, allocation_id,
-                              payload_generation);
-                  reported_pinned_material = true;
-                }
-                *resource = found->second.snapshot.Get();
-                *static_cast<D3D12_SHADER_RESOURCE_VIEW_DESC*>(view) =
-                    found->second.view;
-                *immutable = true;
-                return true;
-              }
-            }
-            xenos::xe_gpu_texture_fetch_t fetch;
-            static_assert(sizeof(fetch) == 6 * sizeof(uint32_t));
-            std::memcpy(&fetch, fetch_words, sizeof(fetch));
-            D3D12_SHADER_RESOURCE_VIEW_DESC descriptor{};
-            xenos::TextureFormat format;
-            system::GraphicsFinalDrawTextureIdentity identity;
-            ID3D12Resource* texture = processor->texture_cache_->RequestSwapTexture(
-                descriptor, format, nullptr, nullptr,
-                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &fetch, &identity);
-            processor->SubmitBarriers();
-            if (!texture || identity.allocation_id != allocation_id ||
-                identity.payload_generation != payload_generation ||
-                identity.outdated_mask ||
-                texture->GetDesc().DepthOrArraySize != 1) {
-              REXGPU_INFO("FH1 native texture rejected frame={} expected={}:{} "
-                          "actual={}:{} dirty={} resource={}",
-                          context.frame_sequence, allocation_id,
-                          payload_generation, identity.allocation_id,
-                          identity.payload_generation, identity.outdated_mask,
-                          bool(texture));
-              return false;
-            }
-            *resource = texture;
-            *static_cast<D3D12_SHADER_RESOURCE_VIEW_DESC*>(view) = descriptor;
-            return true;
-          };
+          ConfigureFh1NativeContext(native_context);
           const auto native_output_begin = Fh1NativeRaceCaptureStartFrame()
               ? std::chrono::steady_clock::now()
               : std::chrono::steady_clock::time_point{};
@@ -3656,9 +3680,21 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           context.frame_sequence = observation_frame_sequence_ - 1;
           context.device = device;
           context.command_context = this;
+          context.deferred_command_list = &deferred_command_list_;
+          context.guest_output =
+              render_target_cache_->GetFh1UiOutputTarget();
+          context.guest_output_width = 1280;
+          context.guest_output_height = 720;
+          context.guest_output_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+          context.submission = submission_current_;
+          context.completed_submission = submission_completed_;
           context.clear_color = &ClearNativeGuestUiOutput;
-          if (renderer(context))
+          ConfigureFh1NativeContext(context);
+          const bool injected = renderer(context);
+          RestoreFh1AfterNativeUi();
+          if (injected) {
             fh1_ui_injected_frame_ = context.frame_sequence;
+          }
         }
       }
       fh1_ui_previous_color_ = color;

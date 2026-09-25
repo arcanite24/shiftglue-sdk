@@ -857,6 +857,8 @@ class D3D12CommandProcessor : public CommandProcessor {
              Fh1NativeMaterial> materials;
   };
   std::map<uint64_t, Fh1NativeMaterialFrame> fh1_native_material_frames_;
+  void ConfigureFh1NativeContext(system::NativeGuestOutputRenderContext& context);
+  void RestoreFh1AfterNativeUi();
 
   static constexpr uint32_t kScratchBufferSizeIncrement = 16 * 1024 * 1024;
   ID3D12Resource* scratch_buffer_ = nullptr;

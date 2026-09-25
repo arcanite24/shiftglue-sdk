@@ -69,6 +69,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
                          std::span<const std::array<float, 4>> colors,
                          bool color, bool depth, bool stencil, uint8_t reference);
   bool ClearFh1UiOutput(const float color[4]);
+  ID3D12Resource* GetFh1UiOutputTarget() const;
+  void RestoreFh1UiOutputTargets();
 
   void InvalidateCommandListRenderTargets() {
     are_current_command_list_render_targets_valid_ = false;

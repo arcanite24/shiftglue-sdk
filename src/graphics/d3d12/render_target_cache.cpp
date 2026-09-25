@@ -1122,15 +1122,27 @@ bool D3D12RenderTargetCache::ClearFh1OwnedDepthTiles(
   return true;
 }
 
-bool D3D12RenderTargetCache::ClearFh1UiOutput(const float color[4]) {
-  if (!color || GetPath() != Path::kHostRenderTargets) return false;
+ID3D12Resource* D3D12RenderTargetCache::GetFh1UiOutputTarget() const {
+  if (GetPath() != Path::kHostRenderTargets) return nullptr;
   auto* target = static_cast<D3D12RenderTarget*>(
       last_update_accumulated_render_targets()[1]);
-  if (!target) return false;
+  if (!target) return nullptr;
   const auto desc = target->resource()->GetDesc();
   if (target->resource_state() != D3D12_RESOURCE_STATE_RENDER_TARGET ||
       desc.Format != DXGI_FORMAT_R10G10B10A2_UNORM || desc.Width != 1280 ||
-      desc.Height < 720 || desc.SampleDesc.Count != 1) return false;
+      desc.Height < 720 || desc.SampleDesc.Count != 1) return nullptr;
+  return target->resource();
+}
+
+void D3D12RenderTargetCache::RestoreFh1UiOutputTargets() {
+  InvalidateCommandListRenderTargets();
+  SetCommandListRenderTargets(last_update_accumulated_render_targets());
+}
+
+bool D3D12RenderTargetCache::ClearFh1UiOutput(const float color[4]) {
+  if (!color || !GetFh1UiOutputTarget()) return false;
+  auto* target = static_cast<D3D12RenderTarget*>(
+      last_update_accumulated_render_targets()[1]);
   command_processor_.SubmitBarriers();
   const D3D12_RECT visible{0, 0, 1280, 720};
   command_processor_.GetDeferredCommandList().D3DClearRenderTargetView(
