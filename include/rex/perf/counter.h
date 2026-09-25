@@ -122,6 +122,8 @@ enum class CounterId : uint16_t {
   kFh1MaterialSnapshotCpuTimeNs,
   kFh1MaterialSnapshotCalls,
   kFh1NativeOutputCpuTimeNs,
+  kFh1TitleThreadCpuTimeNs,
+  kFh1GpuThreadCpuTimeNs,
 
   kCount  // sentinel -- must be last
 };
@@ -141,6 +143,9 @@ int64_t GetCounter(CounterId id);
 // Read the monotonic total of values added through IncrementCounter. Totals
 // are not reset by the per-frame CSV snapshot.
 int64_t GetTotalCounter(CounterId id);
+
+// Current host thread's accumulated user + kernel CPU time, or zero if unavailable.
+int64_t CurrentThreadCpuTimeNs();
 
 // Snapshot current values into the read buffer and zero the live counters.
 // Called once per frame by Profiler::Flip().

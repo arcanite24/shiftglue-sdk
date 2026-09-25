@@ -2752,6 +2752,15 @@ static bool ClearNativeGuestOutput(
 
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
+  static thread_local int64_t previous_cpu_ns = 0;
+  if (Fh1NativeRaceCaptureStartFrame()) {
+    const int64_t cpu_ns = perf::CurrentThreadCpuTimeNs();
+    if (previous_cpu_ns && cpu_ns >= previous_cpu_ns)
+      PERF_counter_add(kFh1GpuThreadCpuTimeNs, cpu_ns - previous_cpu_ns);
+    previous_cpu_ns = cpu_ns;
+  } else {
+    previous_cpu_ns = 0;
+  }
   if (observation_frame_sequence_ % 600 == 0) {
     const auto& reflection_imports = texture_cache_->GetFh1ReflectionImportStats();
     REXGPU_INFO(

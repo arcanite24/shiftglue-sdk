@@ -148,6 +148,8 @@ constexpr const char* kCounterNames[] = {
     "fh1_material_snapshot_cpu_time_ns",
     "fh1_material_snapshot_calls",
     "fh1_native_output_cpu_time_ns",
+    "fh1_title_thread_cpu_time_ns",
+    "fh1_gpu_thread_cpu_time_ns",
 };
 static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
 
@@ -232,6 +234,8 @@ constexpr bool kIsGauge[] = {
     false,  // kFh1MaterialSnapshotCpuTimeNs
     false,  // kFh1MaterialSnapshotCalls
     false,  // kFh1NativeOutputCpuTimeNs
+    false,  // kFh1TitleThreadCpuTimeNs
+    false,  // kFh1GpuThreadCpuTimeNs
 };
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 
@@ -282,6 +286,22 @@ void ResetFrameCounters() {
 
 int64_t GetSnapshotCounter(CounterId id) {
   return g_snapshot[static_cast<size_t>(id)].load(std::memory_order_relaxed);
+}
+
+int64_t CurrentThreadCpuTimeNs() {
+#if REX_PLATFORM_WIN32
+  FILETIME created, exited, kernel, user;
+  if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user))
+    return 0;
+  ULARGE_INTEGER kernel_time{}, user_time{};
+  kernel_time.LowPart = kernel.dwLowDateTime;
+  kernel_time.HighPart = kernel.dwHighDateTime;
+  user_time.LowPart = user.dwLowDateTime;
+  user_time.HighPart = user.dwHighDateTime;
+  return int64_t(kernel_time.QuadPart + user_time.QuadPart) * 100;
+#else
+  return 0;
+#endif
 }
 
 bool CriticalPathTraceEnabled() {
