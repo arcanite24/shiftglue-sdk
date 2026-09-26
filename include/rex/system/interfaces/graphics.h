@@ -361,6 +361,7 @@ struct GraphicsPreparedDrawVertexFetch {
   // 3=per-range limit, 4=per-frame limit.
   uint32_t cpu_snapshot_status = 0;
   uint64_t cpu_snapshot_hash = 0;
+  uint32_t cpu_snapshot_length = 0;
   // Borrowed until the prepared-draw observer returns; valid only on success.
   const uint8_t* cpu_snapshot_bytes = nullptr;
 };
