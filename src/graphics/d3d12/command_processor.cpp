@@ -2765,6 +2765,10 @@ static bool ClearNativeGuestUiOutput(
 
 void D3D12CommandProcessor::ConfigureFh1NativeContext(
     system::NativeGuestOutputRenderContext& native_context) {
+  if (const auto depth = fh1_initial_color_depth_frames_.find(
+          native_context.frame_sequence);
+      depth != fh1_initial_color_depth_frames_.end())
+    native_context.fh1_initial_color_depth = depth->second.Get();
   native_context.shader = +[](
       const system::NativeGuestOutputRenderContext& context,
       uint32_t stage, uint64_t guest_hash, uint64_t modification,
@@ -3042,6 +3046,13 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
               }
             }
             it = fh1_native_material_frames_.erase(it);
+          }
+          for (auto it = fh1_initial_color_depth_frames_.begin();
+               it != fh1_initial_color_depth_frames_.end() &&
+               it->first + 2 < native_context.frame_sequence;) {
+            resources_for_deletion_.emplace_back(
+                submission_current_, it->second.Detach());
+            it = fh1_initial_color_depth_frames_.erase(it);
           }
           ConfigureFh1NativeContext(native_context);
           if (auto captured = fh1_native_material_frames_.find(
@@ -5620,6 +5631,31 @@ bool D3D12CommandProcessor::IssueCopy() {
     observation.depth_info = register_file_->Get<reg::RB_DEPTH_INFO>().value;
     render_target_cache_->PopulateCopySourceTopology(observation);
     observation.succeeded = copy_succeeded;
+    if (copy_succeeded && observation.rb_copy_dest_base == 497831936 &&
+        observation.rb_copy_control == 4 &&
+        observation.surface_info == 0x14000500 &&
+        observation.depth_info == 0x00010000 &&
+        observation.source_target_available &&
+        observation.source_target_base_tiles == 0 &&
+        observation.source_target_pitch_tiles_at_32bpp == 16 &&
+        observation.source_guest_msaa_samples == 1 &&
+        observation.source_resource_width == 1280 &&
+        observation.source_resource_height == 2048 &&
+        observation.resolve_guest_width == 1280 &&
+        observation.resolve_guest_height == 720 &&
+        observation.frame_sequence == std::strtoull(
+            rex::cvar::GetFlagByName(
+                "pinyon_shift_snr01_trace_source_frame").c_str(),
+            nullptr, 10)) {
+      auto snapshot = render_target_cache_->SnapshotFh1InitialColorDepth();
+      if (snapshot) {
+        fh1_initial_color_depth_frames_[observation.frame_sequence] =
+            std::move(snapshot);
+        REXGPU_WARN("FH1 RAY01 initial color depth snapshot frame={} "
+                    "sequence={}", observation.frame_sequence,
+                    observation.draw_sequence);
+      }
+    }
     auto& fh1_key = observation.fh1_execution_key;
     fh1_key.kind = system::GraphicsFh1ExecutionKind::kCopyResolve;
     const auto append = [](uint64_t& hash, uint64_t value) {

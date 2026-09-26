@@ -70,6 +70,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
                          bool color, bool depth, bool stencil, uint8_t reference);
   bool ClearFh1UiOutput(const float color[4]);
   ID3D12Resource* GetFh1UiOutputTarget() const;
+  Microsoft::WRL::ComPtr<ID3D12Resource> SnapshotFh1InitialColorDepth();
   void RestoreFh1UiOutputTargets();
 
   void InvalidateCommandListRenderTargets() {

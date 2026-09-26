@@ -1134,6 +1134,42 @@ ID3D12Resource* D3D12RenderTargetCache::GetFh1UiOutputTarget() const {
   return target->resource();
 }
 
+Microsoft::WRL::ComPtr<ID3D12Resource>
+D3D12RenderTargetCache::SnapshotFh1InitialColorDepth() {
+  Microsoft::WRL::ComPtr<ID3D12Resource> snapshot;
+  if (GetPath() != Path::kHostRenderTargets) return snapshot;
+  auto* target = static_cast<D3D12RenderTarget*>(
+      last_update_accumulated_render_targets()[0]);
+  if (!target) return snapshot;
+  const auto key = target->key();
+  const auto desc = target->resource()->GetDesc();
+  if (!key.is_depth || key.base_tiles || key.GetPitchTiles() != 16 ||
+      key.msaa_samples != xenos::MsaaSamples::k1X ||
+      key.GetDepthFormat() != xenos::DepthRenderTargetFormat::kD24FS8 ||
+      desc.Width != 1280 || desc.Height != 2048 ||
+      desc.Format != DXGI_FORMAT_R32G8X24_TYPELESS ||
+      desc.SampleDesc.Count != 1 ||
+      !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+    return snapshot;
+  auto* device = command_processor_.GetD3D12Provider().GetDevice();
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE,
+          &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+          IID_PPV_ARGS(&snapshot))))
+    return {};
+  const auto previous = target->SetResourceState(
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.PushTransitionBarrier(
+      target->resource(), previous, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.SubmitBarriers();
+  command_processor_.GetDeferredCommandList().D3DCopyResource(
+      snapshot.Get(), target->resource());
+  command_processor_.PushTransitionBarrier(
+      target->resource(), target->SetResourceState(previous), previous);
+  command_processor_.SubmitBarriers();
+  return snapshot;
+}
+
 void D3D12RenderTargetCache::RestoreFh1UiOutputTargets() {
   InvalidateCommandListRenderTargets();
   SetCommandListRenderTargets(last_update_accumulated_render_targets());

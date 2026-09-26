@@ -859,6 +859,8 @@ class D3D12CommandProcessor : public CommandProcessor {
              Fh1NativeMaterial> materials;
   };
   std::map<uint64_t, Fh1NativeMaterialFrame> fh1_native_material_frames_;
+  std::map<uint64_t, Microsoft::WRL::ComPtr<ID3D12Resource>>
+      fh1_initial_color_depth_frames_;
   void ConfigureFh1NativeContext(system::NativeGuestOutputRenderContext& context);
   void RestoreFh1AfterNativeUi();
 

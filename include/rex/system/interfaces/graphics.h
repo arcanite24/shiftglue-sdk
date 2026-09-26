@@ -80,6 +80,9 @@ struct NativeGuestOutputRenderContext {
   void* deferred_command_list = nullptr;
   void* guest_output = nullptr;
   uint32_t guest_output_state = 0;
+  // D3D12-only owned copy of the FH1 initial color producer's 1x depth
+  // input. Borrowed through the callback; initially in COPY_DEST state.
+  void* fh1_initial_color_depth = nullptr;
   uint64_t submission = 0;
   uint64_t completed_submission = 0;
   uint64_t frame_sequence = 0;
