@@ -3414,14 +3414,24 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   static const uint64_t ray_ui_capture_frame = std::strtoull(
       rex::cvar::GetFlagByName("pinyon_shift_snr01_trace_source_frame").c_str(),
       nullptr, 10);
-  static const uint64_t ray_ui_shadow_start = std::strtoull(
-      rex::cvar::GetFlagByName("pinyon_shift_native_ui_shadow_start_frame").c_str(),
-      nullptr, 10);
+  static const bool ray_ui_live =
+      rex::cvar::GetFlagByName("pinyon_shift_native_ui_live") == "true";
+  static const uint64_t ray_ui_shadow_start = [] {
+    const auto configured = std::strtoull(
+        rex::cvar::GetFlagByName(
+            "pinyon_shift_native_ui_shadow_start_frame").c_str(),
+        nullptr, 10);
+    return configured ? configured : ray_ui_live ? uint64_t(1) : uint64_t(0);
+  }();
   const bool ray_trace_frame =
       ray_ui_capture_frame && ray_ui_capture_frame == observation_frame_sequence_;
   const bool ray_shadow_frame = ray_ui_shadow_start &&
       observation_frame_sequence_ >= ray_ui_shadow_start &&
-      observation_frame_sequence_ - ray_ui_shadow_start < 24;
+      (observation_frame_sequence_ - ray_ui_shadow_start < 24 ||
+       (ray_ui_live && fh1_native_race_requested.load(std::memory_order_acquire) &&
+        graphics_system_->prepared_draw_frame_selector() &&
+        graphics_system_->prepared_draw_frame_selector()(
+            observation_frame_sequence_)));
   bool ray_prepared_observed = false, ray_final_observed = false;
   const auto finish_draw = [&](bool succeeded) {
     if (ray_trace_frame && !ray_final_observed &&
