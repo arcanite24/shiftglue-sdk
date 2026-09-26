@@ -18,6 +18,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <utility>
 
@@ -4172,6 +4173,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           prepared_observation.command_buffer_physical_address);
       static thread_local uint64_t track_snapshot_budget_bytes = 0;
       static thread_local uint64_t manager_snapshot_budget_bytes = 0;
+      struct ManagerSnapshot {
+        std::vector<uint8_t> bytes;
+        uint32_t status = 0;
+        uint64_t hash = 0;
+      };
+      static thread_local std::map<std::pair<uint32_t, uint32_t>,
+                                   ManagerSnapshot> manager_snapshots;
       static thread_local uint64_t remaining_snapshot_budget_bytes = 0;
       static thread_local uint64_t ui_snapshot_budget_bytes = 0;
       static thread_local uint64_t snapshot_budget_frame = 0;
@@ -4179,6 +4187,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         snapshot_budget_frame = prepared_observation.frame_sequence;
         track_snapshot_budget_bytes = 0;
         manager_snapshot_budget_bytes = 0;
+        manager_snapshots.clear();
         remaining_snapshot_budget_bytes = 0;
         ui_snapshot_budget_bytes = 0;
       }
@@ -4266,11 +4275,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
               fh1_vertex_hash == 0xB8489164D5A86043ull &&
               ((binding.fetch_constant == 95 && binding.stride_words == 8) ||
                (binding.fetch_constant == 94 && binding.stride_words == 3));
-          // The live renderer does not consume the separate manager family.
           if (ray_ui_draw ||
-              (!(Fh1NativeRaceCaptureStartFrame() && snr03_manager_vertex) &&
-               (snr03_vertex || snr02_item_vertex || snr02_track_vertex ||
-                snr03_manager_vertex || snr03_probe_draw))) {
+              snr03_vertex || snr02_item_vertex || snr02_track_vertex ||
+              snr03_manager_vertex || snr03_probe_draw) {
             auto& observed = vertex_fetches[prepared_observation.vertex_fetch_count];
             auto& bytes = vertex_fetch_snapshot_bytes[prepared_observation.vertex_fetch_count];
             if (ray_ui_draw) {
@@ -4298,13 +4305,32 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                 observed.cpu_snapshot_bytes = bytes.data();
               }
             } else if (snr03_manager_vertex) {
-              copy_bounded_snapshot(observed.guest_base, observed.length,
-                                    3 * 1024 * 1024, manager_snapshot_budget_bytes,
-                                    1280ull * 1024 * 1024, bytes,
-                                    observed.cpu_snapshot_status,
-                                    observed.cpu_snapshot_hash);
-              if (observed.cpu_snapshot_status == 1) {
-                observed.cpu_snapshot_bytes = bytes.data();
+              if (Fh1NativeRaceCaptureStartFrame()) {
+                // ponytail: sampled race ranges were stable within a frame;
+                // use versioned copies if later draws can write them.
+                auto [snapshot, fresh] = manager_snapshots.try_emplace(
+                    {observed.guest_base, observed.length});
+                if (fresh)
+                  copy_bounded_snapshot(observed.guest_base, observed.length,
+                                        3 * 1024 * 1024,
+                                        manager_snapshot_budget_bytes,
+                                        16ull * 1024 * 1024,
+                                        snapshot->second.bytes,
+                                        snapshot->second.status,
+                                        snapshot->second.hash);
+                observed.cpu_snapshot_status = snapshot->second.status;
+                observed.cpu_snapshot_hash = snapshot->second.hash;
+                if (observed.cpu_snapshot_status == 1)
+                  observed.cpu_snapshot_bytes = snapshot->second.bytes.data();
+              } else {
+                copy_bounded_snapshot(observed.guest_base, observed.length,
+                                      3 * 1024 * 1024,
+                                      manager_snapshot_budget_bytes,
+                                      1280ull * 1024 * 1024, bytes,
+                                      observed.cpu_snapshot_status,
+                                      observed.cpu_snapshot_hash);
+                if (observed.cpu_snapshot_status == 1)
+                  observed.cpu_snapshot_bytes = bytes.data();
               }
             } else if (snr03_probe_draw) {
               copy_bounded_snapshot(observed.guest_base, observed.length,
@@ -4358,13 +4384,30 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       if ((ray_ui_draw && !prepared_observation.index_cpu_snapshot_status &&
            (prepared_observation.index_buffer_type == 1 ||
             prepared_observation.index_buffer_type == 2)) ||
-          (!(Fh1NativeRaceCaptureStartFrame() && snr03_manager_draw) &&
           (((snr02_track_draw || snr03_manager_draw) &&
            prepared_observation.index_buffer_type == 1) ||
           (snr03_probe_draw &&
            (prepared_observation.index_buffer_type == 1 ||
-            prepared_observation.index_buffer_type == 2))))) {
-        copy_bounded_snapshot(prepared_observation.index_buffer_guest_base,
+            prepared_observation.index_buffer_type == 2)))) {
+        if (snr03_manager_draw && Fh1NativeRaceCaptureStartFrame()) {
+          auto [snapshot, fresh] = manager_snapshots.try_emplace(
+              {prepared_observation.index_buffer_guest_base,
+               prepared_observation.index_buffer_length});
+          if (fresh)
+            copy_bounded_snapshot(prepared_observation.index_buffer_guest_base,
+                                  prepared_observation.index_buffer_length,
+                                  128 * 1024, manager_snapshot_budget_bytes,
+                                  16ull * 1024 * 1024,
+                                  snapshot->second.bytes,
+                                  snapshot->second.status,
+                                  snapshot->second.hash);
+          prepared_observation.index_cpu_snapshot_status = snapshot->second.status;
+          prepared_observation.index_cpu_snapshot_hash = snapshot->second.hash;
+          if (snapshot->second.status == 1)
+            prepared_observation.index_cpu_snapshot_bytes =
+                snapshot->second.bytes.data();
+        } else {
+          copy_bounded_snapshot(prepared_observation.index_buffer_guest_base,
                               prepared_observation.index_buffer_length,
                               ray_ui_draw ? 1024 * 1024 : 128 * 1024,
                               ray_ui_draw ? ui_snapshot_budget_bytes
@@ -4378,8 +4421,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                               index_snapshot_bytes,
                               prepared_observation.index_cpu_snapshot_status,
                               prepared_observation.index_cpu_snapshot_hash);
-        if (prepared_observation.index_cpu_snapshot_status == 1) {
-          prepared_observation.index_cpu_snapshot_bytes = index_snapshot_bytes.data();
+          if (prepared_observation.index_cpu_snapshot_status == 1)
+            prepared_observation.index_cpu_snapshot_bytes =
+                index_snapshot_bytes.data();
         }
       }
       prepared_observation.vertex_float_constant_words =
