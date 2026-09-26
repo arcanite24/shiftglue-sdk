@@ -5033,7 +5033,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       pixel_shader_modification.value == 0x16003Full;
   const bool fh1_track_structure_material = snr02_track_draw && (
       (((fh1_vertex_hash == 0x0CBC533419F61E0Dull &&
-         fh1_pixel_hash == 0xEFCA69AA2BEE366Bull) ||
+         (fh1_pixel_hash == 0xEFCA69AA2BEE366Bull ||
+          fh1_pixel_hash == 0x56D45C45966FD938ull)) ||
         (fh1_vertex_hash == 0x5DB1ECF39EA11DB0ull &&
          fh1_pixel_hash == 0x6508BAC22C4E1720ull)) &&
        pixel_shader_modification.value == 0x4000002B003Full) ||
@@ -5080,15 +5081,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         auto& frame = fh1_native_material_frames_[observation_frame_sequence_];
         const auto key = std::tuple{fetch_words, identity.allocation_id,
                                     identity.payload_generation};
-        if (!frame.materials.contains(key) && frame.materials.size() < 128 &&
-            frame.bytes < 64 * 1024 * 1024) {
+        constexpr uint64_t kMaterialSnapshotByteLimit = 96ull * 1024 * 1024;
+        if (!frame.materials.contains(key) && frame.materials.size() < 256 &&
+            frame.bytes < kMaterialSnapshotByteLimit) {
           auto it = frame.materials.try_emplace(key).first;
           uint64_t bytes = 0;
           const auto snapshot_begin = time_fh1_draw
               ? std::chrono::steady_clock::now()
               : std::chrono::steady_clock::time_point{};
           const bool snapshot_ready = texture_cache_->SnapshotActiveNativeTexture(
-                  material_fetch, 64 * 1024 * 1024 - frame.bytes,
+                  material_fetch, kMaterialSnapshotByteLimit - frame.bytes,
                   it->second.source, it->second.snapshot, it->second.view, bytes);
           if (time_fh1_draw) {
             PERF_counter_add(kFh1MaterialSnapshotCpuTimeNs,
@@ -5100,6 +5102,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             frame.bytes += bytes;
           } else {
             frame.materials.erase(it);
+          }
+        } else if (!frame.materials.contains(key)) {
+          static thread_local bool reported_native_material_limit = false;
+          if (!reported_native_material_limit) {
+            REXGPU_WARN("FH1 native material snapshot limit frame={} "
+                        "fetch={} materials={} bytes={}",
+                        observation_frame_sequence_, material_fetch,
+                        frame.materials.size(), frame.bytes);
+            reported_native_material_limit = true;
           }
         }
       }
