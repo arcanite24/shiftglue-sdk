@@ -484,6 +484,9 @@ struct GraphicsFinalDrawStateObservation {
   // Borrowed until the observer returns, after texture bindings are prepared.
   const GraphicsFinalDrawTextureIdentity* textures = nullptr;
   uint32_t texture_count = 0;
+  // Borrowed until the observer returns: 8 bool and 32 loop words.
+  const uint32_t* bool_loop_constant_words = nullptr;
+  uint32_t bool_loop_constant_word_count = 0;
 };
 using GraphicsFinalDrawStateObserver = void (*)(
     const GraphicsFinalDrawStateObservation& observation);

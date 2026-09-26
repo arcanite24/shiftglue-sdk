@@ -5088,7 +5088,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                 normalized_depth_control.value,
                 viewport.data(), scissor.data(),
                 regs.values + XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0, 192,
-                textures.data(), texture_count});
+                textures.data(), texture_count,
+                regs.values + XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031, 40});
       ray_final_observed = true;
     }
   }
