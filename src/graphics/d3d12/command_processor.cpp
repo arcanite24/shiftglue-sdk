@@ -3044,6 +3044,49 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             it = fh1_native_material_frames_.erase(it);
           }
           ConfigureFh1NativeContext(native_context);
+          if (auto captured = fh1_native_material_frames_.find(
+                  native_context.frame_sequence);
+              captured != fh1_native_material_frames_.end() &&
+              !captured->second.trace_reported &&
+              native_context.frame_sequence == std::strtoull(
+                  rex::cvar::GetFlagByName(
+                      "pinyon_shift_snr01_trace_source_frame").c_str(),
+                  nullptr, 10)) {
+            const auto& frame = captured->second;
+            REXGPU_WARN("FH1 RAY00 pinned textures frame={} versions={} "
+                        "bytes={} failed_attempts={} limited_attempts={}",
+                        native_context.frame_sequence, frame.materials.size(),
+                        frame.bytes, frame.trace_failed, frame.trace_limited);
+            char* output_dir = nullptr;
+            size_t output_length = 0;
+            if (!_dupenv_s(&output_dir, &output_length,
+                           "PINYON_SHIFT_FH1_RENDER_TEST_OUTPUT") &&
+                output_dir && *output_dir) {
+              const auto path = std::filesystem::path(output_dir) /
+                  fmt::format("ordered-texture-pins-{}.csv",
+                              native_context.frame_sequence);
+              std::error_code error;
+              std::filesystem::create_directories(path.parent_path(), error);
+              std::ofstream manifest(path, std::ios::trunc);
+              if (manifest) {
+                manifest << "word0,word1,word2,word3,word4,word5,"
+                            "allocation_id,payload_generation,format,"
+                            "dimension,width,height,depth_or_array,mips\n";
+                for (const auto& [key, material] : frame.materials) {
+                  const auto& words = std::get<0>(key);
+                  for (uint32_t word : words) manifest << word << ',';
+                  const auto desc = material.snapshot->GetDesc();
+                  manifest << std::get<1>(key) << ',' << std::get<2>(key)
+                           << ',' << uint32_t(desc.Format) << ','
+                           << uint32_t(desc.Dimension) << ',' << desc.Width
+                           << ',' << desc.Height << ',' << desc.DepthOrArraySize
+                           << ',' << desc.MipLevels << '\n';
+                }
+              }
+            }
+            std::free(output_dir);
+            captured->second.trace_reported = true;
+          }
           const auto native_output_begin = Fh1NativeRaceCaptureStartFrame()
               ? std::chrono::steady_clock::now()
               : std::chrono::steady_clock::time_point{};
@@ -5090,17 +5133,17 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       (fh1_pixel_hash == 0xCAE1DB68AFFA9D3Cull ||
        fh1_pixel_hash == 0x6FDA0F1CDE67D12Full);
   if (prepared_draw_observer && observation_frame_sequence_ > 1 &&
-      (ray_ui_material ||
+      (ray_trace_frame || ray_ui_material ||
        ((ray_shadow_frame ||
          fh1_native_race_requested.load(std::memory_order_acquire)) &&
         fh1_sampled_native_material))) {
     for (uint32_t material_fetch = 0;
-         material_fetch < (fh1_car_body_material || fh1_car_glass_material ||
-                           fh1_track_structure_material
-                               ? 14u : 2u);
+         material_fetch < (ray_trace_frame ? 32u :
+                           (fh1_car_body_material || fh1_car_glass_material ||
+                            fh1_track_structure_material ? 14u : 2u));
          ++material_fetch) {
       if (!(used_texture_mask & (1u << material_fetch)) ||
-          (!ray_ui_material && !fh1_car_body_material &&
+          (!ray_trace_frame && !ray_ui_material && !fh1_car_body_material &&
            !fh1_car_glass_material && !fh1_track_structure_material &&
            material_fetch != 0))
         continue;
@@ -5114,16 +5157,19 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         auto& frame = fh1_native_material_frames_[observation_frame_sequence_];
         const auto key = std::tuple{fetch_words, identity.allocation_id,
                                     identity.payload_generation};
-        constexpr uint64_t kMaterialSnapshotByteLimit = 96ull * 1024 * 1024;
-        if (!frame.materials.contains(key) && frame.materials.size() < 256 &&
-            frame.bytes < kMaterialSnapshotByteLimit) {
+        const uint64_t byte_limit = ray_trace_frame
+            ? 512ull * 1024 * 1024 : 96ull * 1024 * 1024;
+        const size_t material_limit = ray_trace_frame ? 1024 : 256;
+        if (!frame.materials.contains(key) &&
+            frame.materials.size() < material_limit &&
+            frame.bytes < byte_limit) {
           auto it = frame.materials.try_emplace(key).first;
           uint64_t bytes = 0;
           const auto snapshot_begin = time_fh1_draw
               ? std::chrono::steady_clock::now()
               : std::chrono::steady_clock::time_point{};
           const bool snapshot_ready = texture_cache_->SnapshotActiveNativeTexture(
-                  material_fetch, kMaterialSnapshotByteLimit - frame.bytes,
+                  material_fetch, byte_limit - frame.bytes,
                   it->second.source, it->second.snapshot, it->second.view, bytes);
           if (time_fh1_draw) {
             PERF_counter_add(kFh1MaterialSnapshotCpuTimeNs,
@@ -5135,8 +5181,19 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             frame.bytes += bytes;
           } else {
             frame.materials.erase(it);
+            if (ray_trace_frame) {
+              ++frame.trace_failed;
+              REXGPU_WARN("FH1 RAY00 texture snapshot rejected frame={} "
+                          "fetch={} words={}:{}:{}:{}:{}:{} allocation={} "
+                          "generation={}", observation_frame_sequence_,
+                          material_fetch, fetch_words[0], fetch_words[1],
+                          fetch_words[2], fetch_words[3], fetch_words[4],
+                          fetch_words[5], identity.allocation_id,
+                          identity.payload_generation);
+            }
           }
         } else if (!frame.materials.contains(key)) {
+          if (ray_trace_frame) ++frame.trace_limited;
           static thread_local bool reported_native_material_limit = false;
           if (!reported_native_material_limit) {
             REXGPU_WARN("FH1 native material snapshot limit frame={} "

@@ -853,6 +853,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   };
   struct Fh1NativeMaterialFrame {
     uint64_t bytes = 0;
+    uint32_t trace_failed = 0, trace_limited = 0;
+    bool trace_reported = false;
     std::map<std::tuple<std::array<uint32_t, 6>, uint64_t, uint64_t>,
              Fh1NativeMaterial> materials;
   };
