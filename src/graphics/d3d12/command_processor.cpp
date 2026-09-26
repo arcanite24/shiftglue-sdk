@@ -4988,8 +4988,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       fh1_pixel_hash == 0xBDFFA72B7ED2FBA4ull &&
       pixel_shader_modification.value == 0x16003Full;
   const bool fh1_track_structure_material = snr02_track_draw &&
-      fh1_vertex_hash == 0x0CBC533419F61E0Dull &&
-      fh1_pixel_hash == 0xEFCA69AA2BEE366Bull &&
+      ((fh1_vertex_hash == 0x0CBC533419F61E0Dull &&
+        fh1_pixel_hash == 0xEFCA69AA2BEE366Bull) ||
+       (fh1_vertex_hash == 0x5DB1ECF39EA11DB0ull &&
+        fh1_pixel_hash == 0x6508BAC22C4E1720ull)) &&
       pixel_shader_modification.value == 0x4000002B003Full;
   const bool fh1_sampled_native_material =
       (snr02_track_draw &&
