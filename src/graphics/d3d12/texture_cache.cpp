@@ -961,7 +961,8 @@ bool D3D12TextureCache::SnapshotActiveNativeTexture(
   const TextureBinding* binding = GetValidTextureBinding(fetch_constant);
   if (!binding || !binding->texture || !binding->key.base_page ||
       binding->texture->outdated_mask() ||
-      binding->key.dimension != xenos::DataDimension::k2DOrStacked)
+      (binding->key.dimension != xenos::DataDimension::k2DOrStacked &&
+       binding->key.dimension != xenos::DataDimension::kCube))
     return false;
   auto* texture = static_cast<D3D12Texture*>(binding->texture);
   ID3D12Resource* resource = texture->resource();
@@ -969,7 +970,9 @@ bool D3D12TextureCache::SnapshotActiveNativeTexture(
   if (!resource || view_format == DXGI_FORMAT_UNKNOWN) return false;
   const D3D12_RESOURCE_DESC desc = resource->GetDesc();
   if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-      desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1)
+      desc.DepthOrArraySize !=
+          (binding->key.dimension == xenos::DataDimension::kCube ? 6 : 1) ||
+      desc.SampleDesc.Count != 1)
     return false;
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
   const uint64_t size = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
@@ -983,11 +986,16 @@ bool D3D12TextureCache::SnapshotActiveNativeTexture(
   const auto fetch = register_file().GetTextureFetch(fetch_constant);
   view = {};
   view.Format = view_format;
-  view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  view.ViewDimension = binding->key.dimension == xenos::DataDimension::kCube
+                           ? D3D12_SRV_DIMENSION_TEXTURECUBE
+                           : D3D12_SRV_DIMENSION_TEXTURE2D;
   view.Shader4ComponentMapping =
       GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding->key)) |
       D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
-  view.Texture2D.MipLevels = 1;
+  if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE)
+    view.TextureCube.MipLevels = desc.MipLevels;
+  else
+    view.Texture2D.MipLevels = desc.MipLevels;
 
   command_processor_.SubmitBarriers();
   const D3D12_RESOURCE_STATES old_state =

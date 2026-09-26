@@ -5002,10 +5002,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
        ((ray_shadow_frame ||
          fh1_native_race_requested.load(std::memory_order_acquire)) &&
         fh1_sampled_native_material))) {
-    for (uint32_t material_fetch = 0; material_fetch < 2; ++material_fetch) {
+    for (uint32_t material_fetch = 0;
+         material_fetch < (fh1_car_body_material ? 14u : 2u);
+         ++material_fetch) {
       if (!(used_texture_mask & (1u << material_fetch)) ||
-          (!ray_ui_material && material_fetch !=
-              (fh1_car_body_material ? 1u : 0u))) continue;
+          (!ray_ui_material && !fh1_car_body_material && material_fetch != 0))
+        continue;
       const auto identity =
           texture_cache_->GetActiveNativeTextureIdentity(material_fetch);
       if (identity.allocation_id && identity.payload_generation &&
@@ -5032,10 +5034,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                     std::chrono::steady_clock::now() - snapshot_begin).count());
             PERF_counter_inc(kFh1MaterialSnapshotCalls);
           }
-          if (snapshot_ready)
+          if (snapshot_ready) {
             frame.bytes += bytes;
-          else
+          } else {
             frame.materials.erase(it);
+          }
         }
       }
     }
