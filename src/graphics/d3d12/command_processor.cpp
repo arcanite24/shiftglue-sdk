@@ -3414,8 +3414,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   static const uint64_t ray_ui_capture_frame = std::strtoull(
       rex::cvar::GetFlagByName("pinyon_shift_snr01_trace_source_frame").c_str(),
       nullptr, 10);
+  static const uint64_t ray_ui_shadow_start = std::strtoull(
+      rex::cvar::GetFlagByName("pinyon_shift_native_ui_shadow_start_frame").c_str(),
+      nullptr, 10);
   const bool ray_trace_frame =
       ray_ui_capture_frame && ray_ui_capture_frame == observation_frame_sequence_;
+  const bool ray_shadow_frame = ray_ui_shadow_start &&
+      observation_frame_sequence_ >= ray_ui_shadow_start &&
+      observation_frame_sequence_ - ray_ui_shadow_start < 24;
   bool ray_prepared_observed = false, ray_final_observed = false;
   const auto finish_draw = [&](bool succeeded) {
     if (ray_trace_frame && !ray_final_observed &&
@@ -3719,7 +3725,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       bound_depth_and_color_render_target_bits == 2 &&
       regs.Get<reg::RB_SURFACE_INFO>().value == 0x14000500 &&
       regs[reg::RB_COLOR_INFO::rt_register_indices[0]] == 0x000A0000;
-  const bool ray_ui_draw = ray_trace_frame && ray_ui_target;
+  const bool ray_ui_draw = (ray_trace_frame || ray_shadow_frame) && ray_ui_target;
   if (ray_ui_capture_frame &&
       observation_frame_sequence_ + 8 >= ray_ui_capture_frame &&
       observation_frame_sequence_ <= ray_ui_capture_frame + 8) {
@@ -4983,7 +4989,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
        fh1_pixel_hash == 0x6FDA0F1CDE67D12Full);
   if (prepared_draw_observer && observation_frame_sequence_ > 1 &&
       (ray_ui_material ||
-       (fh1_native_race_requested.load(std::memory_order_acquire) &&
+       ((ray_shadow_frame ||
+         fh1_native_race_requested.load(std::memory_order_acquire)) &&
         fh1_sampled_native_material))) {
     for (uint32_t material_fetch = 0; material_fetch < 2; ++material_fetch) {
       if (!(used_texture_mask & (1u << material_fetch)) ||
@@ -5027,7 +5034,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       (snr02_track_draw ||
       Fh1SnrProbeOutputFrame(Fh1Snr03ProbeFrame(),
                              observation_frame_sequence_) ||
-      ray_trace_frame ||
+      ray_trace_frame || ray_shadow_frame ||
       (Fh1SnrProbeOutputFrame(Fh1Snr02ItemProbeFrame(),
                               observation_frame_sequence_) &&
        Fh1Snr02ItemShader(fh1_vertex_hash)))) {
@@ -5038,7 +5045,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       if (snr02_track_draw ||
           fh1_vertex_hash == 0x5834939992FFC765ull ||
           fh1_car_presentation_material || fh1_car_body_material ||
-          ray_trace_frame) {
+          ray_trace_frame || ray_shadow_frame) {
         for (uint32_t fetch = 0; fetch < 32; ++fetch) {
           if ((used_texture_mask & (uint32_t(1) << fetch)) &&
               (!fh1_car_presentation_material || !fetch))

@@ -91,8 +91,10 @@ struct NativeGuestOutputRenderContext {
   NativeGuestOutputTexture texture = nullptr;
 };
 
-// Returning false yields without modifying guest output. A callback that has
-// recorded any output command must return true.
+// Returning false yields without modifying guest output. Commands targeting
+// separately owned shadow resources may be recorded before returning false;
+// their resources must remain alive until the submission completes. A callback
+// that has recorded any guest-output command must return true.
 using NativeGuestOutputRenderer = bool (*)(
     const NativeGuestOutputRenderContext& context);
 
