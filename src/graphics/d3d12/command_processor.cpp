@@ -2794,7 +2794,7 @@ void D3D12CommandProcessor::ConfigureFh1NativeContext(
     if (!processor->texture_cache_) return false;
     std::array<uint32_t, 6> words;
     std::copy_n(fetch_words, words.size(), words.begin());
-    for (uint32_t lag = 0; lag <= 1 && context.frame_sequence >= lag; ++lag) {
+    for (uint32_t lag = 0; lag <= 2 && context.frame_sequence >= lag; ++lag) {
       const uint64_t source_frame = context.frame_sequence - lag;
       if (const auto frame = processor->fh1_native_material_frames_.find(
               source_frame);
@@ -3026,7 +3026,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           native_context.clear_color = &ClearNativeGuestOutput;
           for (auto it = fh1_native_material_frames_.begin();
                it != fh1_native_material_frames_.end() &&
-               it->first + 1 < native_context.frame_sequence;) {
+               it->first + 2 < native_context.frame_sequence;) {
             for (auto& item : it->second.materials) {
               auto& material = item.second;
               if (material.source) {
