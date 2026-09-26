@@ -3408,7 +3408,49 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   ID3D12Device* device = GetD3D12Provider().GetDevice();
   const RegisterFile& regs = *register_file_;
-  const auto finish_draw = [](bool succeeded) { return succeeded; };
+  static const uint64_t ray_ui_capture_frame = std::strtoull(
+      rex::cvar::GetFlagByName("pinyon_shift_snr01_trace_source_frame").c_str(),
+      nullptr, 10);
+  const bool ray_trace_frame =
+      ray_ui_capture_frame && ray_ui_capture_frame == observation_frame_sequence_;
+  bool ray_prepared_observed = false, ray_final_observed = false;
+  const auto finish_draw = [&](bool succeeded) {
+    if (ray_trace_frame && !ray_final_observed &&
+        regs.Get<reg::RB_MODECONTROL>().edram_mode != xenos::EdramMode::kCopy)
+      REXGPU_INFO("FH1 RAY00 draw exit frame={} sequence={} prepared={} "
+                  "final={} succeeded={}", observation_frame_sequence_,
+                  fh1_scene_draw_sequence_, ray_prepared_observed,
+                  ray_final_observed, succeeded);
+    return succeeded;
+  };
+  const auto report_clear = [&](uint32_t mode, uint32_t flags,
+                                uint32_t stencil_reference,
+                                std::span<const Fh1ClearRectangle> rectangles,
+                                std::span<const std::array<float, 4>> colors) {
+    if (!ray_trace_frame) return;
+    const auto observer = graphics_system_->fh1_clear_observer();
+    if (!observer) return;
+    system::GraphicsFh1ClearObservation observation;
+    observation.frame_sequence = observation_frame_sequence_;
+    observation.draw_sequence = fh1_scene_draw_sequence_;
+    observation.surface_info = regs.Get<reg::RB_SURFACE_INFO>().value;
+    observation.color_info =
+        regs[reg::RB_COLOR_INFO::rt_register_indices[0]];
+    observation.depth_info = regs.Get<reg::RB_DEPTH_INFO>().value;
+    observation.mode = mode;
+    observation.flags = flags;
+    observation.stencil_reference = stencil_reference;
+    observation.rectangle_count = uint32_t(rectangles.size());
+    for (size_t i = 0; i < rectangles.size(); ++i) {
+      std::copy(rectangles[i].bounds.begin(), rectangles[i].bounds.end(),
+                observation.bounds[i]);
+      observation.depth[i] = rectangles[i].depth;
+      if (i < colors.size())
+        std::copy(colors[i].begin(), colors[i].end(),
+                  observation.colors[i]);
+    }
+    observer(observation);
+  };
 
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
@@ -3418,6 +3460,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   if (fh1_mip_replacement_active_) {
     ++fh1_mip_skipped_draws_;
+    if (ray_trace_frame)
+      REXGPU_INFO("FH1 RAY00 mip skip frame={} sequence={}",
+                  observation_frame_sequence_, fh1_scene_draw_sequence_);
     return true;
   }
 
@@ -3631,8 +3676,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         rectangles[i] = *rectangle;
       }
       const auto clear_rectangles = std::span<const Fh1ClearRectangle>(rectangles).first(count);
-      return owned_tile_clear ? render_target_cache_->ClearFh1OwnedDepthTiles(clear_rectangles)
-                              : render_target_cache_->ClearFh1OwnedDepth(clear_rectangles);
+      const bool cleared = owned_tile_clear
+          ? render_target_cache_->ClearFh1OwnedDepthTiles(clear_rectangles)
+          : render_target_cache_->ClearFh1OwnedDepth(clear_rectangles);
+      if (cleared)
+        report_clear(owned_tile_clear ? 2 : 1,
+                     owned_tile_clear ? 6 : 2, 0, clear_rectangles, {});
+      return cleared;
     };
     if (try_owned_clear()) return finish_draw(true);
   }
@@ -3662,10 +3712,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   } else {
     bound_depth_and_color_render_target_bits = 0;
   }
-  static const uint64_t ray_ui_capture_frame = std::strtoull(
-      rex::cvar::GetFlagByName("pinyon_shift_snr01_trace_source_frame").c_str(),
-      nullptr, 10);
-  const bool ray_ui_draw = ray_ui_capture_frame == observation_frame_sequence_ &&
+  const bool ray_ui_draw = ray_trace_frame &&
       bound_depth_and_color_render_target_bits == 2 &&
       regs.Get<reg::RB_SURFACE_INFO>().value == 0x14000500 &&
       regs[reg::RB_COLOR_INFO::rt_register_indices[0]] == 0x000A0000;
@@ -4092,12 +4139,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       static thread_local uint64_t track_snapshot_budget_bytes = 0;
       static thread_local uint64_t manager_snapshot_budget_bytes = 0;
       static thread_local uint64_t remaining_snapshot_budget_bytes = 0;
+      static thread_local uint64_t ui_snapshot_budget_bytes = 0;
       static thread_local uint64_t snapshot_budget_frame = 0;
       if (snapshot_budget_frame != prepared_observation.frame_sequence) {
         snapshot_budget_frame = prepared_observation.frame_sequence;
         track_snapshot_budget_bytes = 0;
         manager_snapshot_budget_bytes = 0;
         remaining_snapshot_budget_bytes = 0;
+        ui_snapshot_budget_bytes = 0;
       }
       const bool snr03_probe_draw = Fh1SnrProbeOutputFrame(
           Fh1Snr03ProbeFrame(), prepared_observation.frame_sequence) &&
@@ -4158,12 +4207,21 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
               ((binding.fetch_constant == 95 && binding.stride_words == 8) ||
                (binding.fetch_constant == 94 && binding.stride_words == 3));
           // The live renderer does not consume the separate manager family.
-          if (!(Fh1NativeRaceCaptureStartFrame() && snr03_manager_vertex) &&
-              (snr03_vertex || snr02_item_vertex || snr02_track_vertex ||
-               snr03_manager_vertex || snr03_probe_draw || ray_ui_draw)) {
+          if (ray_ui_draw ||
+              (!(Fh1NativeRaceCaptureStartFrame() && snr03_manager_vertex) &&
+               (snr03_vertex || snr02_item_vertex || snr02_track_vertex ||
+                snr03_manager_vertex || snr03_probe_draw))) {
             auto& observed = vertex_fetches[prepared_observation.vertex_fetch_count];
             auto& bytes = vertex_fetch_snapshot_bytes[prepared_observation.vertex_fetch_count];
-            if (snr02_track_vertex) {
+            if (ray_ui_draw) {
+              copy_bounded_snapshot(observed.guest_base, observed.length,
+                                    1024 * 1024, ui_snapshot_budget_bytes,
+                                    128ull * 1024 * 1024, bytes,
+                                    observed.cpu_snapshot_status,
+                                    observed.cpu_snapshot_hash);
+              if (observed.cpu_snapshot_status == 1)
+                observed.cpu_snapshot_bytes = bytes.data();
+            } else if (snr02_track_vertex) {
               copy_bounded_snapshot(observed.guest_base, observed.length,
                                     512 * 1024, track_snapshot_budget_bytes,
                                     128ull * 1024 * 1024, bytes,
@@ -4181,12 +4239,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
               if (observed.cpu_snapshot_status == 1) {
                 observed.cpu_snapshot_bytes = bytes.data();
               }
-            } else if (snr03_probe_draw || ray_ui_draw) {
+            } else if (snr03_probe_draw) {
               copy_bounded_snapshot(observed.guest_base, observed.length,
-                                    ray_ui_draw ? 1024 * 1024 : 3 * 1024 * 1024,
+                                    3 * 1024 * 1024,
                                     remaining_snapshot_budget_bytes,
-                                    ray_ui_draw ? 128ull * 1024 * 1024
-                                                : 512ull * 1024 * 1024, bytes,
+                                    512ull * 1024 * 1024, bytes,
                                     observed.cpu_snapshot_status,
                                     observed.cpu_snapshot_hash);
               if (observed.cpu_snapshot_status == 1) {
@@ -4231,23 +4288,26 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       const bool snr03_manager_draw = Fh1SnrProbeOutputFrame(
           Fh1Snr03ProbeFrame(), prepared_observation.frame_sequence) &&
           fh1_vertex_hash == 0xB8489164D5A86043ull;
-      if (!(Fh1NativeRaceCaptureStartFrame() && snr03_manager_draw) &&
+      if ((ray_ui_draw &&
+           (prepared_observation.index_buffer_type == 1 ||
+            prepared_observation.index_buffer_type == 2)) ||
+          (!(Fh1NativeRaceCaptureStartFrame() && snr03_manager_draw) &&
           (((snr02_track_draw || snr03_manager_draw) &&
            prepared_observation.index_buffer_type == 1) ||
-          ((snr03_probe_draw || ray_ui_draw) &&
+          (snr03_probe_draw &&
            (prepared_observation.index_buffer_type == 1 ||
-            prepared_observation.index_buffer_type == 2)))) {
+            prepared_observation.index_buffer_type == 2))))) {
         copy_bounded_snapshot(prepared_observation.index_buffer_guest_base,
                               prepared_observation.index_buffer_length,
                               ray_ui_draw ? 1024 * 1024 : 128 * 1024,
-                              snr02_track_draw ? track_snapshot_budget_bytes
+                              ray_ui_draw ? ui_snapshot_budget_bytes
+                                  : snr02_track_draw ? track_snapshot_budget_bytes
                                   : snr03_manager_draw ? manager_snapshot_budget_bytes
                                                        : remaining_snapshot_budget_bytes,
-                              snr02_track_draw ? 128ull * 1024 * 1024
+                              ray_ui_draw ? 128ull * 1024 * 1024
+                                  : snr02_track_draw ? 128ull * 1024 * 1024
                                   : snr03_manager_draw ? 1280ull * 1024 * 1024
-                                                       : ray_ui_draw
-                                                             ? 128ull * 1024 * 1024
-                                                             : 512ull * 1024 * 1024,
+                                                       : 512ull * 1024 * 1024,
                               index_snapshot_bytes,
                               prepared_observation.index_cpu_snapshot_status,
                               prepared_observation.index_cpu_snapshot_hash);
@@ -4292,6 +4352,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           ? std::chrono::steady_clock::now()
           : std::chrono::steady_clock::time_point{};
       prepared_draw_observer(prepared_observation);
+      ray_prepared_observed = true;
       if (time_fh1_draw) PERF_counter_add(kFh1PreparedObserverCpuTimeNs,
           std::chrono::duration_cast<std::chrono::nanoseconds>(
               std::chrono::steady_clock::now() - observer_begin).count());
@@ -4577,6 +4638,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           normalized_depth_control.z_enable && normalized_depth_control.z_write_enable,
           normalized_depth_control.stencil_enable, uint8_t(ff_stencil_ref_));
       deferred_command_list_.EndDebugMarker();
+      if (cleared)
+        report_clear(0,
+                     (normalized_color_mask ? 1u : 0u) |
+                     (normalized_depth_control.z_enable &&
+                              normalized_depth_control.z_write_enable ? 2u : 0u) |
+                     (normalized_depth_control.stencil_enable ? 4u : 0u),
+                     uint8_t(ff_stencil_ref_),
+                     std::span<const Fh1ClearRectangle>(rectangles).first(count),
+                     std::span<const std::array<float, 4>>(colors).first(count));
       return cleared;
     };
     if (try_clear()) return finish_draw(true);
@@ -4897,7 +4967,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       (snr02_track_draw ||
       Fh1SnrProbeOutputFrame(Fh1Snr03ProbeFrame(),
                              observation_frame_sequence_) ||
-      ray_ui_draw ||
+      ray_trace_frame ||
       (Fh1SnrProbeOutputFrame(Fh1Snr02ItemProbeFrame(),
                               observation_frame_sequence_) &&
        Fh1Snr02ItemShader(fh1_vertex_hash)))) {
@@ -4908,7 +4978,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       if (snr02_track_draw ||
           fh1_vertex_hash == 0x5834939992FFC765ull ||
           fh1_car_presentation_material || fh1_car_body_material ||
-          ray_ui_draw) {
+          ray_trace_frame) {
         for (uint32_t fetch = 0; fetch < 32; ++fetch) {
           if ((used_texture_mask & (uint32_t(1) << fetch)) &&
               (!fh1_car_presentation_material || !fetch))
@@ -4939,6 +5009,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                 viewport.data(), scissor.data(),
                 regs.values + XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0, 192,
                 textures.data(), texture_count});
+      ray_final_observed = true;
     }
   }
 

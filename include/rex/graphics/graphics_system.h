@@ -76,6 +76,12 @@ class GraphicsSystem : public system::IGraphicsSystem {
   system::GraphicsCopyObserver copy_observer() const {
     return copy_observer_.load(std::memory_order_acquire);
   }
+  void SetFh1ClearObserver(system::GraphicsFh1ClearObserver observer) override {
+    fh1_clear_observer_.store(observer, std::memory_order_release);
+  }
+  system::GraphicsFh1ClearObserver fh1_clear_observer() const {
+    return fh1_clear_observer_.load(std::memory_order_acquire);
+  }
   void SetShaderTranslationObserver(
       system::GraphicsShaderTranslationObserver observer) override {
     shader_translation_observer_.store(observer, std::memory_order_release);
@@ -187,6 +193,7 @@ class GraphicsSystem : public system::IGraphicsSystem {
   std::unique_ptr<::rex::ui::Presenter> presenter_;
 
   std::atomic<system::GraphicsCopyObserver> copy_observer_{nullptr};
+  std::atomic<system::GraphicsFh1ClearObserver> fh1_clear_observer_{nullptr};
   std::atomic<system::GraphicsShaderTranslationObserver>
       shader_translation_observer_{nullptr};
   std::atomic<system::GraphicsPreparedDrawObserver> prepared_draw_observer_{

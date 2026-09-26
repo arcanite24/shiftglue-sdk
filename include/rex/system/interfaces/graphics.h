@@ -272,6 +272,21 @@ struct GraphicsCopyObservation {
 
 using GraphicsCopyObserver = void (*)(const GraphicsCopyObservation& observation);
 
+// An optimized FH1 rectangle clear replaces an IssueDraw command. Borrowed
+// values are valid only during the callback.
+struct GraphicsFh1ClearObservation {
+  uint64_t frame_sequence = 0;
+  uint64_t draw_sequence = 0;
+  uint32_t surface_info = 0, color_info = 0, depth_info = 0;
+  // 0=regular target, 1=owned depth, 2=owned depth tiles.
+  uint32_t mode = 0, flags = 0, stencil_reference = 0, rectangle_count = 0;
+  int32_t bounds[2][4] = {};
+  float depth[2] = {};
+  float colors[2][4] = {};
+};
+using GraphicsFh1ClearObserver = void (*)(
+    const GraphicsFh1ClearObservation& observation);
+
 enum class GraphicsShaderStage : uint32_t {
   kVertex = 1,
   kPixel = 2,
@@ -511,6 +526,9 @@ class IGraphicsSystem {
   // Optional read-only command-stream observation. Backends invoke this
   // before draw submission and observers cannot alter draw behavior.
   virtual void SetCopyObserver(GraphicsCopyObserver observer) {
+    (void)observer;
+  }
+  virtual void SetFh1ClearObserver(GraphicsFh1ClearObserver observer) {
     (void)observer;
   }
   virtual void SetShaderTranslationObserver(
