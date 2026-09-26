@@ -4983,6 +4983,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       fh1_pixel_hash == 0xE9CD565D9C61D037ull &&
       vertex_shader_modification.value == 0x3Full &&
       pixel_shader_modification.value == 0x16003Full;
+  const bool fh1_car_glass_material =
+      fh1_vertex_hash == 0x2E5E0A854BE00027ull &&
+      fh1_pixel_hash == 0xBDFFA72B7ED2FBA4ull &&
+      pixel_shader_modification.value == 0x16003Full;
   const bool fh1_sampled_native_material =
       (snr02_track_draw &&
        ((fh1_vertex_hash == 0x07425D208E8BD688ull &&
@@ -4993,7 +4997,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
          vertex_shader_modification.value == 0x3FFull))) ||
       (fh1_vertex_hash == 0x5834939992FFC765ull &&
        pixel_shader_modification.value == 0x1A001Full) ||
-      fh1_car_presentation_material || fh1_car_body_material;
+      fh1_car_presentation_material || fh1_car_body_material ||
+      fh1_car_glass_material;
   const bool ray_ui_material = ray_ui_draw &&
       (fh1_pixel_hash == 0xCAE1DB68AFFA9D3Cull ||
        fh1_pixel_hash == 0x6FDA0F1CDE67D12Full);
@@ -5003,10 +5008,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
          fh1_native_race_requested.load(std::memory_order_acquire)) &&
         fh1_sampled_native_material))) {
     for (uint32_t material_fetch = 0;
-         material_fetch < (fh1_car_body_material ? 14u : 2u);
+         material_fetch < (fh1_car_body_material || fh1_car_glass_material
+                               ? 14u : 2u);
          ++material_fetch) {
       if (!(used_texture_mask & (1u << material_fetch)) ||
-          (!ray_ui_material && !fh1_car_body_material && material_fetch != 0))
+          (!ray_ui_material && !fh1_car_body_material &&
+           !fh1_car_glass_material && material_fetch != 0))
         continue;
       const auto identity =
           texture_cache_->GetActiveNativeTextureIdentity(material_fetch);
