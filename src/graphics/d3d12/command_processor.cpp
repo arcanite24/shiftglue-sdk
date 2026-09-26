@@ -5107,6 +5107,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       fh1_vertex_hash == 0x2E5E0A854BE00027ull &&
       fh1_pixel_hash == 0xBDFFA72B7ED2FBA4ull &&
       pixel_shader_modification.value == 0x16003Full;
+  const bool fh1_manager_material =
+      fh1_vertex_hash == 0xB8489164D5A86043ull &&
+      fh1_pixel_hash == 0x68150A8E959006CDull &&
+      pixel_shader_modification.value == 0x15001Full;
   const bool fh1_track_structure_material = snr02_track_draw && (
       (((fh1_vertex_hash == 0x0CBC533419F61E0Dull &&
          (fh1_pixel_hash == 0xEFCA69AA2BEE366Bull ||
@@ -5128,7 +5132,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       (fh1_vertex_hash == 0x5834939992FFC765ull &&
        pixel_shader_modification.value == 0x1A001Full) ||
       fh1_car_presentation_material || fh1_car_body_material ||
-      fh1_car_glass_material || fh1_track_structure_material;
+      fh1_car_glass_material || fh1_track_structure_material ||
+      fh1_manager_material;
   const bool ray_ui_material = ray_ui_draw &&
       (fh1_pixel_hash == 0xCAE1DB68AFFA9D3Cull ||
        fh1_pixel_hash == 0x6FDA0F1CDE67D12Full);
@@ -5140,12 +5145,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     for (uint32_t material_fetch = 0;
          material_fetch < (ray_trace_frame ? 32u :
                            (fh1_car_body_material || fh1_car_glass_material ||
-                            fh1_track_structure_material ? 14u : 2u));
+                            fh1_track_structure_material ||
+                            fh1_manager_material ? 14u : 2u));
          ++material_fetch) {
       if (!(used_texture_mask & (1u << material_fetch)) ||
           (!ray_trace_frame && !ray_ui_material && !fh1_car_body_material &&
            !fh1_car_glass_material && !fh1_track_structure_material &&
-           material_fetch != 0))
+           !fh1_manager_material && material_fetch != 0) ||
+          (fh1_manager_material && material_fetch != 0 &&
+           material_fetch != 13))
         continue;
       const auto identity =
           texture_cache_->GetActiveNativeTextureIdentity(material_fetch);
