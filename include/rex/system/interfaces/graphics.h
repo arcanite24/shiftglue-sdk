@@ -223,6 +223,9 @@ struct GraphicsCopyObservation {
   GraphicsFh1ExecutionKey fh1_execution_key;
   uint64_t frame_sequence = 0;
   uint64_t copy_sequence = 0;
+  // IssueDraw ordinal shared with GraphicsPreparedDrawObservation::draw_sequence.
+  // Includes copy-mode draws, so draw and resolve events can be interleaved.
+  uint64_t draw_sequence = 0;
   uint64_t current_submission = 0;
   uint64_t completed_submission = 0;
   uint32_t written_address = 0;

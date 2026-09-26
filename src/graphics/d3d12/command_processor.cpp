@@ -3399,7 +3399,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   const auto fh1_prepare_start =
       Fh1GpuCorpusEnabled() && Fh1ObserveCorpusFrame(observation_frame_sequence_) ? std::chrono::steady_clock::now()
                             : std::chrono::steady_clock::time_point{};
-  if (Fh1GpuCorpusEnabled() || Fh1Snr04LiveHandoffEnabled()) {
+  static const bool ordered_trace = std::strtoull(
+      rex::cvar::GetFlagByName("pinyon_shift_snr01_trace_source_frame").c_str(),
+      nullptr, 10) != 0;
+  if (Fh1GpuCorpusEnabled() || Fh1Snr04LiveHandoffEnabled() || ordered_trace) {
     ++fh1_scene_draw_sequence_;
   }
 
@@ -5264,6 +5267,7 @@ bool D3D12CommandProcessor::IssueCopy() {
     system::GraphicsCopyObservation observation;
     observation.frame_sequence = observation_frame_sequence_;
     observation.copy_sequence = ++observation_copy_sequence_;
+    observation.draw_sequence = fh1_scene_draw_sequence_;
     observation.current_submission = GetCurrentSubmission();
     observation.completed_submission = submission_completed_;
     observation.written_address = written_address;
