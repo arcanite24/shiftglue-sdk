@@ -3480,6 +3480,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }();
   const bool ray_trace_frame =
       ray_ui_capture_frame && ray_ui_capture_frame == observation_frame_sequence_;
+  static const bool ray_ordered_live =
+      rex::cvar::GetFlagByName("pinyon_shift_native_ordered_live_probe") ==
+      "true";
+  static const uint64_t ray_ordered_start = std::strtoull(
+      rex::cvar::GetFlagByName(
+          "pinyon_shift_native_race_capture_start_frame").c_str(),
+      nullptr, 10);
+  const bool ray_ordered_frame = ray_ordered_live && ray_ordered_start &&
+      observation_frame_sequence_ >= ray_ordered_start &&
+      observation_frame_sequence_ - ray_ordered_start < 64;
   const bool ray_shadow_frame = ray_ui_shadow_start &&
       observation_frame_sequence_ >= ray_ui_shadow_start &&
       (observation_frame_sequence_ - ray_ui_shadow_start < 24 ||
@@ -3501,7 +3511,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                                 uint32_t stencil_reference,
                                 std::span<const Fh1ClearRectangle> rectangles,
                                 std::span<const std::array<float, 4>> colors) {
-    if (!ray_trace_frame) return;
+    if (!ray_trace_frame && !ray_ordered_frame) return;
     const auto observer = graphics_system_->fh1_clear_observer();
     if (!observer) return;
     system::GraphicsFh1ClearObservation observation;
