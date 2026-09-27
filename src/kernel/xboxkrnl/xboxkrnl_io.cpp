@@ -12,7 +12,10 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <atomic>
+
 #include <rex/filesystem/device.h>
+#include <rex/kernel/xboxkrnl/io.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
@@ -31,6 +34,14 @@
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
+
+namespace {
+std::atomic<GuestFileOpenObserver> guest_file_open_observer{nullptr};
+}  // namespace
+
+void SetGuestFileOpenObserver(GuestFileOpenObserver observer) {
+  guest_file_open_observer.store(observer, std::memory_order_release);
+}
 
 static uint32_t CurrentGuestLr() {
   auto* thread = XThread::GetCurrentThread();
@@ -168,6 +179,9 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
       "NtCreateFile", "path={} access={:#x} attrs={:#x} share={:#x} disp={:#x} options={:#x}",
       target_path, (uint32_t)desired_access, (uint32_t)file_attributes, (uint32_t)share_access,
       (uint32_t)creation_disposition, (uint32_t)create_options);
+  if (auto observer = guest_file_open_observer.load(std::memory_order_acquire)) {
+    observer(target_path);
+  }
 
   // Enforce that the path is ASCII.
   if (!IsValidPath(target_path, false)) {
