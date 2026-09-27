@@ -5187,6 +5187,21 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             frame.materials.size() < material_limit &&
             frame.bytes < byte_limit) {
           auto it = frame.materials.try_emplace(key).first;
+          // The pinned copy is immutable for this exact texture version.
+          for (uint64_t lag = 1; lag <= 2 &&
+               observation_frame_sequence_ >= lag; ++lag) {
+            const auto previous = fh1_native_material_frames_.find(
+                observation_frame_sequence_ - lag);
+            if (previous == fh1_native_material_frames_.end()) continue;
+            const auto material = previous->second.materials.find(key);
+            if (material == previous->second.materials.end() ||
+                !material->second.snapshot ||
+                material->second.bytes > byte_limit - frame.bytes) continue;
+            it->second = material->second;
+            frame.bytes += material->second.bytes;
+            break;
+          }
+          if (it->second.snapshot) continue;
           uint64_t bytes = 0;
           const auto snapshot_begin = time_fh1_draw
               ? std::chrono::steady_clock::now()
@@ -5201,6 +5216,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             PERF_counter_inc(kFh1MaterialSnapshotCalls);
           }
           if (snapshot_ready) {
+            it->second.bytes = bytes;
             frame.bytes += bytes;
           } else {
             frame.materials.erase(it);

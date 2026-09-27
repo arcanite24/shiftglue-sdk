@@ -850,6 +850,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   struct Fh1NativeMaterial {
     Microsoft::WRL::ComPtr<ID3D12Resource> source, snapshot;
     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    uint64_t bytes = 0;
   };
   struct Fh1NativeMaterialFrame {
     uint64_t bytes = 0;
