@@ -5134,11 +5134,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
        pixel_shader_modification.value == 0x4000005B007Full));
   const bool fh1_sampled_native_material =
       (snr02_track_draw &&
-       ((fh1_vertex_hash == 0x07425D208E8BD688ull &&
+       ((fh1_vertex_hash == 0xD7F57566A51FA243ull &&
+         fh1_pixel_hash == 0x175C1F483406F7FDull &&
+         vertex_shader_modification.value == 0x3FFull) ||
+        (fh1_vertex_hash == 0x07425D208E8BD688ull &&
          fh1_pixel_hash == 0x6F7CDE74CDACCB08ull &&
          vertex_shader_modification.value == 0x7Full) ||
         (fh1_vertex_hash == 0x1193B16753866698ull &&
-         fh1_pixel_hash == 0x93961AB9BDF347DDull &&
+         (fh1_pixel_hash == 0x93961AB9BDF347DDull ||
+          fh1_pixel_hash == 0xA47DB20460BADDDFull) &&
          vertex_shader_modification.value == 0x3FFull))) ||
       (fh1_vertex_hash == 0x5834939992FFC765ull &&
        pixel_shader_modification.value == 0x1A001Full) ||
