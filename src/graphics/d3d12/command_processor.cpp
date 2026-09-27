@@ -4300,6 +4300,34 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       };
       uint32_t ui_max_index = 0;
       bool ui_trim_vertices = false;
+      uint32_t track_max_index = 0;
+      bool track_trim_vertices = false;
+      if (snr02_track_draw && prepared_observation.index_buffer_type == 1 &&
+          prepared_observation.index_buffer_guest_endianness == 1 &&
+          prepared_observation.index_count &&
+          uint64_t(prepared_observation.index_count) * 2 <=
+              prepared_observation.index_buffer_length) {
+        copy_bounded_snapshot(prepared_observation.index_buffer_guest_base,
+                              prepared_observation.index_buffer_length,
+                              128 * 1024, track_snapshot_budget_bytes,
+                              128ull * 1024 * 1024, index_snapshot_bytes,
+                              prepared_observation.index_cpu_snapshot_status,
+                              prepared_observation.index_cpu_snapshot_hash);
+        if (prepared_observation.index_cpu_snapshot_status == 1) {
+          prepared_observation.index_cpu_snapshot_bytes =
+              index_snapshot_bytes.data();
+          for (size_t i = 0;
+               i < size_t(prepared_observation.index_count) * 2; i += 2) {
+            const uint32_t index =
+                (uint32_t(index_snapshot_bytes[i]) << 8) |
+                index_snapshot_bytes[i + 1];
+            if (index != 0xFFFF ||
+                !prepared_observation.host_primitive_reset_enabled)
+              track_max_index = std::max(track_max_index, index);
+          }
+          track_trim_vertices = true;
+        }
+      }
       if (ray_ui_draw && prepared_observation.index_buffer_type == 1 &&
           prepared_observation.index_buffer_guest_endianness == 1) {
         copy_bounded_snapshot(prepared_observation.index_buffer_guest_base,
@@ -4381,13 +4409,19 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                 observed.cpu_snapshot_length = snapshot_length;
               }
             } else if (snr02_track_vertex) {
-              copy_bounded_snapshot(observed.guest_base, observed.length,
-                                    512 * 1024, track_snapshot_budget_bytes,
+              const uint64_t used = uint64_t(track_max_index + 1) *
+                                    observed.stride_words * 4;
+              const uint32_t snapshot_length =
+                  track_trim_vertices && used && used <= observed.length
+                      ? uint32_t(used) : observed.length;
+              copy_bounded_snapshot(observed.guest_base, snapshot_length,
+                                    8 * 1024 * 1024, track_snapshot_budget_bytes,
                                     128ull * 1024 * 1024, bytes,
                                     observed.cpu_snapshot_status,
                                     observed.cpu_snapshot_hash);
               if (observed.cpu_snapshot_status == 1) {
                 observed.cpu_snapshot_bytes = bytes.data();
+                observed.cpu_snapshot_length = snapshot_length;
               }
             } else if (snr03_manager_vertex) {
               if (Fh1NativeRaceCaptureStartFrame()) {
@@ -4481,7 +4515,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           (ray_trace_frame || ray_ordered_producer) &&
           !ray_ui_draw && !snr02_track_draw && !snr03_manager_draw &&
           !snr03_probe_draw && prepared_observation.index_buffer_type;
-      if ((ray_ui_draw && !prepared_observation.index_cpu_snapshot_status &&
+      if (!prepared_observation.index_cpu_snapshot_status &&
+          ((ray_ui_draw &&
            (prepared_observation.index_buffer_type == 1 ||
             prepared_observation.index_buffer_type == 2)) ||
           (((snr02_track_draw || snr03_manager_draw) &&
@@ -4489,7 +4524,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           (snr03_probe_draw &&
            (prepared_observation.index_buffer_type == 1 ||
             prepared_observation.index_buffer_type == 2))) ||
-          ordered_geometry_index) {
+          ordered_geometry_index)) {
         if (snr03_manager_draw && Fh1NativeRaceCaptureStartFrame()) {
           auto [snapshot, fresh] = manager_snapshots.try_emplace(
               {prepared_observation.index_buffer_guest_base,
