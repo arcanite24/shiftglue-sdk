@@ -3047,6 +3047,18 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
   REXGPU_INFO(
       "FH1 native executor frame={} draws={} resolves={} surfaces={} skips={{{}}} stats={{{}}}",
       frame, shadow_draws_, shadow_resolves_, surfaces_.size(), skips, stats);
+  // Memory: surfaces and the executor's buffers, and the texture cache (in
+  // native mode, the command processor's) against its limits.
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  uint64_t surface_bytes = 0;
+  for (const auto& [packed, surface] : surfaces_) {
+    const D3D12_RESOURCE_DESC desc = surface.resource->GetDesc();
+    surface_bytes += device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+  }
+  REXGPU_INFO(
+      "FH1 native executor memory MB: surfaces {} transfer_words {} textures {}",
+      surface_bytes >> 20, transfer_words_size_ >> 20,
+      native_textures_ ? native_textures_->total_host_memory_usage() >> 20 : 0);
   if (cpu_frames_) {
     // Transfers run inside target preparation and resolve clears.
     const double frames = double(cpu_frames_);

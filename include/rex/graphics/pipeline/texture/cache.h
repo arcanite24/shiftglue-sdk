@@ -635,6 +635,12 @@ class TextureCache {
 
   uint64_t textures_total_host_memory_usage_ = 0;
 
+ public:
+  // Host memory of all cached textures, bounded by texture_cache_memory_limit_*.
+  uint64_t total_host_memory_usage() const { return textures_total_host_memory_usage_; }
+
+ private:
+
   Texture* texture_used_first_ = nullptr;
   Texture* texture_used_last_ = nullptr;
 
