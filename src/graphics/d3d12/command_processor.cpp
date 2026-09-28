@@ -4921,20 +4921,26 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   } else {
     texture_cache_->RequestTextures(used_texture_mask);
   }
-  if (fh1_native_executor_ && !fh1_native_presents) {
+  if (fh1_native_executor_) {
     // The native mirror and textures are prepared before the Xenos pipeline is
     // bound, since loading textures may dispatch compute work.
     const bool guest_dma_indices = primitive_processing_result.index_buffer_type ==
                                    PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA;
-    fh1_native_executor_->PrepareDraw(
-        used_texture_mask, *vertex_shader,
-        guest_dma_indices ? primitive_processing_result.guest_index_base : 0,
+    const uint32_t index_base = guest_dma_indices ? primitive_processing_result.guest_index_base : 0;
+    const uint32_t index_size =
         guest_dma_indices
             ? primitive_processing_result.host_draw_vertex_count *
                   (primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
                        ? uint32_t(sizeof(uint16_t))
                        : uint32_t(sizeof(uint32_t)))
-            : 0);
+            : 0;
+    if (fh1_native_presents) {
+      fh1_native_executor_->RecordDrawInputs(used_texture_mask, *vertex_shader, index_base,
+                                             index_size);
+    } else {
+      fh1_native_executor_->PrepareDraw(used_texture_mask, *vertex_shader, index_base,
+                                        index_size);
+    }
   }
   if (time_texture_request) {
     PERF_counter_add(kTextureRequestCpuTimeNs,
@@ -5917,6 +5923,7 @@ bool D3D12CommandProcessor::IssueCopy() {
   uint32_t written_address = 0;
   uint32_t written_length = 0;
   BeginFh1GpuPassTimingCopy();
+  if (fh1_native_executor_) fh1_native_executor_->RecordCopyInputs();
   const bool fh1_native_presents = fh1_native_executor_ && fh1_native_executor_->presents();
   bool copy_succeeded;
   if (fh1_native_presents) {
@@ -8924,6 +8931,19 @@ bool D3D12CommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_addre
   active_occlusion_query_.host_index = host_index;
   active_occlusion_query_.valid = true;
   return true;
+}
+
+void D3D12CommandProcessor::RunRequestedFrameReplay() {
+  const int exit_code =
+      Fh1FrameDump::RunRequestedReplay(*this, *register_file_, *memory_, *shared_memory_);
+  if (exit_code < 0) return;
+  if (fh1_native_executor_) fh1_native_executor_->LogStats(0);
+  const auto work = render_target_cache_->fh1_work_counters();
+  REXGPU_INFO("FH1 frame replay: xenos edram updates={} resolves={}", work.updates,
+              work.resolves);
+  // A replay is a tool run with the title suspended: end the process here.
+  rex::FlushLogging();
+  std::_Exit(exit_code);
 }
 
 ReadbackResolveMode D3D12CommandProcessor::Fh1ReadbackResolveMode() const {

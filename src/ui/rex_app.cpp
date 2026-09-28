@@ -466,6 +466,11 @@ void ReXApp::LaunchModule() {
     }
 
     OnPostLaunchModule(main_thread.get());
+    if (!ShouldStartModuleThread()) {
+      REXLOG_INFO("Module launched suspended");
+      suspended_module_thread_ = std::move(main_thread);
+      return;
+    }
     main_thread->Resume();
 
     module_thread_ = std::thread([this, main_thread = std::move(main_thread)]() mutable {

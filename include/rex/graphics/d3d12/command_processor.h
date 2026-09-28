@@ -239,6 +239,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   // For the FH1 native executor's resolve readback.
   ReadbackResolveMode Fh1ReadbackResolveMode() const;
   bool Fh1AwaitAllQueueOperations() { return AwaitAllQueueOperationsCompletion(); }
+  // Opens a submission for work recorded outside guest packets.
+  bool Fh1BeginSubmission() { return BeginSubmission(false); }
+  void RunRequestedFrameReplay() override;
   D3D12TextureCache& Fh1XenosTextureCache() const { return *texture_cache_; }
 
   // FH1 native executor: after a Xenos draw, rebinds the resources that draw

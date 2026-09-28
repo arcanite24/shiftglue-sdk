@@ -161,6 +161,9 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// Called after the main guest thread is created but before it starts
   /// executing. The thread is suspended -- attach debuggers/monitors here.
   virtual void OnPostLaunchModule(system::XThread* thread) { (void)thread; }
+  // False keeps the title's main thread suspended after launch, for tools that
+  // drive the GPU themselves (frame replays).
+  virtual bool ShouldStartModuleThread() { return true; }
 
   /// Called when the main guest thread exits. The runtime is still alive.
   /// Use for cleanup that depends on runtime resources.
@@ -297,6 +300,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<Runtime> runtime_;
   std::unique_ptr<ui::Window> window_;
   std::thread module_thread_;
+  system::object_ref<system::XThread> suspended_module_thread_;
   std::atomic<bool> shutting_down_{false};
   std::unique_ptr<ui::ImmediateDrawer> immediate_drawer_;
   std::unique_ptr<ui::ImGuiDrawer> imgui_drawer_;

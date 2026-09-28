@@ -715,12 +715,49 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
   } while (reader.read_count());
 }
 
+bool CommandProcessor::ExecuteHostPackets(const uint32_t* dwords, uint32_t count) {
+  if (!count) return true;
+  memory::RingBuffer reader(reinterpret_cast<uint8_t*>(const_cast<uint32_t*>(dwords)),
+                            count * sizeof(uint32_t));
+  reader.set_write_offset(count * sizeof(uint32_t));
+  do {
+    if (!ExecutePacket(&reader)) return false;
+  } while (reader.read_count());
+  return true;
+}
+
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
   const uint32_t packet_offset = reader->read_offset();
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
   if (packet == 0) {
     return true;
+  }
+  if (packet_recorder_) {
+    uint32_t dword_count = 1;
+    switch (packet_type) {
+      case 0x00:
+      case 0x03:
+        dword_count += ((packet >> 16) & 0x3FFF) + 1;
+        break;
+      case 0x01:
+        dword_count += 2;
+        break;
+      default:
+        break;
+    }
+    const uint32_t opcode = (packet >> 8) & 0x7F;
+    // Indirect buffers are recorded as the packets they contain.
+    if (packet_type != 0x03 ||
+        (opcode != PM4_INDIRECT_BUFFER && opcode != PM4_INDIRECT_BUFFER_PFD)) {
+      std::vector<uint32_t> dwords(dword_count);
+      memory::RingBuffer copy = *reader;
+      copy.set_read_offset(packet_offset);
+      if (copy.Read(reinterpret_cast<uint8_t*>(dwords.data()), dword_count * sizeof(uint32_t)) ==
+          dword_count * sizeof(uint32_t)) {
+        packet_recorder_(dwords.data(), dword_count);
+      }
+    }
   }
 
   if (packet == 0xCDCDCDCD) {

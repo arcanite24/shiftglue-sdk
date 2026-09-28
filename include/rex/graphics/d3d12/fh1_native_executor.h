@@ -11,6 +11,7 @@
 #include <tuple>
 #include <vector>
 
+#include <rex/graphics/d3d12/fh1_frame_dump.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/util/draw_extent_estimator.h>
@@ -114,6 +115,13 @@ class Fh1NativeExecutor {
   void PrepareTargets(const Fh1NativeDrawInfo& draw);
   // Before the Xenos pipeline is bound: uploads the draw's vertex and index
   // ranges to the native mirror and loads its textures natively.
+  void LogStats(uint64_t frame);
+  void RecordCopyInputs() {
+    if (frame_dump_) frame_dump_->RecordCopyInputs();
+  }
+  // Frame dumps: the guest ranges a draw reads, once the mirror holds them.
+  void RecordDrawInputs(uint32_t used_texture_mask, const Shader& vertex_shader,
+                        uint32_t guest_dma_index_offset, uint32_t guest_dma_index_size);
   void PrepareDraw(uint32_t used_texture_mask, const Shader& vertex_shader,
                    uint32_t guest_dma_index_offset, uint32_t guest_dma_index_size);
   // Right after the Xenos draw was recorded, with its state still bound.
@@ -291,6 +299,8 @@ class Fh1NativeExecutor {
     uint64_t last_used_frame = 0;
   };
   std::map<uint64_t, ResolveReadback> resolve_readbacks_;
+  // fh1_frame_dump_frame: records one frame for offline replay.
+  std::unique_ptr<Fh1FrameDump> frame_dump_;
   void ReadBackResolve(uint32_t address, uint32_t length);
   class PositionExportSink : public ShaderInterpreter::ExportSink {
    public:
@@ -401,7 +411,7 @@ class Fh1NativeExecutor {
   void QueueFrontBufferDump(D3D12TextureCache& textures, const char* prefix, uint64_t frame,
                             uint32_t width, uint32_t height, const uint32_t* gamma_pwl);
   void DrainDumps();
-  void LogStats(uint64_t frame);
+
 
   D3D12CommandProcessor& command_processor_;
   const RegisterFile& register_file_;

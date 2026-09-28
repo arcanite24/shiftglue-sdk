@@ -420,6 +420,14 @@ void GraphicsSystem::InvalidateGpuMemory() {
 
 void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                              uint32_t title_id, bool blocking) {
+  // A requested frame replay runs once the title's shader storage is ready.
+  struct ReplayAfterStorage {
+    CommandProcessor* command_processor;
+    ~ReplayAfterStorage() {
+      command_processor->CallInThread(
+          [command_processor = command_processor] { command_processor->RunRequestedFrameReplay(); });
+    }
+  } replay_after_storage{command_processor_.get()};
   if (!REXCVAR_GET(store_shaders)) {
     return;
   }

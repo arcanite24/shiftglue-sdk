@@ -91,6 +91,8 @@ class CommandProcessor {
 
   Shader* active_vertex_shader() const { return active_vertex_shader_; }
   Shader* active_pixel_shader() const { return active_pixel_shader_; }
+  uint64_t bin_mask() const { return bin_mask_; }
+  uint64_t bin_select() const { return bin_select_; }
 
   virtual bool Initialize();
   virtual void Shutdown();
@@ -123,6 +125,16 @@ class CommandProcessor {
   void UpdateWritePointer(uint32_t value);
 
   void ExecutePacket(uint32_t ptr, uint32_t count);
+
+  // Frame dumps: while set, the recorder sees the raw (big-endian) dwords of
+  // every packet executed, indirect buffers flattened into their packets.
+  using PacketRecorder = std::function<void(const uint32_t* dwords, uint32_t count)>;
+  void SetPacketRecorder(PacketRecorder recorder) { packet_recorder_ = std::move(recorder); }
+  // Executes big-endian packets from host memory as if read from the ring.
+  bool ExecuteHostPackets(const uint32_t* dwords, uint32_t count);
+  // Replays a frame dump requested at startup (fh1_frame_replay); called on
+  // the command processor thread once shader storage is initialized.
+  virtual void RunRequestedFrameReplay() {}
 
   bool is_paused() const { return paused_; }
   void Pause();
@@ -159,6 +171,8 @@ class CommandProcessor {
   void WriteBoolRangeFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
   void WriteLoopRangeFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
   void WriteREGISTERSRangeFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
+
+  PacketRecorder packet_recorder_;
 
   const reg::DC_LUT_30_COLOR* gamma_ramp_256_entry_table() const {
     return gamma_ramp_256_entry_table_;
