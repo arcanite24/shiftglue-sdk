@@ -792,6 +792,19 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::vector<D3D12TextureCache::TextureSRVKey> current_texture_srv_keys_pixel_;
   std::vector<D3D12TextureCache::SamplerParameters> current_samplers_vertex_;
   std::vector<D3D12TextureCache::SamplerParameters> current_samplers_pixel_;
+  // What current_samplers_*_[i] was derived from: the fetch constant words,
+  // the binding's filter overrides and anisotropic_override. Unchanged inputs
+  // skip GetSamplerParameters, which runs for every sampler of every draw.
+  struct SamplerInputs {
+    std::array<uint32_t, 6> fetch{};
+    uint32_t binding = 0;
+    int32_t anisotropic_override = 0;
+    bool valid = false;
+    bool operator==(const SamplerInputs&) const = default;
+  };
+  SamplerInputs GetSamplerInputs(const D3D12Shader::SamplerBinding& binding) const;
+  std::vector<SamplerInputs> current_sampler_inputs_vertex_;
+  std::vector<SamplerInputs> current_sampler_inputs_pixel_;
   std::vector<uint32_t> current_sampler_bindless_indices_vertex_;
   std::vector<uint32_t> current_sampler_bindless_indices_pixel_;
 

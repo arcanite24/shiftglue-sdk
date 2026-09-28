@@ -139,7 +139,8 @@ const char* CounterName(CounterId id);
 // Set a counter to an absolute value
 void SetCounter(CounterId id, int64_t value);
 
-// Atomically add to a counter
+// Add to a counter. Lock-free and uncontended: each thread adds to its own
+// block, and readers sum the blocks.
 void IncrementCounter(CounterId id, int64_t delta = 1);
 
 // Read a counter's current live value

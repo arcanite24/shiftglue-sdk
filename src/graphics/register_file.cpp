@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <bitset>
 #include <cstring>
 
 #include <rex/graphics/register_file.h>
@@ -18,6 +19,24 @@ namespace rex::graphics {
 
 RegisterFile::RegisterFile() {
   std::memset(values, 0, sizeof(values));
+}
+
+namespace {
+
+const std::bitset<RegisterFile::kRegisterCount> kKnownRegisters = [] {
+  std::bitset<RegisterFile::kRegisterCount> known;
+  // The table also names registers past the file (0x8D00 and up).
+#define XE_GPU_REGISTER(index, type, name) \
+  if ((index) < known.size()) known.set(index);
+#include <rex/graphics/register_table.inc>
+#undef XE_GPU_REGISTER
+  return known;
+}();
+
+}  // namespace
+
+bool RegisterFile::IsKnownRegister(uint32_t index) {
+  return index < kRegisterCount && kKnownRegisters[index];
 }
 
 const RegisterInfo* RegisterFile::GetRegisterInfo(uint32_t index) {

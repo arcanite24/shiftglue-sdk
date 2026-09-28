@@ -3677,6 +3677,21 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   cbuffer_binding_system_.up_to_date &= !dirty;
 }
 
+D3D12CommandProcessor::SamplerInputs D3D12CommandProcessor::GetSamplerInputs(
+    const D3D12Shader::SamplerBinding& binding) const {
+  SamplerInputs inputs;
+  std::memcpy(inputs.fetch.data(),
+              &register_file_->values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 +
+                                      binding.fetch_constant * uint32_t(inputs.fetch.size())],
+              sizeof(inputs.fetch));
+  inputs.binding = binding.fetch_constant | (uint32_t(binding.mag_filter) << 8) |
+                   (uint32_t(binding.min_filter) << 12) | (uint32_t(binding.mip_filter) << 16) |
+                   (uint32_t(binding.aniso_filter) << 20);
+  inputs.anisotropic_override = REXCVAR_GET(anisotropic_override);
+  inputs.valid = true;
+  return inputs;
+}
+
 bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
                                            const D3D12Shader* pixel_shader,
                                            ID3D12RootSignature* root_signature,
@@ -3883,7 +3898,13 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     }
     current_samplers_vertex_.resize(
         std::max(current_samplers_vertex_.size(), sampler_count_vertex));
+    current_sampler_inputs_vertex_.resize(current_samplers_vertex_.size());
     for (size_t i = 0; i < sampler_count_vertex; ++i) {
+      const SamplerInputs inputs = GetSamplerInputs(samplers_vertex[i]);
+      if (current_sampler_inputs_vertex_[i] == inputs) {
+        continue;
+      }
+      current_sampler_inputs_vertex_[i] = inputs;
       D3D12TextureCache::SamplerParameters parameters =
           texture_cache_->GetSamplerParameters(samplers_vertex[i]);
       if (current_samplers_vertex_[i] != parameters) {
@@ -3915,7 +3936,13 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       }
       current_samplers_pixel_.resize(
           std::max(current_samplers_pixel_.size(), size_t(sampler_count_pixel)));
+      current_sampler_inputs_pixel_.resize(current_samplers_pixel_.size());
       for (uint32_t i = 0; i < sampler_count_pixel; ++i) {
+        const SamplerInputs inputs = GetSamplerInputs((*samplers_pixel)[i]);
+        if (current_sampler_inputs_pixel_[i] == inputs) {
+          continue;
+        }
+        current_sampler_inputs_pixel_[i] = inputs;
         D3D12TextureCache::SamplerParameters parameters =
             texture_cache_->GetSamplerParameters((*samplers_pixel)[i]);
         if (current_samplers_pixel_[i] != parameters) {

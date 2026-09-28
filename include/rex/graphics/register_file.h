@@ -36,6 +36,9 @@ class RegisterFile {
   RegisterFile();
 
   static const RegisterInfo* GetRegisterInfo(uint32_t index);
+  // Whether the register table names the index; a bitmap lookup for the
+  // per-write path, where GetRegisterInfo's switch is too slow.
+  static bool IsKnownRegister(uint32_t index);
 
   static constexpr size_t kRegisterCount = 0x5003;
   uint32_t values[kRegisterCount];

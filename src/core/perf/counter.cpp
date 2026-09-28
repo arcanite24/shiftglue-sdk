@@ -65,9 +65,45 @@ constexpr bool CriticalPathEtwEnabled() { return false; }
 
 constexpr size_t kNumCounters = static_cast<size_t>(CounterId::kCount);
 
+// Values written with SetCounter; increments live in per-thread blocks.
 std::array<std::atomic<int64_t>, kNumCounters> g_counters{};
 std::array<std::atomic<int64_t>, kNumCounters> g_snapshot{};
-std::array<std::atomic<int64_t>, kNumCounters> g_totals{};
+
+// Increments go to a block owned by the calling thread: one writer per
+// block, so an increment is a plain load and store with no locked
+// instruction and no cache line shared with other threads. Readers sum the
+// blocks. Blocks are never freed, so totals survive thread exit.
+struct alignas(64) ThreadCounterBlock {
+  std::array<std::atomic<int64_t>, kNumCounters> totals{};
+  ThreadCounterBlock* next = nullptr;
+};
+std::atomic<ThreadCounterBlock*> g_thread_blocks{nullptr};
+
+ThreadCounterBlock& LocalCounterBlock() {
+  thread_local ThreadCounterBlock* block = nullptr;
+  if (!block) {
+    block = new ThreadCounterBlock();
+    ThreadCounterBlock* head = g_thread_blocks.load(std::memory_order_relaxed);
+    do {
+      block->next = head;
+    } while (!g_thread_blocks.compare_exchange_weak(head, block, std::memory_order_release,
+                                                    std::memory_order_relaxed));
+  }
+  return *block;
+}
+
+int64_t SumThreadTotals(size_t index) {
+  int64_t sum = 0;
+  for (ThreadCounterBlock* block = g_thread_blocks.load(std::memory_order_acquire); block;
+       block = block->next) {
+    sum += block->totals[index].load(std::memory_order_relaxed);
+  }
+  return sum;
+}
+
+// Thread totals at the last frame snapshot (accumulators) and at Init.
+std::array<std::atomic<int64_t>, kNumCounters> g_snapshot_totals{};
+std::array<std::atomic<int64_t>, kNumCounters> g_init_totals{};
 
 constexpr const char* kCounterNames[] = {
     "frame_time_us",
@@ -262,27 +298,36 @@ void SetCounter(CounterId id, int64_t value) {
 }
 
 void IncrementCounter(CounterId id, int64_t delta) {
-  const size_t index = static_cast<size_t>(id);
-  g_counters[index].fetch_add(delta, std::memory_order_relaxed);
-  g_totals[index].fetch_add(delta, std::memory_order_relaxed);
+  std::atomic<int64_t>& total = LocalCounterBlock().totals[static_cast<size_t>(id)];
+  total.store(total.load(std::memory_order_relaxed) + delta, std::memory_order_relaxed);
 }
 
 int64_t GetCounter(CounterId id) {
-  return g_counters[static_cast<size_t>(id)].load(std::memory_order_relaxed);
+  const size_t index = static_cast<size_t>(id);
+  const int64_t totals = SumThreadTotals(index);
+  const int64_t base = kIsGauge[index] ? g_init_totals[index].load(std::memory_order_relaxed)
+                                       : g_snapshot_totals[index].load(std::memory_order_relaxed);
+  return g_counters[index].load(std::memory_order_relaxed) + totals - base;
 }
 
 int64_t GetTotalCounter(CounterId id) {
-  return g_totals[static_cast<size_t>(id)].load(std::memory_order_relaxed);
+  const size_t index = static_cast<size_t>(id);
+  return SumThreadTotals(index) - g_init_totals[index].load(std::memory_order_relaxed);
 }
 
 void ResetFrameCounters() {
   for (size_t i = 0; i < kNumCounters; ++i) {
+    const int64_t totals = SumThreadTotals(i);
     if (kIsGauge[i]) {
       // Gauges: snapshot the current value, don't zero
-      g_snapshot[i].store(g_counters[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+      g_snapshot[i].store(g_counters[i].load(std::memory_order_relaxed) + totals -
+                              g_init_totals[i].load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
     } else {
-      // Accumulators: snapshot and zero for next frame
-      g_snapshot[i].store(g_counters[i].exchange(0, std::memory_order_relaxed),
+      // Accumulators: snapshot this frame's increments and set value, then
+      // start the next frame from here.
+      const int64_t previous = g_snapshot_totals[i].exchange(totals, std::memory_order_relaxed);
+      g_snapshot[i].store(g_counters[i].exchange(0, std::memory_order_relaxed) + totals - previous,
                           std::memory_order_relaxed);
     }
   }
@@ -351,8 +396,11 @@ void Init() {
     c.store(0, std::memory_order_relaxed);
   for (auto& s : g_snapshot)
     s.store(0, std::memory_order_relaxed);
-  for (auto& total : g_totals)
-    total.store(0, std::memory_order_relaxed);
+  for (size_t i = 0; i < kNumCounters; ++i) {
+    const int64_t totals = SumThreadTotals(i);
+    g_init_totals[i].store(totals, std::memory_order_relaxed);
+    g_snapshot_totals[i].store(totals, std::memory_order_relaxed);
+  }
 }
 
 void SetCsvLogPath(const std::string& path) {
