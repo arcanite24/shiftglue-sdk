@@ -311,6 +311,9 @@ class Fh1NativeExecutor {
   bool ShouldLog() const { return logged_.size() < 256; }
   // Tracing the current frame (verification dump frames only).
   bool tracing_ = false;
+  // Verification checks run in the frames leading up to a dump frame.
+  bool verify_window_ = false;
+  bool verify_draws_ = false;
   // Verification: ordered events of dump frames.
   void Trace(const std::string& event);
   uint32_t trace_lines_ = 0;

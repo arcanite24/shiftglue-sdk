@@ -454,6 +454,7 @@ bool Fh1NativeExecutor::Initialize(const Fh1NativeExecutorConfig& config) {
   dump_directory_ = std::filesystem::path(REXCVAR_GET(fh1_native_shadow_dump_dir));
   // Verification compares with Xenos, which does not render in native mode.
   verify_ = REXCVAR_GET(fh1_native_shadow_verify) && !config_.presents;
+  verify_draws_ = verify_ && REXCVAR_GET(fh1_native_shadow_verify_draws);
   initialized_ = true;
   REXGPU_INFO("FH1 native executor enabled: {} ({} dump frames, verify {})",
               config_.presents ? "native" : "native-shadow", dump_frames_.size(), verify_);
@@ -527,7 +528,7 @@ void Fh1NativeExecutor::TextureFetchConstantsWritten(uint32_t first_index,
 }
 
 void Fh1NativeExecutor::Trace(const std::string& event) {
-  if (!verify_ || !dump_frames_.count(frame_ + 1) || trace_lines_ >= 400) return;
+  if (!verify_ || !dump_frames_.count(frame_ + 1) || trace_lines_ >= 4000) return;
   ++trace_lines_;
   REXGPU_INFO("FH1 native trace {} {}", frame_ + 1, event);
 }
@@ -1043,7 +1044,7 @@ void Fh1NativeExecutor::PrepareDraw(uint32_t used_texture_mask, const Shader& ve
   }
   native_textures_->RequestTextures(used_texture_mask);
   pending_texture_mask_ = used_texture_mask;
-  if (verify_ && !dump_frames_.count(frame_ + 1)) {
+  if (verify_window_ && !dump_frames_.count(frame_ + 1)) {
     // Compare the mirrors' bytes of each fetched base level, once per texture.
     for (uint32_t mask = used_texture_mask; mask; mask &= mask - 1) {
       const auto fetch = register_file_.GetTextureFetch(uint32_t(std::countr_zero(mask)));
@@ -1140,7 +1141,7 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1NativeDrawInfo& draw) {
           std::to_string(draw.vertex_shader ? draw.vertex_shader->ucode_data_hash() : 0) +
           " targets " + targets);
   }
-  if (verify_) {
+  if (tracing_) {
     std::string targets;
     uint64_t signature = draw.vertex_shader ? draw.vertex_shader->ucode_data_hash() : 0;
     for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
@@ -1186,7 +1187,8 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1NativeDrawInfo& draw) {
 
 void Fh1NativeExecutor::VerifyTargetsBeforeDraw(D3D12RenderTargetCache& render_target_cache,
                                                 const Fh1NativeDrawInfo& draw) {
-  if (!initialized_ || !verify_ || !dump_frames_.count(frame_ + 1) || !pending_targets_valid_) {
+  if (!initialized_ || !verify_draws_ || !dump_frames_.count(frame_ + 1) ||
+      !pending_targets_valid_) {
     return;
   }
   const uint64_t vs = draw.vertex_shader ? draw.vertex_shader->ucode_data_hash() : 0;
@@ -1227,8 +1229,7 @@ void Fh1NativeExecutor::VerifyDrawTarget(D3D12RenderTargetCache& render_target_c
   const uint32_t pitch = (width + 31) & ~31u;
   const uint32_t length = pitch * ((height + 31) & ~31u) * 4;
   if (length > kVerifyScratchSize / 2 || verifies_.size() >= 256 || !EnsureVerifyScratch()) {
-    if (tracing_) Trace("draw verify skipped: size " + std::to_string(length) + " pending " +
-          std::to_string(verifies_.size()));
+    Count("verify_draw_skipped");
     return;
   }
   ID3D12Resource* xenos_target = render_target_cache.Fh1PrepareTargetForRead(
@@ -1319,7 +1320,6 @@ void Fh1NativeExecutor::NativeDrawIssued(const Fh1NativeDrawInfo& draw) {
   pending_targets_valid_ = false;
   if (draw.occlusion_query_active) Count("draw_in_occlusion_query");
   ++shadow_draws_;
-  if (tracing_) Trace("draw executed");
 }
 
 void Fh1NativeExecutor::ShadowDraw(D3D12RenderTargetCache& render_target_cache,
@@ -1404,7 +1404,6 @@ void Fh1NativeExecutor::ShadowDraw(D3D12RenderTargetCache& render_target_cache,
   }
   render_target_cache.Fh1InvalidateCommandListRenderTargets();
   ++shadow_draws_;
-  if (tracing_) Trace("draw executed");
   if (verify_ && dump_frames_.count(frame_ + 1) && trace_lines_ < 400) {
     for (uint32_t mask = pending_texture_mask_; mask; mask &= mask - 1) {
       const uint32_t fetch = uint32_t(std::countr_zero(mask));
@@ -1413,7 +1412,7 @@ void Fh1NativeExecutor::ShadowDraw(D3D12RenderTargetCache& render_target_cache,
             command_processor_.Fh1XenosTextureCache().Fh1DescribeBinding(fetch));
     }
   }
-  if (verify_ && dump_frames_.count(frame_ + 1)) {
+  if (verify_draws_ && dump_frames_.count(frame_ + 1)) {
     const uint64_t vs = draw.vertex_shader ? draw.vertex_shader->ucode_data_hash() : 0;
     const uint64_t ps = draw.pixel_shader ? draw.pixel_shader->ucode_data_hash() : 0;
     for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
@@ -1656,12 +1655,12 @@ bool Fh1NativeExecutor::PlanCopy(CopyPlan& plan) {
 }
 
 void Fh1NativeExecutor::VerifySurfacesBeforeResolve(D3D12RenderTargetCache& render_target_cache) {
-  if (!initialized_ || !verify_) return;
+  if (!initialized_ || !verify_window_) return;
   CopyPlan plan;
   if (!PlanCopy(plan) || !plan.copy) return;
   const uint32_t extent_start = plan.info.copy_dest_extent_start;
   const uint32_t extent_length = plan.info.copy_dest_extent_length;
-  if (extent_length > kVerifyScratchSize / 2 || verifies_.size() >= 64) return;
+  if (extent_length > kVerifyScratchSize / 2 || verifies_.size() >= 192) return;
   if (!EnsureVerifyScratch()) return;
   // Both regions start from the Xenos mirror so words outside the rectangle
   // compare equal; the native owners resolve into the first, the Xenos
@@ -1840,7 +1839,7 @@ bool Fh1NativeExecutor::Resolve(D3D12RenderTargetCache* render_target_cache,
       Count(plan.sources.size() > 1 ? "resolve_multi_owner" : "resolve_single_owner");
     }
     succeeded = complete;
-    if (verify_ && render_target_cache) {
+    if (verify_window_ && render_target_cache) {
       // Owners in both EDRAM models.
       std::vector<uint32_t> native_owners;
       for (const SourceRect& source : plan.sources) {
@@ -1908,7 +1907,9 @@ bool Fh1NativeExecutor::Resolve(D3D12RenderTargetCache* render_target_cache,
 
 void Fh1NativeExecutor::QueueVerify(uint32_t start, uint32_t length, std::string kind) {
   if (!length) return;
-  if (verifies_.size() >= 64) {
+  // Resolves may take most of the bounded readback memory; texture checks
+  // are sampled and give way first.
+  if (verifies_.size() >= (kind.rfind("tex", 0) == 0 ? 32u : 192u)) {
     // Bounded readback memory: skip rather than stall.
     Count("verify_dropped");
     return;
@@ -2047,20 +2048,26 @@ void Fh1NativeExecutor::ShadowSwap(uint64_t frame, uint32_t frontbuffer_address,
   if (tracing_) Trace("swap");
   frame_ = frame;
   tracing_ = verify_ && dump_frames_.count(frame_ + 1) != 0;
+  {
+    // Resolve, texture and surface checks run only in the frames leading up
+    // to a dump frame, so verified runs keep the game's pace elsewhere.
+    const auto next_dump = dump_frames_.lower_bound(frame_ + 1);
+    verify_window_ = verify_ && next_dump != dump_frames_.end() && *next_dump <= frame_ + 3;
+  }
   ++cpu_frames_;
   trace_lines_ = 0;
   DrainDumps();
   DrainVerifies();
   if (dump_frames_.count(frame) && !dump_directory_.empty()) {
     QueueFrontBufferDump(*native_textures_, "native", frame, width, height, gamma_pwl);
-    if (verify_) {
+    if (!config_.presents) {
       // What Xenos presents this swap, for the same-frame comparison.
       QueueFrontBufferDump(command_processor_.Fh1XenosTextureCache(), "xenos", frame, width,
                            height, gamma_pwl);
     }
   }
   (void)frontbuffer_address;
-  if (frame % 600 == 0) LogStats(frame);
+  if (frame % (verify_ ? 120 : 600) == 0) LogStats(frame);
 }
 
 void Fh1NativeExecutor::QueueFrontBufferDump(D3D12TextureCache& textures, const char* prefix,
