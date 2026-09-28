@@ -19,6 +19,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <unordered_set>
 #if defined(REXGPU_FH1_SHADER_PRODUCER)
@@ -61,6 +62,12 @@ REXCVAR_DEFINE_BOOL(d3d12_dxbc_disasm, false, "GPU/D3D12", "Dump DXBC disassembl
 
 REXCVAR_DEFINE_BOOL(d3d12_dxbc_disasm_dxilconv, false, "GPU/D3D12",
                     "Dump DXIL conversion disassembly");
+
+REXCVAR_DEFINE_INT32(fh1_shader_production_threads, 0, "GPU/D3D12",
+                     "Threads translating the FH1 disc corpus in the offline shader producer "
+                     "(0 for one per logical processor)")
+    .range(0, 256)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 #endif
 
 REXCVAR_DEFINE_INT32(d3d12_pipeline_creation_threads, -1, "GPU/D3D12",
@@ -422,6 +429,7 @@ void PipelineCache::Shutdown() {
 
 void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                             uint32_t title_id, bool blocking) {
+  [[maybe_unused]] const uint64_t storage_start = rex::chrono::Clock::QueryHostTickCount();
   ShutdownShaderStorage();
   fh1_shader_miss_root_ = title_id == 0x4D5309C9 ? cache_root : std::filesystem::path();
 
@@ -1041,6 +1049,98 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       string::StringBuffer ucode_disasm_buffer;
       std::array<size_t, 2> translated{};
       size_t failed = 0;
+      // Load the corpus on this thread (LoadShader owns shaders_), then
+      // translate it on workers with a translator each. Every variant of one
+      // program stays on one worker, as in the shader storage loader, and the
+      // pack builder sorts its entries, so the pack does not depend on the
+      // thread count.
+      std::map<uint64_t, std::pair<D3D12Shader*, std::set<uint64_t>>> corpus_programs;
+      // Worker threads for reading and translating the corpus. Reading is
+      // threaded too: the first open of each freshly extracted file costs
+      // milliseconds under real-time antivirus scanning, and it overlaps.
+      size_t corpus_thread_count = size_t(REXCVAR_GET(fh1_shader_production_threads));
+      if (!corpus_thread_count) {
+        corpus_thread_count = std::max(rex::thread::logical_processor_count(), uint32_t(1));
+      }
+      const auto run_corpus_workers = [&](size_t job_count, const auto& run_job) {
+        std::atomic<size_t> next_job{0};
+        const auto worker = [&](size_t worker_index) {
+          for (size_t job = next_job.fetch_add(1, std::memory_order_relaxed); job < job_count;
+               job = next_job.fetch_add(1, std::memory_order_relaxed)) {
+            run_job(job, worker_index);
+          }
+        };
+        std::vector<std::unique_ptr<rex::thread::Thread>> threads;
+        for (size_t i = 1; i < std::min(corpus_thread_count, job_count); ++i) {
+          auto thread = rex::thread::Thread::Create({}, [&worker, i] { worker(i); });
+          assert_not_null(thread);
+          thread->set_name("FH1 Shader Production");
+          threads.push_back(std::move(thread));
+        }
+        worker(0);
+        for (auto& thread : threads) {
+          rex::thread::Wait(thread.get(), false);
+        }
+      };
+      struct CorpusProgram {
+        const std::filesystem::path* path;
+        xenos::ShaderType stage;
+        uint32_t interpolator_count;
+        std::vector<uint32_t> ucode;
+      };
+      std::vector<CorpusProgram> corpus_reads;
+      const uint64_t corpus_load_start = rex::chrono::Clock::QueryHostTickCount();
+      // tools/extract-fh1-shader-corpus.py writes the corpus as one file:
+      // "FH1C", version 1 and a record count, then per record the stage (0
+      // vertex, 1 pixel), the interpolator count, two reserved bytes, the byte
+      // size and the ucode, all little-endian. Older corpora are directories
+      // of one .bin file per program, named as parsed below.
+      if (std::ifstream blob(corpus_root / "corpus.blob", std::ios::binary | std::ios::ate);
+          blob) {
+        std::vector<uint8_t> data(size_t(std::streamoff(blob.tellg())));
+        blob.seekg(0);
+        uint32_t version = 0, count = 0;
+        if (data.size() < 12 ||
+            !blob.read(reinterpret_cast<char*>(data.data()), std::streamsize(data.size())) ||
+            std::memcmp(data.data(), "FH1C", 4)) {
+          ++failed;
+        } else {
+          std::memcpy(&version, data.data() + 4, sizeof(version));
+          std::memcpy(&count, data.data() + 8, sizeof(count));
+        }
+        size_t offset = 12;
+        for (uint32_t i = 0; version == 1 && i < count; ++i) {
+          if (data.size() - offset < 8) {
+            ++failed;
+            break;
+          }
+          uint32_t size;
+          std::memcpy(&size, data.data() + offset + 4, sizeof(size));
+          if (data.size() - offset - 8 < size) {
+            ++failed;
+            break;
+          }
+          const uint8_t stage_index = data[offset];
+          const uint32_t interpolator_count = data[offset + 1];
+          const uint8_t* ucode_bytes = data.data() + offset + 8;
+          offset += 8 + size_t(size);
+          const xenos::ShaderType stage =
+              stage_index ? xenos::ShaderType::kPixel : xenos::ShaderType::kVertex;
+          if (stage_index > 1 || interpolator_count > xenos::kMaxInterpolators ||
+              modifications[size_t(stage)][interpolator_count].empty()) {
+            continue;
+          }
+          CorpusProgram& program =
+              corpus_reads.emplace_back(CorpusProgram{nullptr, stage, interpolator_count, {}});
+          if (size && size <= 0xFFFF * 4 && !(size % 12)) {
+            program.ucode.resize(size / sizeof(uint32_t));
+            std::memcpy(program.ucode.data(), ucode_bytes, size);
+          }
+        }
+        if (version != 1) {
+          ++failed;
+        }
+      }
       for (const std::filesystem::path& corpus_file : corpus_files) {
         const std::string name = corpus_file.filename().string();
         xenos::ShaderType stage;
@@ -1066,41 +1166,42 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
             modifications[size_t(stage)][interpolator_count].empty()) {
           continue;
         }
-        std::ifstream input(corpus_file, std::ios::binary | std::ios::ate);
+        corpus_reads.push_back({&corpus_file, stage, interpolator_count, {}});
+      }
+      run_corpus_workers(corpus_reads.size(), [&](size_t job, size_t) {
+        CorpusProgram& program = corpus_reads[job];
+        if (!program.path) {
+          return;
+        }
+        std::ifstream input(*program.path, std::ios::binary | std::ios::ate);
         std::streamoff size = -1;
         if (input) {
           size = input.tellg();
         }
         if (size <= 0 || size > 0xFFFF * 4 || size % 12) {
-          ++failed;
-          continue;
+          return;
         }
-        std::vector<uint32_t> ucode(size_t(size) / sizeof(uint32_t));
+        program.ucode.resize(size_t(size) / sizeof(uint32_t));
         input.seekg(0);
-        if (!input.read(reinterpret_cast<char*>(ucode.data()), size)) {
+        if (!input.read(reinterpret_cast<char*>(program.ucode.data()), size)) {
+          program.ucode.clear();
+        }
+      });
+      for (CorpusProgram& program : corpus_reads) {
+        if (program.ucode.empty()) {
           ++failed;
           continue;
         }
-        const uint64_t hash = XXH3_64bits(ucode.data(), size_t(size));
-        D3D12Shader* shader = LoadShader(stage, ucode.data(), ucode.size(), hash);
-        if (!shader->is_ucode_analyzed()) {
-          shader->AnalyzeUcode(ucode_disasm_buffer);
-        }
-        const auto translate_modification = [&](uint64_t modification) {
-          auto* translation = static_cast<D3D12Shader::D3D12Translation*>(
-              shader->GetOrCreateTranslation(modification));
-          if (translation->is_translated()) {
-            return;
-          }
-          if (TranslateAnalyzedShader(shader_translator_.get(), *translation)) {
-            ++translated[size_t(stage)];
-          } else {
-            ++failed;
-          }
-        };
-        for (uint64_t modification : modifications[size_t(stage)][interpolator_count]) {
-          translate_modification(modification);
-        }
+        const xenos::ShaderType stage = program.stage;
+        const uint64_t hash =
+            XXH3_64bits(program.ucode.data(), program.ucode.size() * sizeof(uint32_t));
+        D3D12Shader* shader =
+            LoadShader(stage, program.ucode.data(), uint32_t(program.ucode.size()), hash);
+        auto& [program_shader, program_modifications] = corpus_programs[hash];
+        program_shader = shader;
+        program_modifications.insert(
+            modifications[size_t(stage)][program.interpolator_count].begin(),
+            modifications[size_t(stage)][program.interpolator_count].end());
         // These five FH1 car shaders are paired with fewer live interpolators
         // than their asset metadata declares.
         if (stage == xenos::ShaderType::kPixel) {
@@ -1109,14 +1210,75 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
             case 0x47B93AEB981C4449:
             case 0x913B2602741D753F:
             case 0xDCE431C38D411674:
-              translate_modification(0x000000000016003F);
+              program_modifications.insert(0x000000000016003F);
               break;
             case 0xF0DB93F778565F3C:
-              translate_modification(0x000000000016007F);
+              program_modifications.insert(0x000000000016007F);
               break;
           }
         }
       }
+      corpus_reads.clear();
+      const uint64_t corpus_loaded = rex::chrono::Clock::QueryHostTickCount();
+      std::vector<std::pair<D3D12Shader*, std::vector<uint64_t>>> corpus_jobs;
+      corpus_jobs.reserve(corpus_programs.size());
+      for (auto& [hash, program] : corpus_programs) {
+        corpus_jobs.emplace_back(program.first, std::vector<uint64_t>(program.second.begin(),
+                                                                      program.second.end()));
+      }
+      corpus_programs.clear();
+      std::array<std::atomic<size_t>, 2> corpus_translated{};
+      std::atomic<size_t> corpus_failed{0};
+      // One translator and disassembly buffer per worker, created on first use.
+      std::vector<std::unique_ptr<DxbcShaderTranslator>> worker_translators(corpus_thread_count);
+      std::vector<string::StringBuffer> worker_disasm_buffers(corpus_thread_count);
+      const auto make_translator = [&]() {
+        const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+        return std::make_unique<DxbcShaderTranslator>(
+            provider.GetAdapterVendorID(), bindless_resources_used_, /* edram_rov_used */ false,
+            !host_config_.gamma_render_target_as_unorm16(), host_config_.msaa_2x_supported(),
+            host_config_.draw_resolution_scale_x(), host_config_.draw_resolution_scale_y(),
+            provider.GetGraphicsAnalysis() != nullptr);
+      };
+      const uint64_t corpus_translation_start = rex::chrono::Clock::QueryHostTickCount();
+      run_corpus_workers(corpus_jobs.size(), [&](size_t job, size_t worker_index) {
+        std::unique_ptr<DxbcShaderTranslator>& translator = worker_translators[worker_index];
+        string::StringBuffer& worker_disasm_buffer = worker_disasm_buffers[worker_index];
+        if (!translator) {
+          translator = make_translator();
+        }
+        auto& [shader, shader_modifications] = corpus_jobs[job];
+        if (!shader->is_ucode_analyzed()) {
+          shader->AnalyzeUcode(worker_disasm_buffer);
+        }
+        for (uint64_t modification : shader_modifications) {
+          auto* translation = static_cast<D3D12Shader::D3D12Translation*>(
+              shader->GetOrCreateTranslation(modification));
+          if (translation->is_translated()) {
+            continue;
+          }
+          if (TranslateAnalyzedShader(translator.get(), *translation)) {
+            corpus_translated[size_t(shader->type())].fetch_add(1, std::memory_order_relaxed);
+          } else {
+            corpus_failed.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+      });
+      for (size_t i = 0; i < translated.size(); ++i) {
+        translated[i] += corpus_translated[i].load(std::memory_order_relaxed);
+      }
+      failed += corpus_failed.load(std::memory_order_relaxed);
+      const uint64_t tick_frequency = rex::chrono::Clock::QueryHostTickFrequency();
+      REXGPU_INFO(
+          "FH1 disc corpus translation took {} ms on {} threads for {} programs (storage setup "
+          "{} ms, corpus load {} ms; thread-summed translation {} ms, capture {} ms)",
+          (rex::chrono::Clock::QueryHostTickCount() - corpus_translation_start) * 1000 /
+              tick_frequency,
+          std::min(corpus_thread_count, corpus_jobs.size()), corpus_jobs.size(),
+          (corpus_load_start - storage_start) * 1000 / tick_frequency,
+          (corpus_loaded - corpus_load_start) * 1000 / tick_frequency,
+          fh1_production_translate_ticks_.load(std::memory_order_relaxed) * 1000 / tick_frequency,
+          fh1_production_capture_ticks_.load(std::memory_order_relaxed) * 1000 / tick_frequency);
       // These FH1 car-selector variants are generated outside the retail
       // .fxobj corpus and may not be reached on every timed replay.
       static constexpr std::pair<uint64_t, uint64_t> kFh1RuntimeVariants[] = {
@@ -1994,7 +2156,11 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator* translator,
 #if defined(REXGPU_FH1_SHADER_PRODUCER)
     }
     RecordFh1RuntimeShaderTranslation();
-    if (!translator->TranslateAnalyzedShader(translation)) {
+    const uint64_t translate_start = rex::chrono::Clock::QueryHostTickCount();
+    const bool translated = translator->TranslateAnalyzedShader(translation);
+    fh1_production_translate_ticks_.fetch_add(
+        rex::chrono::Clock::QueryHostTickCount() - translate_start, std::memory_order_relaxed);
+    if (!translated) {
       REXGPU_ERROR("Shader {:016X} translation failed; marking as ignored",
                    shader.ucode_data_hash());
       return false;
@@ -2105,7 +2271,10 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator* translator,
     observation.sampler_bindings = observed_sampler_bindings.data();
     observation.sampler_binding_count = observed_sampler_bindings.size();
     observation.used_texture_mask = shader.GetUsedTextureMaskAfterTranslation();
+    const uint64_t capture_start = rex::chrono::Clock::QueryHostTickCount();
     shader_translation_observer(observation);
+    fh1_production_capture_ticks_.fetch_add(
+        rex::chrono::Clock::QueryHostTickCount() - capture_start, std::memory_order_relaxed);
   }
 #endif
   return true;

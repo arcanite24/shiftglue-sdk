@@ -394,6 +394,9 @@ class PipelineCache {
 #if defined(REXGPU_FH1_SHADER_PRODUCER)
   bool fh1_offline_shader_production_ = false;
   bool fh1_analysis_catalog_dirty_ = false;
+  // Host ticks summed over the production threads, for the phase report.
+  std::atomic<uint64_t> fh1_production_translate_ticks_{0};
+  std::atomic<uint64_t> fh1_production_capture_ticks_{0};
 #endif
   std::atomic<uint64_t> fh1_shader_pack_hits_{0};
   std::atomic<uint64_t> fh1_shader_pack_misses_{0};
