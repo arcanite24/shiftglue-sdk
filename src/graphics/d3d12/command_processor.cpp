@@ -177,13 +177,6 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
     Fh1FrameCensus::ObserveZpd(observation_frame_sequence_,
                                register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR]);
   }
-  ZPDMode mode = GetZPDMode();
-  if (mode == ZPDMode::kFast || mode == ZPDMode::kStrict) {
-    return ExecuteModernZPD(reader, packet, count);
-  }
-  if (mode == ZPDMode::kFake) {
-    return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
-  }
   if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_) {
     return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
   }
@@ -246,164 +239,6 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
     return write_fallback_result();
   }
 
-  return true;
-}
-
-ZPDMode D3D12CommandProcessor::GetZPDMode() const {
-  const std::string& mode = REXCVAR_GET(occlusion_query);
-  if (mode == "fake") {
-    return ZPDMode::kFake;
-  }
-  if (mode == "fast") {
-    return ZPDMode::kFast;
-  }
-  if (mode == "strict") {
-    return ZPDMode::kStrict;
-  }
-  return ZPDMode::kLegacy;
-}
-
-bool D3D12CommandProcessor::ExecuteModernZPD(memory::RingBuffer* reader, uint32_t packet,
-                                             uint32_t count) {
-  assert_true(count == 1);
-  uint32_t initiator = reader->ReadAndSwap<uint32_t>();
-  WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
-
-  if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_) {
-    PERF_counter_inc(kZpdFakeFallbacks);
-    // The packet payload has already been consumed, so reproduce the safe fake
-    // completion locally instead of delegating to the base packet reader.
-    uint32_t address = register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
-    auto* report = memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(address);
-    if (report && XenosZPDReport::HasPendingSentinel(report)) {
-      XenosZPDReport::WriteSampleCount(report,
-                                       uint32_t(REXCVAR_GET(query_occlusion_fake_sample_count)));
-    }
-    return true;
-  }
-
-  RetireModernZPDQueries();
-  if (!BeginSubmission(true)) {
-    PERF_counter_inc(kZpdFakeFallbacks);
-    return true;
-  }
-
-  uint32_t address = register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
-  uint32_t record_base = XenosZPDReport::GetRecordBase(address);
-  auto* guest_report =
-      record_base ? memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(record_base)
-                  : nullptr;
-  if (!guest_report) {
-    PERF_counter_inc(kZpdMalformedRecords);
-    return true;
-  }
-
-  bool logical_current = zpd_lifecycle_.active().logical_active &&
-                         zpd_lifecycle_.active().slot_base == XenosZPDReport::GetSlotBase(address);
-  ZPDClassificationResult classification = ClassifyZPD(address, guest_report, logical_current);
-  LogZPDObservation(address, guest_report, logical_current, classification);
-
-  if (classification.classification == ZPDClassification::kBegin) {
-    // A new BEGIN implicitly closes an older logical lifetime.
-    if (zpd_lifecycle_.active().logical_active) {
-      ZPDLifecycle::Report* old_report = zpd_lifecycle_.active_report();
-      ZPDLifecycle::ReportHandle old_handle = zpd_lifecycle_.active().report_handle;
-      uint32_t old_end = old_report ? old_report->end_record : 0;
-      if (old_end) {
-        CloseModernZPDSegment();
-        zpd_lifecycle_.End(old_end);
-        PERF_counter_inc(kZpdReportsEnded);
-        old_report = zpd_lifecycle_.Find(old_handle);
-        if (old_report && old_report->pending_segments == 0) {
-          WriteModernZPDReport(*old_report, 1);
-          ZPDLifecycle::Report abandoned;
-          bool commit = false;
-          zpd_lifecycle_.Abandon(old_handle, 1, abandoned, commit);
-          PERF_counter_inc(kZpdFakeFallbacks);
-        } else if (old_report && GetZPDMode() == ZPDMode::kFast) {
-          uint32_t speculative = old_report->has_cached_delta ? old_report->cached_delta : 1;
-          WriteModernZPDReport(*old_report, speculative);
-          PERF_counter_inc(kZpdFastSpeculativeWrites);
-        } else if (old_report) {
-          AwaitModernZPDReport(old_handle, 2);
-          BeginSubmission(true);
-        }
-      }
-    }
-    uint32_t slot_base = XenosZPDReport::GetSlotBase(address);
-    bool same_slot_reuse = zpd_lifecycle_.HasPendingSlot(slot_base);
-    if (same_slot_reuse && GetZPDMode() == ZPDMode::kStrict) {
-      ZPDLifecycle::ReportHandle pending = zpd_lifecycle_.OldestPendingSlot(slot_base);
-      if (pending != ZPDLifecycle::kInvalidReportHandle) {
-        AwaitModernZPDReport(pending, 2);
-        // Awaiting closes the current submission. Reopen before BeginQuery.
-        BeginSubmission(true);
-      }
-    }
-    std::memset(guest_report, 0, sizeof(*guest_report));
-    auto begin = zpd_lifecycle_.Begin(address);
-    if (begin.report_handle == ZPDLifecycle::kInvalidReportHandle) {
-      PERF_counter_inc(kZpdMalformedRecords);
-      return true;
-    }
-    PERF_counter_inc(kZpdReportsStarted);
-    if (same_slot_reuse || begin.same_slot_reuse) {
-      PERF_counter_inc(kZpdSameSlotReuse);
-    }
-    OpenModernZPDSegment();
-    return true;
-  }
-
-  if (classification.classification == ZPDClassification::kMalformed) {
-    if (XenosZPDReport::HasPendingSentinel(guest_report)) {
-      PERF_counter_inc(kZpdFakeFallbacks);
-      XenosZPDReport::WriteSampleCount(guest_report,
-                                       uint32_t(REXCVAR_GET(query_occlusion_fake_sample_count)));
-    }
-    RecoverStalledZPDSentinel(address, guest_report);
-    return true;
-  }
-
-  ZPDLifecycle::Report* active_report = zpd_lifecycle_.active_report();
-  if (classification.classification == ZPDClassification::kOrphanedEnd || !active_report ||
-      active_report->slot_base != XenosZPDReport::GetSlotBase(address)) {
-    // Orphan END: never leave the guest polling the sentinel.
-    uint32_t cached = zpd_lifecycle_.CachedDelta(record_base, 1);
-    XenosZPDReport::WriteSampleCount(guest_report, cached);
-    PERF_counter_inc(kZpdFastSpeculativeWrites);
-    RecoverStalledZPDSentinel(address, guest_report);
-    return true;
-  }
-
-  ZPDLifecycle::ReportHandle handle = zpd_lifecycle_.active().report_handle;
-  CloseModernZPDSegment();
-  zpd_lifecycle_.End(address);
-  PERF_counter_inc(kZpdReportsEnded);
-
-  active_report = zpd_lifecycle_.Find(handle);
-  if (!active_report) {
-    return true;
-  }
-
-  if (active_report->pending_segments == 0) {
-    // Pool exhaustion or a failed segment open must still release guest
-    // polling. Unknown visibility is conservatively treated as visible.
-    WriteModernZPDReport(*active_report, 1);
-    ZPDLifecycle::Report abandoned;
-    bool commit = false;
-    zpd_lifecycle_.Abandon(handle, 1, abandoned, commit);
-    PERF_counter_inc(kZpdFakeFallbacks);
-    return true;
-  }
-
-  if (GetZPDMode() == ZPDMode::kFast) {
-    uint32_t speculative = active_report->has_cached_delta ? active_report->cached_delta : 1;
-    WriteModernZPDReport(*active_report, speculative);
-    PERF_counter_inc(kZpdFastSpeculativeWrites);
-  } else {
-    AwaitModernZPDReport(handle, 2);
-  }
-  RecoverStalledZPDSentinel(address, guest_report);
   return true;
 }
 
@@ -2480,8 +2315,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
               census.host_render_target_formats);
     census.used_texture_mask = used_texture_mask;
     census.memexport = memexport_used;
-    census.occlusion_query =
-        active_occlusion_query_.valid || zpd_lifecycle_.active().logical_active;
+    census.occlusion_query = active_occlusion_query_.valid;
     Fh1FrameCensus::ObserveDraw(regs, census);
   }
 
@@ -2729,9 +2563,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   Fh1NativeDrawInfo native_draw;
   native_draw.memexport = memexport_used;
-  native_draw.occlusion_query_active = active_occlusion_query_.valid ||
-                                       zpd_lifecycle_.active_report() ||
-                                       modern_occlusion_query_active_index_ != UINT32_MAX;
+  native_draw.occlusion_query_active = active_occlusion_query_.valid;
   native_draw.rasterization_done = is_rasterization_done;
   native_draw.normalized_depth_control = normalized_depth_control;
   native_draw.normalized_color_mask = normalized_color_mask;
@@ -2980,7 +2812,6 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission,
     }
   }
   submission_completed_ = completed;
-  RetireModernZPDQueries();
   RetireNativeGuestOutputGpuTimings();
   if (submission_completed_ <= submission_completed_before) {
     // Not updated - no need to reclaim or download things.
@@ -3209,11 +3040,6 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     texture_cache_->BeginFrame();
   }
 
-  if ((GetZPDMode() == ZPDMode::kFast || GetZPDMode() == ZPDMode::kStrict) &&
-      zpd_lifecycle_.active().segment_pending_begin) {
-    OpenModernZPDSegment();
-  }
-
   return true;
 }
 
@@ -3250,10 +3076,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   if (submission_open_) {
     assert_false(scratch_buffer_used_);
 
-    if ((GetZPDMode() == ZPDMode::kFast || GetZPDMode() == ZPDMode::kStrict) &&
-        modern_occlusion_query_active_index_ != UINT32_MAX) {
-      CloseModernZPDSegment();
-    } else if (active_occlusion_query_.valid && occlusion_query_heap_) {
+    if (active_occlusion_query_.valid && occlusion_query_heap_) {
       deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
                                          active_occlusion_query_.host_index);
       active_occlusion_query_ = {};
@@ -3394,9 +3217,7 @@ bool D3D12CommandProcessor::CanSplitSubmission() const {
   // A submission boundary ends host occlusion queries, and ending with
   // pipelines still being created would wait for them.
   return submission_open_ && frame_open_ && !scratch_buffer_used_ &&
-         !active_occlusion_query_.valid &&
-         modern_occlusion_query_active_index_ == UINT32_MAX &&
-         !pipeline_cache_->IsCreatingPipelines();
+         !active_occlusion_query_.valid && !pipeline_cache_->IsCreatingPipelines();
 }
 
 void D3D12CommandProcessor::StartSubmissionWorker() {
@@ -4885,13 +4706,6 @@ void D3D12CommandProcessor::RetireNativeGuestOutputGpuTimings() {
 bool D3D12CommandProcessor::InitializeOcclusionQueryResources() {
   active_occlusion_query_ = {};
   occlusion_query_cursor_ = 0;
-  zpd_lifecycle_.Reset();
-  modern_occlusion_query_free_indices_.clear();
-  modern_occlusion_query_generations_.clear();
-  modern_occlusion_queries_pending_.clear();
-  modern_occlusion_query_active_index_ = UINT32_MAX;
-  modern_occlusion_query_active_generation_ = 0;
-  modern_occlusion_query_active_report_ = ZPDLifecycle::kInvalidReportHandle;
   occlusion_query_resources_available_ = false;
   occlusion_query_heap_.Reset();
   occlusion_query_readback_.Reset();
@@ -4938,30 +4752,12 @@ bool D3D12CommandProcessor::InitializeOcclusionQueryResources() {
   }
 
   occlusion_query_readback_mapping_ = reinterpret_cast<uint64_t*>(mapping);
-  modern_occlusion_query_generations_.resize(kMaxOcclusionQueries, 0);
-  modern_occlusion_query_free_indices_.reserve(kMaxOcclusionQueries);
-  for (uint32_t i = kMaxOcclusionQueries; i != 0; --i) {
-    modern_occlusion_query_free_indices_.push_back(i - 1);
-  }
   occlusion_query_resources_available_ = true;
   return true;
 }
 
 void D3D12CommandProcessor::ShutdownOcclusionQueryResources() {
-  if (modern_occlusion_query_active_index_ != UINT32_MAX && submission_open_ &&
-      occlusion_query_heap_ && occlusion_query_readback_) {
-    CloseModernZPDSegment();
-    EndSubmission(false);
-  }
   DisableHostOcclusionQueries();
-
-  zpd_lifecycle_.Reset();
-  modern_occlusion_query_free_indices_.clear();
-  modern_occlusion_query_generations_.clear();
-  modern_occlusion_queries_pending_.clear();
-  modern_occlusion_query_active_index_ = UINT32_MAX;
-  modern_occlusion_query_active_generation_ = 0;
-  modern_occlusion_query_active_report_ = ZPDLifecycle::kInvalidReportHandle;
 
   if (occlusion_query_readback_ && occlusion_query_readback_mapping_) {
     occlusion_query_readback_->Unmap(0, nullptr);
@@ -5154,164 +4950,6 @@ void D3D12CommandProcessor::WriteGuestOcclusionResult(
   sample_counts->ZFail_B = 0;
   sample_counts->StencilFail_A = 0;
   sample_counts->StencilFail_B = 0;
-}
-
-bool D3D12CommandProcessor::AcquireModernOcclusionQuery(uint32_t& host_index_out,
-                                                        uint32_t& generation_out) {
-  RetireModernZPDQueries();
-  if (modern_occlusion_query_free_indices_.empty()) {
-    return false;
-  }
-  host_index_out = modern_occlusion_query_free_indices_.back();
-  modern_occlusion_query_free_indices_.pop_back();
-  generation_out = ++modern_occlusion_query_generations_[host_index_out];
-  if (!generation_out) {
-    generation_out = ++modern_occlusion_query_generations_[host_index_out];
-  }
-  return true;
-}
-
-void D3D12CommandProcessor::ReleaseModernOcclusionQuery(uint32_t host_index, uint32_t generation) {
-  if (host_index >= modern_occlusion_query_generations_.size() ||
-      modern_occlusion_query_generations_[host_index] != generation) {
-    return;
-  }
-  modern_occlusion_query_free_indices_.push_back(host_index);
-}
-
-bool D3D12CommandProcessor::OpenModernZPDSegment() {
-  if (!submission_open_ || !occlusion_query_heap_ ||
-      modern_occlusion_query_active_index_ != UINT32_MAX ||
-      !zpd_lifecycle_.active().logical_active || !zpd_lifecycle_.active().segment_pending_begin) {
-    return false;
-  }
-  uint32_t index = UINT32_MAX;
-  uint32_t generation = 0;
-  if (!AcquireModernOcclusionQuery(index, generation)) {
-    return false;
-  }
-  deferred_command_list_.D3DBeginQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
-                                       index);
-  modern_occlusion_query_active_index_ = index;
-  modern_occlusion_query_active_generation_ = generation;
-  modern_occlusion_query_active_report_ = zpd_lifecycle_.active().report_handle;
-  zpd_lifecycle_.SegmentOpened();
-  return true;
-}
-
-bool D3D12CommandProcessor::CloseModernZPDSegment() {
-  if (modern_occlusion_query_active_index_ == UINT32_MAX || !submission_open_ ||
-      !occlusion_query_heap_ || !occlusion_query_readback_) {
-    return false;
-  }
-  uint32_t index = modern_occlusion_query_active_index_;
-  uint32_t generation = modern_occlusion_query_active_generation_;
-  ZPDLifecycle::ReportHandle handle = modern_occlusion_query_active_report_;
-  modern_occlusion_query_active_index_ = UINT32_MAX;
-  modern_occlusion_query_active_generation_ = 0;
-  modern_occlusion_query_active_report_ = ZPDLifecycle::kInvalidReportHandle;
-
-  deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
-                                     index);
-  deferred_command_list_.D3DResolveQueryData(
-      occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, index, 1,
-      occlusion_query_readback_.Get(), sizeof(uint64_t) * index);
-  modern_occlusion_queries_pending_.push_back({submission_current_, index, generation, handle});
-  zpd_lifecycle_.SegmentClosed(submission_current_);
-  PERF_counter_inc(kZpdReportSegments);
-  return true;
-}
-
-void D3D12CommandProcessor::RetireModernZPDQueries() {
-  if (!submission_fence_ || modern_occlusion_queries_pending_.empty()) {
-    return;
-  }
-  submission_completed_ = std::max(submission_completed_, submission_fence_->GetCompletedValue());
-  while (!modern_occlusion_queries_pending_.empty() &&
-         modern_occlusion_queries_pending_.front().submission <= submission_completed_) {
-    PendingModernOcclusionQuery pending = modern_occlusion_queries_pending_.front();
-    modern_occlusion_queries_pending_.pop_front();
-    bool generation_matches =
-        pending.host_index < modern_occlusion_query_generations_.size() &&
-        modern_occlusion_query_generations_[pending.host_index] == pending.generation;
-    uint64_t samples = generation_matches && occlusion_query_readback_mapping_
-                           ? occlusion_query_readback_mapping_[pending.host_index]
-                           : 0;
-    uint32_t delta = 0;
-    bool commit = false;
-    ZPDLifecycle::Report report;
-    bool resolved =
-        generation_matches &&
-        zpd_lifecycle_.Resolve(pending.report_handle, samples,
-                               texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1,
-                               texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1,
-                               delta, commit, report);
-    if (!resolved || !commit) {
-      if (!zpd_lifecycle_.Find(pending.report_handle)) {
-        PERF_counter_inc(kZpdStaleResultRejections);
-      }
-    } else {
-      WriteModernZPDReport(report, delta);
-      PERF_counter_inc(kZpdAsyncResultPatches);
-    }
-    ReleaseModernOcclusionQuery(pending.host_index, pending.generation);
-  }
-}
-
-bool D3D12CommandProcessor::AwaitModernZPDReport(ZPDLifecycle::ReportHandle report_handle,
-                                                 uint32_t timeout_ms) {
-  if (!zpd_lifecycle_.Find(report_handle)) {
-    return true;
-  }
-  if (submission_open_) {
-    EndSubmission(false);
-  }
-  PERF_counter_inc(kZpdStrictWaits);
-  auto wait_start = std::chrono::steady_clock::now();
-  uint64_t wait_submission = 0;
-  for (const PendingModernOcclusionQuery& pending : modern_occlusion_queries_pending_) {
-    if (pending.report_handle == report_handle) {
-      wait_submission = std::max(wait_submission, pending.submission);
-    }
-  }
-  bool signaled = wait_submission == 0 || submission_completed_ >= wait_submission;
-  if (!signaled && submission_fence_ &&
-      SUCCEEDED(
-          submission_fence_->SetEventOnCompletion(wait_submission, fence_completion_event_))) {
-    signaled = WaitForSingleObject(fence_completion_event_, timeout_ms) == WAIT_OBJECT_0;
-  }
-  auto elapsed = std::chrono::steady_clock::now() - wait_start;
-  PERF_counter_add(kZpdStrictWaitTimeNs,
-                   std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
-  if (signaled) {
-    RetireModernZPDQueries();
-    return zpd_lifecycle_.Find(report_handle) == nullptr;
-  }
-
-  ZPDLifecycle::Report report;
-  bool commit = false;
-  uint32_t fallback = 1;
-  if (const ZPDLifecycle::Report* pending = zpd_lifecycle_.Find(report_handle)) {
-    fallback = pending->has_cached_delta ? pending->cached_delta : 1;
-  }
-  if (zpd_lifecycle_.Abandon(report_handle, fallback, report, commit) && commit) {
-    WriteModernZPDReport(report, fallback);
-  }
-  PERF_counter_inc(kZpdRetireTimeouts);
-  return false;
-}
-
-void D3D12CommandProcessor::WriteModernZPDReport(const ZPDLifecycle::Report& report,
-                                                 uint32_t delta) {
-  auto* begin =
-      report.begin_record
-          ? memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(report.begin_record)
-          : nullptr;
-  auto* end =
-      report.end_record
-          ? memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(report.end_record)
-          : nullptr;
-  XenosZPDReport::WriteReportDelta(begin, end, report.begin_value, delta, begin && begin != end);
 }
 
 void D3D12CommandProcessor::WriteGammaRampSRV(bool is_pwl,

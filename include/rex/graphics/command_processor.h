@@ -25,7 +25,6 @@
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
-#include <rex/graphics/zpd_policy.h>
 #include <rex/memory.h>
 #include <rex/memory/ring_buffer.h>
 #include <rex/system/xthread.h>
@@ -252,15 +251,6 @@ class CommandProcessor {
   bool IsReadbackMemexportEnabled(bool legacy_backend_flag) const;
 #endif  // REX_HAS_VULKAN
 
-  ZPDPolicySettings GetZPDPolicySettings() const;
-  ZPDClassificationResult ClassifyZPD(uint32_t report_address,
-                                      const xenos::xe_gpu_depth_sample_counts* report,
-                                      bool logical_active) const;
-  void LogZPDObservation(uint32_t report_address, const xenos::xe_gpu_depth_sample_counts* report,
-                         bool logical_active, const ZPDClassificationResult& classification);
-  void RecoverStalledZPDSentinel(uint32_t report_address,
-                                 xenos::xe_gpu_depth_sample_counts* report);
-
   memory::Memory* memory_ = nullptr;
   system::KernelState* kernel_state_ = nullptr;
   GraphicsSystem* graphics_system_ = nullptr;
@@ -309,10 +299,6 @@ class CommandProcessor {
   // name (for explicit-override compatibility).
   const char* legacy_readback_memexport_cvar_name_ = nullptr;
 #endif  // REX_HAS_VULKAN
-
-  bool zpd_fake_logical_active_ = false;
-  uint32_t zpd_fake_slot_base_ = 0;
-  ZPDObservationRateLimiter zpd_observation_rate_limiter_;
 
  private:
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};

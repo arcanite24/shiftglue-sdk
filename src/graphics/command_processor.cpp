@@ -46,24 +46,6 @@ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_STRING(occlusion_query, "legacy", "GPU",
-                      "Select ZPD occlusion report handling.\n"
-                      " legacy: Existing synchronous renderer path (default)\n"
-                      " fake: Guest-visible fake sample counts\n"
-                      " fast: Asynchronous host queries with speculative writes\n"
-                      " strict: Bounded host-query retirement before writeback")
-    .allowed({"legacy", "fake", "fast", "strict"})
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-
-REXCVAR_DEFINE_STRING(zpd_end_policy, "auto", "GPU",
-                      "Classify ZPD END records by title-aware policy.")
-    .allowed({"auto", "report_layout", "pairwise_sentinel", "relaxed_sentinel"})
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_STRING(zpd_end_fallback, "auto", "GPU",
-                      "Fallback when report-layout ZPD classification is inconclusive.")
-    .allowed({"auto", "none", "pairwise_sentinel", "relaxed_sentinel"})
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-
 REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
                       "Controls CPU readback of render-to-texture resolve results.\n"
                       " none: Disable readback (default)\n"
@@ -1331,107 +1313,26 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
   // Writeback initiator.
   WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
 
-  // Occlusion queries:
-  // This command is send on query begin and end.
-  // As a workaround report some fixed amount of passed samples.
-  auto fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
-  if (fake_sample_count >= 0) {
-    uint32_t report_address = register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
-    uint32_t record_base = XenosZPDReport::GetRecordBase(report_address);
-    auto* pSampleCounts = record_base
-                              ? memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(record_base)
-                              : nullptr;
-    if (!pSampleCounts) {
-      return true;
-    }
-    bool logical_current = zpd_fake_logical_active_ &&
-                           zpd_fake_slot_base_ == XenosZPDReport::GetSlotBase(report_address);
-    auto classification = ClassifyZPD(report_address, pSampleCounts, logical_current);
-    LogZPDObservation(report_address, pSampleCounts, logical_current, classification);
-    std::memset(pSampleCounts, 0, sizeof(xe_gpu_depth_sample_counts));
-    if (classification.classification == ZPDClassification::kEnd ||
-        classification.classification == ZPDClassification::kOrphanedEnd) {
-      pSampleCounts->ZPass_A = fake_sample_count;
-      pSampleCounts->Total_A = fake_sample_count;
-      zpd_fake_logical_active_ = false;
-      zpd_fake_slot_base_ = 0;
-    } else if (classification.classification == ZPDClassification::kBegin) {
-      zpd_fake_logical_active_ = true;
-      zpd_fake_slot_base_ = XenosZPDReport::GetSlotBase(report_address);
-    }
-    RecoverStalledZPDSentinel(report_address, pSampleCounts);
+  // Occlusion queries without host queries: the packet is sent on query
+  // begin and end; report a fixed number of passed samples at the end, which
+  // the title marks by writing the pending sentinel into the report.
+  const uint32_t kQueryFinished = rex::byte_swap(0xFFFFFEED);
+  auto* sample_counts = memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(
+      register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR]);
+  if (!sample_counts) {
+    return true;
   }
-
+  bool is_end = sample_counts->ZPass_A == kQueryFinished ||
+                sample_counts->ZPass_B == kQueryFinished ||
+                sample_counts->ZFail_A == kQueryFinished ||
+                sample_counts->ZFail_B == kQueryFinished;
+  std::memset(sample_counts, 0, sizeof(xe_gpu_depth_sample_counts));
+  if (is_end) {
+    auto fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
+    sample_counts->ZPass_A = fake_sample_count;
+    sample_counts->Total_A = fake_sample_count;
+  }
   return true;
-}
-
-ZPDPolicySettings CommandProcessor::GetZPDPolicySettings() const {
-  uint32_t title_id = kernel_state_ ? kernel_state_->title_id() : 0;
-  return ResolveZPDPolicy(REXCVAR_GET(zpd_end_policy), REXCVAR_GET(zpd_end_fallback), title_id);
-}
-
-ZPDClassificationResult CommandProcessor::ClassifyZPD(
-    uint32_t report_address, const xenos::xe_gpu_depth_sample_counts* report,
-    bool logical_active) const {
-  return ClassifyZPDReport(report_address, report, logical_active, GetZPDPolicySettings());
-}
-
-void CommandProcessor::LogZPDObservation(uint32_t report_address,
-                                         const xenos::xe_gpu_depth_sample_counts* report,
-                                         bool logical_active,
-                                         const ZPDClassificationResult& classification) {
-  switch (classification.classification) {
-    case ZPDClassification::kBegin:
-      PERF_counter_inc(kZpdClassifiedBegins);
-      break;
-    case ZPDClassification::kEnd:
-      PERF_counter_inc(kZpdClassifiedEnds);
-      break;
-    case ZPDClassification::kOrphanedEnd:
-      PERF_counter_inc(kZpdClassifiedOrphanedEnds);
-      break;
-    default:
-      PERF_counter_inc(kZpdMalformedRecords);
-      break;
-  }
-  if (classification.reason == ZPDClassificationReason::kPairwiseFallback ||
-      classification.reason == ZPDClassificationReason::kRelaxedFallback) {
-    PERF_counter_inc(kZpdPolicyFallbacks);
-  }
-
-  uint32_t zpass_a = report ? uint32_t(report->ZPass_A) : 0u;
-  uint32_t zpass_b = report ? uint32_t(report->ZPass_B) : 0u;
-  uint32_t zfail_a = report ? uint32_t(report->ZFail_A) : 0u;
-  uint32_t zfail_b = report ? uint32_t(report->ZFail_B) : 0u;
-  uint64_t signature = report_address;
-  for (uint32_t value :
-       {zpass_a, zpass_b, zfail_a, zfail_b, uint32_t(classification.classification),
-        uint32_t(classification.reason), uint32_t(logical_active)}) {
-    signature ^= uint64_t(value) + 0x9E3779B97F4A7C15ull + (signature << 6) + (signature >> 2);
-  }
-  ZPDObservationRateLimit rate_limit = zpd_observation_rate_limiter_.Observe(signature);
-  if (rate_limit.ShouldLog()) {
-    REXGPU_INFO(
-        "zpd.event classification={} reason={} address={:08X} slot={:08X} "
-        "logical_active={} zpass_a={:08X} zpass_b={:08X} zfail_a={:08X} "
-        "zfail_b={:08X} repeat={} rate_limit_bucket={}",
-        ZPDClassificationName(classification.classification),
-        ZPDClassificationReasonName(classification.reason), report_address,
-        XenosZPDReport::GetSlotBase(report_address), logical_active, zpass_a, zpass_b, zfail_a,
-        zfail_b, rate_limit.count, rate_limit.overflow_sample ? "overflow_sample" : "signature");
-  }
-}
-
-void CommandProcessor::RecoverStalledZPDSentinel(uint32_t report_address,
-                                                 xenos::xe_gpu_depth_sample_counts* report) {
-  if (!XenosZPDReport::HasPendingSentinel(report)) {
-    return;
-  }
-  uint32_t fallback = uint32_t(std::max(REXCVAR_GET(query_occlusion_fake_sample_count), 1));
-  XenosZPDReport::WriteSampleCount(report, fallback);
-  PERF_counter_inc(kZpdWatchdogRecoveries);
-  REXGPU_WARN("zpd.watchdog address={:08X} slot={:08X} action=visible_fallback", report_address,
-              XenosZPDReport::GetSlotBase(report_address));
 }
 
 bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32_t packet,

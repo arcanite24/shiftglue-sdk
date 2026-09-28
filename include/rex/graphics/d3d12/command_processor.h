@@ -43,7 +43,6 @@
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
-#include <rex/graphics/zpd_lifecycle.h>
 #include <rex/system/kernel_state.h>
 #include <rex/ui/d3d12/d3d12_descriptor_heap_pool.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
@@ -417,15 +416,6 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
   void WriteGuestOcclusionResult(xenos::xe_gpu_depth_sample_counts* sample_counts,
                                  uint64_t samples);
-  ZPDMode GetZPDMode() const;
-  bool ExecuteModernZPD(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
-  bool AcquireModernOcclusionQuery(uint32_t& host_index_out, uint32_t& generation_out);
-  void ReleaseModernOcclusionQuery(uint32_t host_index, uint32_t generation);
-  bool OpenModernZPDSegment();
-  bool CloseModernZPDSegment();
-  void RetireModernZPDQueries();
-  bool AwaitModernZPDReport(ZPDLifecycle::ReportHandle report_handle, uint32_t timeout_ms);
-  void WriteModernZPDReport(const ZPDLifecycle::Report& report, uint32_t delta);
   void InvalidateAllVertexBufferResidency();
   void InvalidateVertexBufferResidency(uint32_t vfetch_index);
   void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
@@ -728,20 +718,6 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t host_index = UINT32_MAX;
     bool valid = false;
   } active_occlusion_query_;
-  struct PendingModernOcclusionQuery {
-    uint64_t submission = 0;
-    uint32_t host_index = UINT32_MAX;
-    uint32_t generation = 0;
-    ZPDLifecycle::ReportHandle report_handle = ZPDLifecycle::kInvalidReportHandle;
-  };
-  ZPDLifecycle zpd_lifecycle_;
-  std::vector<uint32_t> modern_occlusion_query_free_indices_;
-  std::vector<uint32_t> modern_occlusion_query_generations_;
-  std::deque<PendingModernOcclusionQuery> modern_occlusion_queries_pending_;
-  uint32_t modern_occlusion_query_active_index_ = UINT32_MAX;
-  uint32_t modern_occlusion_query_active_generation_ = 0;
-  ZPDLifecycle::ReportHandle modern_occlusion_query_active_report_ =
-      ZPDLifecycle::kInvalidReportHandle;
   struct VertexBufferState {
     uint32_t address = UINT32_MAX;
     uint32_t size = UINT32_MAX;

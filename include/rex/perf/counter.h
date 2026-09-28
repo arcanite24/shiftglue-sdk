@@ -75,24 +75,6 @@ enum class CounterId : uint16_t {
   kResolveReadbackFullWaits,
   kResolveReadbackWaitTimeNs,
 
-  // D3D12 ZPD report lifecycle
-  kZpdReportsStarted,
-  kZpdReportsEnded,
-  kZpdReportSegments,
-  kZpdSameSlotReuse,
-  kZpdFastSpeculativeWrites,
-  kZpdAsyncResultPatches,
-  kZpdStrictWaits,
-  kZpdStrictWaitTimeNs,
-  kZpdRetireTimeouts,
-  kZpdFakeFallbacks,
-  kZpdMalformedRecords,
-  kZpdStaleResultRejections,
-  kZpdClassifiedBegins,
-  kZpdClassifiedEnds,
-  kZpdClassifiedOrphanedEnds,
-  kZpdPolicyFallbacks,
-  kZpdWatchdogRecoveries,
 
   // Guest timing and host presentation pacing
   kGuestVblankCount,

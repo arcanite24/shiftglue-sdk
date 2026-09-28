@@ -144,23 +144,6 @@ constexpr const char* kCounterNames[] = {
     "resolve_readback_cache_misses",
     "resolve_readback_full_waits",
     "resolve_readback_wait_time_ns",
-    "zpd_reports_started",
-    "zpd_reports_ended",
-    "zpd_report_segments",
-    "zpd_same_slot_reuse",
-    "zpd_fast_speculative_writes",
-    "zpd_async_result_patches",
-    "zpd_strict_waits",
-    "zpd_strict_wait_time_ns",
-    "zpd_retire_timeouts",
-    "zpd_fake_fallbacks",
-    "zpd_malformed_records",
-    "zpd_stale_result_rejections",
-    "zpd_classified_begins",
-    "zpd_classified_ends",
-    "zpd_classified_orphaned_ends",
-    "zpd_policy_fallbacks",
-    "zpd_watchdog_recoveries",
     "guest_vblank_count",
     "guest_vblank_delta_ns",
     "simulation_tick_count",
@@ -232,23 +215,6 @@ constexpr bool kIsGauge[] = {
     false,  // kResolveReadbackCacheMisses
     false,  // kResolveReadbackFullWaits
     false,  // kResolveReadbackWaitTimeNs
-    false,  // kZpdReportsStarted
-    false,  // kZpdReportsEnded
-    false,  // kZpdReportSegments
-    false,  // kZpdSameSlotReuse
-    false,  // kZpdFastSpeculativeWrites
-    false,  // kZpdAsyncResultPatches
-    false,  // kZpdStrictWaits
-    false,  // kZpdStrictWaitTimeNs
-    false,  // kZpdRetireTimeouts
-    false,  // kZpdFakeFallbacks
-    false,  // kZpdMalformedRecords
-    false,  // kZpdStaleResultRejections
-    false,  // kZpdClassifiedBegins
-    false,  // kZpdClassifiedEnds
-    false,  // kZpdClassifiedOrphanedEnds
-    false,  // kZpdPolicyFallbacks
-    false,  // kZpdWatchdogRecoveries
     false,  // kGuestVblankCount
     false,  // kGuestVblankDeltaNs
     false,  // kSimulationTickCount

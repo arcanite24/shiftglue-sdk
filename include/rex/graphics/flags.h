@@ -26,9 +26,6 @@ REXCVAR_DECLARE(int32_t, draw_resolution_scale_y);
 REXCVAR_DECLARE(bool, resolve_resolution_scale_fill_half_pixel_offset);
 REXCVAR_DECLARE(std::string, readback_resolve);
 REXCVAR_DECLARE(bool, occlusion_query_enable);
-REXCVAR_DECLARE(std::string, occlusion_query);
-REXCVAR_DECLARE(std::string, zpd_end_policy);
-REXCVAR_DECLARE(std::string, zpd_end_fallback);
 REXCVAR_DECLARE(int32_t, query_occlusion_fake_sample_count);
 
 // GPU Depth / Render Target Behavior
