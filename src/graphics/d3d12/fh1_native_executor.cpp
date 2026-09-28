@@ -933,7 +933,18 @@ void Fh1NativeExecutor::TransferTiles(Surface& dest, const TileRun& run) {
     }
     if (full_first < full_end) add_rect(0, full_first, pitch, full_end);
   }
-  if (rect_count) TransferRects(dest, run.previous_owner, rects, rect_count, run.count);
+  if (rect_count) {
+    TransferRects(dest, run.previous_owner, rects, rect_count, run.count,
+                  AnyTileStencil(run.first, run.count));
+  }
+}
+
+bool Fh1NativeExecutor::AnyTileStencil(uint32_t base, uint32_t count) const {
+  count = std::min(count, xenos::kEdramTileCount);
+  for (uint32_t i = 0; i < count; ++i) {
+    if (tile_stencil_nonzero_[(base + i) & (xenos::kEdramTileCount - 1)]) return true;
+  }
+  return false;
 }
 
 void Fh1NativeExecutor::ClaimTileRect(const SurfaceKey& key, uint32_t column_first,
@@ -990,14 +1001,19 @@ void Fh1NativeExecutor::ClaimTileRect(const SurfaceKey& key, uint32_t column_fir
                            LONG(std::min(column_end * tile_width, dest->width)),
                            LONG(std::min(row_end * tile_height, dest->height))};
   if (rect.left < rect.right && rect.top < rect.bottom) {
+    bool tiles_stencil = false;
+    for (uint32_t row = row_first; row < row_end && !tiles_stencil; ++row) {
+      tiles_stencil = AnyTileStencil(key.base_tiles + row * key.pitch_tiles + column_first,
+                                     column_end - column_first);
+    }
     TransferRects(*dest, previous_owner, &rect, 1,
-                  (column_end - column_first) * (row_end - row_first));
+                  (column_end - column_first) * (row_end - row_first), tiles_stencil);
   }
 }
 
 void Fh1NativeExecutor::TransferRects(Surface& dest, uint32_t previous_owner,
                                       const D3D12_RECT* rects, uint32_t rect_count,
-                                      uint32_t tile_count) {
+                                      uint32_t tile_count, bool tiles_stencil) {
   CpuTimer timer(*this, kCpuTransfers);
   GpuTimer gpu_timer(*this, kGpuTransfers);
   Surface* source = FindSurface(previous_owner);
@@ -1014,8 +1030,10 @@ void Fh1NativeExecutor::TransferRects(Surface& dest, uint32_t previous_owner,
   if (verify_ && ShouldLog()) LogOnce((uint64_t(source->key.Pack()) << 32) ^ dest.key.Pack() ^ 0x7F7F,
           "transfer " + source->key.Describe() + " -> " + dest.key.Describe());
   // The depth pass resets stencil to 0; per-bit passes are needed only when
-  // the source's stencil (or a color word's low byte) may be nonzero.
-  const bool source_stencil = source->key.is_depth ? source->stencil_nonzero : true;
+  // the source's stencil (or a color word's low byte) may be nonzero in the
+  // transferred tiles.
+  const bool source_stencil =
+      source->key.is_depth ? source->stencil_nonzero && tiles_stencil : true;
   uint32_t pass_count = 1;
   if (dest.key.is_depth) {
     // Depth destinations take up to nine passes from the EDRAM words, which
@@ -1031,7 +1049,7 @@ void Fh1NativeExecutor::TransferRects(Surface& dest, uint32_t previous_owner,
         uint64_t(tile_count) * pass_count;
   }
   for (uint32_t i = 0; i < rect_count; ++i) {
-    pending_transfers_.push_back({dest.key.Pack(), previous_owner, rects[i]});
+    pending_transfers_.push_back({dest.key.Pack(), previous_owner, rects[i], source_stencil});
   }
 }
 
@@ -1080,6 +1098,7 @@ void Fh1NativeExecutor::FlushTransfers() {
     list.D3DSetComputeRootSignature(resolve_memory_root_signature_.Get());
     list.D3DSetComputeRootUnorderedAccessView(3, transfer_words_->GetGPUVirtualAddress());
     bool any_stencil = false;
+    for (size_t i = group; i < group_end; ++i) any_stencil |= pending_transfers_[i].stencil;
     for (size_t i = group; i < group_end;) {
       size_t source_end = i;
       while (source_end < group_end &&
@@ -1091,7 +1110,7 @@ void Fh1NativeExecutor::FlushTransfers() {
         i = source_end;
         continue;
       }
-      any_stencil |= source->key.is_depth ? source->stencil_nonzero : true;
+
       const bool source_depth = source->key.is_depth;
       ID3D12PipelineState* words_pipeline = GetTransferWordsPipeline(
           SourceKind(source_depth, source->key.format), source->samples > 1);
@@ -1160,10 +1179,7 @@ void Fh1NativeExecutor::FlushTransfers() {
       list.D3DSetGraphicsRoot32BitConstants(0, 3, pass_constants, 0);
       command_processor_.SetStencilReference(pass ? 0xFF : 0);
       for (size_t i = group; i < group_end; ++i) {
-        if (pass) {
-          const Surface* source = FindSurface(pending_transfers_[i].source);
-          if (source && source->key.is_depth && !source->stencil_nonzero) continue;
-        }
+        if (pass && !pending_transfers_[i].stencil) continue;
         const D3D12_RECT& rect = pending_transfers_[i].rect;
         D3D12_VIEWPORT viewport = {float(rect.left), float(rect.top),
                                    float(rect.right - rect.left), float(rect.bottom - rect.top),

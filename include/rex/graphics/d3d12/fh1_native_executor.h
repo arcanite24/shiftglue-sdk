@@ -317,6 +317,8 @@ class Fh1NativeExecutor {
     uint32_t dest;
     uint32_t source;
     D3D12_RECT rect;
+    // Whether the transferred words' stencil (low byte) may be nonzero.
+    bool stencil;
   };
   std::vector<PendingTransfer> pending_transfers_;
   void FlushTransfers();
@@ -324,8 +326,10 @@ class Fh1NativeExecutor {
   bool CreateTransferSourceViews(const Surface& source,
                                  ui::d3d12::util::DescriptorCpuGpuHandlePair (&srvs)[2]);
   // Transfers destination pixel rectangles from the previous owner.
+  // `tiles_stencil`: whether any transferred tile's stencil may be nonzero.
   void TransferRects(Surface& dest, uint32_t previous_owner, const D3D12_RECT* rects,
-                     uint32_t rect_count, uint32_t tile_count);
+                     uint32_t rect_count, uint32_t tile_count, bool tiles_stencil);
+  bool AnyTileStencil(uint32_t base, uint32_t count) const;
   // Claims a rectangle of tiles with one transfer when it has a single
   // previous owner; per-row claims otherwise.
   void ClaimTileRect(const SurfaceKey& key, uint32_t column_first, uint32_t row_first,
