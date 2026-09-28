@@ -98,7 +98,6 @@ class D3D12TextureCache final : public TextureCache {
   // (notifying the command processor about that), so this must be called before
   // binding the actual drawing pipeline.
   void RequestTextures(uint32_t used_texture_mask) override;
-  void RequestFh1VideoTextures(uint32_t used_texture_mask);
 
   // Returns whether texture SRV keys stored externally are still valid for the
   // current bindings and host shader binding layout. Both keys and
@@ -297,7 +296,6 @@ class D3D12TextureCache final : public TextureCache {
   };
 
   bool TryLoadTextureDataFromCpu(Texture& texture, bool load_base, bool load_mips) override;
-  bool request_fh1_video_ = false;
 
   static constexpr uint32_t kSRVDescriptorCachePageSize = 65536;
 

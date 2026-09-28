@@ -2377,18 +2377,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
 
-  const bool fh1_constant_no_output =
-      vertex_shader->ucode_data_hash() == 0xB6C9863F710683ECull &&
-      pixel_shader && pixel_shader->ucode_data_hash() == 0xA4A965C189287B99ull &&
-      !memexport_used && !active_occlusion_query_.valid;
-  if (fh1_constant_no_output) {
-    // These constant point draws have no guest-visible output. Keep query
-    // draws and every writing state on the regular path.
-    const auto no_output_depth = draw_util::GetNormalizedDepthControl(regs);
-    if (!no_output_depth.z_enable && !no_output_depth.stencil_enable &&
-        !draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())) {
-      return true;
-    }
+  reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
+  uint32_t normalized_color_mask =
+      pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
+                   : 0;
+  // A draw that tests and writes neither depth nor stencil, writes no color
+  // and exports no memory outside an occlusion query has no guest-visible
+  // output (FH1 issues thousands of such constant point draws per frame).
+  if (!memexport_used && !active_occlusion_query_.valid && !normalized_depth_control.z_enable &&
+      !normalized_depth_control.stencil_enable && !normalized_color_mask) {
+    return true;
   }
 
   if (!BeginSubmission(true)) {
@@ -2403,8 +2401,6 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // Nothing to draw.
     return true;
   }
-
-  reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
 
   // Shader modifications.
   uint32_t ps_param_gen_pos = UINT32_MAX;
@@ -2424,9 +2420,6 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           : DxbcShaderTranslator::Modification(0);
 
   // Set up the render targets - this may perform dispatches and draws.
-  uint32_t normalized_color_mask =
-      pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
-                   : 0;
   // Native targets and EDRAM ownership transfers for this draw.
   Fh1NativeDrawInfo native_targets;
   native_targets.memexport = memexport_used;
@@ -2493,22 +2486,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
 
   // Update the textures - this may bind pipelines.
-  // Qualified at 1x/2x; unsupported texture layouts retain the normal load path.
-  const bool fh1_video_textures = pixel_shader &&
-      (texture_cache_->draw_resolution_scale_x() == 1 ||
-       texture_cache_->draw_resolution_scale_x() == 2) &&
-      texture_cache_->draw_resolution_scale_y() == texture_cache_->draw_resolution_scale_x() &&
-      vertex_shader->ucode_data_hash() == 0x7156CE05C6365E51ull &&
-      pixel_shader->ucode_data_hash() == 0x31511D87CC0C94B9ull;
   const bool time_texture_request = Fh1GpuCorpusEnabled() &&
       observation_frame_sequence_ % 60 == 0;
   const auto texture_request_start = time_texture_request
       ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-  if (fh1_video_textures) {
-    texture_cache_->RequestFh1VideoTextures(used_texture_mask);
-  } else {
-    texture_cache_->RequestTextures(used_texture_mask);
-  }
+  texture_cache_->RequestTextures(used_texture_mask);
   {
     // Frame dumps: the guest ranges the draw reads.
     const bool guest_dma_indices = primitive_processing_result.index_buffer_type ==

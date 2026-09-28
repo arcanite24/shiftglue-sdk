@@ -735,12 +735,6 @@ void D3D12TextureCache::EndFrame() {
   }
 }
 
-void D3D12TextureCache::RequestFh1VideoTextures(uint32_t used_texture_mask) {
-  request_fh1_video_ = true;
-  RequestTextures(used_texture_mask);
-  request_fh1_video_ = false;
-}
-
 void D3D12TextureCache::RequestTextures(uint32_t used_texture_mask) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
@@ -1615,12 +1609,15 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
 }
 
 bool D3D12TextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_base, bool load_mips) {
-  // BEGIN FH1 LINEAR VIDEO UPLOAD
-  if (request_fh1_video_) {
+  // Linear single-level 8-bit textures (FH1's video planes, rewritten by the
+  // CPU every frame) are copied straight from guest memory into the upload
+  // footprint when the guest row pitch already matches it, instead of
+  // through the untiling compute load. Anything else takes the normal load.
+  {
     const TextureKey key = texture.key();
     if (!load_base || load_mips || key.mip_max_level || key.scaled_resolve ||
         key.tiled || texture.force_load_3d_tiling() || !key.base_page ||
-        key.dimension != xenos::DataDimension::k2DOrStacked ||
+        key.signed_separate || key.dimension != xenos::DataDimension::k2DOrStacked ||
         key.GetDepthOrArraySize() != 1 || key.format != xenos::TextureFormat::k_8 ||
         key.endianness != xenos::Endian::kNone) return false;
     auto& target = static_cast<D3D12Texture&>(texture);
@@ -1657,8 +1654,6 @@ bool D3D12TextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_ba
     command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(&dest, 0, 0, 0, &source, nullptr);
     return true;
   }
-  // END FH1 LINEAR VIDEO UPLOAD
-  return false;
 }
 
 bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
