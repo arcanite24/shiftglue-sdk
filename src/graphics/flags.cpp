@@ -19,8 +19,8 @@ REXCVAR_DEFINE_BOOL(native_2x_msaa, true, "GPU", "Enable native 2x MSAA");
 REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values");
 REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",
                     "Convert float24 depth in pixel shader");
-REXCVAR_DEFINE_BOOL(depth_transfer_not_equal_test, true, "GPU",
-                    "Use not-equal test for depth transfer");
+REXCVAR_DEFINE_BOOL(snorm16_render_target_full_range, true, "GPU",
+                    "Use full range for SNORM16 render targets");
 REXCVAR_DEFINE_BOOL(gamma_render_target_as_unorm16, true, "GPU",
                     "Use R16G16B16A16_UNORM for gamma render targets (more accurate than sRGB)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);

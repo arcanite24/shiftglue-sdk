@@ -52,7 +52,7 @@ struct Fh1NativeExecutorConfig {
   bool gamma_as_unorm16 = false;
   bool depth_float24_round = false;
   // 16_16[_16_16] host targets are snorm limited to -1...1
-  // (D3D12RenderTargetCache::IsFixed16TruncatedToMinus1To1).
+  // (D3D12HostRenderConfig::IsFixed16TruncatedToMinus1To1).
   bool fixed16_truncated = true;
   // The command processor's guest-memory mirror and texture cache.
   D3D12SharedMemory* memory = nullptr;
@@ -88,9 +88,9 @@ class Fh1NativeExecutor {
   void RecordDrawInputs(uint32_t used_texture_mask, const Shader& vertex_shader,
                         uint32_t guest_dma_index_offset, uint32_t guest_dma_index_size);
 
-  // In place of the render target cache's update: binds the surfaces
+  // In place of the Xenos render target cache's update: binds the surfaces
   // PrepareTargets derived and returns the bound slots and their formats as
-  // RenderTargetCache::GetLastUpdateBoundRenderTargets would. False skips the
+  // the Xenos RenderTargetCache::GetLastUpdateBoundRenderTargets did. False skips the
   // draw (the reason is counted).
   bool BindTargets(uint32_t& bound_bits, uint32_t* formats);
   // After the command processor recorded the draw.

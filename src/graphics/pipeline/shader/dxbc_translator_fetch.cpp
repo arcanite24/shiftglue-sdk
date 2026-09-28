@@ -19,7 +19,6 @@
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
-#include <rex/graphics/pipeline/render_target/cache.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
 #include <rex/math.h>
 #include <rex/string.h>

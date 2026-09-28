@@ -13,7 +13,7 @@
 
 #include <rex/assert.h>
 #include <rex/graphics/flags.h>
-#include <rex/graphics/pipeline/render_target/cache.h>
+#include <rex/graphics/pipeline/render_target/psi_color_format.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/util/draw.h>
@@ -1088,7 +1088,7 @@ void DxbcShaderTranslator::ROV_UnpackColor(uint32_t rt_index, uint32_t packed_te
   // k_8_8_8_8_GAMMA
   // ***************************************************************************
   for (uint32_t i = 0; i < 2; ++i) {
-    a_.OpCase(dxbc::Src::LU(RenderTargetCache::AddPSIColorFormatFlags(
+    a_.OpCase(dxbc::Src::LU(psi_color_format::AddFlags(
         i ? xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA
           : xenos::ColorRenderTargetFormat::k_8_8_8_8)));
     // Unpack the components.
@@ -1112,8 +1112,8 @@ void DxbcShaderTranslator::ROV_UnpackColor(uint32_t rt_index, uint32_t packed_te
   // k_2_10_10_10_AS_10_10_10_10
   // ***************************************************************************
   a_.OpCase(dxbc::Src::LU(
-      RenderTargetCache::AddPSIColorFormatFlags(xenos::ColorRenderTargetFormat::k_2_10_10_10)));
-  a_.OpCase(dxbc::Src::LU(RenderTargetCache::AddPSIColorFormatFlags(
+      psi_color_format::AddFlags(xenos::ColorRenderTargetFormat::k_2_10_10_10)));
+  a_.OpCase(dxbc::Src::LU(psi_color_format::AddFlags(
       xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10)));
   {
     // Unpack the components.
@@ -1132,9 +1132,9 @@ void DxbcShaderTranslator::ROV_UnpackColor(uint32_t rt_index, uint32_t packed_te
   // k_2_10_10_10_FLOAT_AS_16_16_16_16
   // https://github.com/Microsoft/DirectXTex/blob/master/DirectXTex/DirectXTexConvert.cpp
   // ***************************************************************************
-  a_.OpCase(dxbc::Src::LU(RenderTargetCache::AddPSIColorFormatFlags(
+  a_.OpCase(dxbc::Src::LU(psi_color_format::AddFlags(
       xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT)));
-  a_.OpCase(dxbc::Src::LU(RenderTargetCache::AddPSIColorFormatFlags(
+  a_.OpCase(dxbc::Src::LU(psi_color_format::AddFlags(
       xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16)));
   {
     // Unpack the alpha.
@@ -1161,7 +1161,7 @@ void DxbcShaderTranslator::ROV_UnpackColor(uint32_t rt_index, uint32_t packed_te
   // ***************************************************************************
   for (uint32_t i = 0; i < 2; ++i) {
     a_.OpCase(dxbc::Src::LU(
-        RenderTargetCache::AddPSIColorFormatFlags(i ? xenos::ColorRenderTargetFormat::k_16_16_16_16
+        psi_color_format::AddFlags(i ? xenos::ColorRenderTargetFormat::k_16_16_16_16
                                                     : xenos::ColorRenderTargetFormat::k_16_16)));
     dxbc::Dest color_components_dest(dxbc::Dest::R(color_temp, i ? 0b1111 : 0b0011));
     // Unpack the components.
@@ -1179,7 +1179,7 @@ void DxbcShaderTranslator::ROV_UnpackColor(uint32_t rt_index, uint32_t packed_te
   // k_16_16_16_16_FLOAT (64bpp)
   // ***************************************************************************
   for (uint32_t i = 0; i < 2; ++i) {
-    a_.OpCase(dxbc::Src::LU(RenderTargetCache::AddPSIColorFormatFlags(
+    a_.OpCase(dxbc::Src::LU(psi_color_format::AddFlags(
         i ? xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT
           : xenos::ColorRenderTargetFormat::k_16_16_FLOAT)));
     dxbc::Dest color_components_dest(dxbc::Dest::R(color_temp, i ? 0b1111 : 0b0011));
@@ -1233,7 +1233,7 @@ void DxbcShaderTranslator::ROV_PackPreClampedColor(uint32_t rt_index, uint32_t c
   // k_8_8_8_8_GAMMA
   // ***************************************************************************
   for (uint32_t i = 0; i < 2; ++i) {
-    a_.OpCase(dxbc::Src::LU(RenderTargetCache::AddPSIColorFormatFlags(
+    a_.OpCase(dxbc::Src::LU(psi_color_format::AddFlags(
         i ? xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA
           : xenos::ColorRenderTargetFormat::k_8_8_8_8)));
     for (uint32_t j = 0; j < 4; ++j) {
@@ -1263,8 +1263,8 @@ void DxbcShaderTranslator::ROV_PackPreClampedColor(uint32_t rt_index, uint32_t c
   // k_2_10_10_10_AS_10_10_10_10
   // ***************************************************************************
   a_.OpCase(dxbc::Src::LU(
-      RenderTargetCache::AddPSIColorFormatFlags(xenos::ColorRenderTargetFormat::k_2_10_10_10)));
-  a_.OpCase(dxbc::Src::LU(RenderTargetCache::AddPSIColorFormatFlags(
+      psi_color_format::AddFlags(xenos::ColorRenderTargetFormat::k_2_10_10_10)));
+  a_.OpCase(dxbc::Src::LU(psi_color_format::AddFlags(
       xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10)));
   for (uint32_t i = 0; i < 4; ++i) {
     // Denormalize and convert to fixed-point.
@@ -1284,9 +1284,9 @@ void DxbcShaderTranslator::ROV_PackPreClampedColor(uint32_t rt_index, uint32_t c
   // k_2_10_10_10_FLOAT_AS_16_16_16_16
   // https://github.com/Microsoft/DirectXTex/blob/master/DirectXTex/DirectXTexConvert.cpp
   // ***************************************************************************
-  a_.OpCase(dxbc::Src::LU(RenderTargetCache::AddPSIColorFormatFlags(
+  a_.OpCase(dxbc::Src::LU(psi_color_format::AddFlags(
       xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT)));
-  a_.OpCase(dxbc::Src::LU(RenderTargetCache::AddPSIColorFormatFlags(
+  a_.OpCase(dxbc::Src::LU(psi_color_format::AddFlags(
       xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16)));
   {
     // Convert red directly to the destination, which may be the same as the
@@ -1315,7 +1315,7 @@ void DxbcShaderTranslator::ROV_PackPreClampedColor(uint32_t rt_index, uint32_t c
   // ***************************************************************************
   for (uint32_t i = 0; i < 2; ++i) {
     a_.OpCase(dxbc::Src::LU(
-        RenderTargetCache::AddPSIColorFormatFlags(i ? xenos::ColorRenderTargetFormat::k_16_16_16_16
+        psi_color_format::AddFlags(i ? xenos::ColorRenderTargetFormat::k_16_16_16_16
                                                     : xenos::ColorRenderTargetFormat::k_16_16)));
     for (uint32_t j = 0; j < (uint32_t(2) << i); ++j) {
       // Denormalize and convert to fixed-point, making 0.5 with the proper sign
@@ -1342,7 +1342,7 @@ void DxbcShaderTranslator::ROV_PackPreClampedColor(uint32_t rt_index, uint32_t c
   // k_16_16_16_16_FLOAT (64bpp)
   // ***************************************************************************
   for (uint32_t i = 0; i < 2; ++i) {
-    a_.OpCase(dxbc::Src::LU(RenderTargetCache::AddPSIColorFormatFlags(
+    a_.OpCase(dxbc::Src::LU(psi_color_format::AddFlags(
         i ? xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT
           : xenos::ColorRenderTargetFormat::k_16_16_FLOAT)));
     for (uint32_t j = 0; j < (uint32_t(2) << i); ++j) {
@@ -1932,7 +1932,7 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
     // Load whether the render target is 64bpp to system_temp_rov_params_.y to
     // get the needed relative sample address.
     a_.OpAnd(dxbc::Dest::R(system_temp_rov_params_, 0b0010), rt_format_flags_src,
-             dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_64bpp));
+             dxbc::Src::LU(psi_color_format::kFlag_64bpp));
     // Choose the relative sample address for the render target to
     // system_temp_rov_params_.y.
     a_.OpMovC(dxbc::Dest::R(system_temp_rov_params_, 0b0010),
@@ -1982,7 +1982,7 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
       // Get if the blending source color is fixed-point for clamping if it is.
       // temp.x = whether color is fixed-point.
       a_.OpAnd(temp_x_dest, rt_format_flags_src,
-               dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointColor));
+               dxbc::Src::LU(psi_color_format::kFlag_FixedPointColor));
       // Check if the blending source color is fixed-point and needs clamping.
       // temp.x = free.
       a_.OpIf(true, temp_x_src);
@@ -1999,7 +1999,7 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
       // Get if the blending source alpha is fixed-point for clamping if it is.
       // temp.x = whether alpha is fixed-point.
       a_.OpAnd(temp_x_dest, rt_format_flags_src,
-               dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointAlpha));
+               dxbc::Src::LU(psi_color_format::kFlag_FixedPointAlpha));
       // Check if the blending source alpha is fixed-point and needs clamping.
       // temp.x = free.
       a_.OpIf(true, temp_x_src);
@@ -2076,7 +2076,7 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
         // Get if the format is 64bpp to temp.w.
         // temp.w = whether the render target is 64bpp.
         a_.OpAnd(temp_w_dest, rt_format_flags_src,
-                 dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_64bpp));
+                 dxbc::Src::LU(psi_color_format::kFlag_64bpp));
         // Check if the format is 64bpp.
         // temp.w = free.
         a_.OpIf(true, temp_w_src);
@@ -2162,7 +2162,7 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
               // color factor needs clamping to temp.x.
               // temp.x = whether color is fixed-point.
               a_.OpAnd(temp_x_dest, rt_format_flags_src,
-                       dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointColor));
+                       dxbc::Src::LU(psi_color_format::kFlag_FixedPointColor));
               // Check if the source color factor needs clamping.
               a_.OpIf(true, temp_x_src);
               {
@@ -2234,7 +2234,7 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
               // destination color factor needs clamping to temp.x.
               // temp.x = whether color is fixed-point.
               a_.OpAnd(temp_x_dest, rt_format_flags_src,
-                       dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointColor));
+                       dxbc::Src::LU(psi_color_format::kFlag_FixedPointColor));
               // Check if the destination color factor needs clamping.
               a_.OpIf(true, temp_x_src);
               {
@@ -2361,7 +2361,7 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
               // alpha factor needs clamping to temp.y.
               // temp.y = whether alpha is fixed-point.
               a_.OpAnd(temp_y_dest, rt_format_flags_src,
-                       dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointAlpha));
+                       dxbc::Src::LU(psi_color_format::kFlag_FixedPointAlpha));
               // Check if the source alpha factor needs clamping.
               a_.OpIf(true, temp_y_src);
               {
@@ -2425,7 +2425,7 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
               // alpha_is_fixed_temp.x = whether alpha is fixed-point.
               uint32_t alpha_is_fixed_temp = PushSystemTemp();
               a_.OpAnd(dxbc::Dest::R(alpha_is_fixed_temp, 0b0001), rt_format_flags_src,
-                       dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointAlpha));
+                       dxbc::Src::LU(psi_color_format::kFlag_FixedPointAlpha));
               // Check if the destination alpha factor needs clamping.
               a_.OpIf(true, dxbc::Src::R(alpha_is_fixed_temp, dxbc::Src::kXXXX));
               {
@@ -2562,7 +2562,7 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
       // Get if the format is 64bpp to temp.z.
       // temp.z = whether the render target is 64bpp.
       a_.OpAnd(temp_z_dest, rt_format_flags_src,
-               dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_64bpp));
+               dxbc::Src::LU(psi_color_format::kFlag_64bpp));
       // Check if the format is 64bpp.
       // temp.z = free.
       a_.OpIf(true, temp_z_src);
@@ -2598,7 +2598,7 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
         if (j & 1) {
           // temp.z = whether the render target is 64bpp.
           a_.OpAnd(temp_z_dest, rt_format_flags_src,
-                   dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_64bpp));
+                   dxbc::Src::LU(psi_color_format::kFlag_64bpp));
           // temp.z = offset from the current sample to the next.
           a_.OpMovC(temp_z_dest, temp_z_src,
                     dxbc::Src::LI(-int32_t(tile_width) + 2 * (2 - int32_t(j))),

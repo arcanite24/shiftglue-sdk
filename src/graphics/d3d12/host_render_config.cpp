@@ -9,47 +9,30 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <algorithm>
-#include <array>
-#include <cstdint>
-#include <cstring>
+#include <rex/graphics/d3d12/host_render_config.h>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
-#include <rex/graphics/d3d12/command_processor.h>
-#include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/flags.h>
-#include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
-#include <rex/ui/d3d12/d3d12_util.h>
-
-REXCVAR_DEFINE_BOOL(native_stencil_value_output_d3d12_intel, false, "GPU/D3D12",
-                    "Native stencil value output for Intel D3D12");
-
-REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU", "Enable native stencil value output");
 
 namespace rex::graphics::d3d12 {
 
-D3D12RenderTargetCache::~D3D12RenderTargetCache() {
-  Shutdown(true);
+D3D12HostRenderConfig::D3D12HostRenderConfig(uint32_t draw_resolution_scale_x,
+                                             uint32_t draw_resolution_scale_y)
+    : draw_resolution_scale_x_(draw_resolution_scale_x),
+      draw_resolution_scale_y_(draw_resolution_scale_y) {
+  assert_not_zero(draw_resolution_scale_x);
+  assert_not_zero(draw_resolution_scale_y);
 }
 
-void D3D12RenderTargetCache::InitializeHostConfig() {
-  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+void D3D12HostRenderConfig::Initialize(const ui::d3d12::D3D12Provider& provider) {
   ID3D12Device* device = provider.GetDevice();
 
-  // Using the cvar on emulator initialization so used pipelines are consistent
-  // across different titles launched in one emulator instance.
-  use_stencil_reference_output_ =
-      REXCVAR_GET(native_stencil_value_output) &&
-      provider.IsPSSpecifiedStencilReferenceSupported() &&
-      (REXCVAR_GET(native_stencil_value_output_d3d12_intel) ||
-       provider.GetAdapterVendorID() != ui::GraphicsProvider::GpuVendorID::kIntel);
-
-  if (GetPath() != Path::kHostRenderTargets) return;
-
+  // Using the cvars on emulator initialization so used pipelines are
+  // consistent across different titles launched in one emulator instance.
   gamma_render_target_as_unorm16_ = REXCVAR_GET(gamma_render_target_as_unorm16);
 
   depth_float24_round_ = REXCVAR_GET(depth_float24_round);
@@ -113,46 +96,7 @@ void D3D12RenderTargetCache::InitializeHostConfig() {
   }
 }
 
-bool D3D12RenderTargetCache::Initialize() {
-  // The FH1 native executor owns EDRAM, render targets, transfers and
-  // resolves; only the host configuration the pipelines are built against is
-  // derived here.
-  InitializeHostConfig();
-  return true;
-}
-
-void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
-  if (!from_destructor) {
-    ShutdownCommon();
-  }
-}
-
-void D3D12RenderTargetCache::WriteEdramUintPow2UAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle,
-                                                             uint32_t element_size_bytes_pow2) {
-  EdramBufferDescriptorIndex descriptor_index;
-  switch (element_size_bytes_pow2) {
-    case 2:
-      descriptor_index = EdramBufferDescriptorIndex::kR32UintUAV;
-      break;
-    case 3:
-      descriptor_index = EdramBufferDescriptorIndex::kR32G32UintUAV;
-      break;
-    case 4:
-      descriptor_index = EdramBufferDescriptorIndex::kR32G32B32A32UintUAV;
-      break;
-    default:
-      assert_unhandled_case(element_size_bytes_pow2);
-      return;
-  }
-  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
-  ID3D12Device* device = provider.GetDevice();
-  device->CopyDescriptorsSimple(1, handle,
-                                provider.OffsetViewDescriptor(edram_buffer_descriptor_heap_start_,
-                                                              uint32_t(descriptor_index)),
-                                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-}
-
-DXGI_FORMAT D3D12RenderTargetCache::GetColorResourceDXGIFormat(
+DXGI_FORMAT D3D12HostRenderConfig::GetColorResourceDXGIFormat(
     xenos::ColorRenderTargetFormat format) const {
   // Typed should be preferred over typeless so there are more opportunities for
   // compression.
@@ -191,7 +135,7 @@ DXGI_FORMAT D3D12RenderTargetCache::GetColorResourceDXGIFormat(
   }
 }
 
-DXGI_FORMAT D3D12RenderTargetCache::GetColorDrawDXGIFormat(
+DXGI_FORMAT D3D12HostRenderConfig::GetColorDrawDXGIFormat(
     xenos::ColorRenderTargetFormat format) const {
   switch (format) {
     case xenos::ColorRenderTargetFormat::k_16_16:
@@ -211,7 +155,7 @@ DXGI_FORMAT D3D12RenderTargetCache::GetColorDrawDXGIFormat(
   }
 }
 
-DXGI_FORMAT D3D12RenderTargetCache::GetDepthResourceDXGIFormat(
+DXGI_FORMAT D3D12HostRenderConfig::GetDepthResourceDXGIFormat(
     xenos::DepthRenderTargetFormat format) {
   switch (format) {
     case xenos::DepthRenderTargetFormat::kD24S8:
@@ -224,7 +168,7 @@ DXGI_FORMAT D3D12RenderTargetCache::GetDepthResourceDXGIFormat(
   }
 }
 
-DXGI_FORMAT D3D12RenderTargetCache::GetDepthDSVDXGIFormat(xenos::DepthRenderTargetFormat format) {
+DXGI_FORMAT D3D12HostRenderConfig::GetDepthDSVDXGIFormat(xenos::DepthRenderTargetFormat format) {
   switch (format) {
     case xenos::DepthRenderTargetFormat::kD24S8:
       return DXGI_FORMAT_D24_UNORM_S8_UINT;
@@ -236,7 +180,7 @@ DXGI_FORMAT D3D12RenderTargetCache::GetDepthDSVDXGIFormat(xenos::DepthRenderTarg
   }
 }
 
-DXGI_FORMAT D3D12RenderTargetCache::GetDepthSRVDepthDXGIFormat(
+DXGI_FORMAT D3D12HostRenderConfig::GetDepthSRVDepthDXGIFormat(
     xenos::DepthRenderTargetFormat format) {
   switch (format) {
     case xenos::DepthRenderTargetFormat::kD24S8:
@@ -249,7 +193,7 @@ DXGI_FORMAT D3D12RenderTargetCache::GetDepthSRVDepthDXGIFormat(
   }
 }
 
-DXGI_FORMAT D3D12RenderTargetCache::GetDepthSRVStencilDXGIFormat(
+DXGI_FORMAT D3D12HostRenderConfig::GetDepthSRVStencilDXGIFormat(
     xenos::DepthRenderTargetFormat format) {
   switch (format) {
     case xenos::DepthRenderTargetFormat::kD24S8:
@@ -260,24 +204,6 @@ DXGI_FORMAT D3D12RenderTargetCache::GetDepthSRVStencilDXGIFormat(
       assert_unhandled_case(format);
       return DXGI_FORMAT_UNKNOWN;
   }
-}
-
-RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(RenderTargetKey key) {
-  // Host render targets are owned by the FH1 native executor.
-  (void)key;
-  return nullptr;
-}
-
-bool D3D12RenderTargetCache::IsHostDepthEncodingDifferent(
-    xenos::DepthRenderTargetFormat format) const {
-  if (format == xenos::DepthRenderTargetFormat::kD24FS8) {
-    return !depth_float24_convert_in_pixel_shader_;
-  }
-  return false;
-}
-
-bool D3D12RenderTargetCache::IsGammaFormatHostStorageSeparate() const {
-  return gamma_render_target_as_unorm16_;
 }
 
 }  // namespace rex::graphics::d3d12

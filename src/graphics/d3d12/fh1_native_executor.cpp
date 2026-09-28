@@ -13,7 +13,7 @@
 
 #include <rex/cvar.h>
 #include <rex/graphics/d3d12/command_processor.h>
-#include <rex/graphics/d3d12/render_target_cache.h>
+#include <rex/graphics/d3d12/host_render_config.h>
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/graphics/d3d12/texture_cache.h>
 #include <rex/graphics/flags.h>
@@ -491,7 +491,8 @@ uint32_t Fh1NativeExecutor::PitchTiles(uint32_t pitch_pixels, uint32_t msaa) {
 
 uint32_t Fh1NativeExecutor::SurfaceHeight(uint32_t pitch_tiles, uint32_t msaa) const {
   // Down to the start of the same surface in the next EDRAM addressing period,
-  // clamped to the guest texture size limit (RenderTargetCache at 1x scale).
+  // clamped to the guest texture size limit (as the Xenos render target cache
+  // did at 1x scale).
   if (!pitch_tiles) return 0;
   uint32_t tile_rows = (xenos::kEdramTileCount + pitch_tiles - 1) / pitch_tiles;
   const uint32_t msaa_y_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k2X));
@@ -607,11 +608,11 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
   D3D12_CLEAR_VALUE clear_value = {};
   if (key.is_depth) {
     const auto format = xenos::DepthRenderTargetFormat(key.format);
-    desc.Format = D3D12RenderTargetCache::GetDepthResourceDXGIFormat(format);
+    desc.Format = D3D12HostRenderConfig::GetDepthResourceDXGIFormat(format);
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-    surface.view_format = D3D12RenderTargetCache::GetDepthDSVDXGIFormat(format);
-    surface.srv_format = D3D12RenderTargetCache::GetDepthSRVDepthDXGIFormat(format);
-    surface.stencil_srv_format = D3D12RenderTargetCache::GetDepthSRVStencilDXGIFormat(format);
+    surface.view_format = D3D12HostRenderConfig::GetDepthDSVDXGIFormat(format);
+    surface.srv_format = D3D12HostRenderConfig::GetDepthSRVDepthDXGIFormat(format);
+    surface.stencil_srv_format = D3D12HostRenderConfig::GetDepthSRVStencilDXGIFormat(format);
     surface.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     clear_value.Format = surface.view_format;
     clear_value.DepthStencil.Depth = format == xenos::DepthRenderTargetFormat::kD24S8 ? 1.0f : 0.0f;
@@ -1831,7 +1832,8 @@ void Fh1NativeExecutor::ClearSurfaceRect(Surface& surface, const D3D12_RECT& gue
   auto& list = command_processor_.GetDeferredCommandList();
   GpuTimer gpu_timer(*this, kGpuClears);
   if (surface.key.is_depth) {
-    // The host keeps float24 depth halved in [0, 1) (RenderTargetCache).
+    // The host keeps float24 depth halved in [0, 1) (as the Xenos render
+    // target cache did).
     const uint32_t depth_bits = (clear_value >> 8) & 0xFFFFFF;
     const float value = xenos::DepthRenderTargetFormat(surface.key.format) ==
                                 xenos::DepthRenderTargetFormat::kD24FS8

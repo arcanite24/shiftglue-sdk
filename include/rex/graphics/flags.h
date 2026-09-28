@@ -38,12 +38,11 @@ REXCVAR_DECLARE(int32_t, query_occlusion_fake_sample_count);
 // GPU Depth / Render Target Behavior
 REXCVAR_DECLARE(bool, depth_float24_round);
 REXCVAR_DECLARE(bool, depth_float24_convert_in_pixel_shader);
-REXCVAR_DECLARE(bool, depth_transfer_not_equal_test);
-REXCVAR_DECLARE(bool, native_stencil_value_output);
-REXCVAR_DECLARE(bool, native_stencil_value_output_d3d12_intel);
 REXCVAR_DECLARE(bool, gamma_render_target_as_unorm16);
 REXCVAR_DECLARE(bool, native_2x_msaa);
 REXCVAR_DECLARE(bool, snorm16_render_target_full_range);
+// EDRAM render target cache only (defined with the Vulkan backend).
+REXCVAR_DECLARE(bool, depth_transfer_not_equal_test);
 REXCVAR_DECLARE(bool, mrt_edram_used_range_clamp_to_min);
 
 // GPU Textures

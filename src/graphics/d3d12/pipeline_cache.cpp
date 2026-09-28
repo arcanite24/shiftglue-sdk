@@ -39,7 +39,7 @@
 #include <rex/filesystem.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/pipeline_cache.h>
-#include <rex/graphics/d3d12/render_target_cache.h>
+#include <rex/graphics/d3d12/host_render_config.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/format/dxbc.h>
 #include <rex/graphics/pipeline_util.h>
@@ -285,26 +285,19 @@ namespace shaders {
 
 PipelineCache::PipelineCache(D3D12CommandProcessor& command_processor,
                              const RegisterFile& register_file,
-                             const D3D12RenderTargetCache& render_target_cache,
+                             const D3D12HostRenderConfig& host_config,
                              bool bindless_resources_used)
     : command_processor_(command_processor),
       register_file_(register_file),
-      render_target_cache_(render_target_cache),
+      host_config_(host_config),
       bindless_resources_used_(bindless_resources_used) {
-  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
-
-  bool edram_rov_used =
-      render_target_cache.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
-
 #if defined(REXGPU_FH1_SHADER_PRODUCER)
+  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   shader_translator_ = std::make_unique<DxbcShaderTranslator>(
-      provider.GetAdapterVendorID(), bindless_resources_used_, edram_rov_used,
-      !render_target_cache_.gamma_render_target_as_unorm16(),
-      render_target_cache_.msaa_2x_supported(), render_target_cache_.draw_resolution_scale_x(),
-      render_target_cache_.draw_resolution_scale_y(), provider.GetGraphicsAnalysis() != nullptr);
-
-#else
-  assert_false(edram_rov_used);
+      provider.GetAdapterVendorID(), bindless_resources_used_, /* edram_rov_used */ false,
+      !host_config_.gamma_render_target_as_unorm16(),
+      host_config_.msaa_2x_supported(), host_config_.draw_resolution_scale_x(),
+      host_config_.draw_resolution_scale_y(), provider.GetGraphicsAnalysis() != nullptr);
 #endif
 }
 
@@ -457,22 +450,17 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
     }
   }
 
-  bool edram_rov_used =
-      render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
-
-
-
   if (title_id == 0x4D5309C9) {
     const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+    // Bit 1 (2) was the removed edram ROV path and is always clear.
     uint32_t pack_flags = bindless_resources_used_ ? 1u : 0u;
-    pack_flags |= edram_rov_used ? 2u : 0u;
-    pack_flags |= !render_target_cache_.gamma_render_target_as_unorm16() ? 4u : 0u;
-    pack_flags |= render_target_cache_.msaa_2x_supported() ? 8u : 0u;
+    pack_flags |= !host_config_.gamma_render_target_as_unorm16() ? 4u : 0u;
+    pack_flags |= host_config_.msaa_2x_supported() ? 8u : 0u;
     const Fh1ShaderPack::Config pack_config{
         DxbcShaderTranslator::Modification::kVersion,
         static_cast<uint32_t>(provider.GetAdapterVendorID()), pack_flags,
-        render_target_cache_.draw_resolution_scale_x(),
-        render_target_cache_.draw_resolution_scale_y()};
+        host_config_.draw_resolution_scale_x(),
+        host_config_.draw_resolution_scale_y()};
     const auto pack_path = shader_storage_shareable_root /
                            fmt::format("{:08X}.fh1-native-v2.{:04X}.{:02X}.{}x{}.pnsp", title_id,
                                        pack_config.vendor_id, pack_config.flags,
@@ -514,8 +502,8 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
   pipeline_storage_file_flush_needed_ = false;
   // 'XEPS'.
   const uint32_t pipeline_storage_magic = 0x53504558;
-  // 'DXRO' or 'DXRT'.
-  const uint32_t pipeline_storage_magic_api = edram_rov_used ? 0x4F525844 : 0x54525844;
+  // 'DXRT' (host render targets; 'DXRO' was the removed ROV path).
+  const uint32_t pipeline_storage_magic_api = 0x54525844;
   const uint32_t pipeline_storage_version_swapped = rex::byte_swap(
       std::max(PipelineDescription::kVersion, DxbcShaderTranslator::Modification::kVersion));
   struct {
@@ -823,10 +811,10 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       const ui::d3d12::D3D12Provider& provider =
           command_processor_.GetD3D12Provider();
       DxbcShaderTranslator translator(
-          provider.GetAdapterVendorID(), bindless_resources_used_, edram_rov_used,
-          !render_target_cache_.gamma_render_target_as_unorm16(),
-          render_target_cache_.msaa_2x_supported(), render_target_cache_.draw_resolution_scale_x(),
-          render_target_cache_.draw_resolution_scale_y(),
+          provider.GetAdapterVendorID(), bindless_resources_used_, /* edram_rov_used */ false,
+          !host_config_.gamma_render_target_as_unorm16(),
+          host_config_.msaa_2x_supported(), host_config_.draw_resolution_scale_x(),
+          host_config_.draw_resolution_scale_y(),
           provider.GetGraphicsAnalysis() != nullptr);
 #endif
       // If needed and possible, create objects needed for DXIL conversion and
@@ -1684,22 +1672,20 @@ DxbcShaderTranslator::Modification PipelineCache::GetCurrentPixelShaderModificat
     modification.pixel.param_gen_point = 0;
   }
 
-  if (render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
-    using DepthStencilMode = DxbcShaderTranslator::Modification::DepthStencilMode;
-    if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
-        normalized_depth_control.z_enable &&
-        regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
-      modification.pixel.depth_stencil_mode = render_target_cache_.depth_float24_round()
-                                                  ? DepthStencilMode::kFloat24Rounding
-                                                  : DepthStencilMode::kFloat24Truncating;
+  using DepthStencilMode = DxbcShaderTranslator::Modification::DepthStencilMode;
+  if (host_config_.depth_float24_convert_in_pixel_shader() &&
+      normalized_depth_control.z_enable &&
+      regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
+    modification.pixel.depth_stencil_mode = host_config_.depth_float24_round()
+                                                ? DepthStencilMode::kFloat24Rounding
+                                                : DepthStencilMode::kFloat24Truncating;
+  } else {
+    if (shader.implicit_early_z_write_allowed() &&
+        (!shader.writes_color_target(0) ||
+         !draw_util::DoesCoverageDependOnAlpha(regs.Get<reg::RB_COLORCONTROL>()))) {
+      modification.pixel.depth_stencil_mode = DepthStencilMode::kEarlyHint;
     } else {
-      if (shader.implicit_early_z_write_allowed() &&
-          (!shader.writes_color_target(0) ||
-           !draw_util::DoesCoverageDependOnAlpha(regs.Get<reg::RB_COLORCONTROL>()))) {
-        modification.pixel.depth_stencil_mode = DepthStencilMode::kEarlyHint;
-      } else {
-        modification.pixel.depth_stencil_mode = DepthStencilMode::kNoModifiers;
-      }
+      modification.pixel.depth_stencil_mode = DepthStencilMode::kNoModifiers;
     }
   }
 
@@ -2066,10 +2052,8 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator* translator,
 
   // Dump shader files if desired.
   if (!REXCVAR_GET(dump_shaders).empty()) {
-    bool edram_rov_used =
-        render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
     translation.Dump(REXCVAR_GET(dump_shaders), (shader.type() == xenos::ShaderType::kPixel)
-                                                    ? (edram_rov_used ? "d3d12_rov" : "d3d12_rtv")
+                                                    ? "d3d12_rtv"
                                                     : "d3d12");
   }
 
@@ -2110,13 +2094,12 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator* translator,
     observation.translator_version = DxbcShaderTranslator::Modification::kVersion;
     observation.vendor_id = static_cast<uint32_t>(provider.GetAdapterVendorID());
     observation.bindless_resources = bindless_resources_used_;
-    observation.edram_rov =
-        render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+    observation.edram_rov = false;
     observation.gamma_render_target_as_unorm8 =
-        !render_target_cache_.gamma_render_target_as_unorm16();
-    observation.msaa_2x = render_target_cache_.msaa_2x_supported();
-    observation.draw_resolution_scale_x = render_target_cache_.draw_resolution_scale_x();
-    observation.draw_resolution_scale_y = render_target_cache_.draw_resolution_scale_y();
+        !host_config_.gamma_render_target_as_unorm16();
+    observation.msaa_2x = host_config_.msaa_2x_supported();
+    observation.draw_resolution_scale_x = host_config_.draw_resolution_scale_x();
+    observation.draw_resolution_scale_y = host_config_.draw_resolution_scale_y();
     observation.texture_bindings = observed_texture_bindings.data();
     observation.texture_binding_count = observed_texture_bindings.size();
     observation.sampler_bindings = observed_sampler_bindings.data();
@@ -2279,9 +2262,6 @@ bool PipelineCache::GetCurrentStateDescription(
     }
   }
 
-  bool edram_rov_used =
-      render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
-
   // Vertex shader.
   runtime_description_out.vertex_shader = vertex_shader;
   description_out.vertex_shader_hash = vertex_shader->shader().ucode_data_hash();
@@ -2403,182 +2383,171 @@ bool PipelineCache::GetCurrentStateDescription(
     cull_front = false;
     cull_back = false;
   }
-  if (!edram_rov_used) {
-    float polygon_offset, polygon_offset_scale;
-    draw_util::GetPreferredFacePolygonOffset(regs, primitive_polygonal, polygon_offset_scale,
-                                             polygon_offset);
-    description_out.depth_bias = draw_util::GetD3D10IntegerPolygonOffset(
-        regs.Get<reg::RB_DEPTH_INFO>().depth_format, polygon_offset);
-    description_out.depth_bias_slope_scaled =
-        polygon_offset_scale * xenos::kPolygonOffsetScaleSubpixelUnit;
-  }
+  float polygon_offset, polygon_offset_scale;
+  draw_util::GetPreferredFacePolygonOffset(regs, primitive_polygonal, polygon_offset_scale,
+                                           polygon_offset);
+  description_out.depth_bias = draw_util::GetD3D10IntegerPolygonOffset(
+      regs.Get<reg::RB_DEPTH_INFO>().depth_format, polygon_offset);
+  description_out.depth_bias_slope_scaled =
+      polygon_offset_scale * xenos::kPolygonOffsetScaleSubpixelUnit;
   if (tessellated && REXCVAR_GET(d3d12_tessellation_wireframe)) {
     description_out.fill_mode_wireframe = 1;
   }
   description_out.depth_clip = !regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable;
   bool depth_stencil_bound_and_used = false;
-  if (!edram_rov_used) {
-    // Depth/stencil. No stencil, always passing depth test and no depth writing
-    // means depth disabled.
-    if (bound_depth_and_color_render_target_bits & 1) {
-      if (normalized_depth_control.z_enable) {
-        description_out.depth_func = normalized_depth_control.zfunc;
-        description_out.depth_write = normalized_depth_control.z_write_enable;
-      } else {
-        description_out.depth_func = xenos::CompareFunction::kAlways;
-      }
-      if (normalized_depth_control.stencil_enable) {
-        description_out.stencil_enable = 1;
-        bool stencil_backface_enable =
-            primitive_polygonal && normalized_depth_control.backface_enable;
-        // Per-face masks not supported by Direct3D 12, choose the back face
-        // ones only if drawing only back faces.
-        Register stencil_ref_mask_reg;
-        if (stencil_backface_enable && cull_front) {
-          stencil_ref_mask_reg = XE_GPU_REG_RB_STENCILREFMASK_BF;
-        } else {
-          stencil_ref_mask_reg = XE_GPU_REG_RB_STENCILREFMASK;
-        }
-        auto stencil_ref_mask = regs.Get<reg::RB_STENCILREFMASK>(stencil_ref_mask_reg);
-        description_out.stencil_read_mask = stencil_ref_mask.stencilmask;
-        description_out.stencil_write_mask = stencil_ref_mask.stencilwritemask;
-        description_out.stencil_front_fail_op = normalized_depth_control.stencilfail;
-        description_out.stencil_front_depth_fail_op = normalized_depth_control.stencilzfail;
-        description_out.stencil_front_pass_op = normalized_depth_control.stencilzpass;
-        description_out.stencil_front_func = normalized_depth_control.stencilfunc;
-        if (stencil_backface_enable) {
-          description_out.stencil_back_fail_op = normalized_depth_control.stencilfail_bf;
-          description_out.stencil_back_depth_fail_op = normalized_depth_control.stencilzfail_bf;
-          description_out.stencil_back_pass_op = normalized_depth_control.stencilzpass_bf;
-          description_out.stencil_back_func = normalized_depth_control.stencilfunc_bf;
-        } else {
-          description_out.stencil_back_fail_op = description_out.stencil_front_fail_op;
-          description_out.stencil_back_depth_fail_op = description_out.stencil_front_depth_fail_op;
-          description_out.stencil_back_pass_op = description_out.stencil_front_pass_op;
-          description_out.stencil_back_func = description_out.stencil_front_func;
-        }
-      }
-      // If not binding the DSV, ignore the format in the hash.
-      if (description_out.depth_func != xenos::CompareFunction::kAlways ||
-          description_out.depth_write || description_out.stencil_enable) {
-        description_out.depth_format =
-            xenos::DepthRenderTargetFormat(bound_depth_and_color_render_target_formats[0]);
-        depth_stencil_bound_and_used = true;
-      }
+  // Depth/stencil. No stencil, always passing depth test and no depth writing
+  // means depth disabled.
+  if (bound_depth_and_color_render_target_bits & 1) {
+    if (normalized_depth_control.z_enable) {
+      description_out.depth_func = normalized_depth_control.zfunc;
+      description_out.depth_write = normalized_depth_control.z_write_enable;
     } else {
       description_out.depth_func = xenos::CompareFunction::kAlways;
     }
-
-    // Render targets and blending state. 32 because of 0x1F mask, for safety
-    // (all unknown to zero).
-    static const PipelineBlendFactor kBlendFactorMap[32] = {
-        /*  0 */ PipelineBlendFactor::kZero,
-        /*  1 */ PipelineBlendFactor::kOne,
-        /*  2 */ PipelineBlendFactor::kZero,  // ?
-        /*  3 */ PipelineBlendFactor::kZero,  // ?
-        /*  4 */ PipelineBlendFactor::kSrcColor,
-        /*  5 */ PipelineBlendFactor::kInvSrcColor,
-        /*  6 */ PipelineBlendFactor::kSrcAlpha,
-        /*  7 */ PipelineBlendFactor::kInvSrcAlpha,
-        /*  8 */ PipelineBlendFactor::kDestColor,
-        /*  9 */ PipelineBlendFactor::kInvDestColor,
-        /* 10 */ PipelineBlendFactor::kDestAlpha,
-        /* 11 */ PipelineBlendFactor::kInvDestAlpha,
-        // CONSTANT_COLOR
-        /* 12 */ PipelineBlendFactor::kBlendFactor,
-        // ONE_MINUS_CONSTANT_COLOR
-        /* 13 */ PipelineBlendFactor::kInvBlendFactor,
-        // CONSTANT_ALPHA
-        /* 14 */ PipelineBlendFactor::kBlendFactor,
-        // ONE_MINUS_CONSTANT_ALPHA
-        /* 15 */ PipelineBlendFactor::kInvBlendFactor,
-        /* 16 */ PipelineBlendFactor::kSrcAlphaSat,
-    };
-    // Like kBlendFactorMap, but with color modes changed to alpha. Some
-    // pipelines aren't created in 545407E0 because a color mode is used for
-    // alpha.
-    static const PipelineBlendFactor kBlendFactorAlphaMap[32] = {
-        /*  0 */ PipelineBlendFactor::kZero,
-        /*  1 */ PipelineBlendFactor::kOne,
-        /*  2 */ PipelineBlendFactor::kZero,  // ?
-        /*  3 */ PipelineBlendFactor::kZero,  // ?
-        /*  4 */ PipelineBlendFactor::kSrcAlpha,
-        /*  5 */ PipelineBlendFactor::kInvSrcAlpha,
-        /*  6 */ PipelineBlendFactor::kSrcAlpha,
-        /*  7 */ PipelineBlendFactor::kInvSrcAlpha,
-        /*  8 */ PipelineBlendFactor::kDestAlpha,
-        /*  9 */ PipelineBlendFactor::kInvDestAlpha,
-        /* 10 */ PipelineBlendFactor::kDestAlpha,
-        /* 11 */ PipelineBlendFactor::kInvDestAlpha,
-        /* 12 */ PipelineBlendFactor::kBlendFactor,
-        // ONE_MINUS_CONSTANT_COLOR
-        /* 13 */ PipelineBlendFactor::kInvBlendFactor,
-        // CONSTANT_ALPHA
-        /* 14 */ PipelineBlendFactor::kBlendFactor,
-        // ONE_MINUS_CONSTANT_ALPHA
-        /* 15 */ PipelineBlendFactor::kInvBlendFactor,
-        /* 16 */ PipelineBlendFactor::kSrcAlphaSat,
-    };
-    // While it's okay to specify fewer render targets in the pipeline state
-    // (even fewer than written by the shader) than actually bound to the
-    // command list (though this kind of truncation may only happen at the end -
-    // DXGI_FORMAT_UNKNOWN *requires* a null RTV descriptor to be bound), not
-    // doing that because sample counts of all render targets bound via
-    // OMSetRenderTargets, even those beyond NumRenderTargets, apparently must
-    // have their sample count matching the one set in the pipeline - however if
-    // we set NumRenderTargets to 0 and also disable depth / stencil, the sample
-    // count must be set to 1 - while the command list may still have
-    // multisampled render targets bound (happens in 4D5307E6 main menu).
-    // TODO(Triang3l): Investigate interaction of OMSetRenderTargets with
-    // non-null depth and DSVFormat DXGI_FORMAT_UNKNOWN in the same case.
-    for (uint32_t i = 0; i < 4; ++i) {
-      if (!(bound_depth_and_color_render_target_bits & (uint32_t(1) << (1 + i)))) {
-        continue;
-      }
-      PipelineRenderTarget& rt = description_out.render_targets[i];
-      rt.used = 1;
-      auto color_info = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
-      rt.format =
-          xenos::ColorRenderTargetFormat(bound_depth_and_color_render_target_formats[1 + i]);
-      rt.write_mask = (normalized_color_mask >> (i * 4)) & 0xF;
-      if (rt.write_mask) {
-        auto blendcontrol =
-            regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
-        rt.src_blend = kBlendFactorMap[uint32_t(blendcontrol.color_srcblend)];
-        rt.dest_blend = kBlendFactorMap[uint32_t(blendcontrol.color_destblend)];
-        rt.blend_op = blendcontrol.color_comb_fcn;
-        rt.src_blend_alpha = kBlendFactorAlphaMap[uint32_t(blendcontrol.alpha_srcblend)];
-        rt.dest_blend_alpha = kBlendFactorAlphaMap[uint32_t(blendcontrol.alpha_destblend)];
-        rt.blend_op_alpha = blendcontrol.alpha_comb_fcn;
+    if (normalized_depth_control.stencil_enable) {
+      description_out.stencil_enable = 1;
+      bool stencil_backface_enable =
+          primitive_polygonal && normalized_depth_control.backface_enable;
+      // Per-face masks not supported by Direct3D 12, choose the back face
+      // ones only if drawing only back faces.
+      Register stencil_ref_mask_reg;
+      if (stencil_backface_enable && cull_front) {
+        stencil_ref_mask_reg = XE_GPU_REG_RB_STENCILREFMASK_BF;
       } else {
-        rt.src_blend = PipelineBlendFactor::kOne;
-        rt.dest_blend = PipelineBlendFactor::kZero;
-        rt.blend_op = xenos::BlendOp::kAdd;
-        rt.src_blend_alpha = PipelineBlendFactor::kOne;
-        rt.dest_blend_alpha = PipelineBlendFactor::kZero;
-        rt.blend_op_alpha = xenos::BlendOp::kAdd;
+        stencil_ref_mask_reg = XE_GPU_REG_RB_STENCILREFMASK;
       }
+      auto stencil_ref_mask = regs.Get<reg::RB_STENCILREFMASK>(stencil_ref_mask_reg);
+      description_out.stencil_read_mask = stencil_ref_mask.stencilmask;
+      description_out.stencil_write_mask = stencil_ref_mask.stencilwritemask;
+      description_out.stencil_front_fail_op = normalized_depth_control.stencilfail;
+      description_out.stencil_front_depth_fail_op = normalized_depth_control.stencilzfail;
+      description_out.stencil_front_pass_op = normalized_depth_control.stencilzpass;
+      description_out.stencil_front_func = normalized_depth_control.stencilfunc;
+      if (stencil_backface_enable) {
+        description_out.stencil_back_fail_op = normalized_depth_control.stencilfail_bf;
+        description_out.stencil_back_depth_fail_op = normalized_depth_control.stencilzfail_bf;
+        description_out.stencil_back_pass_op = normalized_depth_control.stencilzpass_bf;
+        description_out.stencil_back_func = normalized_depth_control.stencilfunc_bf;
+      } else {
+        description_out.stencil_back_fail_op = description_out.stencil_front_fail_op;
+        description_out.stencil_back_depth_fail_op = description_out.stencil_front_depth_fail_op;
+        description_out.stencil_back_pass_op = description_out.stencil_front_pass_op;
+        description_out.stencil_back_func = description_out.stencil_front_func;
+      }
+    }
+    // If not binding the DSV, ignore the format in the hash.
+    if (description_out.depth_func != xenos::CompareFunction::kAlways ||
+        description_out.depth_write || description_out.stencil_enable) {
+      description_out.depth_format =
+          xenos::DepthRenderTargetFormat(bound_depth_and_color_render_target_formats[0]);
+      depth_stencil_bound_and_used = true;
+    }
+  } else {
+    description_out.depth_func = xenos::CompareFunction::kAlways;
+  }
+
+  // Render targets and blending state. 32 because of 0x1F mask, for safety
+  // (all unknown to zero).
+  static const PipelineBlendFactor kBlendFactorMap[32] = {
+      /*  0 */ PipelineBlendFactor::kZero,
+      /*  1 */ PipelineBlendFactor::kOne,
+      /*  2 */ PipelineBlendFactor::kZero,  // ?
+      /*  3 */ PipelineBlendFactor::kZero,  // ?
+      /*  4 */ PipelineBlendFactor::kSrcColor,
+      /*  5 */ PipelineBlendFactor::kInvSrcColor,
+      /*  6 */ PipelineBlendFactor::kSrcAlpha,
+      /*  7 */ PipelineBlendFactor::kInvSrcAlpha,
+      /*  8 */ PipelineBlendFactor::kDestColor,
+      /*  9 */ PipelineBlendFactor::kInvDestColor,
+      /* 10 */ PipelineBlendFactor::kDestAlpha,
+      /* 11 */ PipelineBlendFactor::kInvDestAlpha,
+      // CONSTANT_COLOR
+      /* 12 */ PipelineBlendFactor::kBlendFactor,
+      // ONE_MINUS_CONSTANT_COLOR
+      /* 13 */ PipelineBlendFactor::kInvBlendFactor,
+      // CONSTANT_ALPHA
+      /* 14 */ PipelineBlendFactor::kBlendFactor,
+      // ONE_MINUS_CONSTANT_ALPHA
+      /* 15 */ PipelineBlendFactor::kInvBlendFactor,
+      /* 16 */ PipelineBlendFactor::kSrcAlphaSat,
+  };
+  // Like kBlendFactorMap, but with color modes changed to alpha. Some
+  // pipelines aren't created in 545407E0 because a color mode is used for
+  // alpha.
+  static const PipelineBlendFactor kBlendFactorAlphaMap[32] = {
+      /*  0 */ PipelineBlendFactor::kZero,
+      /*  1 */ PipelineBlendFactor::kOne,
+      /*  2 */ PipelineBlendFactor::kZero,  // ?
+      /*  3 */ PipelineBlendFactor::kZero,  // ?
+      /*  4 */ PipelineBlendFactor::kSrcAlpha,
+      /*  5 */ PipelineBlendFactor::kInvSrcAlpha,
+      /*  6 */ PipelineBlendFactor::kSrcAlpha,
+      /*  7 */ PipelineBlendFactor::kInvSrcAlpha,
+      /*  8 */ PipelineBlendFactor::kDestAlpha,
+      /*  9 */ PipelineBlendFactor::kInvDestAlpha,
+      /* 10 */ PipelineBlendFactor::kDestAlpha,
+      /* 11 */ PipelineBlendFactor::kInvDestAlpha,
+      /* 12 */ PipelineBlendFactor::kBlendFactor,
+      // ONE_MINUS_CONSTANT_COLOR
+      /* 13 */ PipelineBlendFactor::kInvBlendFactor,
+      // CONSTANT_ALPHA
+      /* 14 */ PipelineBlendFactor::kBlendFactor,
+      // ONE_MINUS_CONSTANT_ALPHA
+      /* 15 */ PipelineBlendFactor::kInvBlendFactor,
+      /* 16 */ PipelineBlendFactor::kSrcAlphaSat,
+  };
+  // While it's okay to specify fewer render targets in the pipeline state
+  // (even fewer than written by the shader) than actually bound to the
+  // command list (though this kind of truncation may only happen at the end -
+  // DXGI_FORMAT_UNKNOWN *requires* a null RTV descriptor to be bound), not
+  // doing that because sample counts of all render targets bound via
+  // OMSetRenderTargets, even those beyond NumRenderTargets, apparently must
+  // have their sample count matching the one set in the pipeline - however if
+  // we set NumRenderTargets to 0 and also disable depth / stencil, the sample
+  // count must be set to 1 - while the command list may still have
+  // multisampled render targets bound (happens in 4D5307E6 main menu).
+  // TODO(Triang3l): Investigate interaction of OMSetRenderTargets with
+  // non-null depth and DSVFormat DXGI_FORMAT_UNKNOWN in the same case.
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (!(bound_depth_and_color_render_target_bits & (uint32_t(1) << (1 + i)))) {
+      continue;
+    }
+    PipelineRenderTarget& rt = description_out.render_targets[i];
+    rt.used = 1;
+    auto color_info = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
+    rt.format =
+        xenos::ColorRenderTargetFormat(bound_depth_and_color_render_target_formats[1 + i]);
+    rt.write_mask = (normalized_color_mask >> (i * 4)) & 0xF;
+    if (rt.write_mask) {
+      auto blendcontrol =
+          regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
+      rt.src_blend = kBlendFactorMap[uint32_t(blendcontrol.color_srcblend)];
+      rt.dest_blend = kBlendFactorMap[uint32_t(blendcontrol.color_destblend)];
+      rt.blend_op = blendcontrol.color_comb_fcn;
+      rt.src_blend_alpha = kBlendFactorAlphaMap[uint32_t(blendcontrol.alpha_srcblend)];
+      rt.dest_blend_alpha = kBlendFactorAlphaMap[uint32_t(blendcontrol.alpha_destblend)];
+      rt.blend_op_alpha = blendcontrol.alpha_comb_fcn;
+    } else {
+      rt.src_blend = PipelineBlendFactor::kOne;
+      rt.dest_blend = PipelineBlendFactor::kZero;
+      rt.blend_op = xenos::BlendOp::kAdd;
+      rt.src_blend_alpha = PipelineBlendFactor::kOne;
+      rt.dest_blend_alpha = PipelineBlendFactor::kZero;
+      rt.blend_op_alpha = xenos::BlendOp::kAdd;
     }
   }
   xenos::MsaaSamples host_msaa_samples = regs.Get<reg::RB_SURFACE_INFO>().msaa_samples;
-  if (edram_rov_used) {
-    if (host_msaa_samples == xenos::MsaaSamples::k2X) {
-      // 2 is not supported in ForcedSampleCount on Nvidia.
-      host_msaa_samples = xenos::MsaaSamples::k4X;
-    }
-  } else {
-    if (!(bound_depth_and_color_render_target_bits & ~uint32_t(1)) &&
-        !depth_stencil_bound_and_used) {
-      // Direct3D 12 requires the sample count to be 1 when no color or depth /
-      // stencil render targets are bound.
-      // FIXME(Triang3l): Use ForcedSampleCount or some other fallback for
-      // sample counting when needed, though with 2x it will be as incorrect as
-      // with 1x / 4x anyway; or bind a dummy depth / stencil buffer if really
-      // needed.
-      host_msaa_samples = xenos::MsaaSamples::k1X;
-    }
-    // TODO(Triang3l): 4x MSAA fallback when 2x isn't supported.
+  if (!(bound_depth_and_color_render_target_bits & ~uint32_t(1)) &&
+      !depth_stencil_bound_and_used) {
+    // Direct3D 12 requires the sample count to be 1 when no color or depth /
+    // stencil render targets are bound.
+    // FIXME(Triang3l): Use ForcedSampleCount or some other fallback for
+    // sample counting when needed, though with 2x it will be as incorrect as
+    // with 1x / 4x anyway; or bind a dummy depth / stencil buffer if really
+    // needed.
+    host_msaa_samples = xenos::MsaaSamples::k1X;
   }
+  // TODO(Triang3l): 4x MSAA fallback when 2x isn't supported.
   description_out.host_msaa_samples = host_msaa_samples;
 
   return true;
@@ -3677,8 +3646,6 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
 
   D3D12_GRAPHICS_PIPELINE_STATE_DESC state_desc;
   std::memset(&state_desc, 0, sizeof(state_desc));
-  bool edram_rov_used =
-      render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
 
   // Root signature.
   state_desc.pRootSignature = runtime_description.root_signature;
@@ -3824,10 +3791,10 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     state_desc.PS.BytecodeLength =
         runtime_description.pixel_shader->translated_binary().size();
   } else {
-    if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
+    if (host_config_.depth_float24_convert_in_pixel_shader() &&
         (description.depth_func != xenos::CompareFunction::kAlways || description.depth_write) &&
         description.depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
-      if (render_target_cache_.depth_float24_round()) {
+      if (host_config_.depth_float24_round()) {
         state_desc.PS.pShaderBytecode = shaders::float24_round_ps;
         state_desc.PS.BytecodeLength = sizeof(shaders::float24_round_ps);
       } else {
@@ -3870,128 +3837,110 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
   // more likely.
   state_desc.RasterizerState.SlopeScaledDepthBias =
       description.depth_bias_slope_scaled *
-      float(std::max(render_target_cache_.draw_resolution_scale_x(),
-                     render_target_cache_.draw_resolution_scale_y()));
+      float(std::max(host_config_.draw_resolution_scale_x(),
+                     host_config_.draw_resolution_scale_y()));
   state_desc.RasterizerState.DepthClipEnable = description.depth_clip ? TRUE : FALSE;
   uint32_t msaa_sample_count = uint32_t(1) << uint32_t(description.host_msaa_samples);
-  if (edram_rov_used) {
-    // Only 1, 4, 8 and (not on all GPUs) 16 are allowed, using sample 0 as 0
-    // and 3 as 1 for 2x instead (not exactly the same sample positions, but
-    // still top-left and bottom-right - however, this can be adjusted with
-    // programmable sample positions).
-    assert_true(msaa_sample_count == 1 || msaa_sample_count == 4);
-    if (msaa_sample_count != 1 && msaa_sample_count != 4) {
-      return nullptr;
-    }
-    state_desc.RasterizerState.ForcedSampleCount = uint32_t(1)
-                                                   << uint32_t(description.host_msaa_samples);
-  }
 
   // Sample mask and description.
   state_desc.SampleMask = UINT_MAX;
   // TODO(Triang3l): 4x MSAA fallback when 2x isn't supported without ROV.
-  if (edram_rov_used) {
-    state_desc.SampleDesc.Count = 1;
+  assert_true(msaa_sample_count <= 4);
+  if (msaa_sample_count > 4) {
+    return nullptr;
+  }
+  if (msaa_sample_count == 2 && !host_config_.msaa_2x_supported()) {
+    // Using sample 0 as 0 and 3 as 1 for 2x instead (not exactly the same
+    // sample positions, but still top-left and bottom-right - however, this
+    // can be adjusted with programmable sample positions).
+    state_desc.SampleMask = 0b1001;
+    state_desc.SampleDesc.Count = 4;
   } else {
-    assert_true(msaa_sample_count <= 4);
-    if (msaa_sample_count > 4) {
-      return nullptr;
-    }
-    if (msaa_sample_count == 2 && !render_target_cache_.msaa_2x_supported()) {
-      // Using sample 0 as 0 and 3 as 1 for 2x instead (not exactly the same
-      // sample positions, but still top-left and bottom-right - however, this
-      // can be adjusted with programmable sample positions).
-      state_desc.SampleMask = 0b1001;
-      state_desc.SampleDesc.Count = 4;
-    } else {
-      state_desc.SampleDesc.Count = msaa_sample_count;
-    }
+    state_desc.SampleDesc.Count = msaa_sample_count;
   }
 
-  if (!edram_rov_used) {
-    // Depth/stencil.
-    if (description.depth_func != xenos::CompareFunction::kAlways || description.depth_write) {
-      state_desc.DepthStencilState.DepthEnable = TRUE;
-      state_desc.DepthStencilState.DepthWriteMask =
-          description.depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
-      // Comparison functions are the same in Direct3D 12 but plus one (minus
-      // one, bit 0 for less, bit 1 for equal, bit 2 for greater).
-      state_desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC(
-          uint32_t(D3D12_COMPARISON_FUNC_NEVER) + uint32_t(description.depth_func));
-    }
-    if (description.stencil_enable) {
-      state_desc.DepthStencilState.StencilEnable = TRUE;
-      state_desc.DepthStencilState.StencilReadMask = description.stencil_read_mask;
-      state_desc.DepthStencilState.StencilWriteMask = description.stencil_write_mask;
-      // Stencil operations are the same in Direct3D 12 too but plus one.
-      state_desc.DepthStencilState.FrontFace.StencilFailOp = D3D12_STENCIL_OP(
-          uint32_t(D3D12_STENCIL_OP_KEEP) + uint32_t(description.stencil_front_fail_op));
-      state_desc.DepthStencilState.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP(
-          uint32_t(D3D12_STENCIL_OP_KEEP) + uint32_t(description.stencil_front_depth_fail_op));
-      state_desc.DepthStencilState.FrontFace.StencilPassOp = D3D12_STENCIL_OP(
-          uint32_t(D3D12_STENCIL_OP_KEEP) + uint32_t(description.stencil_front_pass_op));
-      state_desc.DepthStencilState.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC(
-          uint32_t(D3D12_COMPARISON_FUNC_NEVER) + uint32_t(description.stencil_front_func));
-      state_desc.DepthStencilState.BackFace.StencilFailOp = D3D12_STENCIL_OP(
-          uint32_t(D3D12_STENCIL_OP_KEEP) + uint32_t(description.stencil_back_fail_op));
-      state_desc.DepthStencilState.BackFace.StencilDepthFailOp = D3D12_STENCIL_OP(
-          uint32_t(D3D12_STENCIL_OP_KEEP) + uint32_t(description.stencil_back_depth_fail_op));
-      state_desc.DepthStencilState.BackFace.StencilPassOp = D3D12_STENCIL_OP(
-          uint32_t(D3D12_STENCIL_OP_KEEP) + uint32_t(description.stencil_back_pass_op));
-      state_desc.DepthStencilState.BackFace.StencilFunc = D3D12_COMPARISON_FUNC(
-          uint32_t(D3D12_COMPARISON_FUNC_NEVER) + uint32_t(description.stencil_back_func));
-    }
-    if (state_desc.DepthStencilState.DepthEnable || state_desc.DepthStencilState.StencilEnable) {
-      state_desc.DSVFormat =
-          D3D12RenderTargetCache::GetDepthDSVDXGIFormat(description.depth_format);
-    }
+  // Depth/stencil.
+  if (description.depth_func != xenos::CompareFunction::kAlways || description.depth_write) {
+    state_desc.DepthStencilState.DepthEnable = TRUE;
+    state_desc.DepthStencilState.DepthWriteMask =
+        description.depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+    // Comparison functions are the same in Direct3D 12 but plus one (minus
+    // one, bit 0 for less, bit 1 for equal, bit 2 for greater).
+    state_desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC(
+        uint32_t(D3D12_COMPARISON_FUNC_NEVER) + uint32_t(description.depth_func));
+  }
+  if (description.stencil_enable) {
+    state_desc.DepthStencilState.StencilEnable = TRUE;
+    state_desc.DepthStencilState.StencilReadMask = description.stencil_read_mask;
+    state_desc.DepthStencilState.StencilWriteMask = description.stencil_write_mask;
+    // Stencil operations are the same in Direct3D 12 too but plus one.
+    state_desc.DepthStencilState.FrontFace.StencilFailOp = D3D12_STENCIL_OP(
+        uint32_t(D3D12_STENCIL_OP_KEEP) + uint32_t(description.stencil_front_fail_op));
+    state_desc.DepthStencilState.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP(
+        uint32_t(D3D12_STENCIL_OP_KEEP) + uint32_t(description.stencil_front_depth_fail_op));
+    state_desc.DepthStencilState.FrontFace.StencilPassOp = D3D12_STENCIL_OP(
+        uint32_t(D3D12_STENCIL_OP_KEEP) + uint32_t(description.stencil_front_pass_op));
+    state_desc.DepthStencilState.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC(
+        uint32_t(D3D12_COMPARISON_FUNC_NEVER) + uint32_t(description.stencil_front_func));
+    state_desc.DepthStencilState.BackFace.StencilFailOp = D3D12_STENCIL_OP(
+        uint32_t(D3D12_STENCIL_OP_KEEP) + uint32_t(description.stencil_back_fail_op));
+    state_desc.DepthStencilState.BackFace.StencilDepthFailOp = D3D12_STENCIL_OP(
+        uint32_t(D3D12_STENCIL_OP_KEEP) + uint32_t(description.stencil_back_depth_fail_op));
+    state_desc.DepthStencilState.BackFace.StencilPassOp = D3D12_STENCIL_OP(
+        uint32_t(D3D12_STENCIL_OP_KEEP) + uint32_t(description.stencil_back_pass_op));
+    state_desc.DepthStencilState.BackFace.StencilFunc = D3D12_COMPARISON_FUNC(
+        uint32_t(D3D12_COMPARISON_FUNC_NEVER) + uint32_t(description.stencil_back_func));
+  }
+  if (state_desc.DepthStencilState.DepthEnable || state_desc.DepthStencilState.StencilEnable) {
+    state_desc.DSVFormat =
+        D3D12HostRenderConfig::GetDepthDSVDXGIFormat(description.depth_format);
+  }
 
-    // Render targets and blending.
-    state_desc.BlendState.IndependentBlendEnable = TRUE;
-    static const D3D12_BLEND kBlendFactorMap[] = {
-        D3D12_BLEND_ZERO,          D3D12_BLEND_ONE,
-        D3D12_BLEND_SRC_COLOR,     D3D12_BLEND_INV_SRC_COLOR,
-        D3D12_BLEND_SRC_ALPHA,     D3D12_BLEND_INV_SRC_ALPHA,
-        D3D12_BLEND_DEST_COLOR,    D3D12_BLEND_INV_DEST_COLOR,
-        D3D12_BLEND_DEST_ALPHA,    D3D12_BLEND_INV_DEST_ALPHA,
-        D3D12_BLEND_BLEND_FACTOR,  D3D12_BLEND_INV_BLEND_FACTOR,
-        D3D12_BLEND_SRC_ALPHA_SAT,
-    };
-    // 8 entries for safety since 3 bits from the guest are passed directly.
-    static const D3D12_BLEND_OP kBlendOpMap[] = {
-        D3D12_BLEND_OP_ADD, D3D12_BLEND_OP_SUBTRACT,     D3D12_BLEND_OP_MIN,
-        D3D12_BLEND_OP_MAX, D3D12_BLEND_OP_REV_SUBTRACT, D3D12_BLEND_OP_ADD,
-        D3D12_BLEND_OP_ADD, D3D12_BLEND_OP_ADD};
-    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
-      const PipelineRenderTarget& rt = description.render_targets[i];
-      if (!rt.used) {
-        // Null RTV descriptors can be used for slots with DXGI_FORMAT_UNKNOWN
-        // in the pipeline state.
-        state_desc.RTVFormats[i] = DXGI_FORMAT_UNKNOWN;
-        continue;
-      }
-      state_desc.NumRenderTargets = i + 1;
-      state_desc.RTVFormats[i] = render_target_cache_.GetColorDrawDXGIFormat(rt.format);
-      if (state_desc.RTVFormats[i] == DXGI_FORMAT_UNKNOWN) {
-        assert_always();
-        return nullptr;
-      }
-      D3D12_RENDER_TARGET_BLEND_DESC& blend_desc = state_desc.BlendState.RenderTarget[i];
-      if (rt.src_blend != PipelineBlendFactor::kOne ||
-          rt.dest_blend != PipelineBlendFactor::kZero || rt.blend_op != xenos::BlendOp::kAdd ||
-          rt.src_blend_alpha != PipelineBlendFactor::kOne ||
-          rt.dest_blend_alpha != PipelineBlendFactor::kZero ||
-          rt.blend_op_alpha != xenos::BlendOp::kAdd) {
-        blend_desc.BlendEnable = TRUE;
-        blend_desc.SrcBlend = kBlendFactorMap[uint32_t(rt.src_blend)];
-        blend_desc.DestBlend = kBlendFactorMap[uint32_t(rt.dest_blend)];
-        blend_desc.BlendOp = kBlendOpMap[uint32_t(rt.blend_op)];
-        blend_desc.SrcBlendAlpha = kBlendFactorMap[uint32_t(rt.src_blend_alpha)];
-        blend_desc.DestBlendAlpha = kBlendFactorMap[uint32_t(rt.dest_blend_alpha)];
-        blend_desc.BlendOpAlpha = kBlendOpMap[uint32_t(rt.blend_op_alpha)];
-      }
-      blend_desc.RenderTargetWriteMask = rt.write_mask;
+  // Render targets and blending.
+  state_desc.BlendState.IndependentBlendEnable = TRUE;
+  static const D3D12_BLEND kBlendFactorMap[] = {
+      D3D12_BLEND_ZERO,          D3D12_BLEND_ONE,
+      D3D12_BLEND_SRC_COLOR,     D3D12_BLEND_INV_SRC_COLOR,
+      D3D12_BLEND_SRC_ALPHA,     D3D12_BLEND_INV_SRC_ALPHA,
+      D3D12_BLEND_DEST_COLOR,    D3D12_BLEND_INV_DEST_COLOR,
+      D3D12_BLEND_DEST_ALPHA,    D3D12_BLEND_INV_DEST_ALPHA,
+      D3D12_BLEND_BLEND_FACTOR,  D3D12_BLEND_INV_BLEND_FACTOR,
+      D3D12_BLEND_SRC_ALPHA_SAT,
+  };
+  // 8 entries for safety since 3 bits from the guest are passed directly.
+  static const D3D12_BLEND_OP kBlendOpMap[] = {
+      D3D12_BLEND_OP_ADD, D3D12_BLEND_OP_SUBTRACT,     D3D12_BLEND_OP_MIN,
+      D3D12_BLEND_OP_MAX, D3D12_BLEND_OP_REV_SUBTRACT, D3D12_BLEND_OP_ADD,
+      D3D12_BLEND_OP_ADD, D3D12_BLEND_OP_ADD};
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    const PipelineRenderTarget& rt = description.render_targets[i];
+    if (!rt.used) {
+      // Null RTV descriptors can be used for slots with DXGI_FORMAT_UNKNOWN
+      // in the pipeline state.
+      state_desc.RTVFormats[i] = DXGI_FORMAT_UNKNOWN;
+      continue;
     }
+    state_desc.NumRenderTargets = i + 1;
+    state_desc.RTVFormats[i] = host_config_.GetColorDrawDXGIFormat(rt.format);
+    if (state_desc.RTVFormats[i] == DXGI_FORMAT_UNKNOWN) {
+      assert_always();
+      return nullptr;
+    }
+    D3D12_RENDER_TARGET_BLEND_DESC& blend_desc = state_desc.BlendState.RenderTarget[i];
+    if (rt.src_blend != PipelineBlendFactor::kOne ||
+        rt.dest_blend != PipelineBlendFactor::kZero || rt.blend_op != xenos::BlendOp::kAdd ||
+        rt.src_blend_alpha != PipelineBlendFactor::kOne ||
+        rt.dest_blend_alpha != PipelineBlendFactor::kZero ||
+        rt.blend_op_alpha != xenos::BlendOp::kAdd) {
+      blend_desc.BlendEnable = TRUE;
+      blend_desc.SrcBlend = kBlendFactorMap[uint32_t(rt.src_blend)];
+      blend_desc.DestBlend = kBlendFactorMap[uint32_t(rt.dest_blend)];
+      blend_desc.BlendOp = kBlendOpMap[uint32_t(rt.blend_op)];
+      blend_desc.SrcBlendAlpha = kBlendFactorMap[uint32_t(rt.src_blend_alpha)];
+      blend_desc.DestBlendAlpha = kBlendFactorMap[uint32_t(rt.dest_blend_alpha)];
+      blend_desc.BlendOpAlpha = kBlendOpMap[uint32_t(rt.blend_op_alpha)];
+    }
+    blend_desc.RenderTargetWriteMask = rt.write_mask;
   }
 
   // Disable rasterization if needed (parameter combinations that make no

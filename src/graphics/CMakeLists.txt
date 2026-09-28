@@ -21,7 +21,6 @@ set(REXGPU_XENOS_SOURCES
     util/draw_extent_estimator.cpp
     util/draw.cpp
     primitive_processor.cpp
-    pipeline/render_target/cache.cpp
     shared_memory.cpp
     pipeline/texture/cache.cpp
     pipeline/shader/interpreter.cpp
@@ -43,8 +42,10 @@ set(REXGPU_XENOS_SPIRV_SOURCES
     pipeline/shader/spirv_translator_rb.cpp
 )
 
-# Vulkan backend
+# Vulkan backend (the Xenos EDRAM render target cache is only used by Vulkan;
+# the D3D12 FH1 native executor owns its render targets)
 set(REXGPU_XENOS_VULKAN_SOURCES
+    pipeline/render_target/cache.cpp
     vulkan/graphics_system.cpp
     vulkan/deferred_command_buffer.cpp
     vulkan/command_processor.cpp
@@ -81,8 +82,8 @@ if(REXGLUE_USE_D3D12)
     set(REXGPU_XENOS_D3D12_SOURCES
         d3d12/graphics_system.cpp
         d3d12/command_processor.cpp
+        d3d12/host_render_config.cpp
         d3d12/primitive_processor.cpp
-        d3d12/render_target_cache.cpp
         d3d12/shader.cpp
         d3d12/shared_memory.cpp
         d3d12/texture_cache.cpp

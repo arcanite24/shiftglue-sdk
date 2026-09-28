@@ -29,10 +29,10 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/d3d12/deferred_command_list.h>
 #include <rex/graphics/d3d12/graphics_system.h>
+#include <rex/graphics/d3d12/fh1_native_executor.h>
+#include <rex/graphics/d3d12/host_render_config.h>
 #include <rex/graphics/d3d12/pipeline_cache.h>
 #include <rex/graphics/d3d12/primitive_processor.h>
-#include <rex/graphics/d3d12/render_target_cache.h>
-#include <rex/graphics/d3d12/fh1_native_executor.h>
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/graphics/d3d12/texture_cache.h>
 #include <rex/graphics/pipeline/shader/dxbc.h>
@@ -161,15 +161,6 @@ class D3D12CommandProcessor : public CommandProcessor {
     kSharedMemoryR32G32UintUAV,
     kSharedMemoryR32G32B32A32UintUAV,
 
-    kEdramRawSRV,
-    kEdramR32UintSRV,
-    kEdramR32G32UintSRV,
-    kEdramR32G32B32A32UintSRV,
-    kEdramRawUAV,
-    kEdramR32UintUAV,
-    kEdramR32G32UintUAV,
-    kEdramR32G32B32A32UintUAV,
-
     kGammaRampTableSRV,
     kGammaRampPWLSRV,
 
@@ -188,10 +179,6 @@ class D3D12CommandProcessor : public CommandProcessor {
   ui::d3d12::util::DescriptorCpuGpuHandlePair GetSharedMemoryUintPow2BindlessSRVHandlePair(
       uint32_t element_size_bytes_pow2) const;
   ui::d3d12::util::DescriptorCpuGpuHandlePair GetSharedMemoryUintPow2BindlessUAVHandlePair(
-      uint32_t element_size_bytes_pow2) const;
-  ui::d3d12::util::DescriptorCpuGpuHandlePair GetEdramUintPow2BindlessSRVHandlePair(
-      uint32_t element_size_bytes_pow2) const;
-  ui::d3d12::util::DescriptorCpuGpuHandlePair GetEdramUintPow2BindlessUAVHandlePair(
       uint32_t element_size_bytes_pow2) const;
 
   // Returns a single temporary GPU-side buffer within a submission for tasks
@@ -285,9 +272,8 @@ class D3D12CommandProcessor : public CommandProcessor {
     kRootParameter_Bindful_BoolLoopConstants,  // +2 = 8 in all.
     // Changed only when starting a new descriptor heap or when switching
     // between shared memory as SRV and UAV - shared memory byte address buffer
-    // (as SRV and as UAV, either may be null if not used), and, if ROV is used
-    // for EDRAM, EDRAM R32_UINT UAV.
-    kRootParameter_Bindful_SharedMemoryAndEdram,  // +1 = 9 in all.
+    // (as SRV and as UAV, either may be null if not used).
+    kRootParameter_Bindful_SharedMemory,  // +1 = 9 in all.
 
     kRootParameter_Bindful_Count_Base,
 
@@ -505,7 +491,9 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   std::unique_ptr<D3D12SharedMemory> shared_memory_;
 
-  std::unique_ptr<D3D12RenderTargetCache> render_target_cache_;
+  // Host render target configuration (the FH1 native executor owns the render
+  // targets).
+  std::unique_ptr<D3D12HostRenderConfig> host_render_config_;
   std::unique_ptr<Fh1NativeExecutor> fh1_native_executor_;
 
   std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> constant_buffer_pool_;
@@ -806,8 +794,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::vector<uint32_t> current_sampler_bindless_indices_pixel_;
 
   // Latest bindful descriptor handles used for handling Xenos draw calls.
-  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_shared_memory_srv_and_edram_;
-  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_shared_memory_uav_and_edram_;
+  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_shared_memory_srv_;
+  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_shared_memory_uav_;
   D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_textures_vertex_;
   D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_textures_pixel_;
   D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_samplers_vertex_;

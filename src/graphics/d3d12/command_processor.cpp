@@ -541,36 +541,27 @@ ID3D12RootSignature* D3D12CommandProcessor::GetRootSignature(const DxbcShader* v
     parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   }
 
-  // Shared memory and, if ROVs are used, EDRAM.
-  D3D12_DESCRIPTOR_RANGE shared_memory_and_edram_ranges[3];
+  // Shared memory.
+  D3D12_DESCRIPTOR_RANGE shared_memory_ranges[2];
   {
-    auto& parameter = parameters[kRootParameter_Bindful_SharedMemoryAndEdram];
+    auto& parameter = parameters[kRootParameter_Bindful_SharedMemory];
     parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     parameter.DescriptorTable.NumDescriptorRanges = 2;
-    parameter.DescriptorTable.pDescriptorRanges = shared_memory_and_edram_ranges;
+    parameter.DescriptorTable.pDescriptorRanges = shared_memory_ranges;
     parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    shared_memory_and_edram_ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    shared_memory_and_edram_ranges[0].NumDescriptors = 1;
-    shared_memory_and_edram_ranges[0].BaseShaderRegister =
+    shared_memory_ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    shared_memory_ranges[0].NumDescriptors = 1;
+    shared_memory_ranges[0].BaseShaderRegister =
         uint32_t(DxbcShaderTranslator::SRVMainRegister::kSharedMemory);
-    shared_memory_and_edram_ranges[0].RegisterSpace =
+    shared_memory_ranges[0].RegisterSpace =
         uint32_t(DxbcShaderTranslator::SRVSpace::kMain);
-    shared_memory_and_edram_ranges[0].OffsetInDescriptorsFromTableStart = 0;
-    shared_memory_and_edram_ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    shared_memory_and_edram_ranges[1].NumDescriptors = 1;
-    shared_memory_and_edram_ranges[1].BaseShaderRegister =
+    shared_memory_ranges[0].OffsetInDescriptorsFromTableStart = 0;
+    shared_memory_ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    shared_memory_ranges[1].NumDescriptors = 1;
+    shared_memory_ranges[1].BaseShaderRegister =
         UINT(DxbcShaderTranslator::UAVRegister::kSharedMemory);
-    shared_memory_and_edram_ranges[1].RegisterSpace = 0;
-    shared_memory_and_edram_ranges[1].OffsetInDescriptorsFromTableStart = 1;
-    if (render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock) {
-      ++parameter.DescriptorTable.NumDescriptorRanges;
-      shared_memory_and_edram_ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-      shared_memory_and_edram_ranges[2].NumDescriptors = 1;
-      shared_memory_and_edram_ranges[2].BaseShaderRegister =
-          UINT(DxbcShaderTranslator::UAVRegister::kEdram);
-      shared_memory_and_edram_ranges[2].RegisterSpace = 0;
-      shared_memory_and_edram_ranges[2].OffsetInDescriptorsFromTableStart = 2;
-    }
+    shared_memory_ranges[1].RegisterSpace = 0;
+    shared_memory_ranges[1].OffsetInDescriptorsFromTableStart = 1;
   }
 
   // Extra parameters.
@@ -823,48 +814,6 @@ D3D12CommandProcessor::GetSharedMemoryUintPow2BindlessUAVHandlePair(
   return GetSystemBindlessViewHandlePair(view);
 }
 
-ui::d3d12::util::DescriptorCpuGpuHandlePair
-D3D12CommandProcessor::GetEdramUintPow2BindlessSRVHandlePair(
-    uint32_t element_size_bytes_pow2) const {
-  SystemBindlessView view;
-  switch (element_size_bytes_pow2) {
-    case 2:
-      view = SystemBindlessView::kEdramR32UintSRV;
-      break;
-    case 3:
-      view = SystemBindlessView::kEdramR32G32UintSRV;
-      break;
-    case 4:
-      view = SystemBindlessView::kEdramR32G32B32A32UintSRV;
-      break;
-    default:
-      assert_unhandled_case(element_size_bytes_pow2);
-      view = SystemBindlessView::kEdramR32UintSRV;
-  }
-  return GetSystemBindlessViewHandlePair(view);
-}
-
-ui::d3d12::util::DescriptorCpuGpuHandlePair
-D3D12CommandProcessor::GetEdramUintPow2BindlessUAVHandlePair(
-    uint32_t element_size_bytes_pow2) const {
-  SystemBindlessView view;
-  switch (element_size_bytes_pow2) {
-    case 2:
-      view = SystemBindlessView::kEdramR32UintUAV;
-      break;
-    case 3:
-      view = SystemBindlessView::kEdramR32G32UintUAV;
-      break;
-    case 4:
-      view = SystemBindlessView::kEdramR32G32B32A32UintUAV;
-      break;
-    default:
-      assert_unhandled_case(element_size_bytes_pow2);
-      view = SystemBindlessView::kEdramR32UintUAV;
-  }
-  return GetSystemBindlessViewHandlePair(view);
-}
-
 uint64_t D3D12CommandProcessor::RequestSamplerBindfulDescriptors(
     uint64_t previous_heap_index, uint32_t count_for_partial_update, uint32_t count_for_full_update,
     D3D12_CPU_DESCRIPTOR_HANDLE& cpu_handle_out, D3D12_GPU_DESCRIPTOR_HANDLE& gpu_handle_out) {
@@ -1003,24 +952,8 @@ void D3D12CommandProcessor::SetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY primit
 std::string D3D12CommandProcessor::GetWindowTitleText() const {
   std::ostringstream title;
   title << "Direct3D 12";
-  if (render_target_cache_) {
-    // Rasterizer-ordered views are a feature very rarely used as of 2020 and
-    // that faces adoption complications (outside of Direct3D - on Vulkan - at
-    // least), but crucial to Xenia - raise awareness of its usage.
-    // https://github.com/KhronosGroup/Vulkan-Ecosystem/issues/27#issuecomment-455712319
-    // "In Xenia's title bar "D3D12 ROV" can be seen, which was a surprise, as I
-    //  wasn't aware that Xenia D3D12 backend was using Raster Order Views
-    //  feature" - oscarbg in that issue.
-    switch (render_target_cache_->GetPath()) {
-      case RenderTargetCache::Path::kHostRenderTargets:
-        title << " - RTV/DSV";
-        break;
-      case RenderTargetCache::Path::kPixelShaderInterlock:
-        title << " - ROV";
-        break;
-      default:
-        break;
-    }
+  if (host_render_config_) {
+    title << " - RTV/DSV";
     uint32_t draw_resolution_scale_x =
         texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1;
     uint32_t draw_resolution_scale_y =
@@ -1118,17 +1051,11 @@ bool D3D12CommandProcessor::SetupContext() {
     return false;
   }
 
-  // Initialize the render target cache before configuring binding - need to
-  // know if using rasterizer-ordered views for the bindless root signature.
-  render_target_cache_ = std::make_unique<D3D12RenderTargetCache>(
-      *register_file_, *memory_, draw_resolution_scale_x, draw_resolution_scale_y, *this,
-      bindless_resources_used_);
-  // The native executor owns EDRAM; the render target cache only provides the
-  // host configuration the pipelines are built against.
-  if (!render_target_cache_->Initialize()) {
-    REXGPU_ERROR("Failed to initialize the render target cache");
-    return false;
-  }
+  // The native executor owns EDRAM and the render targets; only the host
+  // render target configuration the pipelines are built against is derived.
+  host_render_config_ =
+      std::make_unique<D3D12HostRenderConfig>(draw_resolution_scale_x, draw_resolution_scale_y);
+  host_render_config_->Initialize(provider);
 
   // Initialize resource binding.
   constant_buffer_pool_ = std::make_unique<ui::d3d12::D3D12UploadBufferPool>(
@@ -1298,17 +1225,6 @@ bool D3D12CommandProcessor::SetupContext() {
       parameter.DescriptorTable.NumDescriptorRanges = 0;
       parameter.DescriptorTable.pDescriptorRanges = root_bindless_view_ranges;
       parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-      // EDRAM.
-      if (render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock) {
-        assert_true(parameter.DescriptorTable.NumDescriptorRanges <
-                    rex::countof(root_bindless_view_ranges));
-        auto& range = root_bindless_view_ranges[parameter.DescriptorTable.NumDescriptorRanges++];
-        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        range.NumDescriptors = 1;
-        range.BaseShaderRegister = UINT(DxbcShaderTranslator::UAVRegister::kEdram);
-        range.RegisterSpace = 0;
-        range.OffsetInDescriptorsFromTableStart = UINT(SystemBindlessView::kEdramR32UintUAV);
-      }
       // Used UAV and SRV ranges must not overlap on Nvidia Fermi, so textures
       // have OffsetInDescriptorsFromTableStart after all static descriptors of
       // other types.
@@ -1385,10 +1301,10 @@ bool D3D12CommandProcessor::SetupContext() {
 
   fh1_native_executor_ = std::make_unique<Fh1NativeExecutor>(*this, *register_file_, *memory_);
   Fh1NativeExecutorConfig native_config;
-  native_config.msaa_2x_supported = render_target_cache_->msaa_2x_supported();
-  native_config.gamma_as_unorm16 = render_target_cache_->gamma_render_target_as_unorm16();
-  native_config.depth_float24_round = render_target_cache_->depth_float24_round();
-  native_config.fixed16_truncated = render_target_cache_->IsFixed16TruncatedToMinus1To1();
+  native_config.msaa_2x_supported = host_render_config_->msaa_2x_supported();
+  native_config.gamma_as_unorm16 = host_render_config_->gamma_render_target_as_unorm16();
+  native_config.depth_float24_round = host_render_config_->depth_float24_round();
+  native_config.fixed16_truncated = host_render_config_->IsFixed16TruncatedToMinus1To1();
   native_config.memory = shared_memory_.get();
   native_config.textures = texture_cache_.get();
   if (!fh1_native_executor_->Initialize(native_config)) {
@@ -1399,7 +1315,7 @@ bool D3D12CommandProcessor::SetupContext() {
   }
 
   pipeline_cache_ = std::make_unique<PipelineCache>(
-      *this, *register_file_, *render_target_cache_.get(), bindless_resources_used_);
+      *this, *register_file_, *host_render_config_, bindless_resources_used_);
   if (!pipeline_cache_->Initialize()) {
     REXGPU_ERROR("Failed to initialize the graphics pipeline cache");
     return false;
@@ -1715,24 +1631,6 @@ bool D3D12CommandProcessor::SetupContext() {
             view_bindless_heap_cpu_start_,
             uint32_t(SystemBindlessView::kSharedMemoryR32G32B32A32UintUAV)),
         4);
-    // No EDRAM buffer: the native executor owns EDRAM, so the EDRAM views are
-    // null (only the pixel shader interlock path binds them).
-    for (SystemBindlessView view :
-         {SystemBindlessView::kEdramRawSRV, SystemBindlessView::kEdramR32UintSRV,
-          SystemBindlessView::kEdramR32G32UintSRV,
-          SystemBindlessView::kEdramR32G32B32A32UintSRV}) {
-      ui::d3d12::util::CreateBufferRawSRV(
-          device, provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_, uint32_t(view)),
-          nullptr, 0);
-    }
-    for (SystemBindlessView view :
-         {SystemBindlessView::kEdramRawUAV, SystemBindlessView::kEdramR32UintUAV,
-          SystemBindlessView::kEdramR32G32UintUAV,
-          SystemBindlessView::kEdramR32G32B32A32UintUAV}) {
-      ui::d3d12::util::CreateBufferRawUAV(
-          device, provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_, uint32_t(view)),
-          nullptr, 0);
-    }
     // kGammaRampTableSRV.
     WriteGammaRampSRV(
         false, provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
@@ -1820,7 +1718,7 @@ void D3D12CommandProcessor::ShutdownContext() {
   constant_buffer_pool_.reset();
 
   fh1_native_executor_.reset();
-  render_target_cache_.reset();
+  host_render_config_.reset();
 
   shared_memory_.reset();
 
@@ -2538,8 +2436,6 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       pixel_shader ? static_cast<D3D12Shader::D3D12Translation*>(
                          pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
                    : nullptr;
-  bool host_render_targets_used =
-      render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
   void* pipeline_handle = nullptr;
   ID3D12RootSignature* root_signature = nullptr;
   if (!pipeline_cache_->ConfigurePipeline(
@@ -2635,8 +2531,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
   uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
 
-  bool convert_z_to_float24 =
-      host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader();
+  bool convert_z_to_float24 = host_render_config_->depth_float24_convert_in_pixel_shader();
   bool ps_writes_depth = pixel_shader && pixel_shader->writes_depth();
 
   // Build a cache key from all viewport-affecting state to skip redundant
@@ -2650,8 +2545,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   viewport_key.normalized_depth_control = normalized_depth_control.value;
   std::memcpy(viewport_key.vport_regs, &regs[XE_GPU_REG_PA_CL_VPORT_XSCALE],
               sizeof(viewport_key.vport_regs));
-  viewport_key.flags = (uint32_t(convert_z_to_float24) << 0) |
-                       (uint32_t(host_render_targets_used) << 1) | (uint32_t(ps_writes_depth) << 2);
+  viewport_key.flags = (uint32_t(convert_z_to_float24) << 0) | (uint32_t(ps_writes_depth) << 2);
 
   draw_util::ViewportInfo viewport_info;
   if (viewport_cache_valid_ && viewport_key == previous_viewport_key_) {
@@ -2660,7 +2554,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     draw_util::GetHostViewportInfo(regs, draw_resolution_scale_x, draw_resolution_scale_y, true,
                                    D3D12_VIEWPORT_BOUNDS_MAX, D3D12_VIEWPORT_BOUNDS_MAX, false,
                                    normalized_depth_control, convert_z_to_float24,
-                                   host_render_targets_used, ps_writes_depth, viewport_info);
+                                   // Host render targets are the only path.
+                                   /* full_float24_in_0_to_1 */ true, ps_writes_depth,
+                                   viewport_info);
     previous_viewport_key_ = viewport_key;
     previous_viewport_info_ = viewport_info;
     viewport_cache_valid_ = true;
@@ -3500,43 +3396,41 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(
   scissor_rect.bottom = LONG(scissor.offset[1] + scissor.extent[1]);
   SetScissorRect(scissor_rect);
 
-  if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
-    const RegisterFile& regs = *register_file_;
+  const RegisterFile& regs = *register_file_;
 
-    // Blend factor.
-    float blend_factor[] = {
-        regs.Get<float>(XE_GPU_REG_RB_BLEND_RED),
-        regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN),
-        regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE),
-        regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA),
-    };
-    // std::memcmp instead of != so in case of NaN, every draw won't be
-    // invalidating it.
-    ff_blend_factor_update_needed_ |=
-        std::memcmp(ff_blend_factor_, blend_factor, sizeof(float) * 4) != 0;
-    if (ff_blend_factor_update_needed_) {
-      std::memcpy(ff_blend_factor_, blend_factor, sizeof(float) * 4);
-      deferred_command_list_.D3DOMSetBlendFactor(ff_blend_factor_);
-      ff_blend_factor_update_needed_ = false;
-    }
+  // Blend factor.
+  float blend_factor[] = {
+      regs.Get<float>(XE_GPU_REG_RB_BLEND_RED),
+      regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN),
+      regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE),
+      regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA),
+  };
+  // std::memcmp instead of != so in case of NaN, every draw won't be
+  // invalidating it.
+  ff_blend_factor_update_needed_ |=
+      std::memcmp(ff_blend_factor_, blend_factor, sizeof(float) * 4) != 0;
+  if (ff_blend_factor_update_needed_) {
+    std::memcpy(ff_blend_factor_, blend_factor, sizeof(float) * 4);
+    deferred_command_list_.D3DOMSetBlendFactor(ff_blend_factor_);
+    ff_blend_factor_update_needed_ = false;
+  }
 
-    // Stencil reference value. Per-face reference not supported by Direct3D 12,
-    // choose the back face one only if drawing only back faces.
-    Register stencil_ref_mask_reg;
-    auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
-    if (primitive_polygonal && normalized_depth_control.backface_enable &&
-        pa_su_sc_mode_cntl.cull_front && !pa_su_sc_mode_cntl.cull_back) {
-      stencil_ref_mask_reg = XE_GPU_REG_RB_STENCILREFMASK_BF;
-    } else {
-      stencil_ref_mask_reg = XE_GPU_REG_RB_STENCILREFMASK;
-    }
-    uint32_t stencil_ref = regs.Get<reg::RB_STENCILREFMASK>(stencil_ref_mask_reg).stencilref;
-    ff_stencil_ref_update_needed_ |= ff_stencil_ref_ != stencil_ref;
-    if (ff_stencil_ref_update_needed_) {
-      ff_stencil_ref_ = stencil_ref;
-      deferred_command_list_.D3DOMSetStencilRef(ff_stencil_ref_);
-      ff_stencil_ref_update_needed_ = false;
-    }
+  // Stencil reference value. Per-face reference not supported by Direct3D 12,
+  // choose the back face one only if drawing only back faces.
+  Register stencil_ref_mask_reg;
+  auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  if (primitive_polygonal && normalized_depth_control.backface_enable &&
+      pa_su_sc_mode_cntl.cull_front && !pa_su_sc_mode_cntl.cull_back) {
+    stencil_ref_mask_reg = XE_GPU_REG_RB_STENCILREFMASK_BF;
+  } else {
+    stencil_ref_mask_reg = XE_GPU_REG_RB_STENCILREFMASK;
+  }
+  uint32_t stencil_ref = regs.Get<reg::RB_STENCILREFMASK>(stencil_ref_mask_reg).stencilref;
+  ff_stencil_ref_update_needed_ |= ff_stencil_ref_ != stencil_ref;
+  if (ff_stencil_ref_update_needed_) {
+    ff_stencil_ref_ = stencil_ref;
+    deferred_command_list_.D3DOMSetStencilRef(ff_stencil_ref_);
+    ff_stencil_ref_update_needed_ = false;
   }
 }
 
@@ -3552,12 +3446,9 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   const RegisterFile& regs = *register_file_;
   auto pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
   auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
-  auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
   auto rb_alpha_ref = regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF);
   auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
   auto rb_depth_info = regs.Get<reg::RB_DEPTH_INFO>();
-  auto rb_stencilrefmask = regs.Get<reg::RB_STENCILREFMASK>();
-  auto rb_stencilrefmask_bf = regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF);
   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   auto sq_context_misc = regs.Get<reg::SQ_CONTEXT_MISC>();
   auto sq_program_cntl = regs.Get<reg::SQ_PROGRAM_CNTL>();
@@ -3566,44 +3457,13 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   uint32_t vgt_max_vtx_indx = regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
   uint32_t vgt_min_vtx_indx = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
 
-  bool edram_rov_used =
-      render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
   uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
   uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
 
-  // Get the color info register values for each render target. Also, for ROV,
-  // exclude components that don't exist in the format from the write mask.
-  // Don't exclude fully overlapping render targets, however - two render
-  // targets with the same base address are used in the lighting pass of
-  // 4D5307E6, for example, with the needed one picked with dynamic control
-  // flow.
+  // Get the color info register values for each render target.
   reg::RB_COLOR_INFO color_infos[4];
-  float rt_clamp[4][4];
-  // Two UINT32_MAX if no components actually existing in the RT are written.
-  uint32_t rt_keep_masks[4][2];
   for (uint32_t i = 0; i < 4; ++i) {
-    auto color_info = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
-    color_infos[i] = color_info;
-    if (edram_rov_used) {
-      RenderTargetCache::GetPSIColorFormatInfo(
-          color_info.color_format, (normalized_color_mask >> (i * 4)) & 0b1111, rt_clamp[i][0],
-          rt_clamp[i][1], rt_clamp[i][2], rt_clamp[i][3], rt_keep_masks[i][0], rt_keep_masks[i][1]);
-    }
-  }
-
-  // Disable depth and stencil if it aliases a color render target (for
-  // instance, during the XBLA logo in 58410954, though depth writing is already
-  // disabled there).
-  bool depth_stencil_enabled =
-      normalized_depth_control.stencil_enable || normalized_depth_control.z_enable;
-  if (edram_rov_used && depth_stencil_enabled) {
-    for (uint32_t i = 0; i < 4; ++i) {
-      if (rb_depth_info.depth_base == color_infos[i].color_base &&
-          (rt_keep_masks[i][0] != UINT32_MAX || rt_keep_masks[i][1] != UINT32_MAX)) {
-        depth_stencil_enabled = false;
-        break;
-      }
-    }
+    color_infos[i] = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
   }
 
   bool dirty = false;
@@ -3651,35 +3511,11 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
                                                    : xenos::CompareFunction::kAlways;
   flags |= uint32_t(alpha_test_function) << DxbcShaderTranslator::kSysFlag_AlphaPassIfLess_Shift;
   // Gamma writing.
-  if (!render_target_cache_->gamma_render_target_as_unorm16()) {
+  if (!host_render_config_->gamma_render_target_as_unorm16()) {
     for (uint32_t i = 0; i < 4; ++i) {
       if (color_infos[i].color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
         flags |= DxbcShaderTranslator::kSysFlag_ConvertColor0ToGamma << i;
       }
-    }
-  }
-  if (edram_rov_used && depth_stencil_enabled) {
-    flags |= DxbcShaderTranslator::kSysFlag_ROVDepthStencil;
-    if (normalized_depth_control.z_enable) {
-      flags |= uint32_t(normalized_depth_control.zfunc)
-               << DxbcShaderTranslator::kSysFlag_ROVDepthPassIfLess_Shift;
-      if (normalized_depth_control.z_write_enable) {
-        flags |= DxbcShaderTranslator::kSysFlag_ROVDepthWrite;
-      }
-    } else {
-      // In case stencil is used without depth testing - always pass, and
-      // don't modify the stored depth.
-      flags |= DxbcShaderTranslator::kSysFlag_ROVDepthPassIfLess |
-               DxbcShaderTranslator::kSysFlag_ROVDepthPassIfEqual |
-               DxbcShaderTranslator::kSysFlag_ROVDepthPassIfGreater;
-    }
-    if (normalized_depth_control.stencil_enable) {
-      flags |= DxbcShaderTranslator::kSysFlag_ROVStencilTest;
-    }
-    // Hint - if not applicable to the shader, will not have effect.
-    if (alpha_test_function == xenos::CompareFunction::kAlways &&
-        !rb_colorcontrol.alpha_to_mask_enable) {
-      flags |= DxbcShaderTranslator::kSysFlag_ROVDepthStencilEarlyWrite;
     }
   }
   dirty |= system_constants_.flags != flags;
@@ -3819,32 +3655,14 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   dirty |= system_constants_.alpha_to_mask != alpha_to_mask;
   system_constants_.alpha_to_mask = alpha_to_mask;
 
-  uint32_t edram_tile_dwords_scaled = xenos::kEdramTileWidthSamples *
-                                      xenos::kEdramTileHeightSamples *
-                                      (draw_resolution_scale_x * draw_resolution_scale_y);
-
-  // EDRAM pitch for ROV writing.
-  if (edram_rov_used) {
-    // Align, then multiply by 32bpp tile size in dwords.
-    uint32_t edram_32bpp_tile_pitch_dwords_scaled =
-        ((rb_surface_info.surface_pitch *
-          (rb_surface_info.msaa_samples >= xenos::MsaaSamples::k4X ? 2 : 1)) +
-         (xenos::kEdramTileWidthSamples - 1)) /
-        xenos::kEdramTileWidthSamples * edram_tile_dwords_scaled;
-    dirty |= system_constants_.edram_32bpp_tile_pitch_dwords_scaled !=
-             edram_32bpp_tile_pitch_dwords_scaled;
-    system_constants_.edram_32bpp_tile_pitch_dwords_scaled = edram_32bpp_tile_pitch_dwords_scaled;
-  }
-
-  // Color exponent bias and ROV render target writing.
+  // Color exponent bias.
   for (uint32_t i = 0; i < 4; ++i) {
     reg::RB_COLOR_INFO color_info = color_infos[i];
     // Exponent bias is in bits 20:25 of RB_COLOR_INFO.
     int32_t color_exp_bias = color_info.color_exp_bias;
     if (color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16 ||
         color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16_16_16) {
-      if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
-          !render_target_cache_->IsFixed16TruncatedToMinus1To1()) {
+      if (!host_render_config_->IsFixed16TruncatedToMinus1To1()) {
         // Remap from -32...32 to -1...1 by dividing the output values by 32,
         // losing blending correctness, but getting the full range.
         color_exp_bias -= 5;
@@ -3854,116 +3672,6 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
         rex::memory::Reinterpret<float>(int32_t(0x3F800000 + (color_exp_bias << 23)));
     dirty |= system_constants_.color_exp_bias[i] != color_exp_bias_scale;
     system_constants_.color_exp_bias[i] = color_exp_bias_scale;
-    if (edram_rov_used) {
-      dirty |= system_constants_.edram_rt_keep_mask[i][0] != rt_keep_masks[i][0];
-      system_constants_.edram_rt_keep_mask[i][0] = rt_keep_masks[i][0];
-      dirty |= system_constants_.edram_rt_keep_mask[i][1] != rt_keep_masks[i][1];
-      system_constants_.edram_rt_keep_mask[i][1] = rt_keep_masks[i][1];
-      if (rt_keep_masks[i][0] != UINT32_MAX || rt_keep_masks[i][1] != UINT32_MAX) {
-        uint32_t rt_base_dwords_scaled = color_info.color_base * edram_tile_dwords_scaled;
-        dirty |= system_constants_.edram_rt_base_dwords_scaled[i] != rt_base_dwords_scaled;
-        system_constants_.edram_rt_base_dwords_scaled[i] = rt_base_dwords_scaled;
-        uint32_t format_flags = RenderTargetCache::AddPSIColorFormatFlags(color_info.color_format);
-        dirty |= system_constants_.edram_rt_format_flags[i] != format_flags;
-        system_constants_.edram_rt_format_flags[i] = format_flags;
-        // Can't do float comparisons here because NaNs would result in always
-        // setting the dirty flag.
-        dirty |=
-            std::memcmp(system_constants_.edram_rt_clamp[i], rt_clamp[i], 4 * sizeof(float)) != 0;
-        std::memcpy(system_constants_.edram_rt_clamp[i], rt_clamp[i], 4 * sizeof(float));
-        uint32_t blend_factors_ops =
-            regs[reg::RB_BLENDCONTROL::rt_register_indices[i]] & 0x1FFF1FFF;
-        dirty |= system_constants_.edram_rt_blend_factors_ops[i] != blend_factors_ops;
-        system_constants_.edram_rt_blend_factors_ops[i] = blend_factors_ops;
-      }
-    }
-  }
-
-  if (edram_rov_used) {
-    uint32_t depth_base_dwords_scaled = rb_depth_info.depth_base * edram_tile_dwords_scaled;
-    dirty |= system_constants_.edram_depth_base_dwords_scaled != depth_base_dwords_scaled;
-    system_constants_.edram_depth_base_dwords_scaled = depth_base_dwords_scaled;
-
-    // For non-polygons, front polygon offset is used, and it's enabled if
-    // POLY_OFFSET_PARA_ENABLED is set, for polygons, separate front and back
-    // are used.
-    float poly_offset_front_scale = 0.0f, poly_offset_front_offset = 0.0f;
-    float poly_offset_back_scale = 0.0f, poly_offset_back_offset = 0.0f;
-    if (primitive_polygonal) {
-      if (pa_su_sc_mode_cntl.poly_offset_front_enable) {
-        poly_offset_front_scale = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE);
-        poly_offset_front_offset = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET);
-      }
-      if (pa_su_sc_mode_cntl.poly_offset_back_enable) {
-        poly_offset_back_scale = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_SCALE);
-        poly_offset_back_offset = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_OFFSET);
-      }
-    } else {
-      if (pa_su_sc_mode_cntl.poly_offset_para_enable) {
-        poly_offset_front_scale = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE);
-        poly_offset_front_offset = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET);
-        poly_offset_back_scale = poly_offset_front_scale;
-        poly_offset_back_offset = poly_offset_front_offset;
-      }
-    }
-    // With non-square resolution scaling, make sure the worst-case impact is
-    // reverted (slope only along the scaled axis), thus max. More bias is
-    // better than less bias, because less bias means Z fighting with the
-    // background is more likely.
-    float poly_offset_scale_factor = xenos::kPolygonOffsetScaleSubpixelUnit *
-                                     std::max(draw_resolution_scale_x, draw_resolution_scale_y);
-    poly_offset_front_scale *= poly_offset_scale_factor;
-    poly_offset_back_scale *= poly_offset_scale_factor;
-    dirty |= system_constants_.edram_poly_offset_front_scale != poly_offset_front_scale;
-    system_constants_.edram_poly_offset_front_scale = poly_offset_front_scale;
-    dirty |= system_constants_.edram_poly_offset_front_offset != poly_offset_front_offset;
-    system_constants_.edram_poly_offset_front_offset = poly_offset_front_offset;
-    dirty |= system_constants_.edram_poly_offset_back_scale != poly_offset_back_scale;
-    system_constants_.edram_poly_offset_back_scale = poly_offset_back_scale;
-    dirty |= system_constants_.edram_poly_offset_back_offset != poly_offset_back_offset;
-    system_constants_.edram_poly_offset_back_offset = poly_offset_back_offset;
-
-    if (depth_stencil_enabled && normalized_depth_control.stencil_enable) {
-      dirty |= system_constants_.edram_stencil_front_reference != rb_stencilrefmask.stencilref;
-      system_constants_.edram_stencil_front_reference = rb_stencilrefmask.stencilref;
-      dirty |= system_constants_.edram_stencil_front_read_mask != rb_stencilrefmask.stencilmask;
-      system_constants_.edram_stencil_front_read_mask = rb_stencilrefmask.stencilmask;
-      dirty |=
-          system_constants_.edram_stencil_front_write_mask != rb_stencilrefmask.stencilwritemask;
-      system_constants_.edram_stencil_front_write_mask = rb_stencilrefmask.stencilwritemask;
-      uint32_t stencil_func_ops = (normalized_depth_control.value >> 8) & ((1 << 12) - 1);
-      dirty |= system_constants_.edram_stencil_front_func_ops != stencil_func_ops;
-      system_constants_.edram_stencil_front_func_ops = stencil_func_ops;
-
-      if (primitive_polygonal && normalized_depth_control.backface_enable) {
-        dirty |= system_constants_.edram_stencil_back_reference != rb_stencilrefmask_bf.stencilref;
-        system_constants_.edram_stencil_back_reference = rb_stencilrefmask_bf.stencilref;
-        dirty |= system_constants_.edram_stencil_back_read_mask != rb_stencilrefmask_bf.stencilmask;
-        system_constants_.edram_stencil_back_read_mask = rb_stencilrefmask_bf.stencilmask;
-        dirty |= system_constants_.edram_stencil_back_write_mask !=
-                 rb_stencilrefmask_bf.stencilwritemask;
-        system_constants_.edram_stencil_back_write_mask = rb_stencilrefmask_bf.stencilwritemask;
-        uint32_t stencil_func_ops_bf = (normalized_depth_control.value >> 20) & ((1 << 12) - 1);
-        dirty |= system_constants_.edram_stencil_back_func_ops != stencil_func_ops_bf;
-        system_constants_.edram_stencil_back_func_ops = stencil_func_ops_bf;
-      } else {
-        dirty |= std::memcmp(system_constants_.edram_stencil_back,
-                             system_constants_.edram_stencil_front, 4 * sizeof(uint32_t)) != 0;
-        std::memcpy(system_constants_.edram_stencil_back, system_constants_.edram_stencil_front,
-                    4 * sizeof(uint32_t));
-      }
-    }
-
-    dirty |= system_constants_.edram_blend_constant[0] != regs.Get<float>(XE_GPU_REG_RB_BLEND_RED);
-    system_constants_.edram_blend_constant[0] = regs.Get<float>(XE_GPU_REG_RB_BLEND_RED);
-    dirty |=
-        system_constants_.edram_blend_constant[1] != regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN);
-    system_constants_.edram_blend_constant[1] = regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN);
-    dirty |= system_constants_.edram_blend_constant[2] != regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE);
-    system_constants_.edram_blend_constant[2] = regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE);
-    dirty |=
-        system_constants_.edram_blend_constant[3] != regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA);
-    system_constants_.edram_blend_constant[3] = regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA);
   }
 
   cbuffer_binding_system_.up_to_date &= !dirty;
@@ -4009,9 +3717,9 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
   uint32_t root_parameter_bool_loop_constants = bindless_resources_used_
                                                     ? kRootParameter_Bindless_BoolLoopConstants
                                                     : kRootParameter_Bindful_BoolLoopConstants;
-  uint32_t root_parameter_shared_memory_and_bindful_edram =
-      bindless_resources_used_ ? kRootParameter_Bindless_SharedMemory
-                               : kRootParameter_Bindful_SharedMemoryAndEdram;
+  uint32_t root_parameter_shared_memory = bindless_resources_used_
+                                              ? kRootParameter_Bindless_SharedMemory
+                                              : kRootParameter_Bindful_SharedMemory;
 
   //
   // Update root constant buffers that are common for bindful and bindless.
@@ -4154,7 +3862,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
   if (!current_shared_memory_binding_is_uav_.has_value() ||
       current_shared_memory_binding_is_uav_.value() != shared_memory_is_uav) {
     current_shared_memory_binding_is_uav_ = shared_memory_is_uav;
-    current_graphics_root_up_to_date_ &= ~(1u << root_parameter_shared_memory_and_bindful_edram);
+    current_graphics_root_up_to_date_ &= ~(1u << root_parameter_shared_memory);
   }
 
   // Get textures and samplers used by the vertex shader, check if the last used
@@ -4442,8 +4150,6 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
              current_texture_srv_keys_pixel_.data(), textures_pixel->data(), texture_count_pixel));
     bool write_samplers_vertex = sampler_count_vertex && !bindful_samplers_written_vertex_;
     bool write_samplers_pixel = sampler_count_pixel && !bindful_samplers_written_pixel_;
-    bool edram_rov_used =
-        render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
 
     // Allocate the descriptors.
     size_t view_count_partial_update = 0;
@@ -4456,11 +4162,6 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     // Shared memory SRV and null UAV + null SRV and shared memory UAV +
     // textures.
     size_t view_count_full_update = 4 + texture_count_vertex + texture_count_pixel;
-    if (edram_rov_used) {
-      // + EDRAM UAV in two tables (with the shared memory SRV and with the
-      // shared memory UAV).
-      view_count_full_update += 2;
-    }
     D3D12_CPU_DESCRIPTOR_HANDLE view_cpu_handle;
     D3D12_GPU_DESCRIPTOR_HANDLE view_gpu_handle;
     uint32_t descriptor_size_view = provider.GetViewDescriptorSize();
@@ -4498,35 +4199,24 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       write_textures_pixel = texture_count_pixel != 0;
       bindful_textures_written_vertex_ = false;
       bindful_textures_written_pixel_ = false;
-      // If updating fully, write the shared memory SRV and UAV descriptors and,
-      // if needed, the EDRAM descriptor.
-      // SRV + null UAV + EDRAM.
-      gpu_handle_shared_memory_srv_and_edram_ = view_gpu_handle;
+      // If updating fully, write the shared memory SRV and UAV descriptors.
+      // SRV + null UAV.
+      gpu_handle_shared_memory_srv_ = view_gpu_handle;
       shared_memory_->WriteRawSRVDescriptor(view_cpu_handle);
       view_cpu_handle.ptr += descriptor_size_view;
       view_gpu_handle.ptr += descriptor_size_view;
       ui::d3d12::util::CreateBufferRawUAV(device, view_cpu_handle, nullptr, 0);
       view_cpu_handle.ptr += descriptor_size_view;
       view_gpu_handle.ptr += descriptor_size_view;
-      if (edram_rov_used) {
-        render_target_cache_->WriteEdramUintPow2UAVDescriptor(view_cpu_handle, 2);
-        view_cpu_handle.ptr += descriptor_size_view;
-        view_gpu_handle.ptr += descriptor_size_view;
-      }
-      // Null SRV + UAV + EDRAM.
-      gpu_handle_shared_memory_uav_and_edram_ = view_gpu_handle;
+      // Null SRV + UAV.
+      gpu_handle_shared_memory_uav_ = view_gpu_handle;
       ui::d3d12::util::CreateBufferRawSRV(device, view_cpu_handle, nullptr, 0);
       view_cpu_handle.ptr += descriptor_size_view;
       view_gpu_handle.ptr += descriptor_size_view;
       shared_memory_->WriteRawUAVDescriptor(view_cpu_handle);
       view_cpu_handle.ptr += descriptor_size_view;
       view_gpu_handle.ptr += descriptor_size_view;
-      if (edram_rov_used) {
-        render_target_cache_->WriteEdramUintPow2UAVDescriptor(view_cpu_handle, 2);
-        view_cpu_handle.ptr += descriptor_size_view;
-        view_gpu_handle.ptr += descriptor_size_view;
-      }
-      current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindful_SharedMemoryAndEdram);
+      current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindful_SharedMemory);
     }
     if (sampler_heap_index != ui::d3d12::D3D12DescriptorHeapPool::kHeapIndexInvalid &&
         draw_sampler_bindful_heap_index_ != sampler_heap_index) {
@@ -4636,23 +4326,23 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     current_graphics_root_up_to_date_ |= 1u << root_parameter_bool_loop_constants;
   }
   if (!(current_graphics_root_up_to_date_ &
-        (1u << root_parameter_shared_memory_and_bindful_edram))) {
+        (1u << root_parameter_shared_memory))) {
     assert_true(current_shared_memory_binding_is_uav_.has_value());
-    D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_shared_memory_and_bindful_edram;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_shared_memory;
     if (bindless_resources_used_) {
-      gpu_handle_shared_memory_and_bindful_edram = provider.OffsetViewDescriptor(
+      gpu_handle_shared_memory = provider.OffsetViewDescriptor(
           view_bindless_heap_gpu_start_,
           uint32_t(current_shared_memory_binding_is_uav_.value()
                        ? SystemBindlessView ::kNullRawSRVAndSharedMemoryRawUAVStart
                        : SystemBindlessView ::kSharedMemoryRawSRVAndNullRawUAVStart));
     } else {
-      gpu_handle_shared_memory_and_bindful_edram = current_shared_memory_binding_is_uav_.value()
-                                                       ? gpu_handle_shared_memory_uav_and_edram_
-                                                       : gpu_handle_shared_memory_srv_and_edram_;
+      gpu_handle_shared_memory = current_shared_memory_binding_is_uav_.value()
+                                     ? gpu_handle_shared_memory_uav_
+                                     : gpu_handle_shared_memory_srv_;
     }
     deferred_command_list_.D3DSetGraphicsRootDescriptorTable(
-        root_parameter_shared_memory_and_bindful_edram, gpu_handle_shared_memory_and_bindful_edram);
-    current_graphics_root_up_to_date_ |= 1u << root_parameter_shared_memory_and_bindful_edram;
+        root_parameter_shared_memory, gpu_handle_shared_memory);
+    current_graphics_root_up_to_date_ |= 1u << root_parameter_shared_memory;
   }
   if (bindless_resources_used_) {
     if (!(current_graphics_root_up_to_date_ &

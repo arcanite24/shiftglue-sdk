@@ -27,8 +27,8 @@
 #include <vector>
 
 #include <rex/assert.h>
-#include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/d3d12/fh1_shader_pack.h>
+#include <rex/graphics/d3d12/host_render_config.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
@@ -51,7 +51,7 @@ class PipelineCache {
   static constexpr size_t kLayoutUIDEmpty = 0;
 
   PipelineCache(D3D12CommandProcessor& command_processor, const RegisterFile& register_file,
-                const D3D12RenderTargetCache& render_target_cache, bool bindless_resources_used);
+                const D3D12HostRenderConfig& host_config, bool bindless_resources_used);
   ~PipelineCache();
 
   bool Initialize();
@@ -313,7 +313,7 @@ class PipelineCache {
 
   D3D12CommandProcessor& command_processor_;
   const RegisterFile& register_file_;
-  const D3D12RenderTargetCache& render_target_cache_;
+  const D3D12HostRenderConfig& host_config_;
   bool bindless_resources_used_;
 
   // Temporary storage for producer-only AnalyzeUcode calls.

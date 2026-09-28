@@ -23,6 +23,7 @@
 #include <fmt/format.h>
 
 #include <rex/assert.h>
+#include <rex/graphics/pipeline/render_target/psi_color_format.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
@@ -87,35 +88,18 @@ class RenderTargetCache {
 
   // Appended to the format in the format constant via bitwise OR.
   enum : uint32_t {
-    kPSIColorFormatFlag_64bpp_Shift = xenos::kColorRenderTargetFormatBits,
+    kPSIColorFormatFlag_64bpp_Shift = psi_color_format::kFlag_64bpp_Shift,
     // Requires clamping of blending sources and factors.
-    kPSIColorFormatFlag_FixedPointColor_Shift,
-    kPSIColorFormatFlag_FixedPointAlpha_Shift,
+    kPSIColorFormatFlag_FixedPointColor_Shift = psi_color_format::kFlag_FixedPointColor_Shift,
+    kPSIColorFormatFlag_FixedPointAlpha_Shift = psi_color_format::kFlag_FixedPointAlpha_Shift,
 
-    kPSIColorFormatFlag_64bpp = uint32_t(1) << kPSIColorFormatFlag_64bpp_Shift,
-    kPSIColorFormatFlag_FixedPointColor = uint32_t(1) << kPSIColorFormatFlag_FixedPointColor_Shift,
-    kPSIColorFormatFlag_FixedPointAlpha = uint32_t(1) << kPSIColorFormatFlag_FixedPointAlpha_Shift,
+    kPSIColorFormatFlag_64bpp = psi_color_format::kFlag_64bpp,
+    kPSIColorFormatFlag_FixedPointColor = psi_color_format::kFlag_FixedPointColor,
+    kPSIColorFormatFlag_FixedPointAlpha = psi_color_format::kFlag_FixedPointAlpha,
   };
 
   static constexpr uint32_t AddPSIColorFormatFlags(xenos::ColorRenderTargetFormat format) {
-    uint32_t format_flags = uint32_t(format);
-    if (format == xenos::ColorRenderTargetFormat::k_16_16_16_16 ||
-        format == xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT ||
-        format == xenos::ColorRenderTargetFormat::k_32_32_FLOAT) {
-      format_flags |= kPSIColorFormatFlag_64bpp;
-    }
-    if (format == xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
-        format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA ||
-        format == xenos::ColorRenderTargetFormat::k_2_10_10_10 ||
-        format == xenos::ColorRenderTargetFormat::k_16_16 ||
-        format == xenos::ColorRenderTargetFormat::k_16_16_16_16 ||
-        format == xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10) {
-      format_flags |= kPSIColorFormatFlag_FixedPointColor | kPSIColorFormatFlag_FixedPointAlpha;
-    } else if (format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
-               format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16) {
-      format_flags |= kPSIColorFormatFlag_FixedPointAlpha;
-    }
-    return format_flags;
+    return psi_color_format::AddFlags(format);
   }
 
   static void GetPSIColorFormatInfo(xenos::ColorRenderTargetFormat format, uint32_t write_mask,

@@ -368,8 +368,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
 
     uint32_t edram_rt_base_dwords_scaled[4];
 
-    // RT format combined with RenderTargetCache::kPSIColorFormatFlag values
-    // (pass via RenderTargetCache::AddPSIColorFormatFlags).
+    // RT format combined with psi_color_format::kFlag values (pass via
+    // psi_color_format::AddFlags).
     uint32_t edram_rt_format_flags[4];
 
     // Format info - values to clamp the color to before blending or storing.
