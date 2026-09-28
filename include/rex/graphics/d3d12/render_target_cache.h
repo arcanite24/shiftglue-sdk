@@ -50,8 +50,13 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
         bindless_resources_used_(bindless_resources_used) {}
   ~D3D12RenderTargetCache() override;
 
-  bool Initialize();
+  // With fh1_config_only (FH1 native mode, where the native executor owns
+  // EDRAM), only the host configuration the pipelines are built against is
+  // derived: no EDRAM buffer, render targets, transfers or resolve pipelines
+  // exist, and the cache must not be updated or asked to resolve.
+  bool Initialize(bool fh1_config_only = false);
   void Shutdown(bool from_destructor = false);
+  bool fh1_config_only() const { return fh1_config_only_; }
 
   void CompletedSubmissionUpdated();
   void BeginSubmission();
@@ -669,6 +674,10 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
   bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
                          uint32_t dump_pitch);
+
+  // Host render target configuration shared with the pipeline cache.
+  void InitializeHostConfig();
+  bool fh1_config_only_ = false;
 
   bool use_stencil_reference_output_ = false;
 

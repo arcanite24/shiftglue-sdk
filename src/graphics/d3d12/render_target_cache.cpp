@@ -165,9 +165,92 @@ D3D12RenderTargetCache::~D3D12RenderTargetCache() {
   Shutdown(true);
 }
 
-bool D3D12RenderTargetCache::Initialize() {
+void D3D12RenderTargetCache::InitializeHostConfig() {
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
+
+  // Using the cvar on emulator initialization so used pipelines are consistent
+  // across different titles launched in one emulator instance.
+  use_stencil_reference_output_ =
+      REXCVAR_GET(native_stencil_value_output) &&
+      provider.IsPSSpecifiedStencilReferenceSupported() &&
+      (REXCVAR_GET(native_stencil_value_output_d3d12_intel) ||
+       provider.GetAdapterVendorID() != ui::GraphicsProvider::GpuVendorID::kIntel);
+
+  if (GetPath() != Path::kHostRenderTargets) return;
+
+  gamma_render_target_as_unorm16_ = REXCVAR_GET(gamma_render_target_as_unorm16);
+
+  depth_float24_round_ = REXCVAR_GET(depth_float24_round);
+  depth_float24_convert_in_pixel_shader_ = REXCVAR_GET(depth_float24_convert_in_pixel_shader);
+
+  // Check if 2x MSAA is supported or needs to be emulated with 4x MSAA
+  // instead.
+  if (REXCVAR_GET(native_2x_msaa)) {
+    msaa_2x_supported_ = true;
+    static const DXGI_FORMAT kRenderTargetDXGIFormats[] = {
+        DXGI_FORMAT_R16G16B16A16_FLOAT,
+        DXGI_FORMAT_R16G16B16A16_SNORM,
+        DXGI_FORMAT_R32G32_FLOAT,
+        DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+        DXGI_FORMAT_R10G10B10A2_UNORM,
+        DXGI_FORMAT_R8G8B8A8_UNORM,
+        DXGI_FORMAT_R16G16_FLOAT,
+        DXGI_FORMAT_R16G16_SNORM,
+        DXGI_FORMAT_R32_FLOAT,
+        DXGI_FORMAT_D24_UNORM_S8_UINT,
+        // For ownership transfer.
+        DXGI_FORMAT_R16G16B16A16_UINT,
+        DXGI_FORMAT_R32G32_UINT,
+        DXGI_FORMAT_R16G16_UINT,
+        DXGI_FORMAT_R32_UINT,
+    };
+    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS multisample_quality_levels;
+    multisample_quality_levels.SampleCount = 2;
+    multisample_quality_levels.Flags = D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE;
+    for (size_t i = 0; i < rex::countof(kRenderTargetDXGIFormats); ++i) {
+      multisample_quality_levels.Format = kRenderTargetDXGIFormats[i];
+      multisample_quality_levels.NumQualityLevels = 0;
+      if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                                             &multisample_quality_levels,
+                                             sizeof(multisample_quality_levels))) ||
+          !multisample_quality_levels.NumQualityLevels) {
+        msaa_2x_supported_ = false;
+        break;
+      }
+    }
+  } else {
+    msaa_2x_supported_ = false;
+  }
+  if (msaa_2x_supported_ && gamma_render_target_as_unorm16_) {
+    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS multisample_quality_levels;
+    multisample_quality_levels.SampleCount = 2;
+    multisample_quality_levels.Flags = D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE;
+    multisample_quality_levels.Format = DXGI_FORMAT_R16G16B16A16_UNORM;
+    multisample_quality_levels.NumQualityLevels = 0;
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                                           &multisample_quality_levels,
+                                           sizeof(multisample_quality_levels))) ||
+        !multisample_quality_levels.NumQualityLevels) {
+      msaa_2x_supported_ = false;
+    }
+  }
+  if (!msaa_2x_supported_) {
+    REXGPU_WARN(
+        "2x MSAA is not supported, emulated via top-left and bottom-right "
+        "samples of 4x MSAA");
+  }
+}
+
+bool D3D12RenderTargetCache::Initialize(bool fh1_config_only) {
+  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+
+  if (fh1_config_only) {
+    fh1_config_only_ = true;
+    InitializeHostConfig();
+    return true;
+  }
 
   // Create the buffer for reinterpreting EDRAM contents.
   uint32_t edram_buffer_size =
@@ -327,78 +410,10 @@ bool D3D12RenderTargetCache::Initialize() {
     resolve_copy_pipelines_[i] = resolve_copy_pipeline;
   }
 
-  // Using the cvar on emulator initialization so used pipelines are consistent
-  // across different titles launched in one emulator instance.
-  use_stencil_reference_output_ =
-      REXCVAR_GET(native_stencil_value_output) &&
-      provider.IsPSSpecifiedStencilReferenceSupported() &&
-      (REXCVAR_GET(native_stencil_value_output_d3d12_intel) ||
-       provider.GetAdapterVendorID() != ui::GraphicsProvider::GpuVendorID::kIntel);
+  InitializeHostConfig();
 
   if (GetPath() == Path::kHostRenderTargets) {
     // Host render targets.
-
-    gamma_render_target_as_unorm16_ = REXCVAR_GET(gamma_render_target_as_unorm16);
-
-    depth_float24_round_ = REXCVAR_GET(depth_float24_round);
-    depth_float24_convert_in_pixel_shader_ = REXCVAR_GET(depth_float24_convert_in_pixel_shader);
-
-    // Check if 2x MSAA is supported or needs to be emulated with 4x MSAA
-    // instead.
-    if (REXCVAR_GET(native_2x_msaa)) {
-      msaa_2x_supported_ = true;
-      static const DXGI_FORMAT kRenderTargetDXGIFormats[] = {
-          DXGI_FORMAT_R16G16B16A16_FLOAT,
-          DXGI_FORMAT_R16G16B16A16_SNORM,
-          DXGI_FORMAT_R32G32_FLOAT,
-          DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
-          DXGI_FORMAT_R10G10B10A2_UNORM,
-          DXGI_FORMAT_R8G8B8A8_UNORM,
-          DXGI_FORMAT_R16G16_FLOAT,
-          DXGI_FORMAT_R16G16_SNORM,
-          DXGI_FORMAT_R32_FLOAT,
-          DXGI_FORMAT_D24_UNORM_S8_UINT,
-          // For ownership transfer.
-          DXGI_FORMAT_R16G16B16A16_UINT,
-          DXGI_FORMAT_R32G32_UINT,
-          DXGI_FORMAT_R16G16_UINT,
-          DXGI_FORMAT_R32_UINT,
-      };
-      D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS multisample_quality_levels;
-      multisample_quality_levels.SampleCount = 2;
-      multisample_quality_levels.Flags = D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE;
-      for (size_t i = 0; i < rex::countof(kRenderTargetDXGIFormats); ++i) {
-        multisample_quality_levels.Format = kRenderTargetDXGIFormats[i];
-        multisample_quality_levels.NumQualityLevels = 0;
-        if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
-                                               &multisample_quality_levels,
-                                               sizeof(multisample_quality_levels))) ||
-            !multisample_quality_levels.NumQualityLevels) {
-          msaa_2x_supported_ = false;
-          break;
-        }
-      }
-    } else {
-      msaa_2x_supported_ = false;
-    }
-    if (msaa_2x_supported_ && gamma_render_target_as_unorm16_) {
-      D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS multisample_quality_levels;
-      multisample_quality_levels.SampleCount = 2;
-      multisample_quality_levels.Flags = D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE;
-      multisample_quality_levels.Format = DXGI_FORMAT_R16G16B16A16_UNORM;
-      multisample_quality_levels.NumQualityLevels = 0;
-      if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
-                                             &multisample_quality_levels,
-                                             sizeof(multisample_quality_levels))) ||
-          !multisample_quality_levels.NumQualityLevels) {
-        msaa_2x_supported_ = false;
-      }
-    }
-    if (!msaa_2x_supported_) {
-      REXGPU_WARN(
-          "2x MSAA is not supported, emulated via top-left and bottom-right "
-          "samples of 4x MSAA");
-    }
 
     descriptor_pool_color_ = std::make_unique<ui::d3d12::D3D12CpuDescriptorPool>(
         provider, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 11);

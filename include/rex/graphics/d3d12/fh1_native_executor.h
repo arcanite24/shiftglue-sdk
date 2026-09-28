@@ -57,6 +57,13 @@ struct Fh1NativeExecutorConfig {
   bool gamma_as_unorm16 = false;
   bool bindless = true;
   bool depth_float24_round = false;
+  // `native` mode: the executor is the only renderer. It uses the command
+  // processor's guest-memory mirror and texture cache instead of its own, binds
+  // its surfaces for the command processor's draws, and performs every clear
+  // and resolve; nothing is compared with Xenos.
+  bool presents = false;
+  D3D12SharedMemory* memory = nullptr;
+  D3D12TextureCache* textures = nullptr;
 };
 
 // XR-02/03/04 native executor, shadow mode. It replays every consumed guest
@@ -76,13 +83,17 @@ class Fh1NativeExecutor {
                     memory::Memory& memory);
   ~Fh1NativeExecutor();
 
+  // Session renderer (fh1_renderer): native-shadow or native.
   static bool Enabled();
+  static bool Presents();
 
   bool Initialize(const Fh1NativeExecutorConfig& config);
   void Shutdown();
 
-  D3D12SharedMemory* shared_memory() const { return native_memory_.get(); }
+  // The executor's own mirror in shadow mode (none in native mode).
+  D3D12SharedMemory* shared_memory() const { return owned_memory_.get(); }
   bool verifying() const { return verify_; }
+  bool presents() const { return config_.presents; }
 
   // Submission and frame lifecycle, mirroring the Xenos caches.
   void CompletedSubmissionUpdated(uint64_t completed_submission);
@@ -105,9 +116,24 @@ class Fh1NativeExecutor {
   void ShadowDraw(D3D12RenderTargetCache& render_target_cache, const Fh1NativeDrawInfo& draw);
   // After the Xenos resolve of the same copy.
   void ShadowResolve(D3D12RenderTargetCache& render_target_cache, bool xenos_succeeded);
+
+  // Native mode, in place of the render target cache's update: binds the
+  // surfaces PrepareTargets derived and returns the bound slots and their
+  // formats as RenderTargetCache::GetLastUpdateBoundRenderTargets would.
+  // False skips the draw (the reason is counted).
+  bool BindTargets(uint32_t& bound_bits, uint32_t* formats);
+  // Native mode, after the command processor recorded the draw.
+  void NativeDrawIssued(const Fh1NativeDrawInfo& draw);
+  // Native mode, in place of the render target cache's resolve. Returns
+  // whether the copy (or clear) ran, and the guest range it wrote.
+  bool NativeResolve(uint32_t& written_address, uint32_t& written_length);
   // Verification, before the Xenos resolve: the copy from the native owners
   // and from the Xenos render targets of the same keys, compared.
   void VerifySurfacesBeforeResolve(D3D12RenderTargetCache& render_target_cache);
+  // Verification on dump frames, after both renderers took the draw's EDRAM
+  // tiles and before either drew: separates transfer from draw differences.
+  void VerifyTargetsBeforeDraw(D3D12RenderTargetCache& render_target_cache,
+                               const Fh1NativeDrawInfo& draw);
   void ShadowSwap(uint64_t frame, uint32_t frontbuffer_address, uint32_t width,
                   uint32_t height, const uint32_t* gamma_pwl);
 
@@ -172,6 +198,8 @@ class Fh1NativeExecutor {
     std::string kind;
     std::vector<uint8_t> cpu;  // Guest memory when queued.
     Microsoft::WRL::ComPtr<ID3D12Resource> readback;  // native, then Xenos
+    // Surface verifies: only these texels of the tiled 32bpp layout count.
+    uint32_t texels_width = 0, texels_height = 0, texels_pitch = 0;
   };
   // A rectangle of a resolve, in resolve surface pixels, whose tiles one
   // native surface owns.
@@ -253,10 +281,14 @@ class Fh1NativeExecutor {
   };
   // False when there is nothing to do or the copy cannot be planned.
   bool PlanCopy(CopyPlan& plan);
+  // Shared by shadow and native resolves; the render target cache is only
+  // used for verification. Returns whether the copy ran completely.
+  bool Resolve(D3D12RenderTargetCache* render_target_cache, uint32_t* written_address,
+               uint32_t* written_length);
   bool EnsureVerifyScratch();
   // Verification: a draw's target against the Xenos target of the same key.
   void VerifyDrawTarget(D3D12RenderTargetCache& render_target_cache, Surface& surface,
-                        uint64_t vs, uint64_t ps);
+                        uint64_t vs, uint64_t ps, const char* when = "draw");
   uint64_t draw_verify_index_ = 0;
   bool CreateVerifyReadback(PendingVerify& verify);
   void Transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES& state,
@@ -272,6 +304,9 @@ class Fh1NativeExecutor {
   // Verification: ordered events of dump frames.
   void Trace(const std::string& event);
   uint32_t trace_lines_ = 0;
+  uint32_t pending_texture_mask_ = 0;
+  // Verification: the last pre-draw native readback, by surface.
+  std::map<std::string, std::vector<uint8_t>> last_pre_native_;
   void QueueFrontBufferDump(D3D12TextureCache& textures, const char* prefix, uint64_t frame,
                             uint32_t width, uint32_t height, const uint32_t* gamma_pwl);
   void DrainDumps();
@@ -283,8 +318,15 @@ class Fh1NativeExecutor {
   DrawExtentEstimator draw_extent_estimator_;
   Fh1NativeExecutorConfig config_;
 
-  std::unique_ptr<D3D12SharedMemory> native_memory_;
-  std::unique_ptr<D3D12TextureCache> native_textures_;
+  // The mirror and texture cache the executor draws from: its own in shadow
+  // mode, the command processor's in native mode.
+  D3D12SharedMemory* native_memory_ = nullptr;
+  D3D12TextureCache* native_textures_ = nullptr;
+  std::unique_ptr<D3D12SharedMemory> owned_memory_;
+  std::unique_ptr<D3D12TextureCache> owned_textures_;
+  // Null render target views for gaps between bound color slots.
+  D3D12_CPU_DESCRIPTOR_HANDLE null_rtv_single_ = {};
+  D3D12_CPU_DESCRIPTOR_HANDLE null_rtv_multisample_ = {};
 
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> rtv_heap_;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> dsv_heap_;

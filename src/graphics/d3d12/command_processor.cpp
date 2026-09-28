@@ -1606,7 +1606,9 @@ bool D3D12CommandProcessor::SetupContext() {
   render_target_cache_ = std::make_unique<D3D12RenderTargetCache>(
       *register_file_, *memory_, draw_resolution_scale_x, draw_resolution_scale_y, *this,
       bindless_resources_used_);
-  if (!render_target_cache_->Initialize()) {
+  // In FH1 native mode the native executor owns EDRAM; the render target cache
+  // only provides the host configuration the pipelines are built against.
+  if (!render_target_cache_->Initialize(Fh1NativeExecutor::Presents())) {
     REXGPU_ERROR("Failed to initialize the render target cache");
     return false;
   }
@@ -1928,9 +1930,16 @@ bool D3D12CommandProcessor::SetupContext() {
     native_config.gamma_as_unorm16 = render_target_cache_->gamma_render_target_as_unorm16();
     native_config.bindless = bindless_resources_used_;
     native_config.depth_float24_round = render_target_cache_->depth_float24_round();
+    native_config.presents = Fh1NativeExecutor::Presents();
+    if (native_config.presents) {
+      native_config.memory = shared_memory_.get();
+      native_config.textures = texture_cache_.get();
+    }
     if (!fh1_native_executor_->Initialize(native_config)) {
-      REXGPU_ERROR("Failed to initialize the FH1 native executor; shadow mode is off");
+      REXGPU_ERROR("Failed to initialize the FH1 native executor");
       fh1_native_executor_.reset();
+      // Native mode has no EDRAM without the executor.
+      if (native_config.presents) return false;
     } else if (fh1_native_executor_->verifying()) {
       render_target_cache_->Fh1SetRecordResolveOwners(true);
     }
@@ -2280,6 +2289,26 @@ bool D3D12CommandProcessor::SetupContext() {
             view_bindless_heap_cpu_start_,
             uint32_t(SystemBindlessView::kSharedMemoryR32G32B32A32UintUAV)),
         4);
+    if (render_target_cache_->fh1_config_only()) {
+      // No EDRAM buffer: null views (only the pixel shader interlock path
+      // binds them).
+      for (SystemBindlessView view :
+           {SystemBindlessView::kEdramRawSRV, SystemBindlessView::kEdramR32UintSRV,
+            SystemBindlessView::kEdramR32G32UintSRV,
+            SystemBindlessView::kEdramR32G32B32A32UintSRV}) {
+        ui::d3d12::util::CreateBufferRawSRV(
+            device, provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_, uint32_t(view)),
+            nullptr, 0);
+      }
+      for (SystemBindlessView view :
+           {SystemBindlessView::kEdramRawUAV, SystemBindlessView::kEdramR32UintUAV,
+            SystemBindlessView::kEdramR32G32UintUAV,
+            SystemBindlessView::kEdramR32G32B32A32UintUAV}) {
+        ui::d3d12::util::CreateBufferRawUAV(
+            device, provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_, uint32_t(view)),
+            nullptr, 0);
+      }
+    } else {
     // kEdramRawSRV.
     render_target_cache_->WriteEdramRawSRVDescriptor(provider.OffsetViewDescriptor(
         view_bindless_heap_cpu_start_, uint32_t(SystemBindlessView::kEdramRawSRV)));
@@ -2316,6 +2345,7 @@ bool D3D12CommandProcessor::SetupContext() {
         provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
                                       uint32_t(SystemBindlessView::kEdramR32G32B32A32UintUAV)),
         4);
+    }
     // kGammaRampTableSRV.
     WriteGammaRampSRV(
         false, provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
@@ -2942,7 +2972,7 @@ void D3D12CommandProcessor::RestoreFh1AfterNativeUi() {
     deferred_command_list_.SetDescriptorHeaps(view_bindful_heap_current_,
                                               sampler_bindful_heap_current_);
   }
-  render_target_cache_->RestoreFh1UiOutputTargets();
+  if (!render_target_cache_->fh1_config_only()) render_target_cache_->RestoreFh1UiOutputTargets();
 }
 
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
@@ -3878,9 +3908,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     };
     if (try_owned_clear()) return finish_draw(true);
   }
+  const bool fh1_native_presents = fh1_native_executor_ && fh1_native_executor_->presents();
   if (fh1_native_executor_) {
     // Native targets and EDRAM ownership transfers before Xenos binds its own
-    // render targets for this draw.
+    // render targets for this draw (or, in native mode, instead of them).
     Fh1NativeDrawInfo native_targets;
     native_targets.memexport = memexport_used;
     native_targets.rasterization_done = is_rasterization_done;
@@ -3888,11 +3919,23 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     native_targets.normalized_color_mask = normalized_color_mask;
     native_targets.vertex_shader = vertex_shader;
     fh1_native_executor_->PrepareTargets(native_targets);
-    render_target_cache_->Fh1InvalidateCommandListRenderTargets();
+    if (!fh1_native_presents) render_target_cache_->Fh1InvalidateCommandListRenderTargets();
   }
-  if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
-                                    normalized_color_mask, *vertex_shader)) {
+  uint32_t bound_depth_and_color_render_target_bits = 0;
+  uint32_t bound_depth_and_color_render_target_formats[1 + xenos::kMaxColorRenderTargets] = {};
+  if (fh1_native_presents) {
+    if (!fh1_native_executor_->BindTargets(bound_depth_and_color_render_target_bits,
+                                           bound_depth_and_color_render_target_formats)) {
+      return finish_draw(false);
+    }
+  } else if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+                                           normalized_color_mask, *vertex_shader)) {
     return finish_draw(false);
+  } else if (fh1_native_executor_ && fh1_native_executor_->verifying()) {
+    Fh1NativeDrawInfo verify_draw;
+    verify_draw.vertex_shader = vertex_shader;
+    verify_draw.pixel_shader = pixel_shader;
+    fh1_native_executor_->VerifyTargetsBeforeDraw(*render_target_cache_, verify_draw);
   }
 
   // Obtain shader metadata and the actual render-target formats. Native passes
@@ -3905,16 +3948,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       pixel_shader ? static_cast<D3D12Shader::D3D12Translation*>(
                          pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
                    : nullptr;
-  uint32_t bound_depth_and_color_render_target_bits;
-  uint32_t bound_depth_and_color_render_target_formats[1 + xenos::kMaxColorRenderTargets] = {};
   bool host_render_targets_used =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
-  if (host_render_targets_used) {
+  if (fh1_native_presents) {
+    // Bound by the native executor above.
+  } else if (host_render_targets_used) {
     bound_depth_and_color_render_target_bits =
         render_target_cache_->GetLastUpdateBoundRenderTargets(
             bound_depth_and_color_render_target_formats);
-  } else {
-    bound_depth_and_color_render_target_bits = 0;
   }
   const bool ray_ui_target =
       bound_depth_and_color_render_target_bits == 2 &&
@@ -4868,7 +4909,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   } else {
     texture_cache_->RequestTextures(used_texture_mask);
   }
-  if (fh1_native_executor_) {
+  if (fh1_native_executor_ && !fh1_native_presents) {
     // The native mirror and textures are prepared before the Xenos pipeline is
     // bound, since loading textures may dispatch compute work.
     const bool guest_dma_indices = primitive_processing_result.index_buffer_type ==
@@ -5640,7 +5681,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       native_draw.normalized_color_mask = normalized_color_mask;
       native_draw.vertex_shader = vertex_shader;
       native_draw.pixel_shader = pixel_shader;
-      fh1_native_executor_->ShadowDraw(*render_target_cache_, native_draw);
+      if (fh1_native_presents) {
+        fh1_native_executor_->NativeDrawIssued(native_draw);
+      } else {
+        fh1_native_executor_->ShadowDraw(*render_target_cache_, native_draw);
+      }
     }
     if (snr04_mark_foliage) deferred_command_list_.EndDebugMarker();
   } else {
@@ -5732,7 +5777,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         native_draw.guest_dma_index_size = index_buffer_view.SizeInBytes;
         native_draw.guest_dma_index_format = index_buffer_view.Format;
       }
-      fh1_native_executor_->ShadowDraw(*render_target_cache_, native_draw);
+      if (fh1_native_presents) {
+        fh1_native_executor_->NativeDrawIssued(native_draw);
+      } else {
+        fh1_native_executor_->ShadowDraw(*render_target_cache_, native_draw);
+      }
     }
     if (snr04_mark_foliage) deferred_command_list_.EndDebugMarker();
     if (scratch_index_buffer != nullptr) {
@@ -5855,15 +5904,24 @@ bool D3D12CommandProcessor::IssueCopy() {
   uint32_t written_address = 0;
   uint32_t written_length = 0;
   BeginFh1GpuPassTimingCopy();
-  if (fh1_native_executor_) fh1_native_executor_->VerifySurfacesBeforeResolve(*render_target_cache_);
-  const bool copy_succeeded =
-      render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, written_address,
-                                    written_length, fh1_mip_replacement_active_);
+  const bool fh1_native_presents = fh1_native_executor_ && fh1_native_executor_->presents();
+  bool copy_succeeded;
+  if (fh1_native_presents) {
+    copy_succeeded = fh1_native_executor_->NativeResolve(written_address, written_length);
+  } else {
+    if (fh1_native_executor_) {
+      fh1_native_executor_->VerifySurfacesBeforeResolve(*render_target_cache_);
+    }
+    copy_succeeded =
+        render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                      written_address, written_length,
+                                      fh1_mip_replacement_active_);
+  }
   if (Fh1FrameCensus::Enabled()) {
     Fh1FrameCensus::ObserveCopy(*register_file_, observation_frame_sequence_,
                                 written_address, written_length, copy_succeeded);
   }
-  if (fh1_native_executor_) {
+  if (fh1_native_executor_ && !fh1_native_presents) {
     fh1_native_executor_->ShadowResolve(*render_target_cache_, copy_succeeded);
   }
   if (copy_succeeded && REXCVAR_GET(fh1_post_chain_probe)) {
@@ -5881,7 +5939,7 @@ bool D3D12CommandProcessor::IssueCopy() {
     ++fh1_mip_skipped_copies_;
 
   auto copy_observer = graphics_system_->copy_observer();
-  if (!Fh1ObserveCorpusFrame(observation_frame_sequence_)) {
+  if (!Fh1ObserveCorpusFrame(observation_frame_sequence_) || fh1_native_presents) {
     copy_observer = nullptr;
   }
   if (copy_observer) {
@@ -6151,7 +6209,7 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission,
   shared_memory_->CompletedSubmissionUpdated();
   if (fh1_native_executor_) fh1_native_executor_->CompletedSubmissionUpdated(submission_completed_);
 
-  render_target_cache_->CompletedSubmissionUpdated();
+  if (!render_target_cache_->fh1_config_only()) render_target_cache_->CompletedSubmissionUpdated();
 
   primitive_processor_->CompletedSubmissionUpdated();
 
@@ -6293,7 +6351,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     }
     primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
 
-    render_target_cache_->BeginSubmission();
+    if (!render_target_cache_->fh1_config_only()) render_target_cache_->BeginSubmission();
 
     primitive_processor_->BeginSubmission();
 
@@ -6551,7 +6609,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
 
       primitive_processor_->ClearCache();
 
-      render_target_cache_->ClearCache();
+      if (!render_target_cache_->fh1_config_only()) render_target_cache_->ClearCache();
 
       shared_memory_->ClearCache();
     }
