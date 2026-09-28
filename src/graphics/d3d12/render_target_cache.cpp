@@ -1049,203 +1049,6 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
   return true;
 }
 
-bool D3D12RenderTargetCache::ClearFh1OwnedDepth(
-    std::span<const Fh1ClearRectangle> rectangles) {
-  const auto surface = register_file().Get<reg::RB_SURFACE_INFO>();
-  const auto depth = register_file().Get<reg::RB_DEPTH_INFO>();
-  const uint32_t scale = draw_resolution_scale_x();
-  if (GetPath() != Path::kHostRenderTargets || rectangles.empty() || rectangles.size() > 2 ||
-      draw_resolution_scale_y() != scale ||
-      surface.msaa_samples != xenos::MsaaSamples::k4X ||
-      depth.depth_format != xenos::DepthRenderTargetFormat::kD24S8) return false;
-  RenderTargetKey key;
-  key.base_tiles = depth.depth_base;
-  const uint32_t pitch = (surface.surface_pitch * 2 + 79) / 80;
-  if (!pitch || pitch > 255 || IsHostDepthEncodingDifferent(depth.depth_format)) return false;
-  key.pitch_tiles_at_32bpp = pitch;
-  key.msaa_samples = xenos::MsaaSamples::k1X;
-  key.is_depth = 1;
-  key.resource_format = uint32_t(xenos::DepthRenderTargetFormat::kD24S8);
-  auto* target = static_cast<D3D12RenderTarget*>(GetFullyOwnedRenderTarget(key));
-  if (!target) return false;
-  std::array<Fh1ClearRectangle, 2> mapped;
-  const auto desc = target->resource()->GetDesc();
-  for (size_t i = 0; i < rectangles.size(); ++i) {
-    auto rectangle = fh1_clear_to_single_sample(rectangles[i], scale, key.GetPitchTiles());
-    if (!rectangle || uint32_t(rectangle->bounds[2]) > desc.Width ||
-        uint32_t(rectangle->bounds[3]) > desc.Height) return false;
-    mapped[i] = *rectangle;
-  }
-  // Keep current ownership and independent float-depth history. Only depth
-  // changes; stencil and pixels outside the mapped rectangle stay in place.
-  command_processor_.PushTransitionBarrier(target->resource(),
-      target->SetResourceState(D3D12_RESOURCE_STATE_DEPTH_WRITE), D3D12_RESOURCE_STATE_DEPTH_WRITE);
-  command_processor_.SubmitBarriers();
-  auto& commands = command_processor_.GetDeferredCommandList();
-  commands.BeginDebugMarker("PinyonShift native owned depth clear");
-  for (size_t i = 0; i < rectangles.size(); ++i) {
-    const auto& r = mapped[i].bounds;
-    const D3D12_RECT rect{r[0],r[1],r[2],r[3]};
-    commands.D3DClearDepthStencilView(target->descriptor_draw().GetHandle(),
-        D3D12_CLEAR_FLAG_DEPTH, mapped[i].depth, 0, 1, &rect);
-  }
-  commands.EndDebugMarker();
-  static uint64_t clear_count = 0;
-  if (++clear_count == 1 || !(clear_count % 1024))
-    REXGPU_INFO("FH1 native owned depth clears {}", clear_count);
-  return true;
-}
-
-bool D3D12RenderTargetCache::ClearFh1OwnedDepthTiles(
-    std::span<const Fh1ClearRectangle> rectangles) {
-  const auto surface = register_file().Get<reg::RB_SURFACE_INFO>();
-  const auto depth = register_file().Get<reg::RB_DEPTH_INFO>();
-  const uint32_t scale = draw_resolution_scale_x();
-  if (GetPath() != Path::kHostRenderTargets || rectangles.empty() || rectangles.size() > 2 ||
-      draw_resolution_scale_y() != scale || surface.surface_pitch != 640 ||
-      surface.msaa_samples != xenos::MsaaSamples::k4X || depth.depth_base ||
-      depth.depth_format != xenos::DepthRenderTargetFormat::kD24S8) return false;
-  std::array<std::array<uint32_t, 4>, 2> tiles;
-  for (size_t i = 0; i < rectangles.size(); ++i) {
-    const auto bounds = fh1_zero_clear_tiles(rectangles[i], scale, 16);
-    if (!bounds) return false;
-    tiles[i] = *bounds;
-  }
-  RenderTargetKey key;
-  key.pitch_tiles_at_32bpp = 16;
-  key.msaa_samples = xenos::MsaaSamples::k4X;
-  key.is_depth = 1;
-  key.resource_format = uint32_t(xenos::DepthRenderTargetFormat::kD24S8);
-  auto* target = static_cast<D3D12RenderTarget*>(PrepareFh1FullTileDepthClear(
-      key, std::span<const std::array<uint32_t, 4>>(tiles).first(rectangles.size())));
-  if (!target) return false;
-  command_processor_.PushTransitionBarrier(target->resource(),
-      target->SetResourceState(D3D12_RESOURCE_STATE_DEPTH_WRITE), D3D12_RESOURCE_STATE_DEPTH_WRITE);
-  command_processor_.SubmitBarriers();
-  auto& commands = command_processor_.GetDeferredCommandList();
-  commands.BeginDebugMarker("PinyonShift native owned depth tile clear");
-  for (const auto& rectangle : rectangles) {
-    const auto& r = rectangle.bounds;
-    const D3D12_RECT rect{r[0], r[1], r[2], r[3]};
-    commands.D3DClearDepthStencilView(target->descriptor_draw().GetHandle(),
-        D3D12_CLEAR_FLAGS(D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL), 0, 0, 1, &rect);
-  }
-  commands.EndDebugMarker();
-  static uint64_t clear_count = 0;
-  if (++clear_count == 1 || !(clear_count % 1024))
-    REXGPU_INFO("FH1 native owned depth tile clears {}", clear_count);
-  return true;
-}
-
-ID3D12Resource* D3D12RenderTargetCache::GetFh1UiOutputTarget() const {
-  if (GetPath() != Path::kHostRenderTargets) return nullptr;
-  auto* target = static_cast<D3D12RenderTarget*>(
-      last_update_accumulated_render_targets()[1]);
-  if (!target) return nullptr;
-  const auto desc = target->resource()->GetDesc();
-  if (target->resource_state() != D3D12_RESOURCE_STATE_RENDER_TARGET ||
-      desc.Format != DXGI_FORMAT_R10G10B10A2_UNORM || desc.Width != 1280 ||
-      desc.Height < 720 || desc.SampleDesc.Count != 1) return nullptr;
-  return target->resource();
-}
-
-Microsoft::WRL::ComPtr<ID3D12Resource>
-D3D12RenderTargetCache::SnapshotFh1InitialColorDepth() {
-  Microsoft::WRL::ComPtr<ID3D12Resource> snapshot;
-  if (GetPath() != Path::kHostRenderTargets) return snapshot;
-  auto* target = static_cast<D3D12RenderTarget*>(
-      last_update_accumulated_render_targets()[0]);
-  if (!target) return snapshot;
-  const auto key = target->key();
-  const auto desc = target->resource()->GetDesc();
-  if (!key.is_depth || key.base_tiles || key.GetPitchTiles() != 16 ||
-      key.msaa_samples != xenos::MsaaSamples::k1X ||
-      key.GetDepthFormat() != xenos::DepthRenderTargetFormat::kD24FS8 ||
-      desc.Width != 1280 || desc.Height != 2048 ||
-      desc.Format != DXGI_FORMAT_R32G8X24_TYPELESS ||
-      desc.SampleDesc.Count != 1 ||
-      !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
-    return snapshot;
-  auto* device = command_processor_.GetD3D12Provider().GetDevice();
-  if (FAILED(device->CreateCommittedResource(
-          &ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE,
-          &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-          IID_PPV_ARGS(&snapshot))))
-    return {};
-  const auto previous = target->SetResourceState(
-      D3D12_RESOURCE_STATE_COPY_SOURCE);
-  command_processor_.PushTransitionBarrier(
-      target->resource(), previous, D3D12_RESOURCE_STATE_COPY_SOURCE);
-  command_processor_.SubmitBarriers();
-  command_processor_.GetDeferredCommandList().D3DCopyResource(
-      snapshot.Get(), target->resource());
-  command_processor_.PushTransitionBarrier(
-      target->resource(), target->SetResourceState(previous), previous);
-  command_processor_.SubmitBarriers();
-  return snapshot;
-}
-
-void D3D12RenderTargetCache::RestoreFh1UiOutputTargets() {
-  InvalidateCommandListRenderTargets();
-  SetCommandListRenderTargets(last_update_accumulated_render_targets());
-}
-
-bool D3D12RenderTargetCache::ClearFh1UiOutput(const float color[4]) {
-  if (!color || !GetFh1UiOutputTarget()) return false;
-  auto* target = static_cast<D3D12RenderTarget*>(
-      last_update_accumulated_render_targets()[1]);
-  command_processor_.SubmitBarriers();
-  const D3D12_RECT visible{0, 0, 1280, 720};
-  command_processor_.GetDeferredCommandList().D3DClearRenderTargetView(
-      target->descriptor_draw().GetHandle(), color, 1, &visible);
-  return true;
-}
-
-bool D3D12RenderTargetCache::ClearFh1Rectangles(
-    std::span<const Fh1ClearRectangle> rectangles,
-    std::span<const std::array<float, 4>> colors,
-    bool color, bool depth, bool stencil, uint8_t reference) {
-  if (GetPath() != Path::kHostRenderTargets || rectangles.empty() ||
-      rectangles.size() > 2 || colors.size() != rectangles.size() ||
-      !(color || depth || stencil)) return false;
-  auto targets = last_update_accumulated_render_targets();
-  auto* color_target = static_cast<D3D12RenderTarget*>(targets[1]);
-  auto* depth_target = static_cast<D3D12RenderTarget*>(targets[0]);
-  if ((color && !color_target) || ((depth || stencil) && !depth_target)) return false;
-  if (color) {
-    const auto format = color_target->key().GetColorFormat();
-    if (format != xenos::ColorRenderTargetFormat::k_8_8_8_8 &&
-        format != xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT &&
-        format != xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT) return false;
-  }
-  for (size_t i = 0; i < rectangles.size(); ++i) {
-    if (!std::isfinite(rectangles[i].depth) || rectangles[i].depth < 0 || rectangles[i].depth > 1) return false;
-    for (float component : colors[i]) if (!std::isfinite(component)) return false;
-  }
-  if (color) command_processor_.PushTransitionBarrier(color_target->resource(),
-      color_target->SetResourceState(D3D12_RESOURCE_STATE_RENDER_TARGET), D3D12_RESOURCE_STATE_RENDER_TARGET);
-  if (depth || stencil) command_processor_.PushTransitionBarrier(depth_target->resource(),
-      depth_target->SetResourceState(D3D12_RESOURCE_STATE_DEPTH_WRITE), D3D12_RESOURCE_STATE_DEPTH_WRITE);
-  command_processor_.SubmitBarriers();
-  auto& commands = command_processor_.GetDeferredCommandList();
-  for (size_t i = 0; i < rectangles.size(); ++i) {
-    const auto clear = [&](D3D12RenderTarget* target, bool is_depth) {
-      const auto desc = target->resource()->GetDesc();
-      const auto& bounds = rectangles[i].bounds;
-      D3D12_RECT rect{std::max<LONG>(0, bounds[0]), std::max<LONG>(0, bounds[1]),
-                      std::min<LONG>(LONG(desc.Width), bounds[2]), std::min<LONG>(LONG(desc.Height), bounds[3])};
-      if (rect.right <= rect.left || rect.bottom <= rect.top) return;
-      if (is_depth) commands.D3DClearDepthStencilView(target->descriptor_draw().GetHandle(),
-          D3D12_CLEAR_FLAGS((depth ? D3D12_CLEAR_FLAG_DEPTH : 0) | (stencil ? D3D12_CLEAR_FLAG_STENCIL : 0)),
-          rectangles[i].depth, reference, 1, &rect);
-      else commands.D3DClearRenderTargetView(target->descriptor_draw().GetHandle(), colors[i].data(), 1, &rect);
-    };
-    if (color) clear(color_target, false);
-    if (depth || stencil) clear(depth_target, true);
-  }
-  return true;
-}
-
 void D3D12RenderTargetCache::WriteEdramRawSRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
@@ -1318,12 +1121,10 @@ void D3D12RenderTargetCache::WriteEdramUintPow2UAVDescriptor(D3D12_CPU_DESCRIPTO
 
 bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMemory& shared_memory,
                                      D3D12TextureCache& texture_cache,
-                                     uint32_t& written_address_out, uint32_t& written_length_out,
-                                     bool native_mip_copy) {
+                                     uint32_t& written_address_out, uint32_t& written_length_out) {
   ++fh1_work_counters_.resolves;
   written_address_out = 0;
   written_length_out = 0;
-  copy_observation_resolve_info_valid_ = false;
 
   bool draw_resolution_scaled = IsDrawResolutionScaled();
 
@@ -1335,8 +1136,6 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
     draw_util::LogResolveFailureState(register_file(), memory);
     return false;
   }
-  copy_observation_resolve_info_ = resolve_info;
-  copy_observation_resolve_info_valid_ = true;
 
   // Nothing to copy/clear.
   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
@@ -1348,7 +1147,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
   bool copied = false;
   // The validated native reflection list already published these mip pixels.
   // Keep the common clear path below, including ownership transfers.
-  if (resolve_info.copy_dest_extent_length && !native_mip_copy) {
+  if (resolve_info.copy_dest_extent_length) {
     draw_util::ResolveCopyShaderConstants copy_shader_constants;
     uint32_t copy_group_count_x, copy_group_count_y;
     draw_util::ResolveCopyShaderIndex copy_shader =
@@ -1851,77 +1650,6 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(Rend
   return new D3D12RenderTarget(key, resource.Get(), std::move(descriptor_draw),
                                std::move(descriptor_load_separate), std::move(descriptor_srv),
                                std::move(descriptor_srv_stencil), resource_state);
-}
-
-void D3D12RenderTargetCache::PopulateCopySourceTopology(
-    system::GraphicsCopyObservation& observation) const {
-  observation.draw_resolution_scale_x = draw_resolution_scale_x();
-  observation.draw_resolution_scale_y = draw_resolution_scale_y();
-  observation.native_2x_msaa = msaa_2x_supported();
-  if (GetPath() != Path::kHostRenderTargets) {
-    return;
-  }
-  const uint32_t copy_source = observation.rb_copy_control & 7;
-  RenderTarget* const* guest_targets =
-      last_update_accumulated_render_targets();
-  RenderTarget* source_target =
-      copy_source < 4 ? guest_targets[1 + copy_source] : guest_targets[0];
-  if (!source_target) {
-    return;
-  }
-  const auto* d3d12_source =
-      static_cast<const D3D12RenderTarget*>(source_target);
-  const D3D12_RESOURCE_DESC source_desc = d3d12_source->resource()->GetDesc();
-  observation.source_resource_width = uint32_t(source_desc.Width);
-  observation.source_resource_height = source_desc.Height;
-  observation.source_resource_format = uint32_t(source_desc.Format);
-  observation.source_sample_count = source_desc.SampleDesc.Count;
-  observation.source_sample_quality = source_desc.SampleDesc.Quality;
-  observation.source_guest_msaa_samples =
-      uint32_t(1) << uint32_t(source_target->key().msaa_samples);
-  observation.source_target_base_tiles = source_target->key().base_tiles;
-  observation.source_target_pitch_tiles_at_32bpp =
-      source_target->key().pitch_tiles_at_32bpp;
-  observation.source_target_available = true;
-  if (!copy_observation_resolve_info_valid_) {
-    return;
-  }
-  const draw_util::ResolveInfo& resolve_info =
-      copy_observation_resolve_info_;
-  const draw_util::ResolveEdramInfo& source_info =
-      resolve_info.IsCopyingDepth() ? resolve_info.depth_edram_info
-                                    : resolve_info.color_edram_info;
-  observation.resolve_source_base_tiles = source_info.base_tiles;
-  observation.resolve_source_pitch_tiles = source_info.pitch_tiles;
-  observation.resolve_source_format = source_info.format;
-  observation.resolve_source_guest_msaa_samples =
-      uint32_t(1) << uint32_t(source_info.msaa_samples);
-  observation.resolve_guest_offset_x =
-      resolve_info.coordinate_info.edram_offset_x_div_8 << 3;
-  observation.resolve_guest_offset_y =
-      resolve_info.coordinate_info.edram_offset_y_div_8 << 3;
-  observation.resolve_guest_width =
-      resolve_info.coordinate_info.width_div_8 << 3;
-  observation.resolve_guest_height = resolve_info.height_div_8 << 3;
-  observation.resolve_physical_offset_x =
-      observation.resolve_guest_offset_x * draw_resolution_scale_x();
-  observation.resolve_physical_offset_y =
-      observation.resolve_guest_offset_y * draw_resolution_scale_y();
-  observation.resolve_physical_width =
-      observation.resolve_guest_width * draw_resolution_scale_x();
-  observation.resolve_physical_height =
-      observation.resolve_guest_height * draw_resolution_scale_y();
-  observation.resolve_dest_offset_x =
-      resolve_info.copy_dest_coordinate_info.offset_x_div_8 << 3;
-  observation.resolve_dest_offset_y =
-      resolve_info.copy_dest_coordinate_info.offset_y_div_8 << 3;
-  observation.resolve_dest_pitch =
-      resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32 << 5;
-  observation.resolve_dest_height =
-      resolve_info.copy_dest_coordinate_info.height_aligned_div_32 << 5;
-  observation.resolve_sample_select = uint32_t(
-      resolve_info.copy_dest_coordinate_info.copy_sample_select);
-  observation.resolve_info_valid = true;
 }
 
 bool D3D12RenderTargetCache::IsHostDepthEncodingDifferent(

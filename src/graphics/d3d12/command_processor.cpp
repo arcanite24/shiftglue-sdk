@@ -10,19 +10,14 @@
  */
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <map>
 #include <sstream>
 #include <utility>
-
-#include <xxhash.h>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -31,10 +26,8 @@
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/fh1_frame_census.h>
-#include <rex/graphics/d3d12/fh1_geometry.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
-#include <rex/graphics/fh1_mip_contract.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
@@ -43,39 +36,15 @@
 #include <rex/memory/utils.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_util.h>
-#include <rex/ui/renderdoc_api.h>
 
 REXCVAR_DEFINE_BOOL(fh1_post_chain_probe, false, "GPU/D3D12",
                     "Log resolve publications and their texture consumers")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_BOOL(fh1_mip_decode_probe, false, "GPU/D3D12",
-                    "Measure reflection mip contract and packet replay CPU time")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_BOOL(fh1_native_ui_boundary_probe, false, "GPU/D3D12",
-                    "Assemble the native race scene before guest UI draws")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_STRING(fh1_resolve_dump_dir, "", "GPU/D3D12",
                       "Diagnostics: write every resolve's output bytes (scaled when resolution "
                       "scaling is on) to this directory, waiting for the GPU after each")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_BOOL(fh1_native_reflection_mips, true, "GPU/D3D12",
-                    "Use experimental native reflection mips at symmetric 1x/2x; "
-                    "fall back when the current command/input contract does not match")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_BOOL(fh1_owned_depth_clear, true, "GPU/D3D12",
-                    "Native owned depth clear at 1x; scaled rendering keeps compatibility transfers");
-REXCVAR_DEFINE_BOOL(fh1_owned_depth_tile_clear, false, "GPU/D3D12",
-                    "Experimental full-tile base-0 depth/stencil clear ownership");
-REXCVAR_DEFINE_BOOL(fh1_recycle_geometry_buffers, false, "GPU/D3D12",
-                    "Reuse the oldest completed same-sized geometry buffer under cache pressure");
-REXCVAR_DEFINE_BOOL(fh1_contain_geometry_windows, false, "GPU/D3D12",
-                    "Reuse the smallest same-base geometry window containing the request")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_BOOL(fh1_cache_geometry_rejections, false, "GPU/D3D12",
-                    "Skip repeated owned-geometry admission work until cache state changes");
-REXCVAR_DEFINE_INT32(fh1_geometry_cache_mb, 32, "GPU/D3D12",
-                     "Owned-geometry cache budget in MiB (8-128)");
 
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -84,163 +53,12 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, false, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(fh1_discovery_sampling, false, "GPU/D3D12",
-                    "Observe one complete source frame in 60 for manual discovery")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-
 namespace rex::graphics::d3d12 {
-
-static bool Fh1ObserveCorpusFrame(uint64_t frame) {
-  return !REXCVAR_GET(fh1_discovery_sampling) || frame % 60 == 0;
-}
 
 static bool Fh1GpuCorpusEnabled() {
   static const bool enabled =
       rex::cvar::GetFlagByName("pinyon_shift_fh1_gpu_corpus") == "true";
   return enabled;
-}
-
-static std::atomic_bool fh1_native_race_requested{false};
-
-static uint64_t Fh1NativeRaceCaptureStartFrame() {
-  static const bool callback_registered = [] {
-    fh1_native_race_requested.store(
-        rex::cvar::GetFlagByName("pinyon_shift_native_race") == "true",
-        std::memory_order_release);
-    rex::cvar::RegisterChangeCallback(
-        "pinyon_shift_native_race", [](std::string_view, std::string_view value) {
-          fh1_native_race_requested.store(value == "true", std::memory_order_release);
-        });
-    return true;
-  }();
-  (void)callback_registered;
-  static const int64_t configured_frame = std::strtoll(
-      rex::cvar::GetFlagByName(
-          "pinyon_shift_native_race_capture_start_frame").c_str(),
-      nullptr, 10);
-  return configured_frame > 0 ? uint64_t(configured_frame)
-      : fh1_native_race_requested.load(std::memory_order_acquire) ? 1 : 0;
-}
-
-static bool Fh1RayOrderedLiveFrame(uint64_t frame) {
-  static const bool enabled =
-      rex::cvar::GetFlagByName("pinyon_shift_native_ordered_live_probe") ==
-      "true";
-  const uint64_t start = Fh1NativeRaceCaptureStartFrame();
-  return enabled && start && frame >= start && frame - start < 64;
-}
-
-static uint64_t Fh1SnapshotHash(const std::vector<uint8_t>& bytes) {
-  if (Fh1NativeRaceCaptureStartFrame()) {
-    return XXH3_64bits(bytes.data(), bytes.size());
-  }
-  uint64_t hash = 14695981039346656037ull;
-  for (uint8_t byte : bytes) hash = (hash ^ byte) * 1099511628211ull;
-  return hash;
-}
-
-static bool Fh1Snr04LiveHandoffEnabled() {
-  static const bool diagnostic =
-      rex::cvar::GetFlagByName("pinyon_shift_snr04_live_handoff") == "true";
-  return Fh1NativeRaceCaptureStartFrame() || diagnostic;
-}
-
-static bool Fh1SceneDumpEnabled() {
-  static const bool enabled =
-      rex::cvar::GetFlagByName("pinyon_shift_fh1_scene_dump") == "true";
-  return enabled;
-}
-
-static uint64_t Fh1Snr03ProbeFrame() {
-  static const uint64_t diagnostic = std::strtoull(
-      rex::cvar::GetFlagByName("pinyon_shift_snr03_probe_frame").c_str(),
-      nullptr, 10);
-  const uint64_t native = Fh1NativeRaceCaptureStartFrame();
-  return native ? native : diagnostic;
-}
-
-static uint64_t Fh1Snr04RenderDocFrame(uint64_t current_frame) {
-  // A render-test capture file appears after its output; capture the next frame.
-  static uint64_t trigger_frame = 0;
-  const char* trigger = std::getenv("PINYON_SHIFT_SNR04_RENDERDOC_TRIGGER_FILE");
-  if (trigger && *trigger) {
-    std::error_code error;
-    if (!trigger_frame && std::filesystem::exists(trigger, error)) {
-      trigger_frame = current_frame;
-    }
-    return trigger_frame;
-  }
-  return Fh1Snr03ProbeFrame();
-}
-
-static bool Fh1SnrProbeOutputFrame(uint64_t source_frame,
-                                  uint64_t output_frame) {
-  static const bool following = rex::cvar::GetFlagByName(
-      "pinyon_shift_snr03_probe_following_frame") == "true";
-  static const bool diagnostic_continuous =
-      rex::cvar::GetFlagByName("pinyon_shift_snr04_live_handoff") == "true" &&
-       rex::cvar::GetFlagByName("pinyon_shift_snr04_live_continuous") == "true" &&
-       rex::cvar::GetFlagByName("pinyon_shift_snr04_live_worker") == "false";
-  const bool continuous = Fh1NativeRaceCaptureStartFrame() || diagnostic_continuous;
-  return source_frame &&
-      (output_frame == source_frame + 1 ||
-          (following && output_frame == source_frame + 2) ||
-          (continuous && output_frame > source_frame));
-}
-
-static uint64_t Fh1Snr04Bc3RebindFrame() {
-  static const uint64_t frame = std::strtoull(
-      rex::cvar::GetFlagByName("pinyon_shift_snr01_trace_source_frame").c_str(),
-      nullptr, 10);
-  return frame;
-}
-
-static uint64_t Fh1Snr02ItemProbeFrame() {
-  static const uint64_t diagnostic =
-      rex::cvar::GetFlagByName("pinyon_shift_snr02_item_payload_probe") == "true"
-          ? std::strtoull(rex::cvar::GetFlagByName(
-                             rex::cvar::GetFlagByName("pinyon_shift_snr04_live_handoff") == "true"
-                                 ? "pinyon_shift_snr04_live_source_frame"
-                                 : "pinyon_shift_snr01_trace_source_frame").c_str(),
-                         nullptr, 10)
-          : 0;
-  const uint64_t native = Fh1NativeRaceCaptureStartFrame();
-  return native ? native : diagnostic;
-}
-
-static bool Fh1Snr02TrackProbeEnabled() {
-  static const bool diagnostic =
-      rex::cvar::GetFlagByName("pinyon_shift_snr02_track_payload_probe") == "true";
-  return Fh1NativeRaceCaptureStartFrame() || diagnostic;
-}
-
-static bool Fh1Snr02ItemShader(uint64_t hash) {
-  return hash == 0x3BC346726C1C2535ull ||
-         hash == 0xBDFD2AD68464101Aull ||
-         hash == 0xCB8AC98467C0C283ull ||
-         hash == 0xA715C815EDB8EEE8ull;
-}
-
-static const std::string& Fh1Snr04Bc3OutputDir() {
-  static const std::string directory = [] {
-    char* value = nullptr;
-    size_t length = 0;
-    if (_dupenv_s(&value, &length, "PINYON_SHIFT_SNR04_BC3_DIR") || !value) {
-      return std::string{};
-    }
-    std::string result(value);
-    std::free(value);
-    return result;
-  }();
-  return directory;
-}
-
-static uint64_t HashFh1ExecutionValue(uint64_t hash, uint64_t value) {
-  for (uint32_t byte = 0; byte < 8; ++byte) {
-    hash ^= uint8_t(value >> (byte * 8));
-    hash *= 0x100000001B3ull;
-  }
-  return hash;
 }
 
 // Generated with `xb buildshaders`.
@@ -251,9 +69,6 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/apply_gamma_table_fxaa_luma_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/fxaa_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/fxaa_extreme_cs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_tonemap_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_tonemap_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_velocity_dilate_ps.h"
 }  // namespace shaders
 
 D3D12CommandProcessor::D3D12CommandProcessor(D3D12GraphicsSystem* graphics_system,
@@ -1126,309 +941,6 @@ void D3D12CommandProcessor::ReleaseScratchGPUBuffer(ID3D12Resource* buffer,
   }
 }
 
-// BEGIN FH1 OWNED GEOMETRY CACHE
-auto D3D12CommandProcessor::FindFh1OwnedGeometry(uint32_t base, uint32_t size)
-    -> std::map<uint64_t, Fh1Geometry>::iterator {
-  const uint64_t key = (uint64_t(base) << 32) | size;
-  if (!REXCVAR_GET(fh1_contain_geometry_windows)) return fh1_geometry_.find(key);
-  // Choose the smallest containing owner. A later, larger import cannot switch
-  // CPU bounds to a different resource while the caller holds this owner's GPU
-  // address. Smaller requests already reuse it, so cannot insert a nearer key;
-  // last_submission prevents eviction while the address is in flight.
-  auto found = fh1_geometry_.lower_bound(key);
-  return found != fh1_geometry_.end() && uint32_t(found->first >> 32) == base
-      ? found : fh1_geometry_.end();
-}
-
-D3D12_GPU_VIRTUAL_ADDRESS D3D12CommandProcessor::GetFh1OwnedGeometry(
-    uint32_t address, uint32_t size, bool keep_cpu_snapshot) {
-  const uint64_t budget = uint64_t(std::clamp(REXCVAR_GET(fh1_geometry_cache_mb), 8, 128)) << 20;
-  if (!size || address >= SharedMemory::kBufferSize || size > SharedMemory::kBufferSize - address) {
-    return 0;
-  }
-  // Share allocation-sized guest windows between nearby geometry ranges.
-  // The view is 16-byte aligned; the fetch constant retains the low offset.
-  const uint32_t view_offset = address & 0xFFF0u;
-  const uint32_t end = (address + size + 0xFFFFu) & ~0xFFFFu;
-  address &= ~0xFFFFu;
-  size = end - address;
-  const uint64_t key = (uint64_t(address) << 32) | size;
-  auto found = FindFh1OwnedGeometry(address, size);
-  if (found == fh1_geometry_.end()) {
-    ++fh1_geometry_admission_attempts_;
-    auto& rejection = fh1_geometry_rejections_[(key ^ (key >> 32)) % fh1_geometry_rejections_.size()];
-    if (REXCVAR_GET(fh1_cache_geometry_rejections) && rejection.reason && rejection.key == key &&
-        rejection.frame == frame_current_ &&
-        rejection.completed_submission == submission_completed_ &&
-        rejection.cache_generation == fh1_geometry_cache_generation_) {
-      ++fh1_geometry_rejection_hits_;
-      return 0;
-    }
-    auto reject = [&](uint8_t reason) {
-      rejection = {key, frame_current_, submission_completed_, fh1_geometry_cache_generation_, reason};
-      if (reason == 1) ++fh1_geometry_rejected_in_flight_;
-      else ++fh1_geometry_rejected_recent_;
-      return D3D12_GPU_VIRTUAL_ADDRESS(0);
-    };
-    D3D12_RESOURCE_DESC desc;
-    ui::d3d12::util::FillBufferResourceDesc(desc, size, D3D12_RESOURCE_FLAG_NONE);
-    const auto& provider = GetD3D12Provider();
-    auto* device = provider.GetDevice();
-    ++fh1_geometry_allocation_info_calls_;
-    const uint64_t allocation = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
-    if (allocation > budget) {
-      return 0;
-    }
-    Fh1Geometry entry;
-    // ponytail: linear eviction is bounded to 512 entries; no in-flight retirement
-    // queue, so churn cannot exceed the geometry allocation budget.
-    while (fh1_geometry_.size() >= 512 || fh1_geometry_bytes_ + allocation > budget) {
-      ++fh1_geometry_eviction_scans_;
-      auto oldest = std::min_element(fh1_geometry_.begin(), fh1_geometry_.end(),
-          [](const auto& a, const auto& b) { return a.second.last_submission < b.second.last_submission; });
-      if (REXCVAR_GET(fh1_recycle_geometry_buffers) && !entry.buffer.Get()) {
-        auto fitting = fh1_geometry_.end();
-        for (auto it = fh1_geometry_.begin(); it != fh1_geometry_.end(); ++it) {
-          const auto& candidate = it->second;
-          if (candidate.last_submission > submission_completed_ || uint32_t(it->first) != size ||
-              candidate.allocation_bytes != allocation) continue;
-          if (fitting == fh1_geometry_.end() ||
-              candidate.last_submission < fitting->second.last_submission) fitting = it;
-        }
-        if (fitting != fh1_geometry_.end()) oldest = fitting;
-      }
-      if (oldest == fh1_geometry_.end() || oldest->second.last_submission > submission_completed_) {
-        return reject(1);
-      }
-      // A scene larger than the cache must not recreate its working set every
-      // frame. Keep recently used owners and use the shared-memory fallback.
-      if (frame_current_ <= oldest->second.last_frame ||
-          frame_current_ - oldest->second.last_frame <= 1) {
-        return reject(2);
-      }
-      {
-        auto lock = thread::global_critical_region::AcquireDirect();
-        if (oldest->second.watch) shared_memory_->UnwatchMemoryRange(oldest->second.watch);
-      }
-      // Prefer matching completed storage without retaining oversized capacity.
-      // The normal full-window import replaces all bytes and ownership metadata.
-      if (REXCVAR_GET(fh1_recycle_geometry_buffers) && !entry.buffer.Get() &&
-          uint32_t(oldest->first) == size && oldest->second.allocation_bytes == allocation) {
-        entry.buffer = std::move(oldest->second.buffer);
-        entry.state = oldest->second.state;
-        ++fh1_geometry_recycles_;
-      }
-      fh1_geometry_bytes_ -= oldest->second.allocation_bytes;
-      fh1_geometry_.erase(oldest);
-      ++fh1_geometry_cache_generation_;
-    }
-    if (!entry.buffer.Get()) {
-      if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
-            provider.GetHeapFlagCreateNotZeroed(), &desc, D3D12_RESOURCE_STATE_COPY_DEST,
-            nullptr, IID_PPV_ARGS(&entry.buffer)))) {
-        return 0;
-      }
-      ++fh1_geometry_allocations_;
-    }
-    entry.buffer->SetName((L"FH1 owned geometry " + std::to_wstring(address) + L" " +
-                           std::to_wstring(size)).c_str());
-    entry.allocation_bytes = allocation;
-    found = fh1_geometry_.emplace(key, std::move(entry)).first;
-    fh1_geometry_bytes_ += allocation;
-    ++fh1_geometry_cache_generation_;
-    fh1_geometry_peak_bytes_ = std::max(fh1_geometry_peak_bytes_, fh1_geometry_bytes_);
-  }
-  if (found->first != key) ++fh1_geometry_contained_uses_;
-  // Watch, snapshot and import the entire selected owner, including bytes
-  // outside a nested request that a later caller may consume.
-  size = uint32_t(found->first);
-  auto& entry = found->second;
-  const bool add_snapshot = keep_cpu_snapshot && !entry.keep_cpu_snapshot;
-  entry.keep_cpu_snapshot |= keep_cpu_snapshot;
-  bool needs_import;
-  {
-    auto lock = thread::global_critical_region::AcquireDirect();
-    needs_import = entry.watch == nullptr || add_snapshot;
-    if (needs_import) {
-      if (entry.watch) shared_memory_->UnwatchMemoryRange(entry.watch);
-      // Arm before requesting/copying. A notification during import must stay
-      // dirty for the next use, including writes made by the GPU.
-      entry.watch = shared_memory_->WatchMemoryRange(address, size,
-          [](const auto&, void*, void* data, uint64_t, bool) {
-            static_cast<Fh1Geometry*>(data)->watch = nullptr;
-          }, nullptr, &entry, 0);
-    }
-  }
-  if (needs_import) {
-    entry.depth_bounds.clear();
-    entry.next_depth_bound = 0;
-    entry.terrain_bounds.clear();
-    entry.next_terrain_bound = 0;
-    ID3D12Resource* source = nullptr;
-    size_t source_offset = 0;
-    uint8_t* upload = constant_buffer_pool_->Request(
-        frame_current_, size, 16, &source, &source_offset, nullptr);
-    bool from_cpu;
-    if (entry.keep_cpu_snapshot) {
-      entry.cpu_snapshot.resize(size);
-      from_cpu = upload && shared_memory_->CopyCpuRange(address, entry.cpu_snapshot);
-      if (from_cpu) std::memcpy(upload, entry.cpu_snapshot.data(), size);
-      else entry.cpu_snapshot.clear();
-    } else {
-      from_cpu = upload && shared_memory_->CopyCpuRange(address, {upload, size});
-    }
-    if (!from_cpu && !shared_memory_->RequestRange(address, size)) {
-      auto lock = thread::global_critical_region::AcquireDirect();
-      if (entry.watch) shared_memory_->UnwatchMemoryRange(entry.watch);
-      entry.watch = nullptr;
-      return 0;
-    }
-    PushTransitionBarrier(entry.buffer.Get(), entry.state, D3D12_RESOURCE_STATE_COPY_DEST);
-    if (!from_cpu) {
-      shared_memory_->UseAsCopySource();
-      source = shared_memory_->GetBuffer();
-      source_offset = address;
-    }
-    SubmitBarriers();
-    deferred_command_list_.D3DCopyBufferRegion(entry.buffer.Get(), 0, source, source_offset, size);
-    PushTransitionBarrier(entry.buffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
-                          (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_INDEX_BUFFER));
-    entry.state = (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_INDEX_BUFFER);
-    if (from_cpu) {
-      // This import may contain CPU writes absent from shared memory. A later
-      // shared draw must request residency instead of reusing an older tag.
-      for (uint32_t fetch : {89u, 90u, 94u, 95u}) {
-        InvalidateVertexBufferResidency(fetch);
-        vertex_buffer_states_[fetch] = {};
-      }
-      ++fh1_geometry_cpu_imports_;
-    }
-    fh1_geometry_import_bytes_ += size;
-    if (++fh1_geometry_imports_ == 1) {
-      REXGPU_INFO("FH1 owned geometry first import (bytes {}, CPU {})", size, from_cpu);
-    }
-  } else {
-    if ((++fh1_geometry_hits_ & 0x3ffff) == 0) {
-      REXGPU_INFO("FH1 owned geometry imports {}, CPU imports {}, cache hits {}, allocation bytes {}",
-                  fh1_geometry_imports_, fh1_geometry_cpu_imports_, fh1_geometry_hits_, fh1_geometry_bytes_);
-      REXGPU_INFO("FH1 geometry storage allocations {}, recycled {}",
-                  fh1_geometry_allocations_, fh1_geometry_recycles_);
-      REXGPU_INFO("FH1 geometry containment uses {}, import bytes {}",
-                  fh1_geometry_contained_uses_, fh1_geometry_import_bytes_);
-      REXGPU_INFO(
-          "FH1 geometry admission attempts {}, allocation queries {}, eviction scans {}, "
-          "rejection hits {}, in-flight rejects {}, recent rejects {}, peak bytes {}",
-          fh1_geometry_admission_attempts_, fh1_geometry_allocation_info_calls_,
-          fh1_geometry_eviction_scans_, fh1_geometry_rejection_hits_,
-          fh1_geometry_rejected_in_flight_, fh1_geometry_rejected_recent_,
-          fh1_geometry_peak_bytes_);
-    }
-  }
-  entry.last_submission = submission_current_;
-  entry.last_frame = frame_current_;
-  return entry.buffer->GetGPUVirtualAddress() + view_offset;
-}
-
-std::span<const uint8_t> D3D12CommandProcessor::GetFh1OwnedGeometryCpuRange(
-    uint32_t address, uint32_t size) {
-  if (!size || address >= SharedMemory::kBufferSize ||
-      size > SharedMemory::kBufferSize - address) return {};
-  const uint32_t base = address & ~0xFFFFu;
-  const uint32_t end = (address + size + 0xFFFFu) & ~0xFFFFu;
-  auto found = FindFh1OwnedGeometry(base, end - base);
-  if (found == fh1_geometry_.end() || found->second.cpu_snapshot.empty()) return {};
-  // This is the import's immutable CPU copy, even if guest memory is now dirty.
-  // A later import may replace it; callers revalidate after aliased imports.
-  return std::span<const uint8_t>(found->second.cpu_snapshot).subspan(address - base, size);
-}
-
-std::optional<std::pair<uint32_t, uint32_t>> D3D12CommandProcessor::GetFh1DepthGeometryRange(
-    uint32_t address, uint32_t size, std::span<const uint32_t, 8> system,
-    uint32_t width, uint32_t stride, uint32_t fetch_address, uint32_t fetch_size,
-    bool primitive_reset, uint32_t vertex_bytes) {
-  if (!size || address >= SharedMemory::kBufferSize ||
-      size > SharedMemory::kBufferSize - address) return {};
-  const uint32_t base = address & ~0xFFFFu;
-  const uint32_t end = (address + size + 0xFFFFu) & ~0xFFFFu;
-  auto found = FindFh1OwnedGeometry(base, end - base);
-  if (found == fh1_geometry_.end() || found->second.cpu_snapshot.empty()) return {};
-  auto& entry = found->second;
-  std::array<uint32_t, 16> key = {address, size, width, stride, fetch_address,
-                                 fetch_size, uint32_t(primitive_reset), vertex_bytes};
-  std::copy(system.begin(), system.end(), key.begin() + 8);
-  for (const auto& bounds : entry.depth_bounds) {
-    if (bounds.key == key) return bounds.range;
-  }
-  const auto range = depth_geometry_range(system, GetFh1OwnedGeometryCpuRange(address, size),
-                                         width, stride, fetch_address, fetch_size, primitive_reset, vertex_bytes);
-  // ponytail: at most 32 linear probes per window; measure before adding a hash table.
-  if (entry.depth_bounds.empty()) entry.depth_bounds.reserve(32);
-  if (entry.depth_bounds.size() < 32) {
-    entry.depth_bounds.push_back({key, range});
-  } else {
-    entry.depth_bounds[entry.next_depth_bound] = {key, range};
-    entry.next_depth_bound = (entry.next_depth_bound + 1) % 32;
-  }
-  return range;
-}
-
-std::optional<std::array<std::pair<uint32_t, uint32_t>, 3>>
-D3D12CommandProcessor::GetFh1TerrainGeometryRanges(
-    uint32_t address, uint32_t size, std::span<const uint32_t, 8> system,
-    uint32_t width, bool primitive_reset, std::span<const float, 44> constants,
-    std::span<const uint32_t, 6> fetches) {
-  if (!size || address >= SharedMemory::kBufferSize ||
-      size > SharedMemory::kBufferSize - address) return {};
-  const uint32_t base = address & ~0xFFFFu;
-  const uint32_t end = (address + size + 0xFFFFu) & ~0xFFFFu;
-  auto found = FindFh1OwnedGeometry(base, end - base);
-  if (found == fh1_geometry_.end() || found->second.cpu_snapshot.empty()) return {};
-  auto& entry = found->second;
-  std::array<uint32_t, 33> key = {address, size, width, uint32_t(primitive_reset)};
-  std::copy(system.begin(), system.end(), key.begin() + 4);
-  std::copy(fetches.begin(), fetches.end(), key.begin() + 12);
-  // Matrices and unused constants do not affect resource bounds. Direction's
-  // branch, rather than its arbitrary nonzero value, is the only relevant bit.
-  constexpr uint32_t components[] = {16, 17, 18, 20, 21, 22, 28, 29, 30, 31, 32, 36, 37, 38, 39};
-  for (uint32_t i = 0; i < 15; ++i) {
-    if (components[i] == 32) key[18 + i] = constants[32] != 0;
-    else std::memcpy(&key[18 + i], &constants[components[i]], sizeof(uint32_t));
-  }
-  for (const auto& bounds : entry.terrain_bounds) {
-    if (bounds.key == key) return bounds.ranges;
-  }
-  // A different terrain tile can use the same immutable indices. Reuse that
-  // maximum when only fetches or float bounds changed; imports clear both.
-  const auto same_indices = std::find_if(entry.terrain_bounds.begin(), entry.terrain_bounds.end(),
-      [&](const auto& bounds) { return std::equal(key.begin(), key.begin() + 12, bounds.key.begin()); });
-  const auto maximum = same_indices != entry.terrain_bounds.end() ? same_indices->maximum :
-      geometry_index_maximum(system, GetFh1OwnedGeometryCpuRange(address, size), width, primitive_reset);
-  const auto ranges = maximum ? terrain_geometry_ranges(*maximum, constants, fetches) : std::nullopt;
-  // ponytail: same bounded 32-probe policy as mesh depth; no second global cache.
-  if (entry.terrain_bounds.empty()) entry.terrain_bounds.reserve(32);
-  if (entry.terrain_bounds.size() < 32) {
-    entry.terrain_bounds.push_back({key, maximum, ranges});
-  } else {
-    entry.terrain_bounds[entry.next_terrain_bound] = {key, maximum, ranges};
-    entry.next_terrain_bound = (entry.next_terrain_bound + 1) % 32;
-  }
-  return ranges;
-}
-
-void D3D12CommandProcessor::ClearFh1OwnedGeometry() {
-  {
-    auto lock = thread::global_critical_region::AcquireDirect();
-    for (auto& item : fh1_geometry_) {
-      if (item.second.watch) shared_memory_->UnwatchMemoryRange(item.second.watch);
-    }
-  }
-  fh1_geometry_.clear();
-  fh1_geometry_bytes_ = 0;
-  ++fh1_geometry_cache_generation_;
-  fh1_geometry_rejections_ = {};
-}
-// END FH1 OWNED GEOMETRY CACHE
-
 void D3D12CommandProcessor::SetExternalPipeline(ID3D12PipelineState* pipeline) {
   if (current_external_pipeline_ != pipeline) {
     current_external_pipeline_ = pipeline;
@@ -1590,6 +1102,15 @@ bool D3D12CommandProcessor::SetupContext() {
         "the emulator, reducing to {}x{}",
         draw_resolution_scale_x, draw_resolution_scale_y);
   }
+  // The FH1 native executor is the only renderer; it supports symmetric 1x,
+  // 2x and 3x draw resolution scales.
+  if (draw_resolution_scale_x != draw_resolution_scale_y || draw_resolution_scale_x < 1 ||
+      draw_resolution_scale_x > 3) {
+    REXGPU_ERROR(
+        "FH1 native renderer supports 1x, 2x and 3x resolution scale, but {}x{} was requested",
+        draw_resolution_scale_x, draw_resolution_scale_y);
+    return false;
+  }
 
   shared_memory_ = std::make_unique<D3D12SharedMemory>(*this, *memory_);
   if (!shared_memory_->Initialize()) {
@@ -1602,9 +1123,9 @@ bool D3D12CommandProcessor::SetupContext() {
   render_target_cache_ = std::make_unique<D3D12RenderTargetCache>(
       *register_file_, *memory_, draw_resolution_scale_x, draw_resolution_scale_y, *this,
       bindless_resources_used_);
-  // In FH1 native mode the native executor owns EDRAM; the render target cache
-  // only provides the host configuration the pipelines are built against.
-  if (!render_target_cache_->Initialize(Fh1NativeExecutor::Enabled())) {
+  // The native executor owns EDRAM; the render target cache only provides the
+  // host configuration the pipelines are built against.
+  if (!render_target_cache_->Initialize(true)) {
     REXGPU_ERROR("Failed to initialize the render target cache");
     return false;
   }
@@ -1833,62 +1354,6 @@ bool D3D12CommandProcessor::SetupContext() {
           "the version for use without tessellation");
       return false;
     }
-    // The layered program uses one geometry SRV, two texture views and one sampler.
-    // Keep constant slots compatible with UpdateBindings; reuse the unused pixel
-    // descriptor-index slot for the signed texture table.
-    D3D12_ROOT_PARAMETER layered_parameters[kRootParameter_Bindless_Count];
-    std::copy(std::begin(root_parameters_bindless), std::end(root_parameters_bindless),
-              std::begin(layered_parameters));
-    auto& geometry_parameter = layered_parameters[kRootParameter_Bindless_SharedMemory];
-    geometry_parameter = {};
-    geometry_parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-    geometry_parameter.Descriptor.ShaderRegister = 0;
-    geometry_parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-    // Depth needs the same direct geometry SRV with the ordinary constant slots.
-    auto depth_desc = root_signature_bindless_desc;
-    depth_desc.pParameters = layered_parameters;
-    root_signature_fh1_depth_ = ui::d3d12::util::CreateRootSignature(provider, depth_desc);
-    // Skinned geometry keeps ordinary pixel tables and repurposes only the
-    // unused vertex descriptor-index CBV for its second raw input.
-    D3D12_ROOT_PARAMETER skinned_parameters[kRootParameter_Bindless_Count];
-    std::copy(std::begin(layered_parameters), std::end(layered_parameters),
-              std::begin(skinned_parameters));
-    skinned_parameters[kRootParameter_Bindless_DescriptorIndicesVertex] = geometry_parameter;
-    skinned_parameters[kRootParameter_Bindless_DescriptorIndicesVertex].Descriptor.ShaderRegister = 1;
-    auto skinned_desc = depth_desc;
-    skinned_desc.pParameters = skinned_parameters;
-    root_signature_fh1_skinned_ = ui::d3d12::util::CreateRootSignature(provider, skinned_desc);
-    // Terrain uses three raw vertex streams and no texture descriptor indices.
-    D3D12_ROOT_PARAMETER terrain_parameters[kRootParameter_Bindless_Count];
-    std::copy(std::begin(layered_parameters), std::end(layered_parameters),
-              std::begin(terrain_parameters));
-    const uint32_t terrain_slots[] = {kRootParameter_Bindless_DescriptorIndicesVertex,
-                                      kRootParameter_Bindless_DescriptorIndicesPixel};
-    for (uint32_t i = 0; i < 2; ++i) {
-      auto& parameter = terrain_parameters[terrain_slots[i]];
-      parameter = geometry_parameter;
-      parameter.Descriptor.ShaderRegister = i + 1;
-    }
-    auto terrain_desc = depth_desc;
-    terrain_desc.pParameters = terrain_parameters;
-    root_signature_fh1_terrain_ = ui::d3d12::util::CreateRootSignature(provider, terrain_desc);
-    D3D12_DESCRIPTOR_RANGE layered_ranges[3] = {
-        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 1, 0},
-        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 1, 0},
-        {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 1, 0, 0, 0}};
-    const uint32_t layered_slots[] = {kRootParameter_Bindless_ViewHeap,
-                                     kRootParameter_Bindless_DescriptorIndicesPixel,
-                                     kRootParameter_Bindless_SamplerHeap};
-    for (uint32_t i = 0; i < 3; ++i) {
-      auto& parameter = layered_parameters[layered_slots[i]];
-      parameter = {};
-      parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-      parameter.DescriptorTable = {1, &layered_ranges[i]};
-      parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    }
-    auto layered_desc = root_signature_bindless_desc;
-    layered_desc.pParameters = layered_parameters;
-    root_signature_fh1_layered_ = ui::d3d12::util::CreateRootSignature(provider, layered_desc);
     root_parameters_bindless[kRootParameter_Bindless_FloatConstantsVertex].ShaderVisibility =
         D3D12_SHADER_VISIBILITY_DOMAIN;
     root_parameters_bindless[kRootParameter_Bindless_DescriptorIndicesVertex].ShaderVisibility =
@@ -1918,22 +1383,19 @@ bool D3D12CommandProcessor::SetupContext() {
     return false;
   }
 
-  if (Fh1NativeExecutor::Enabled()) {
-    fh1_native_executor_ =
-        std::make_unique<Fh1NativeExecutor>(*this, *register_file_, *memory_);
-    Fh1NativeExecutorConfig native_config;
-    native_config.msaa_2x_supported = render_target_cache_->msaa_2x_supported();
-    native_config.gamma_as_unorm16 = render_target_cache_->gamma_render_target_as_unorm16();
-    native_config.depth_float24_round = render_target_cache_->depth_float24_round();
-    native_config.fixed16_truncated = render_target_cache_->IsFixed16TruncatedToMinus1To1();
-    native_config.memory = shared_memory_.get();
-    native_config.textures = texture_cache_.get();
-    if (!fh1_native_executor_->Initialize(native_config)) {
-      REXGPU_ERROR("Failed to initialize the FH1 native executor");
-      fh1_native_executor_.reset();
-      // Native mode has no EDRAM without the executor.
-      return false;
-    }
+  fh1_native_executor_ = std::make_unique<Fh1NativeExecutor>(*this, *register_file_, *memory_);
+  Fh1NativeExecutorConfig native_config;
+  native_config.msaa_2x_supported = render_target_cache_->msaa_2x_supported();
+  native_config.gamma_as_unorm16 = render_target_cache_->gamma_render_target_as_unorm16();
+  native_config.depth_float24_round = render_target_cache_->depth_float24_round();
+  native_config.fixed16_truncated = render_target_cache_->IsFixed16TruncatedToMinus1To1();
+  native_config.memory = shared_memory_.get();
+  native_config.textures = texture_cache_.get();
+  if (!fh1_native_executor_->Initialize(native_config)) {
+    REXGPU_ERROR("Failed to initialize the FH1 native executor");
+    fh1_native_executor_.reset();
+    // There is no EDRAM without the executor.
+    return false;
   }
 
   pipeline_cache_ = std::make_unique<PipelineCache>(
@@ -2253,62 +1715,23 @@ bool D3D12CommandProcessor::SetupContext() {
             view_bindless_heap_cpu_start_,
             uint32_t(SystemBindlessView::kSharedMemoryR32G32B32A32UintUAV)),
         4);
-    if (render_target_cache_->fh1_config_only()) {
-      // No EDRAM buffer: null views (only the pixel shader interlock path
-      // binds them).
-      for (SystemBindlessView view :
-           {SystemBindlessView::kEdramRawSRV, SystemBindlessView::kEdramR32UintSRV,
-            SystemBindlessView::kEdramR32G32UintSRV,
-            SystemBindlessView::kEdramR32G32B32A32UintSRV}) {
-        ui::d3d12::util::CreateBufferRawSRV(
-            device, provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_, uint32_t(view)),
-            nullptr, 0);
-      }
-      for (SystemBindlessView view :
-           {SystemBindlessView::kEdramRawUAV, SystemBindlessView::kEdramR32UintUAV,
-            SystemBindlessView::kEdramR32G32UintUAV,
-            SystemBindlessView::kEdramR32G32B32A32UintUAV}) {
-        ui::d3d12::util::CreateBufferRawUAV(
-            device, provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_, uint32_t(view)),
-            nullptr, 0);
-      }
-    } else {
-    // kEdramRawSRV.
-    render_target_cache_->WriteEdramRawSRVDescriptor(provider.OffsetViewDescriptor(
-        view_bindless_heap_cpu_start_, uint32_t(SystemBindlessView::kEdramRawSRV)));
-    // kEdramR32UintSRV.
-    render_target_cache_->WriteEdramUintPow2SRVDescriptor(
-        provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
-                                      uint32_t(SystemBindlessView::kEdramR32UintSRV)),
-        2);
-    // kEdramR32G32UintSRV.
-    render_target_cache_->WriteEdramUintPow2SRVDescriptor(
-        provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
-                                      uint32_t(SystemBindlessView::kEdramR32G32UintSRV)),
-        3);
-    // kEdramR32G32B32A32UintSRV.
-    render_target_cache_->WriteEdramUintPow2SRVDescriptor(
-        provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
-                                      uint32_t(SystemBindlessView::kEdramR32G32B32A32UintSRV)),
-        4);
-    // kEdramRawUAV.
-    render_target_cache_->WriteEdramRawUAVDescriptor(provider.OffsetViewDescriptor(
-        view_bindless_heap_cpu_start_, uint32_t(SystemBindlessView::kEdramRawUAV)));
-    // kEdramR32UintUAV.
-    render_target_cache_->WriteEdramUintPow2UAVDescriptor(
-        provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
-                                      uint32_t(SystemBindlessView::kEdramR32UintUAV)),
-        2);
-    // kEdramR32G32UintUAV.
-    render_target_cache_->WriteEdramUintPow2UAVDescriptor(
-        provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
-                                      uint32_t(SystemBindlessView::kEdramR32G32UintUAV)),
-        3);
-    // kEdramR32G32B32A32UintUAV.
-    render_target_cache_->WriteEdramUintPow2UAVDescriptor(
-        provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
-                                      uint32_t(SystemBindlessView::kEdramR32G32B32A32UintUAV)),
-        4);
+    // No EDRAM buffer: the native executor owns EDRAM, so the EDRAM views are
+    // null (only the pixel shader interlock path binds them).
+    for (SystemBindlessView view :
+         {SystemBindlessView::kEdramRawSRV, SystemBindlessView::kEdramR32UintSRV,
+          SystemBindlessView::kEdramR32G32UintSRV,
+          SystemBindlessView::kEdramR32G32B32A32UintSRV}) {
+      ui::d3d12::util::CreateBufferRawSRV(
+          device, provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_, uint32_t(view)),
+          nullptr, 0);
+    }
+    for (SystemBindlessView view :
+         {SystemBindlessView::kEdramRawUAV, SystemBindlessView::kEdramR32UintUAV,
+          SystemBindlessView::kEdramR32G32UintUAV,
+          SystemBindlessView::kEdramR32G32B32A32UintUAV}) {
+      ui::d3d12::util::CreateBufferRawUAV(
+          device, provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_, uint32_t(view)),
+          nullptr, 0);
     }
     // kGammaRampTableSRV.
     WriteGammaRampSRV(
@@ -2335,15 +1758,6 @@ void D3D12CommandProcessor::ShutdownContext() {
   InvalidateAllVertexBufferResidency();
   ShutdownNativeGuestOutputGpuTiming();
   ShutdownOcclusionQueryResources();
-  ClearFh1OwnedGeometry();
-  REXGPU_INFO("FH1 owned geometry imports {}, cache hits {}", fh1_geometry_imports_, fh1_geometry_hits_);
-  REXGPU_INFO(
-      "FH1 geometry admission attempts {}, allocation queries {}, eviction scans {}, "
-      "rejection hits {}, in-flight rejects {}, recent rejects {}, peak bytes {}",
-      fh1_geometry_admission_attempts_, fh1_geometry_allocation_info_calls_,
-      fh1_geometry_eviction_scans_, fh1_geometry_rejection_hits_,
-      fh1_geometry_rejected_in_flight_, fh1_geometry_rejected_recent_,
-      fh1_geometry_peak_bytes_);
 
   ui::d3d12::util::ReleaseAndNull(scratch_buffer_);
   scratch_buffer_size_ = 0;
@@ -2356,15 +1770,6 @@ void D3D12CommandProcessor::ShutdownContext() {
 
   fxaa_source_texture_submission_ = 0;
   fxaa_source_texture_.Reset();
-
-  fh1_tonemap_pipeline_.Reset();
-  fh1_tonemap_root_signature_.Reset();
-  fh1_tonemap_render_target_format_ = DXGI_FORMAT_UNKNOWN;
-  fh1_tonemap_native_draws_ = 0;
-  fh1_velocity_dilate_pipeline_.Reset();
-  fh1_velocity_dilate_root_signature_.Reset();
-  fh1_velocity_dilate_render_target_format_ = DXGI_FORMAT_UNKNOWN;
-  fh1_velocity_dilate_native_draws_ = 0;
 
   fxaa_extreme_pipeline_.Reset();
   fxaa_pipeline_.Reset();
@@ -2392,10 +1797,6 @@ void D3D12CommandProcessor::ShutdownContext() {
   // Root signatures are used by pipelines, thus freed after the pipelines.
   ui::d3d12::util::ReleaseAndNull(root_signature_bindless_ds_);
   ui::d3d12::util::ReleaseAndNull(root_signature_bindless_vs_);
-  ui::d3d12::util::ReleaseAndNull(root_signature_fh1_layered_);
-  ui::d3d12::util::ReleaseAndNull(root_signature_fh1_depth_);
-  ui::d3d12::util::ReleaseAndNull(root_signature_fh1_skinned_);
-  ui::d3d12::util::ReleaseAndNull(root_signature_fh1_terrain_);
   for (auto it : root_signatures_bindful_) {
     it.second->Release();
   }
@@ -2556,12 +1957,6 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
     memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
-    if (graphics_system_->prepared_draw_observer()) {
-      for (uint32_t index = start_index; index <= end_index; ++index) {
-        observation_fetch_origins_[index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0] = {
-            observation_current_packet_address_, observation_indirect_buffer_execution_id_};
-      }
-    }
     cbuffer_binding_fetch_.up_to_date = false;
     uint32_t first_fetch_dword = start_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
     uint32_t last_fetch_dword = end_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
@@ -2583,353 +1978,6 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_up_to_date_ = false;
 }
 
-bool D3D12CommandProcessor::DrawFh1ToneMap(
-    const D3D12Shader::TextureBinding& source,
-    DXGI_FORMAT render_target_format, float exposure) {
-  if (!bindless_resources_used_ || render_target_format == DXGI_FORMAT_UNKNOWN ||
-      (fh1_tonemap_pipeline_ &&
-       fh1_tonemap_render_target_format_ != render_target_format)) {
-    return false;
-  }
-  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
-  ID3D12Device* device = provider.GetDevice();
-  if (!device) {
-    return false;
-  }
-  if (!fh1_tonemap_root_signature_) {
-    D3D12_DESCRIPTOR_RANGE source_range{};
-    source_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    source_range.NumDescriptors = 1;
-    source_range.BaseShaderRegister = 0;
-
-    D3D12_ROOT_PARAMETER parameters[2]{};
-    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    parameters[0].Constants.Num32BitValues = 1;
-    parameters[0].Constants.ShaderRegister = 0;
-    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    parameters[1].DescriptorTable.NumDescriptorRanges = 1;
-    parameters[1].DescriptorTable.pDescriptorRanges = &source_range;
-    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-
-    D3D12_STATIC_SAMPLER_DESC sampler{};
-    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    sampler.MaxAnisotropy = 1;
-    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
-    sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
-    sampler.MaxLOD = D3D12_FLOAT32_MAX;
-    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-
-    D3D12_ROOT_SIGNATURE_DESC desc{};
-    desc.NumParameters = uint32_t(rex::countof(parameters));
-    desc.pParameters = parameters;
-    desc.NumStaticSamplers = 1;
-    desc.pStaticSamplers = &sampler;
-    desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-    *fh1_tonemap_root_signature_.ReleaseAndGetAddressOf() =
-        ui::d3d12::util::CreateRootSignature(provider, desc);
-    if (!fh1_tonemap_root_signature_) {
-      return false;
-    }
-  }
-  if (!fh1_tonemap_pipeline_) {
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
-    desc.pRootSignature = fh1_tonemap_root_signature_.Get();
-    desc.VS = {shaders::fh1_tonemap_vs, sizeof(shaders::fh1_tonemap_vs)};
-    desc.PS = {shaders::fh1_tonemap_ps, sizeof(shaders::fh1_tonemap_ps)};
-    auto& blend = desc.BlendState.RenderTarget[0];
-    blend.SrcBlend = D3D12_BLEND_ONE;
-    blend.DestBlend = D3D12_BLEND_ZERO;
-    blend.BlendOp = D3D12_BLEND_OP_ADD;
-    blend.SrcBlendAlpha = D3D12_BLEND_ONE;
-    blend.DestBlendAlpha = D3D12_BLEND_ZERO;
-    blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
-    blend.LogicOp = D3D12_LOGIC_OP_NOOP;
-    blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    desc.SampleMask = UINT_MAX;
-    desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    desc.RasterizerState.DepthClipEnable = TRUE;
-    desc.DepthStencilState.DepthEnable = FALSE;
-    desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-    desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-    desc.DepthStencilState.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
-    desc.DepthStencilState.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
-    desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    desc.NumRenderTargets = 1;
-    desc.RTVFormats[0] = render_target_format;
-    desc.SampleDesc.Count = 1;
-    if (FAILED(device->CreateGraphicsPipelineState(
-            &desc, IID_PPV_ARGS(fh1_tonemap_pipeline_.ReleaseAndGetAddressOf())))) {
-      return false;
-    }
-    fh1_tonemap_render_target_format_ = render_target_format;
-  }
-
-  const uint32_t source_index =
-      texture_cache_->GetActiveTextureBindlessSRVIndex(source);
-  if (source_index == UINT32_MAX) {
-    return false;
-  }
-  const D3D12_GPU_DESCRIPTOR_HANDLE source_handle =
-      provider.OffsetViewDescriptor(view_bindless_heap_gpu_start_, source_index);
-  SubmitBarriers();
-  SetExternalGraphicsRootSignature(fh1_tonemap_root_signature_.Get());
-  deferred_command_list_.D3DSetGraphicsRoot32BitConstants(
-      0, 1, &exposure, 0);
-  deferred_command_list_.D3DSetGraphicsRootDescriptorTable(1, source_handle);
-  SetExternalPipeline(fh1_tonemap_pipeline_.Get());
-  SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-  deferred_command_list_.D3DDrawInstanced(3, 1, 0, 0);
-  return true;
-}
-
-bool D3D12CommandProcessor::DrawFh1VelocityDilate(
-    const D3D12Shader::TextureBinding& source,
-    DXGI_FORMAT render_target_format) {
-  if (!bindless_resources_used_ || render_target_format == DXGI_FORMAT_UNKNOWN ||
-      (fh1_velocity_dilate_pipeline_ &&
-       fh1_velocity_dilate_render_target_format_ != render_target_format)) {
-    return false;
-  }
-  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
-  ID3D12Device* device = provider.GetDevice();
-  if (!device) {
-    return false;
-  }
-  if (!fh1_velocity_dilate_root_signature_) {
-    D3D12_DESCRIPTOR_RANGE source_range{};
-    source_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    source_range.NumDescriptors = 1;
-    source_range.BaseShaderRegister = 0;
-
-    D3D12_ROOT_PARAMETER parameter{};
-    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    parameter.DescriptorTable.NumDescriptorRanges = 1;
-    parameter.DescriptorTable.pDescriptorRanges = &source_range;
-    parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-
-    D3D12_STATIC_SAMPLER_DESC sampler{};
-    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    sampler.MaxAnisotropy = 1;
-    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
-    sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
-    sampler.MaxLOD = D3D12_FLOAT32_MAX;
-    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-
-    D3D12_ROOT_SIGNATURE_DESC desc{};
-    desc.NumParameters = 1;
-    desc.pParameters = &parameter;
-    desc.NumStaticSamplers = 1;
-    desc.pStaticSamplers = &sampler;
-    desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-    *fh1_velocity_dilate_root_signature_.ReleaseAndGetAddressOf() =
-        ui::d3d12::util::CreateRootSignature(provider, desc);
-    if (!fh1_velocity_dilate_root_signature_) {
-      return false;
-    }
-  }
-  if (!fh1_velocity_dilate_pipeline_) {
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
-    desc.pRootSignature = fh1_velocity_dilate_root_signature_.Get();
-    desc.VS = {shaders::fh1_tonemap_vs, sizeof(shaders::fh1_tonemap_vs)};
-    desc.PS = {shaders::fh1_velocity_dilate_ps,
-               sizeof(shaders::fh1_velocity_dilate_ps)};
-    auto& blend = desc.BlendState.RenderTarget[0];
-    blend.SrcBlend = D3D12_BLEND_ONE;
-    blend.DestBlend = D3D12_BLEND_ZERO;
-    blend.BlendOp = D3D12_BLEND_OP_ADD;
-    blend.SrcBlendAlpha = D3D12_BLEND_ONE;
-    blend.DestBlendAlpha = D3D12_BLEND_ZERO;
-    blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
-    blend.LogicOp = D3D12_LOGIC_OP_NOOP;
-    blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    desc.SampleMask = UINT_MAX;
-    desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    desc.RasterizerState.DepthClipEnable = TRUE;
-    desc.DepthStencilState.DepthEnable = FALSE;
-    desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-    desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-    desc.DepthStencilState.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
-    desc.DepthStencilState.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
-    desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    desc.NumRenderTargets = 1;
-    desc.RTVFormats[0] = render_target_format;
-    desc.SampleDesc.Count = 1;
-    if (FAILED(device->CreateGraphicsPipelineState(
-            &desc, IID_PPV_ARGS(
-                       fh1_velocity_dilate_pipeline_.ReleaseAndGetAddressOf())))) {
-      return false;
-    }
-    fh1_velocity_dilate_render_target_format_ = render_target_format;
-  }
-
-  const uint32_t source_index =
-      texture_cache_->GetActiveTextureBindlessSRVIndex(source);
-  if (source_index == UINT32_MAX) {
-    return false;
-  }
-  const D3D12_GPU_DESCRIPTOR_HANDLE source_handle =
-      provider.OffsetViewDescriptor(view_bindless_heap_gpu_start_, source_index);
-  SubmitBarriers();
-  SetExternalGraphicsRootSignature(fh1_velocity_dilate_root_signature_.Get());
-  deferred_command_list_.D3DSetGraphicsRootDescriptorTable(0, source_handle);
-  SetExternalPipeline(fh1_velocity_dilate_pipeline_.Get());
-  SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-  deferred_command_list_.D3DDrawInstanced(3, 1, 0, 0);
-  return true;
-}
-
-static bool ClearNativeGuestOutput(
-    const system::NativeGuestOutputRenderContext& context,
-    const float color[4]) {
-  auto* processor = static_cast<D3D12CommandProcessor*>(context.command_context);
-  auto* resource = static_cast<ID3D12Resource*>(context.guest_output);
-  auto* device = static_cast<ID3D12Device*>(context.device);
-  if (!processor || !resource || !device || !color) return false;
-  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor;
-  if (!processor->RequestOneUseSingleViewDescriptors(1, &descriptor))
-    return false;
-  D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
-  view.Format = ui::d3d12::D3D12Presenter::kGuestOutputFormat;
-  view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-  device->CreateUnorderedAccessView(resource, nullptr, &view, descriptor.first);
-  processor->PushTransitionBarrier(
-      resource, ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
-      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-  processor->SubmitBarriers();
-  processor->GetDeferredCommandList().D3DClearUnorderedAccessViewFloat(
-      descriptor.second, descriptor.first, resource, color, 0, nullptr);
-  processor->PushTransitionBarrier(
-      resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-      ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
-  return true;
-}
-
-static bool ClearNativeGuestUiOutput(
-    const system::NativeGuestOutputRenderContext& context,
-    const float color[4]) {
-  if (context.phase != system::NativeGuestOutputPhase::kBeforeUi ||
-      !context.command_context) return false;
-  return static_cast<D3D12CommandProcessor*>(context.command_context)
-      ->ClearFh1UiOutput(color);
-}
-
-void D3D12CommandProcessor::ConfigureFh1NativeContext(
-    system::NativeGuestOutputRenderContext& native_context) {
-  if (const auto depth = fh1_initial_color_depth_frames_.find(
-          native_context.frame_sequence);
-      depth != fh1_initial_color_depth_frames_.end())
-    native_context.fh1_initial_color_depth = depth->second.Get();
-  native_context.shader = +[](
-      const system::NativeGuestOutputRenderContext& context,
-      uint32_t stage, uint64_t guest_hash, uint64_t modification,
-      const uint8_t** bytecode, size_t* bytecode_size) {
-    if (!context.command_context || !bytecode || !bytecode_size ||
-        stage > 1) return false;
-    const auto* processor = static_cast<const D3D12CommandProcessor*>(
-        context.command_context);
-    if (!processor->pipeline_cache_) return false;
-    const auto* entry = processor->pipeline_cache_->FindFh1ShaderPackEntry(
-        xenos::ShaderType(stage), guest_hash, modification);
-    if (!entry) return false;
-    *bytecode = entry->bytecode.data();
-    *bytecode_size = entry->bytecode.size();
-    return true;
-  };
-  native_context.texture = +[](
-      const system::NativeGuestOutputRenderContext& context,
-      const uint32_t fetch_words[6], uint64_t allocation_id,
-      uint64_t payload_generation, void** resource, void* view,
-      bool* immutable) {
-    if (!context.command_context || !fetch_words || !resource || !view ||
-        !immutable ||
-        !allocation_id || !payload_generation) return false;
-    *immutable = false;
-    auto* processor = static_cast<D3D12CommandProcessor*>(
-        context.command_context);
-    if (!processor->texture_cache_) return false;
-    std::array<uint32_t, 6> words;
-    std::copy_n(fetch_words, words.size(), words.begin());
-    for (uint32_t lag = 0; lag <= 2 && context.frame_sequence >= lag; ++lag) {
-      const uint64_t source_frame = context.frame_sequence - lag;
-      if (const auto frame = processor->fh1_native_material_frames_.find(
-              source_frame);
-          frame != processor->fh1_native_material_frames_.end()) {
-        const auto found = frame->second.materials.find(
-            {words, allocation_id, payload_generation});
-        if (found != frame->second.materials.end() &&
-            found->second.snapshot) {
-          static thread_local bool reported_pinned_material = false;
-          if (!reported_pinned_material) {
-            REXGPU_INFO("FH1 native source-pinned material frame={} "
-                        "allocation={} generation={}",
-                        source_frame, allocation_id,
-                        payload_generation);
-            reported_pinned_material = true;
-          }
-          *resource = found->second.snapshot.Get();
-          *static_cast<D3D12_SHADER_RESOURCE_VIEW_DESC*>(view) =
-              found->second.view;
-          *immutable = true;
-          return true;
-        }
-      }
-    }
-    xenos::xe_gpu_texture_fetch_t fetch;
-    static_assert(sizeof(fetch) == 6 * sizeof(uint32_t));
-    std::memcpy(&fetch, fetch_words, sizeof(fetch));
-    D3D12_SHADER_RESOURCE_VIEW_DESC descriptor{};
-    xenos::TextureFormat format;
-    system::GraphicsFinalDrawTextureIdentity identity;
-    ID3D12Resource* texture = processor->texture_cache_->RequestSwapTexture(
-        descriptor, format, nullptr, nullptr,
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &fetch, &identity);
-    processor->SubmitBarriers();
-    if (!texture || identity.allocation_id != allocation_id ||
-        identity.payload_generation != payload_generation ||
-        identity.outdated_mask ||
-        texture->GetDesc().DepthOrArraySize != 1) {
-      REXGPU_INFO("FH1 native texture rejected frame={} expected={}:{} "
-                  "actual={}:{} dirty={} resource={}",
-                  context.frame_sequence, allocation_id,
-                  payload_generation, identity.allocation_id,
-                  identity.payload_generation, identity.outdated_mask,
-                  bool(texture));
-      return false;
-    }
-    *resource = texture;
-    *static_cast<D3D12_SHADER_RESOURCE_VIEW_DESC*>(view) = descriptor;
-    return true;
-  };
-}
-
-void D3D12CommandProcessor::RestoreFh1AfterNativeUi() {
-  current_guest_pipeline_ = nullptr;
-  current_external_pipeline_ = nullptr;
-  current_graphics_root_signature_ = nullptr;
-  current_graphics_root_up_to_date_ = 0;
-  ff_viewport_update_needed_ = true;
-  ff_scissor_update_needed_ = true;
-  viewport_cache_valid_ = false;
-  primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
-  if (bindless_resources_used_) {
-    deferred_command_list_.SetDescriptorHeaps(view_bindless_heap_,
-                                              sampler_bindless_heap_current_);
-  } else {
-    deferred_command_list_.SetDescriptorHeaps(view_bindful_heap_current_,
-                                              sampler_bindful_heap_current_);
-  }
-  if (!render_target_cache_->fh1_config_only()) render_target_cache_->RestoreFh1UiOutputTargets();
-}
-
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   if (Fh1FrameCensus::Enabled()) {
@@ -2938,15 +1986,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                                 frontbuffer_height,
                                 uint32_t(register_file_->GetTextureFetch(0).format));
   }
-  if (fh1_native_executor_ && observation_frame_sequence_ % 600 == 0) {
-    // Native mode: the EDRAM emulation must do no work at all.
-    const auto work = render_target_cache_->fh1_work_counters();
-    REXGPU_INFO(
-        "FH1 xenos edram work: updates={} resolves={} render_targets={} "
-        "transfer_tile_passes={}",
-        work.updates, work.resolves, work.render_targets, work.transfer_tile_passes);
-  }
-  if (fh1_native_executor_) {
+  {
     const xenos::TextureFormat front_format = register_file_->GetTextureFetch(0).format;
     const uint32_t* gamma_pwl =
         front_format == xenos::TextureFormat::k_2_10_10_10 ||
@@ -2955,36 +1995,6 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             : nullptr;
     fh1_native_executor_->OnSwap(observation_frame_sequence_, frontbuffer_ptr,
                                  frontbuffer_width, frontbuffer_height, gamma_pwl);
-  }
-  static thread_local int64_t previous_cpu_ns = 0;
-  if (Fh1NativeRaceCaptureStartFrame()) {
-    const int64_t cpu_ns = perf::CurrentThreadCpuTimeNs();
-    if (previous_cpu_ns && cpu_ns >= previous_cpu_ns)
-      PERF_counter_add(kFh1GpuThreadCpuTimeNs, cpu_ns - previous_cpu_ns);
-    previous_cpu_ns = cpu_ns;
-  } else {
-    previous_cpu_ns = 0;
-  }
-  if (observation_frame_sequence_ % 600 == 0) {
-    const auto& reflection_imports = texture_cache_->GetFh1ReflectionImportStats();
-    REXGPU_INFO(
-        "FH1 native reflection mips enabled={} candidates={} native_faces={} fallback_lists={} "
-        "replaced_draws={} replaced_copies={} rejected_guard/state/contract/publication={}/{}/{}/{} "
-        "cube_imports={} cube_direct_imports={} cube_subresource_copies={} cube_guest_bytes={} "
-        "cube_upload_bytes={}",
-        REXCVAR_GET(fh1_native_reflection_mips), fh1_mip_candidates_, fh1_mip_native_faces_,
-        fh1_mip_candidates_ - fh1_mip_native_faces_, fh1_mip_native_faces_ * 8,
-        fh1_mip_native_faces_ * 8, fh1_mip_rejections_[0], fh1_mip_rejections_[1],
-        fh1_mip_rejections_[2], fh1_mip_rejections_[3], reflection_imports.loads,
-        reflection_imports.direct_loads, reflection_imports.subresource_copies,
-        reflection_imports.guest_bytes, reflection_imports.upload_bytes);
-    if (REXCVAR_GET(fh1_mip_decode_probe) && fh1_mip_probe_faces_) {
-      REXGPU_INFO(
-          "FH1 mip decode probe {{\"faces\":{},\"contract_ns\":{},"
-          "\"native_ns\":{},\"replay_ns\":{}}}",
-          fh1_mip_probe_faces_, fh1_mip_probe_contract_ns_, fh1_mip_probe_native_ns_,
-          fh1_mip_probe_replay_ns_);
-    }
   }
 
   SCOPE_profile_cpu_f("gpu");
@@ -3091,121 +2101,6 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             static_cast<ui::d3d12::D3D12Presenter::D3D12GuestOutputRefreshContext&>(context)
                 .resource_uav_capable();
         auto renderer = graphics_system_->native_guest_output_renderer().Get();
-        system::NativeGuestOutputRenderContext native_context;
-        if (renderer) {
-          SubmitBarriers();
-          native_context.backend = system::NativeGuestOutputBackend::kD3D12;
-          native_context.phase = system::NativeGuestOutputPhase::kNativeAttempt;
-          native_context.guest_output_width = guest_output_width;
-          native_context.guest_output_height = guest_output_height;
-          native_context.display_width = display_width;
-          native_context.display_height = display_height;
-          native_context.output_format =
-              uint32_t(ui::d3d12::D3D12Presenter::kGuestOutputFormat);
-          native_context.device = device;
-          native_context.command_context = this;
-          native_context.deferred_command_list = &deferred_command_list_;
-          native_context.guest_output = guest_output_resource;
-          native_context.guest_output_state =
-              uint32_t(ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
-          native_context.submission = submission_current_;
-          native_context.completed_submission = submission_completed_;
-          native_context.frame_sequence = observation_frame_sequence_ - 1;
-          native_context.clear_color = &ClearNativeGuestOutput;
-          for (auto it = fh1_native_material_frames_.begin();
-               it != fh1_native_material_frames_.end() &&
-               it->first + 2 < native_context.frame_sequence;) {
-            for (auto& item : it->second.materials) {
-              auto& material = item.second;
-              if (material.source) {
-                resources_for_deletion_.emplace_back(submission_current_,
-                                                     material.source.Get());
-                material.source.Detach();
-              }
-              if (material.snapshot) {
-                resources_for_deletion_.emplace_back(submission_current_,
-                                                     material.snapshot.Get());
-                material.snapshot.Detach();
-              }
-            }
-            it = fh1_native_material_frames_.erase(it);
-          }
-          for (auto it = fh1_initial_color_depth_frames_.begin();
-               it != fh1_initial_color_depth_frames_.end() &&
-               it->first + 2 < native_context.frame_sequence;) {
-            resources_for_deletion_.emplace_back(
-                submission_current_, it->second.Detach());
-            it = fh1_initial_color_depth_frames_.erase(it);
-          }
-          ConfigureFh1NativeContext(native_context);
-          if (auto captured = fh1_native_material_frames_.find(
-                  native_context.frame_sequence);
-              captured != fh1_native_material_frames_.end() &&
-              !captured->second.trace_reported &&
-              native_context.frame_sequence == std::strtoull(
-                  rex::cvar::GetFlagByName(
-                      "pinyon_shift_snr01_trace_source_frame").c_str(),
-                  nullptr, 10)) {
-            const auto& frame = captured->second;
-            REXGPU_WARN("FH1 RAY00 pinned textures frame={} versions={} "
-                        "bytes={} failed_attempts={} limited_attempts={}",
-                        native_context.frame_sequence, frame.materials.size(),
-                        frame.bytes, frame.trace_failed, frame.trace_limited);
-            char* output_dir = nullptr;
-            size_t output_length = 0;
-            if (!_dupenv_s(&output_dir, &output_length,
-                           "PINYON_SHIFT_FH1_RENDER_TEST_OUTPUT") &&
-                output_dir && *output_dir) {
-              const auto path = std::filesystem::path(output_dir) /
-                  fmt::format("ordered-texture-pins-{}.csv",
-                              native_context.frame_sequence);
-              std::error_code error;
-              std::filesystem::create_directories(path.parent_path(), error);
-              std::ofstream manifest(path, std::ios::trunc);
-              if (manifest) {
-                manifest << "word0,word1,word2,word3,word4,word5,"
-                            "allocation_id,payload_generation,format,"
-                            "dimension,width,height,depth_or_array,mips\n";
-                for (const auto& [key, material] : frame.materials) {
-                  const auto& words = std::get<0>(key);
-                  for (uint32_t word : words) manifest << word << ',';
-                  const auto desc = material.snapshot->GetDesc();
-                  manifest << std::get<1>(key) << ',' << std::get<2>(key)
-                           << ',' << uint32_t(desc.Format) << ','
-                           << uint32_t(desc.Dimension) << ',' << desc.Width
-                           << ',' << desc.Height << ',' << desc.DepthOrArraySize
-                           << ',' << desc.MipLevels << '\n';
-                }
-              }
-            }
-            std::free(output_dir);
-            captured->second.trace_reported = true;
-          }
-          const auto native_output_begin = Fh1NativeRaceCaptureStartFrame()
-              ? std::chrono::steady_clock::now()
-              : std::chrono::steady_clock::time_point{};
-          const bool native_output_ready =
-              fh1_ui_injected_frame_ != native_context.frame_sequence &&
-              renderer(native_context);
-          if (native_output_begin != std::chrono::steady_clock::time_point{})
-            PERF_counter_add(kFh1NativeOutputCpuTimeNs,
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - native_output_begin).count());
-          if (native_output_ready) {
-            context.SetIs8bpc(false);
-            SubmitBarriers();
-            native_context.phase = system::NativeGuestOutputPhase::kPresented;
-            native_context.presenter = system::NativeGuestOutputPresenter::kPilot;
-            native_context.clear_color = nullptr;
-            native_context.shader = nullptr;
-            native_context.texture = nullptr;
-            native_context.deferred_command_list = nullptr;
-            renderer(native_context);
-            SubmitBarriers();
-            EndSubmission(true);
-            return true;
-          }
-        }
 
         SwapPostEffect swap_post_effect = GetActualSwapPostEffect();
         bool use_fxaa = swap_post_effect == SwapPostEffect::kFxaa ||
@@ -3459,16 +2354,26 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         // queue.
         SubmitBarriers();
         if (renderer) {
+          // Notify the host of the presented guest output (render tests
+          // capture it here).
+          system::NativeGuestOutputRenderContext native_context;
+          native_context.backend = system::NativeGuestOutputBackend::kD3D12;
           native_context.phase = system::NativeGuestOutputPhase::kPresented;
-          native_context.presenter =
-              fh1_native_executor_
-                  ? system::NativeGuestOutputPresenter::kNativeExecutor
-                  : system::NativeGuestOutputPresenter::kXenos;
-          native_context.clear_color = nullptr;
-          native_context.shader = nullptr;
-          native_context.deferred_command_list = nullptr;
+          native_context.presenter = system::NativeGuestOutputPresenter::kNativeExecutor;
+          native_context.guest_output_width = guest_output_width;
+          native_context.guest_output_height = guest_output_height;
+          native_context.display_width = display_width;
+          native_context.display_height = display_height;
+          native_context.output_format = uint32_t(ui::d3d12::D3D12Presenter::kGuestOutputFormat);
+          native_context.device = device;
+          native_context.command_context = this;
+          native_context.guest_output = guest_output_resource;
+          native_context.guest_output_state =
+              uint32_t(ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
+          native_context.submission = submission_current_;
+          native_context.completed_submission = submission_completed_;
+          native_context.frame_sequence = observation_frame_sequence_ - 1;
           native_context.use_pwl_gamma_ramp = use_pwl_gamma_ramp;
-          native_context.xenos_fxaa_applied = use_fxaa;
           renderer(native_context);
         }
         SubmitBarriers();
@@ -3479,36 +2384,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
   EndSubmission(true);
-
-  static std::unique_ptr<rex::ui::RenderDocAPI> snr04_renderdoc;
-  static bool snr04_capture_started = false;
-  const uint64_t snr04_source_frame =
-      Fh1Snr04RenderDocFrame(observation_frame_sequence_);
-  const uint64_t snr04_capture_end_frame = snr04_source_frame +
-      (rex::cvar::GetFlagByName(
-           "pinyon_shift_snr03_probe_following_frame") == "true" ? 2 : 1);
-  if (snr04_source_frame && observation_frame_sequence_ == snr04_source_frame) {
-    snr04_renderdoc = rex::ui::RenderDocAPI::CreateIfConnected();
-    if (snr04_renderdoc && !snr04_renderdoc->api_1_0_0()->IsFrameCapturing()) {
-      snr04_renderdoc->api_1_0_0()->StartFrameCapture(GetD3D12Provider().GetDevice(), nullptr);
-      snr04_capture_started = snr04_renderdoc->api_1_0_0()->IsFrameCapturing();
-      REXGPU_INFO("SNR04 RenderDoc capture start next_output_frame={} started={}",
-                  observation_frame_sequence_ + 1, snr04_capture_started);
-    }
-  } else if (snr04_source_frame &&
-             observation_frame_sequence_ == snr04_capture_end_frame &&
-             snr04_capture_started) {
-    const bool saved = snr04_renderdoc->api_1_0_0()->EndFrameCapture(
-        GetD3D12Provider().GetDevice(), nullptr);
-    REXGPU_INFO("SNR04 RenderDoc capture end output_frame={} saved={}",
-                observation_frame_sequence_, saved);
-    snr04_capture_started = false;
-    snr04_renderdoc.reset();
-  }
 }
 
 void D3D12CommandProcessor::FlushCpuVisibleResults() {
-  if (fh1_native_executor_) fh1_native_executor_->FlushResolveReadbacks();
+  fh1_native_executor_->FlushResolveReadbacks();
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
@@ -3529,111 +2408,17 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+  // The primitive processor reads the draw description from the registers.
+  (void)primitive_type;
+  (void)index_count;
+  (void)major_mode_explicit;
 
-  const bool time_fh1_draw = Fh1NativeRaceCaptureStartFrame() &&
-      fh1_native_race_requested.load(std::memory_order_acquire);
-  struct Fh1DrawClock {
-    bool active;
-    std::chrono::steady_clock::time_point begin;
-    ~Fh1DrawClock() {
-      if (!active) return;
-      PERF_counter_add(kFh1IssueDrawCpuTimeNs,
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now() - begin).count());
-      PERF_counter_inc(kFh1IssueDrawCalls);
-    }
-  } fh1_draw_clock{time_fh1_draw, time_fh1_draw
-      ? std::chrono::steady_clock::now()
-      : std::chrono::steady_clock::time_point{}};
-
-  const auto fh1_prepare_start =
-      Fh1GpuCorpusEnabled() && Fh1ObserveCorpusFrame(observation_frame_sequence_) ? std::chrono::steady_clock::now()
-                            : std::chrono::steady_clock::time_point{};
-  static const bool ordered_trace = std::strtoull(
-      rex::cvar::GetFlagByName("pinyon_shift_snr01_trace_source_frame").c_str(),
-      nullptr, 10) != 0;
-  if (Fh1GpuCorpusEnabled() || Fh1Snr04LiveHandoffEnabled() || ordered_trace) {
-    ++fh1_scene_draw_sequence_;
-  }
-
-  ID3D12Device* device = GetD3D12Provider().GetDevice();
   const RegisterFile& regs = *register_file_;
-  static const uint64_t ray_ui_capture_frame = std::strtoull(
-      rex::cvar::GetFlagByName("pinyon_shift_snr01_trace_source_frame").c_str(),
-      nullptr, 10);
-  static const bool ray_ui_live =
-      rex::cvar::GetFlagByName("pinyon_shift_native_ui_live") == "true";
-  static const uint64_t ray_ui_shadow_start = [] {
-    const auto configured = std::strtoull(
-        rex::cvar::GetFlagByName(
-            "pinyon_shift_native_ui_shadow_start_frame").c_str(),
-        nullptr, 10);
-    return configured ? configured : ray_ui_live ? uint64_t(1) : uint64_t(0);
-  }();
-  const bool ray_trace_frame =
-      ray_ui_capture_frame && ray_ui_capture_frame == observation_frame_sequence_;
-  const bool ray_ordered_frame =
-      Fh1RayOrderedLiveFrame(observation_frame_sequence_);
-  const bool ray_shadow_frame = ray_ui_shadow_start &&
-      observation_frame_sequence_ >= ray_ui_shadow_start &&
-      (observation_frame_sequence_ - ray_ui_shadow_start < 24 ||
-       (ray_ui_live && fh1_native_race_requested.load(std::memory_order_acquire) &&
-        graphics_system_->prepared_draw_frame_selector() &&
-        graphics_system_->prepared_draw_frame_selector()(
-            observation_frame_sequence_)));
-  bool ray_prepared_observed = false, ray_final_observed = false;
-  const auto finish_draw = [&](bool succeeded) {
-    if (ray_trace_frame && !ray_final_observed &&
-        regs.Get<reg::RB_MODECONTROL>().edram_mode != xenos::EdramMode::kCopy)
-      REXGPU_INFO("FH1 RAY00 draw exit frame={} sequence={} prepared={} "
-                  "final={} succeeded={}", observation_frame_sequence_,
-                  fh1_scene_draw_sequence_, ray_prepared_observed,
-                  ray_final_observed, succeeded);
-    return succeeded;
-  };
-  const auto report_clear = [&](uint32_t mode, uint32_t flags,
-                                uint32_t stencil_reference,
-                                std::span<const Fh1ClearRectangle> rectangles,
-                                std::span<const std::array<float, 4>> colors) {
-    if (Fh1FrameCensus::Enabled())
-      Fh1FrameCensus::ObserveOptimizedClear(observation_frame_sequence_, mode);
-    if (!ray_trace_frame && !ray_ordered_frame) return;
-    const auto observer = graphics_system_->fh1_clear_observer();
-    if (!observer) return;
-    system::GraphicsFh1ClearObservation observation;
-    observation.frame_sequence = observation_frame_sequence_;
-    observation.draw_sequence = fh1_scene_draw_sequence_;
-    observation.surface_info = regs.Get<reg::RB_SURFACE_INFO>().value;
-    observation.color_info =
-        regs[reg::RB_COLOR_INFO::rt_register_indices[0]];
-    observation.depth_info = regs.Get<reg::RB_DEPTH_INFO>().value;
-    observation.mode = mode;
-    observation.flags = flags;
-    observation.stencil_reference = stencil_reference;
-    observation.rectangle_count = uint32_t(rectangles.size());
-    for (size_t i = 0; i < rectangles.size(); ++i) {
-      std::copy(rectangles[i].bounds.begin(), rectangles[i].bounds.end(),
-                observation.bounds[i]);
-      observation.depth[i] = rectangles[i].depth;
-      if (i < colors.size())
-        std::copy(colors[i].begin(), colors[i].end(),
-                  observation.colors[i]);
-    }
-    observer(observation);
-  };
 
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
-    return finish_draw(IssueCopy());
-  }
-
-  if (fh1_mip_replacement_active_) {
-    ++fh1_mip_skipped_draws_;
-    if (ray_trace_frame)
-      REXGPU_INFO("FH1 RAY00 mip skip frame={} sequence={}",
-                  observation_frame_sequence_, fh1_scene_draw_sequence_);
-    return true;
+    return IssueCopy();
   }
 
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
@@ -3642,7 +2427,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   auto vertex_shader = static_cast<D3D12Shader*>(active_vertex_shader());
   if (!vertex_shader) {
     // Always need a vertex shader.
-    return finish_draw(false);
+    return false;
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
@@ -3653,7 +2438,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (surface_pitch_is_zero && is_rasterization_done) {
     // Doesn't actually draw.
     // Unlikely that zero would even really be legal though.
-    return finish_draw(true);
+    return true;
   }
   D3D12Shader* pixel_shader = nullptr;
   if (is_rasterization_done) {
@@ -3673,7 +2458,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // cache.
     if (!memexport_used_vertex) {
       // This draw has no effect.
-      return finish_draw(true);
+      return true;
     }
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
@@ -3689,77 +2474,21 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     const auto no_output_depth = draw_util::GetNormalizedDepthControl(regs);
     if (!no_output_depth.z_enable && !no_output_depth.stencil_enable &&
         !draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())) {
-      return finish_draw(true);
+      return true;
     }
   }
 
   if (!BeginSubmission(true)) {
-    return finish_draw(false);
+    return false;
   }
 
-  const uint64_t fh1_vertex_hash = vertex_shader->ucode_data_hash();
-  const uint64_t fh1_pixel_hash =
-      pixel_shader ? pixel_shader->ucode_data_hash() : 0;
-  const uint32_t ray_color =
-      regs[reg::RB_COLOR_INFO::rt_register_indices[0]];
-  const bool ray_ordered_producer = ray_ordered_frame &&
-      ((ray_color == 720 && fh1_pixel_hash) ||
-       (regs.Get<reg::RB_SURFACE_INFO>().value == 335676672 &&
-        ray_color == 786432 &&
-        fh1_vertex_hash == 0x21FBB5F33759B350ull &&
-        fh1_pixel_hash == 0xCF453BD52292E8E8ull) ||
-       (regs.Get<reg::RB_SURFACE_INFO>().value == 335545600 &&
-        ray_color == 196608 &&
-        fh1_vertex_hash == 0x2C53E1A563484076ull &&
-        (fh1_pixel_hash == 0xE17BECBE8BE65806ull ||
-         fh1_pixel_hash == 0xAE59F518D522BDD1ull)));
-  const uint32_t fh1_depth_stride =
-      fh1_vertex_hash == 0x9BF2991815B941B9ull ? 20 :
-      fh1_vertex_hash == 0xC8C39E5AE1B08DE6ull ? 24 :
-      fh1_vertex_hash == 0xB646F85EF69A57E0ull ? 28 :
-      fh1_vertex_hash == 0xD0C40C04F166092Eull ? 32 : 0;
-  const bool fh1_terrain_depth = fh1_vertex_hash == 0x5A28C7FAFD86F112ull ||
-      fh1_vertex_hash == 0xCA293E0A1CB4B416ull || fh1_vertex_hash == 0x4E1DA281CC3D7EDBull;
-  const uint32_t fh1_scene_stride =
-      fh1_vertex_hash == 0xB8489164D5A86043ull && fh1_pixel_hash == 0x68150A8E959006CDull ? 32 :
-      fh1_vertex_hash == 0xA3B9ED5D5C87230Eull ? 12 :
-      fh1_vertex_hash == 0x6934E161812AB10Bull ? 28 :
-      fh1_vertex_hash == 0xAD2C355A6BE1EE87ull && fh1_pixel_hash == 0x2F2137BF953DA7AFull ? 20 :
-      fh1_vertex_hash == 0x8D8A197476841A9Aull && fh1_pixel_hash == 0xBA6A2871A980A4E8ull ? 16 : 0;
-  // The owned geometry cache feeds the Xenos-side families only; with the
-  // native executor both renderers fetch guest indices and vertices as-is.
-  const bool fh1_depth_indices = !fh1_native_executor_ &&
-      (((fh1_depth_stride || fh1_terrain_depth) && !pixel_shader) ||
-      fh1_scene_stride) && !memexport_used &&
-      render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
-  // With the native executor, Xenos renders these guest draws as-is so both
-  // renderers execute the same stream.
-  const bool fh1_native_velocity_candidate = !fh1_native_executor_ &&
-      fh1_vertex_hash == 0xC7D52884ECA9A039ull &&
-      fh1_pixel_hash == 0xECE830AC0333767Full;
-  const bool fh1_native_draw_candidate = fh1_native_velocity_candidate ||
-      (!fh1_native_executor_ && fh1_vertex_hash == 0xA2FC50159EB69BA2ull &&
-       fh1_pixel_hash == 0x618DD627F3D3B9A4ull);
-  // FH1's fullscreen rectangle is auto-indexed with no conversion. Keep the
-  // exact guest description for admission and fallback; native geometry is
-  // supplied by SV_VertexID. Other backend expansion modes use Process.
-  const bool native_primitive_prepared = fh1_native_velocity_candidate &&
-      index_count == 3 && regs.Get<reg::VGT_DRAW_INITIATOR>().value == 0x00030088 &&
-      regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().value == 0 &&
-      !primitive_processor_->IsExpandingRectangleListsInVS();
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
-  if (native_primitive_prepared) {
-    primitive_processing_result = {
-        xenos::PrimitiveType::kRectangleList, xenos::PrimitiveType::kRectangleList,
-        Shader::HostVertexShaderType::kVertex, regs.Get<reg::VGT_HOS_CNTL>().tess_mode,
-        3, 3, 0, PrimitiveProcessor::ProcessedIndexBufferType::kNone, 0,
-        xenos::IndexFormat::kInt16, xenos::Endian::kNone, false, SIZE_MAX};
-  } else if (!primitive_processor_->Process(primitive_processing_result, fh1_depth_indices)) {
-    return finish_draw(false);
+  if (!primitive_processor_->Process(primitive_processing_result)) {
+    return false;
   }
   if (!primitive_processing_result.host_draw_vertex_count) {
     // Nothing to draw.
-    return finish_draw(true);
+    return true;
   }
 
   reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
@@ -3785,124 +2514,23 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   uint32_t normalized_color_mask =
       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                    : 0;
-  // A6's 2x depth-only design failed North Carson tail qualification.
-  // The native executor replays the guest clear draws these shortcuts replace.
-  const bool owned_depth_clear = REXCVAR_GET(fh1_owned_depth_clear) && !fh1_native_executor_ &&
-      texture_cache_->draw_resolution_scale_x() == 1 &&
-      texture_cache_->draw_resolution_scale_y() == 1 &&
-      !normalized_depth_control.stencil_enable;
-  const bool owned_tile_clear = REXCVAR_GET(fh1_owned_depth_tile_clear) && !fh1_native_executor_ &&
-      normalized_depth_control.stencil_enable &&
-      !regs.Get<reg::RB_STENCILREFMASK>().stencilref &&
-      (!normalized_depth_control.backface_enable ||
-       !regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF).stencilref);
-  if ((owned_depth_clear || owned_tile_clear) && is_rasterization_done &&
-      fh1_vertex_hash == 0x1E6883FCCDE1F688ull && !memexport_used &&
-      !pixel_shader && !normalized_color_mask &&
-      normalized_depth_control.z_enable && normalized_depth_control.z_write_enable &&
-      regs.Get<reg::RB_SURFACE_INFO>().msaa_samples == xenos::MsaaSamples::k4X &&
-      regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24S8 &&
-      !active_occlusion_query_.valid && !zpd_lifecycle_.active_report() &&
-      modern_occlusion_query_active_index_ == UINT32_MAX &&
-      (index_count == 3 || index_count == 6) &&
-      primitive_processing_result.index_buffer_type == PrimitiveProcessor::ProcessedIndexBufferType::kNone &&
-      primitive_processing_result.guest_primitive_type == xenos::PrimitiveType::kRectangleList &&
-      primitive_processing_result.host_draw_vertex_count == index_count &&
-      !regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable) {
-    const auto try_owned_clear = [&]() {
-      // Validate the same pipeline description as the established clear path,
-      // without first asking Update to materialize its 4x target.
-      auto* translation = static_cast<D3D12Shader::D3D12Translation*>(
-          vertex_shader->GetOrCreateTranslation(vertex_shader_modification.value));
-      const uint32_t formats[1 + xenos::kMaxColorRenderTargets] = {
-          uint32_t(xenos::DepthRenderTargetFormat::kD24S8)};
-      void* clear_pipeline = nullptr;
-      ID3D12RootSignature* clear_root = nullptr;
-      if (!pipeline_cache_->ConfigurePipeline(translation, nullptr, primitive_processing_result,
-          normalized_depth_control, 0, 1, formats, &clear_pipeline, &clear_root) ||
-          !pipeline_cache_->IsFh1ClearPipeline(clear_pipeline)) return false;
-      const uint32_t sx = texture_cache_->draw_resolution_scale_x();
-      const uint32_t sy = texture_cache_->draw_resolution_scale_y();
-      const bool convert = render_target_cache_->depth_float24_convert_in_pixel_shader();
-      draw_util::ViewportInfo viewport;
-      draw_util::GetHostViewportInfo(regs, sx, sy, true,
-          D3D12_VIEWPORT_BOUNDS_MAX, D3D12_VIEWPORT_BOUNDS_MAX, false,
-          normalized_depth_control, convert, true, false, viewport);
-      draw_util::Scissor clip;
-      draw_util::GetScissor(regs, clip);
-      clip.offset[0] *= sx; clip.offset[1] *= sy;
-      clip.extent[0] *= sx; clip.extent[1] *= sy;
-      UpdateSystemConstantValues(false, primitive_polygonal,
-          primitive_processing_result.line_loop_closing_index,
-          primitive_processing_result.host_shader_index_endian, viewport, 0,
-          normalized_depth_control, 0);
-      std::array<uint32_t, 120> system{};
-      static_assert(sizeof(system_constants_) <= sizeof(system));
-      std::memcpy(system.data(), &system_constants_, sizeof(system_constants_));
-      if ((system[0] & 1u) || system[4] || system[5] || system[6] ||
-          system[7] < index_count - 1 || (system[3] && system[3] < index_count)) return false;
-      const uint32_t fetch_address = regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0];
-      if ((fetch_address & 3u) != 3u) return false;
-      std::array<uint8_t, 168> bytes;
-      if (!shared_memory_->CopyCpuSnapshot(fetch_address & ~3u,
-          std::span<uint8_t>(bytes).first(index_count * 28))) return false;
-      std::array<Fh1ClearRectangle, 2> rectangles;
-      const uint32_t count = index_count / 3;
-      for (uint32_t i = 0; i < count; ++i) {
-        std::array<std::array<float, 4>, 3> vertices;
-        for (uint32_t j = 0; j < 3; ++j) {
-          const auto vertex = fh1_clear_vertex(
-              std::span<const uint8_t, 28>(bytes.data() + (i * 3 + j) * 28, 28),
-              regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_1] & 3u, system, false);
-          if (!vertex) return false;
-          std::copy_n(vertex->begin(), 4, vertices[j].begin());
-        }
-        const auto rectangle = fh1_clear_rectangle(vertices,
-            {viewport.xy_offset[0], viewport.xy_offset[1], viewport.xy_extent[0], viewport.xy_extent[1]},
-            {viewport.z_min, viewport.z_max},
-            {clip.offset[0], clip.offset[1], clip.extent[0], clip.extent[1]});
-        if (!rectangle || (convert && rectangle->depth != 0)) return false;
-        rectangles[i] = *rectangle;
-      }
-      const auto clear_rectangles = std::span<const Fh1ClearRectangle>(rectangles).first(count);
-      const bool cleared = owned_tile_clear
-          ? render_target_cache_->ClearFh1OwnedDepthTiles(clear_rectangles)
-          : render_target_cache_->ClearFh1OwnedDepth(clear_rectangles);
-      if (cleared)
-        report_clear(owned_tile_clear ? 2 : 1,
-                     owned_tile_clear ? 6 : 2, 0, clear_rectangles, {});
-      return cleared;
-    };
-    if (try_owned_clear()) return finish_draw(true);
-  }
-  const bool fh1_native_presents = fh1_native_executor_ != nullptr;
-  if (fh1_native_executor_) {
-    // Native targets and EDRAM ownership transfers, in place of the Xenos
-    // render targets for this draw.
-    Fh1NativeDrawInfo native_targets;
-    native_targets.memexport = memexport_used;
-    native_targets.rasterization_done = is_rasterization_done;
-    native_targets.normalized_depth_control = normalized_depth_control;
-    native_targets.normalized_color_mask = normalized_color_mask;
-    native_targets.vertex_shader = vertex_shader;
-    native_targets.pixel_shader = pixel_shader;
-    fh1_native_executor_->PrepareTargets(native_targets);
-  }
+  // Native targets and EDRAM ownership transfers for this draw.
+  Fh1NativeDrawInfo native_targets;
+  native_targets.memexport = memexport_used;
+  native_targets.rasterization_done = is_rasterization_done;
+  native_targets.normalized_depth_control = normalized_depth_control;
+  native_targets.normalized_color_mask = normalized_color_mask;
+  native_targets.vertex_shader = vertex_shader;
+  native_targets.pixel_shader = pixel_shader;
+  fh1_native_executor_->PrepareTargets(native_targets);
   uint32_t bound_depth_and_color_render_target_bits = 0;
   uint32_t bound_depth_and_color_render_target_formats[1 + xenos::kMaxColorRenderTargets] = {};
-  if (fh1_native_presents) {
-    if (!fh1_native_executor_->BindTargets(bound_depth_and_color_render_target_bits,
-                                           bound_depth_and_color_render_target_formats)) {
-      return finish_draw(false);
-    }
-  } else if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
-                                           normalized_color_mask, *vertex_shader)) {
-    return finish_draw(false);
+  if (!fh1_native_executor_->BindTargets(bound_depth_and_color_render_target_bits,
+                                         bound_depth_and_color_render_target_formats)) {
+    return false;
   }
 
-  // Obtain shader metadata and the actual render-target formats. Native passes
-  // can validate this state without configuring a guest pipeline; fallback
-  // still prepares the translations needed to obtain the used textures.
+  // Obtain shader metadata and configure the pipeline for the bound targets.
   D3D12Shader::D3D12Translation* vertex_shader_translation =
       static_cast<D3D12Shader::D3D12Translation*>(
           vertex_shader->GetOrCreateTranslation(vertex_shader_modification.value));
@@ -3912,107 +2540,21 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                    : nullptr;
   bool host_render_targets_used =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
-  if (fh1_native_presents) {
-    // Bound by the native executor above.
-  } else if (host_render_targets_used) {
-    bound_depth_and_color_render_target_bits =
-        render_target_cache_->GetLastUpdateBoundRenderTargets(
-            bound_depth_and_color_render_target_formats);
-  }
-  const bool ray_ui_target =
-      bound_depth_and_color_render_target_bits == 2 &&
-      regs.Get<reg::RB_SURFACE_INFO>().value == 0x14000500 &&
-      regs[reg::RB_COLOR_INFO::rt_register_indices[0]] == 0x000A0000;
-  const bool ray_ui_draw = (ray_trace_frame || ray_shadow_frame) && ray_ui_target;
-  if (ray_ui_capture_frame &&
-      observation_frame_sequence_ + 8 >= ray_ui_capture_frame &&
-      observation_frame_sequence_ <= ray_ui_capture_frame + 8) {
-    static thread_local uint64_t census_frame = 0;
-    static thread_local uint32_t census_ui_draws = 0;
-    if (census_frame != observation_frame_sequence_) {
-      if (census_frame)
-        REXGPU_WARN("FH1 RAY00 adjacent frame={} ui_draws={}", census_frame,
-                    census_ui_draws);
-      census_frame = observation_frame_sequence_;
-      census_ui_draws = 0;
-    }
-    census_ui_draws += ray_ui_target;
-  }
-  if (REXCVAR_GET(fh1_native_ui_boundary_probe) &&
-      Fh1NativeRaceCaptureStartFrame() <= observation_frame_sequence_ &&
-      fh1_native_race_requested.load(std::memory_order_acquire)) {
-    if (fh1_ui_last_frame_ != observation_frame_sequence_) {
-      fh1_ui_last_frame_ = observation_frame_sequence_;
-      fh1_ui_previous_color_ = 0;
-    }
-    if (bound_depth_and_color_render_target_bits == 2) {
-      const uint32_t color =
-          regs[reg::RB_COLOR_INFO::rt_register_indices[0]];
-      if (fh1_ui_boundary_frame_ != observation_frame_sequence_ &&
-          color == 0x000A0000 &&
-          regs.Get<reg::RB_SURFACE_INFO>().value == 0x14000500) {
-        fh1_ui_boundary_frame_ = observation_frame_sequence_;
-        if (fh1_ui_previous_color_ == 0x00020000) {
-          if (auto renderer = graphics_system_->native_guest_output_renderer().Get()) {
-            system::NativeGuestOutputRenderContext context;
-            context.backend = system::NativeGuestOutputBackend::kD3D12;
-            context.phase = system::NativeGuestOutputPhase::kBeforeUi;
-            context.frame_sequence = observation_frame_sequence_ - 1;
-            context.device = device;
-            context.command_context = this;
-            context.deferred_command_list = &deferred_command_list_;
-            context.guest_output =
-                render_target_cache_->GetFh1UiOutputTarget();
-            context.guest_output_width = 1280;
-            context.guest_output_height = 720;
-            context.guest_output_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            context.submission = submission_current_;
-            context.completed_submission = submission_completed_;
-            context.clear_color = &ClearNativeGuestUiOutput;
-            ConfigureFh1NativeContext(context);
-            const bool injected = renderer(context);
-            RestoreFh1AfterNativeUi();
-            if (injected) {
-              fh1_ui_injected_frame_ = context.frame_sequence;
-            }
-          }
-        }
-      }
-      fh1_ui_previous_color_ = color;
-    }
-  }
   void* pipeline_handle = nullptr;
   ID3D12RootSignature* root_signature = nullptr;
-  uint64_t pipeline_description_hash = 0;
-  const auto configure_guest_pipeline = [&]() {
-    return pipeline_cache_->ConfigurePipeline(
-        vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
-        normalized_depth_control, normalized_color_mask, bound_depth_and_color_render_target_bits,
-        bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature);
-  };
-  const bool native_pipeline_description_ready =
-      fh1_native_draw_candidate &&
-      pipeline_cache_->GetNativeDrawPipelineDescriptionHash(
+  if (!pipeline_cache_->ConfigurePipeline(
           vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
           normalized_depth_control, normalized_color_mask, bound_depth_and_color_render_target_bits,
-          bound_depth_and_color_render_target_formats, pipeline_description_hash,
-          fh1_native_velocity_candidate);
-  if (!native_pipeline_description_ready) {
-    if (!configure_guest_pipeline()) {
-      return finish_draw(false);
-    }
-    if (REXCVAR_GET(async_shader_compilation) &&
-        pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
-      return finish_draw(true);
-    }
-    pipeline_description_hash = pipeline_cache_->GetPipelineDescriptionHash(pipeline_handle);
+          bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature)) {
+    return false;
   }
-  // This exact full-screen shader pair only samples fetch 3, including when
-  // native admission later declines and the guest shaders are prepared lazily.
-  uint32_t used_texture_mask = fh1_native_velocity_candidate
-      ? (uint32_t(1) << 3)
-      : vertex_shader->GetUsedTextureMaskAfterTranslation() |
-            (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+  if (REXCVAR_GET(async_shader_compilation) &&
+      pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
+    return true;
+  }
+  uint32_t used_texture_mask =
+      vertex_shader->GetUsedTextureMaskAfterTranslation() |
+      (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
   if (Fh1FrameCensus::Enabled()) {
     Fh1CensusDraw census{};
     census.frame = observation_frame_sequence_;
@@ -4020,7 +2562,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     census.pixel_shader = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
     census.vertex_modification = vertex_shader_modification.value;
     census.pixel_modification = pixel_shader_modification.value;
-    census.pipeline_hash = pipeline_description_hash;
+    census.pipeline_hash = pipeline_cache_->GetPipelineDescriptionHash(pipeline_handle);
     census.guest_primitive = uint32_t(primitive_processing_result.guest_primitive_type);
     census.host_primitive = uint32_t(primitive_processing_result.host_primitive_type);
     census.indexed = index_buffer_info != nullptr;
@@ -4038,820 +2580,6 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         active_occlusion_query_.valid || zpd_lifecycle_.active().logical_active;
     Fh1FrameCensus::ObserveDraw(regs, census);
   }
-  auto prepared_draw_observer = graphics_system_->prepared_draw_observer();
-  // The pilot's observers never run in FH1 native mode.
-  if (!Fh1ObserveCorpusFrame(observation_frame_sequence_) || fh1_native_presents) {
-    prepared_draw_observer = nullptr;
-  }
-  if (prepared_draw_observer) {
-    const auto select_frame = graphics_system_->prepared_draw_frame_selector();
-    if (select_frame && !select_frame(observation_frame_sequence_))
-      prepared_draw_observer = nullptr;
-  }
-  system::GraphicsPreparedDrawObservation prepared_observation;
-  bool snr02_track_draw = false;
-  const auto get_fh1_attachment_state = [&]() {
-    uint64_t state = 0xCBF29CE484222325ull;
-    state = HashFh1ExecutionValue(
-        state, regs.Get<reg::RB_SURFACE_INFO>().value);
-    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
-      state = HashFh1ExecutionValue(
-          state, regs[reg::RB_COLOR_INFO::rt_register_indices[i]]);
-    }
-    state = HashFh1ExecutionValue(
-        state, regs.Get<reg::RB_DEPTH_INFO>().value);
-    state = HashFh1ExecutionValue(
-        state, bound_depth_and_color_render_target_bits);
-    for (uint32_t format : bound_depth_and_color_render_target_formats) {
-      state = HashFh1ExecutionValue(state, format);
-    }
-    return state;
-  };
-  if (prepared_draw_observer || fh1_native_draw_candidate) {
-    prepared_observation.frame_sequence = observation_frame_sequence_;
-    prepared_observation.draw_sequence = fh1_scene_draw_sequence_;
-    prepared_observation.indirect_buffer_execution_id =
-        observation_indirect_buffer_execution_id_;
-    prepared_observation.indirect_buffer_parent_execution_id =
-        observation_indirect_buffer_parent_execution_id_;
-    prepared_observation.indirect_dispatch_packet_physical_address =
-        observation_indirect_dispatch_packet_physical_address_;
-    prepared_observation.draw_packet_physical_address =
-        observation_draw_packet_address_;
-    prepared_observation.command_buffer_physical_address =
-        observation_draw_buffer_base_;
-    prepared_observation.command_buffer_bytes =
-        observation_draw_buffer_bytes_;
-    prepared_observation.command_buffer_end_offset =
-        observation_draw_buffer_end_offset_;
-    prepared_observation.vertex_shader_hash = fh1_vertex_hash;
-    prepared_observation.pixel_shader_hash = fh1_pixel_hash;
-    prepared_observation.vertex_specialization_mask =
-        vertex_shader_modification.value;
-    prepared_observation.pixel_specialization_mask =
-        pixel_shader_modification.value;
-    prepared_observation.guest_primitive_type =
-        uint32_t(primitive_processing_result.guest_primitive_type);
-    prepared_observation.host_primitive_type =
-        uint32_t(primitive_processing_result.host_primitive_type);
-    prepared_observation.host_vertex_shader_type =
-        uint32_t(primitive_processing_result.host_vertex_shader_type);
-    prepared_observation.tessellation_mode =
-        uint32_t(primitive_processing_result.tessellation_mode);
-    prepared_observation.index_buffer_type =
-        uint32_t(primitive_processing_result.index_buffer_type);
-    prepared_observation.host_index_format =
-        uint32_t(primitive_processing_result.host_index_format);
-    prepared_observation.host_primitive_reset_enabled =
-        primitive_processing_result.host_primitive_reset_enabled;
-    prepared_observation.host_shader_index_endianness =
-        uint32_t(primitive_processing_result.host_shader_index_endian);
-    prepared_observation.guest_primitive_reset_index =
-        regs.Get<reg::VGT_MULTI_PRIM_IB_RESET_INDX>().reset_indx;
-    prepared_observation.index_count = index_count;
-    if (index_buffer_info) {
-      prepared_observation.index_buffer_guest_base =
-          index_buffer_info->guest_base;
-      prepared_observation.index_buffer_length =
-          uint32_t(index_buffer_info->length);
-      prepared_observation.index_buffer_guest_endianness =
-          uint32_t(index_buffer_info->endianness);
-    }
-    prepared_observation.normalized_depth_control =
-        normalized_depth_control.value;
-    prepared_observation.normalized_color_mask = normalized_color_mask;
-    prepared_observation.bound_render_target_bits =
-        bound_depth_and_color_render_target_bits;
-    prepared_observation.surface_info = regs.Get<reg::RB_SURFACE_INFO>().value;
-    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
-      prepared_observation.color_info[i] =
-          regs[reg::RB_COLOR_INFO::rt_register_indices[i]];
-    }
-    prepared_observation.depth_info = regs.Get<reg::RB_DEPTH_INFO>().value;
-    std::memcpy(prepared_observation.bound_render_target_formats,
-                bound_depth_and_color_render_target_formats,
-                sizeof(prepared_observation.bound_render_target_formats));
-    prepared_observation.flags = uint32_t(host_render_targets_used) |
-                                 (uint32_t(is_rasterization_done) << 1);
-    auto& fh1_key = prepared_observation.fh1_execution_key;
-    const auto append = [](uint64_t& hash, uint64_t value) {
-      hash = HashFh1ExecutionValue(hash, value);
-    };
-    fh1_key.shader_state = 0xCBF29CE484222325ull;
-    for (uint64_t value :
-         {prepared_observation.vertex_shader_hash,
-          prepared_observation.pixel_shader_hash,
-          prepared_observation.vertex_specialization_mask,
-          prepared_observation.pixel_specialization_mask,
-          uint64_t(prepared_observation.host_vertex_shader_type),
-          uint64_t(prepared_observation.tessellation_mode)}) {
-      append(fh1_key.shader_state, value);
-    }
-    fh1_key.pipeline_state = pipeline_description_hash;
-    fh1_key.attachment_state = get_fh1_attachment_state();
-    fh1_key.resource_state = 0xCBF29CE484222325ull;
-    append(fh1_key.resource_state, used_texture_mask);
-    for (uint32_t fetch_index = 0; fetch_index < 32; ++fetch_index) {
-      if (!(used_texture_mask & (uint32_t(1) << fetch_index))) {
-        continue;
-      }
-      const auto fetch = regs.GetTextureFetch(fetch_index);
-      uint32_t words[6];
-      static_assert(sizeof(words) == sizeof(fetch));
-      std::memcpy(words, &fetch, sizeof(words));
-      // FH1 streams resource addresses while the binding layout stays stable.
-      // ShiftGlue still resolves and validates the live resources; addresses
-      // are not part of the title's prewarmed execution identity.
-      words[1] &= 0xFFF;
-      words[5] &= 0xFFF;
-      append(fh1_key.resource_state, fetch_index);
-      for (uint32_t word : words) {
-        append(fh1_key.resource_state, word);
-      }
-    }
-    for (const Shader::VertexBinding& binding :
-         vertex_shader->vertex_bindings()) {
-      const auto fetch = regs.GetVertexFetch(binding.fetch_constant);
-      uint32_t words[2];
-      static_assert(sizeof(words) == sizeof(fetch));
-      std::memcpy(words, &fetch, sizeof(words));
-      append(fh1_key.resource_state, binding.fetch_constant);
-      append(fh1_key.resource_state, binding.stride_words);
-      append(fh1_key.resource_state, words[0] & 0x3);
-      append(fh1_key.resource_state, words[1]);
-    }
-    if (index_buffer_info) {
-      append(fh1_key.resource_state, index_buffer_info->length);
-      append(fh1_key.resource_state, uint32_t(index_buffer_info->format));
-      append(fh1_key.resource_state,
-             uint32_t(index_buffer_info->endianness));
-    }
-    fh1_key.dynamic_state = 0xCBF29CE484222325ull;
-    for (uint32_t register_index :
-         {uint32_t(XE_GPU_REG_PA_CL_CLIP_CNTL),
-          uint32_t(XE_GPU_REG_PA_CL_VTE_CNTL),
-          uint32_t(XE_GPU_REG_PA_SU_SC_MODE_CNTL),
-          uint32_t(XE_GPU_REG_PA_SU_VTX_CNTL),
-          uint32_t(XE_GPU_REG_PA_SC_WINDOW_OFFSET),
-          uint32_t(XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL),
-          uint32_t(XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR),
-          uint32_t(XE_GPU_REG_RB_BLEND_RED),
-          uint32_t(XE_GPU_REG_RB_BLEND_GREEN),
-          uint32_t(XE_GPU_REG_RB_BLEND_BLUE),
-          uint32_t(XE_GPU_REG_RB_BLEND_ALPHA),
-          uint32_t(XE_GPU_REG_RB_STENCILREFMASK),
-          uint32_t(XE_GPU_REG_RB_STENCILREFMASK_BF)}) {
-      append(fh1_key.dynamic_state, regs[register_index]);
-    }
-    for (uint32_t register_index = XE_GPU_REG_PA_CL_VPORT_XSCALE;
-         register_index <= XE_GPU_REG_PA_CL_VPORT_ZOFFSET;
-         ++register_index) {
-      append(fh1_key.dynamic_state, regs[register_index]);
-    }
-    fh1_key.operation_state = 0xCBF29CE484222325ull;
-    for (uint64_t value :
-         {uint64_t(prepared_observation.guest_primitive_type),
-          uint64_t(prepared_observation.host_primitive_type),
-          uint64_t(index_count),
-          uint64_t(prepared_observation.index_buffer_type),
-          uint64_t(prepared_observation.host_index_format),
-          uint64_t(prepared_observation.host_primitive_reset_enabled),
-          uint64_t(major_mode_explicit)}) {
-      append(fh1_key.operation_state, value);
-    }
-    fh1_key.hazard_flags =
-        uint32_t(!vertex_shader->memexport_stream_constants().empty()) |
-        (uint32_t(regs.Get<reg::PA_SC_VIZ_QUERY>().value != 0) << 1);
-    fh1_key.flags = uint32_t(host_render_targets_used) |
-                    (uint32_t(is_rasterization_done) << 1) |
-                    (uint32_t(index_buffer_info != nullptr) << 2);
-    fh1_key.identity = fh1_key.ComputeIdentity();
-    // Diagnostic snapshots retain addresses and constants deliberately omitted
-    // from prewarm identities. They are evidence, never batching admission.
-    const bool snr03_vegetation_binding =
-        Fh1SnrProbeOutputFrame(Fh1Snr03ProbeFrame(),
-                               observation_frame_sequence_) &&
-        (fh1_vertex_hash == 0xC62548CAA393B216ull ||
-         fh1_vertex_hash == 0x5834939992FFC765ull);
-    if (prepared_draw_observer && Fh1GpuCorpusEnabled() && Fh1SceneDumpEnabled() &&
-        fh1_scene_binding_records_ < 4096 &&
-        (snr03_vegetation_binding ||
-         (observation_frame_sequence_ >= 1200 &&
-          observation_frame_sequence_ % 600 == 0 &&
-          ((fh1_vertex_hash == 0xAD2C355A6BE1EE87ull &&
-            fh1_pixel_hash == 0x2F2137BF953DA7AFull &&
-            fh1_key.attachment_state == 0x7336ADFF531DCC00ull) ||
-           fh1_scene_draw_sequence_ == fh1_scene_followup_sequence_)))) {
-      fh1_scene_followup_sequence_ =
-          fh1_scene_draw_sequence_ == fh1_scene_followup_sequence_
-              ? 0 : fh1_scene_draw_sequence_ + 1;
-      std::string textures, vertices, constants;
-      uint64_t command_hash = 0;
-      if (observation_draw_buffer_bytes_ <= 8192 &&
-          observation_draw_buffer_bytes_ % sizeof(uint32_t) == 0) {
-        const auto* words = reinterpret_cast<const uint32_t*>(
-            memory_->TranslatePhysical(observation_draw_buffer_base_));
-        command_hash = 0xCBF29CE484222325ull;
-        for (uint32_t i = 0; i < observation_draw_buffer_bytes_ / 4; ++i) {
-          command_hash = HashFh1ExecutionValue(command_hash, words[i]);
-        }
-        if (fh1_scene_command_snapshots_.size() < 32 &&
-            fh1_scene_command_snapshots_.insert(command_hash).second) {
-          std::string commands;
-          for (uint32_t i = 0; i < observation_draw_buffer_bytes_ / 4; ++i) {
-            commands += fmt::format("{:08X}", rex::byte_swap(words[i]));
-          }
-          REXGPU_INFO("FH1 scene commands {{\"hash\":\"{:016X}\","
-                      "\"address\":{},\"words\":\"{}\"}}",
-                      command_hash, observation_draw_buffer_base_, commands);
-        }
-      }
-      for (uint32_t i = 0; i < 32; ++i) {
-        if (!(used_texture_mask & (uint32_t(1) << i))) {
-          continue;
-        }
-        const auto fetch = regs.GetTextureFetch(i);
-        uint32_t words[6];
-        std::memcpy(words, &fetch, sizeof(words));
-        textures += fmt::format("{}:", i);
-        for (uint32_t word : words) {
-          textures += fmt::format("{:08X}", word);
-        }
-        textures += ';';
-      }
-      for (const auto& binding : vertex_shader->vertex_bindings()) {
-        const auto fetch = regs.GetVertexFetch(binding.fetch_constant);
-        uint32_t words[2];
-        std::memcpy(words, &fetch, sizeof(words));
-        vertices += fmt::format("{}:{}:{:08X}{:08X};",
-                                binding.fetch_constant, binding.stride_words,
-                                words[0], words[1]);
-      }
-      for (uint32_t stage = 0; stage < 2; ++stage) {
-        if (stage && !pixel_shader) {
-          break;
-        }
-        const auto& map = (stage ? pixel_shader : vertex_shader)
-                              ->constant_register_map();
-        for (uint32_t i = 0; i < 256; ++i) {
-          if (!(map.float_bitmap[i / 64] & (uint64_t(1) << (i % 64)))) {
-            continue;
-          }
-          const uint32_t r = XE_GPU_REG_SHADER_CONSTANT_000_X +
-                             stage * 1024 + i * 4;
-          constants += fmt::format("{}:{:08X}{:08X}{:08X}{:08X};", r,
-                                   regs[r], regs[r + 1], regs[r + 2], regs[r + 3]);
-        }
-      }
-      // Include the entire small bool/loop bank and constant base selectors.
-      for (uint32_t r = XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031;
-           r <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31; ++r) {
-        constants += fmt::format("{}:{:08X};", r, regs[r]);
-      }
-      constants += fmt::format("bases:{:08X}{:08X};",
-                               regs[XE_GPU_REG_SQ_VS_CONST],
-                               regs[XE_GPU_REG_SQ_PS_CONST]);
-      REXGPU_INFO(
-          "FH1 scene binding {{\"frame\":{},\"sequence\":{},"
-          "\"packet_physical\":{},"
-          "\"command_buffer\":{},\"command_bytes\":{},\"draw_end_offset\":{},"
-          "\"command_hash\":\"{:016X}\","
-          "\"scratch_mask\":{},\"scratch_address\":{},"
-          "\"bin_mask\":\"{:016X}\",\"bin_select\":\"{:016X}\","
-          "\"vertex_shader\":\"{:016X}\",\"pixel_shader\":\"{:016X}\","
-          "\"attachment\":\"{:016X}\","
-          "\"pipeline\":\"{:016X}\",\"dynamic\":\"{:016X}\","
-          "\"operation\":\"{:016X}\",\"hazards\":{},\"flags\":{},"
-          "\"index_base\":{},\"index_count\":{},\"index_length\":{},"
-          "\"textures\":\"{}\",\"vertices\":\"{}\",\"constants\":\"{}\"}}",
-          observation_frame_sequence_, fh1_scene_draw_sequence_,
-          observation_draw_packet_address_,
-          observation_draw_buffer_base_, observation_draw_buffer_bytes_,
-          observation_draw_buffer_end_offset_,
-          command_hash,
-          regs[XE_GPU_REG_SCRATCH_UMSK], regs[XE_GPU_REG_SCRATCH_ADDR],
-          bin_mask_, bin_select_,
-          fh1_vertex_hash, fh1_pixel_hash, fh1_key.attachment_state,
-          fh1_key.pipeline_state, fh1_key.dynamic_state, fh1_key.operation_state,
-          fh1_key.hazard_flags, fh1_key.flags,
-          prepared_observation.index_buffer_guest_base, index_count,
-          prepared_observation.index_buffer_length, textures, vertices, constants);
-      if (++fh1_scene_binding_records_ == 4096) {
-        REXGPU_INFO("FH1 scene binding record limit reached");
-      }
-    }
-    if (fh1_prepare_start != std::chrono::steady_clock::time_point{}) {
-      prepared_observation.fh1_prepare_cpu_time_ns =
-          uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                       std::chrono::steady_clock::now() - fh1_prepare_start)
-                       .count());
-    }
-    ObserveFh1GpuPassTimingDraw(fh1_key,
-                                prepared_observation.frame_sequence,
-                                prepared_observation.fh1_prepare_cpu_time_ns);
-    if (!pipeline_cache_->IsFh1PrewarmManifestLoaded()) {
-      prepared_observation.fh1_fallback_reason =
-          system::GraphicsFh1FallbackReason::kManifestUnavailable;
-    } else if (fh1_key.hazard_flags) {
-      prepared_observation.fh1_fallback_reason =
-          system::GraphicsFh1FallbackReason::kHazardousDraw;
-    } else if (!pipeline_cache_->IsFh1ExecutionCovered(fh1_key.identity)) {
-      prepared_observation.fh1_fallback_reason =
-          system::GraphicsFh1FallbackReason::kExecutionKeyNotCaptured;
-    } else if (!pipeline_cache_->IsFh1PipelinePrewarmed(
-                   fh1_key.pipeline_state)) {
-      prepared_observation.fh1_fallback_reason =
-          system::GraphicsFh1FallbackReason::kPipelineNotPrewarmed;
-    } else {
-      prepared_observation.fh1_execution_mode =
-          system::GraphicsFh1ExecutionMode::kCoveredInPlace;
-      prepared_observation.fh1_fallback_reason =
-          system::GraphicsFh1FallbackReason::kNone;
-    }
-    prepared_observation.fh1_runtime_shader_translations =
-        pipeline_cache_->GetFh1RuntimeShaderTranslationCount();
-    prepared_observation.fh1_runtime_sync_pipeline_creations =
-        pipeline_cache_->GetFh1RuntimeSyncPipelineCreationCount();
-    if (prepared_draw_observer) {
-      const auto snapshot_begin = time_fh1_draw
-          ? std::chrono::steady_clock::now()
-          : std::chrono::steady_clock::time_point{};
-      std::array<system::GraphicsPreparedDrawVertexFetch, 8> vertex_fetches;
-      std::array<system::GraphicsPreparedDrawTextureFetch, 32> texture_fetches;
-      std::array<std::vector<uint8_t>, 8> vertex_fetch_snapshot_bytes;
-      std::vector<uint8_t> index_snapshot_bytes;
-      const auto snapshot_selector = graphics_system_->prepared_draw_snapshot_selector();
-      snr02_track_draw = snapshot_selector && snapshot_selector(
-          prepared_observation.frame_sequence,
-          prepared_observation.command_buffer_physical_address);
-      static thread_local uint64_t track_snapshot_budget_bytes = 0;
-      static thread_local uint64_t manager_snapshot_budget_bytes = 0;
-      struct ManagerSnapshot {
-        std::vector<uint8_t> bytes;
-        uint32_t status = 0;
-        uint64_t hash = 0;
-      };
-      static thread_local std::map<std::pair<uint32_t, uint32_t>,
-                                   ManagerSnapshot> manager_snapshots;
-      static thread_local uint64_t remaining_snapshot_budget_bytes = 0;
-      static thread_local uint64_t ui_snapshot_budget_bytes = 0;
-      static thread_local uint64_t ordered_snapshot_budget_bytes = 0;
-      static thread_local uint64_t snapshot_budget_frame = 0;
-      if (snapshot_budget_frame != prepared_observation.frame_sequence) {
-        snapshot_budget_frame = prepared_observation.frame_sequence;
-        track_snapshot_budget_bytes = 0;
-        manager_snapshot_budget_bytes = 0;
-        manager_snapshots.clear();
-        remaining_snapshot_budget_bytes = 0;
-        ui_snapshot_budget_bytes = 0;
-        ordered_snapshot_budget_bytes = 0;
-      }
-      const bool snr03_probe_draw = Fh1SnrProbeOutputFrame(
-          Fh1Snr03ProbeFrame(), prepared_observation.frame_sequence) &&
-          prepared_observation.surface_info == 0x14020500 &&
-          (prepared_observation.color_info[0] == 0x00030000 ||
-           prepared_observation.color_info[0] == 0x000C0000) &&
-          prepared_observation.depth_info == 0x00010400 &&
-          prepared_observation.bound_render_target_bits == 3;
-      const auto copy_bounded_snapshot = [&](uint32_t address, uint32_t length,
-                                             uint32_t limit, uint64_t& budget_bytes,
-                                             uint64_t budget_limit,
-                                             std::vector<uint8_t>& bytes,
-                                             uint32_t& status, uint64_t& hash) {
-        if (!length || length > limit) {
-          status = 3;
-        } else if (budget_bytes > budget_limit ||
-                   length > budget_limit - budget_bytes) {
-          status = 4;
-        } else {
-          budget_bytes += length;
-          bytes.resize(length);
-          if (!shared_memory_->CopyCpuSnapshot(address, bytes)) {
-            status = 2;
-          } else {
-            status = 1;
-            hash = Fh1SnapshotHash(bytes);
-          }
-        }
-      };
-      uint32_t ui_max_index = 0;
-      bool ui_trim_vertices = false;
-      uint32_t track_max_index = 0;
-      bool track_trim_vertices = false;
-      if (snr02_track_draw && prepared_observation.index_buffer_type == 1 &&
-          prepared_observation.index_buffer_guest_endianness == 1 &&
-          prepared_observation.index_count &&
-          uint64_t(prepared_observation.index_count) * 2 <=
-              prepared_observation.index_buffer_length) {
-        copy_bounded_snapshot(prepared_observation.index_buffer_guest_base,
-                              prepared_observation.index_buffer_length,
-                              128 * 1024, track_snapshot_budget_bytes,
-                              128ull * 1024 * 1024, index_snapshot_bytes,
-                              prepared_observation.index_cpu_snapshot_status,
-                              prepared_observation.index_cpu_snapshot_hash);
-        if (prepared_observation.index_cpu_snapshot_status == 1) {
-          prepared_observation.index_cpu_snapshot_bytes =
-              index_snapshot_bytes.data();
-          for (size_t i = 0;
-               i < size_t(prepared_observation.index_count) * 2; i += 2) {
-            const uint32_t index =
-                (uint32_t(index_snapshot_bytes[i]) << 8) |
-                index_snapshot_bytes[i + 1];
-            if (index != 0xFFFF ||
-                !prepared_observation.host_primitive_reset_enabled)
-              track_max_index = std::max(track_max_index, index);
-          }
-          track_trim_vertices = true;
-        }
-      }
-      if (ray_ui_draw && prepared_observation.index_buffer_type == 1 &&
-          prepared_observation.index_buffer_guest_endianness == 1) {
-        copy_bounded_snapshot(prepared_observation.index_buffer_guest_base,
-                              prepared_observation.index_buffer_length,
-                              1024 * 1024, ui_snapshot_budget_bytes,
-                              128ull * 1024 * 1024, index_snapshot_bytes,
-                              prepared_observation.index_cpu_snapshot_status,
-                              prepared_observation.index_cpu_snapshot_hash);
-        if (prepared_observation.index_cpu_snapshot_status == 1) {
-          prepared_observation.index_cpu_snapshot_bytes =
-              index_snapshot_bytes.data();
-          if (prepared_observation.index_count &&
-              uint64_t(prepared_observation.index_count) * 2 <=
-                  index_snapshot_bytes.size()) {
-            for (size_t i = 0;
-                 i < size_t(prepared_observation.index_count) * 2; i += 2)
-              ui_max_index = std::max(
-                  ui_max_index,
-                  (uint32_t(index_snapshot_bytes[i]) << 8) |
-                      index_snapshot_bytes[i + 1]);
-            ui_trim_vertices = true;
-          }
-        }
-      }
-      for (const auto& binding : vertex_shader->vertex_bindings()) {
-        if (prepared_observation.vertex_fetch_count < vertex_fetches.size()) {
-          const auto fetch = regs.GetVertexFetch(binding.fetch_constant);
-          const uint32_t origin_index = binding.fetch_constant * 2;
-          const auto& source_0 = observation_fetch_origins_[origin_index];
-          const auto& source_1 = observation_fetch_origins_[origin_index + 1];
-          vertex_fetches[prepared_observation.vertex_fetch_count] = {
-              binding.fetch_constant, binding.stride_words,
-              uint32_t(fetch.address) << 2, uint32_t(fetch.size) << 2,
-              uint32_t(fetch.type), source_0.packet_physical,
-              source_1.packet_physical, source_0.execution_id,
-              source_1.execution_id};
-          const bool snr03_vertex =
-              Fh1SnrProbeOutputFrame(Fh1Snr03ProbeFrame(),
-                                     prepared_observation.frame_sequence) &&
-              binding.fetch_constant == 95 && binding.stride_words == 4;
-          const bool snr02_item_vertex =
-              Fh1SnrProbeOutputFrame(Fh1Snr02ItemProbeFrame(),
-                                     prepared_observation.frame_sequence) &&
-              binding.fetch_constant == 95 && binding.stride_words == 10 &&
-              Fh1Snr02ItemShader(fh1_vertex_hash);
-          const bool snr02_track_vertex = snr02_track_draw &&
-              binding.fetch_constant == 95 &&
-              binding.stride_words >= 4 && binding.stride_words <= 9;
-          const bool snr03_manager_vertex =
-              Fh1SnrProbeOutputFrame(Fh1Snr03ProbeFrame(),
-                                     prepared_observation.frame_sequence) &&
-              fh1_vertex_hash == 0xB8489164D5A86043ull &&
-              ((binding.fetch_constant == 95 && binding.stride_words == 8) ||
-               (binding.fetch_constant == 94 && binding.stride_words == 3));
-          const bool ordered_geometry_vertex =
-              (ray_trace_frame || ray_ordered_producer) &&
-              !ray_ui_draw && !snr03_vertex && !snr02_item_vertex &&
-              !snr02_track_vertex && !snr03_manager_vertex &&
-              !snr03_probe_draw;
-          if (ray_ui_draw ||
-              snr03_vertex || snr02_item_vertex || snr02_track_vertex ||
-              snr03_manager_vertex || snr03_probe_draw ||
-              ordered_geometry_vertex) {
-            auto& observed = vertex_fetches[prepared_observation.vertex_fetch_count];
-            auto& bytes = vertex_fetch_snapshot_bytes[prepared_observation.vertex_fetch_count];
-            if (ray_ui_draw) {
-              const uint64_t used = uint64_t(ui_max_index + 1) *
-                                    observed.stride_words * 4;
-              const uint32_t snapshot_length =
-                  ui_trim_vertices && used && used <= observed.length
-                      ? uint32_t(used) : observed.length;
-              copy_bounded_snapshot(observed.guest_base, snapshot_length,
-                                    1024 * 1024, ui_snapshot_budget_bytes,
-                                    128ull * 1024 * 1024, bytes,
-                                    observed.cpu_snapshot_status,
-                                    observed.cpu_snapshot_hash);
-              if (observed.cpu_snapshot_status == 1) {
-                observed.cpu_snapshot_bytes = bytes.data();
-                observed.cpu_snapshot_length = snapshot_length;
-              }
-            } else if (snr02_track_vertex) {
-              const uint64_t used = uint64_t(track_max_index + 1) *
-                                    observed.stride_words * 4;
-              const uint32_t snapshot_length =
-                  track_trim_vertices && used && used <= observed.length
-                      ? uint32_t(used) : observed.length;
-              copy_bounded_snapshot(observed.guest_base, snapshot_length,
-                                    8 * 1024 * 1024, track_snapshot_budget_bytes,
-                                    128ull * 1024 * 1024, bytes,
-                                    observed.cpu_snapshot_status,
-                                    observed.cpu_snapshot_hash);
-              if (observed.cpu_snapshot_status == 1) {
-                observed.cpu_snapshot_bytes = bytes.data();
-                observed.cpu_snapshot_length = snapshot_length;
-              }
-            } else if (snr03_manager_vertex) {
-              if (Fh1NativeRaceCaptureStartFrame()) {
-                // ponytail: sampled race ranges were stable within a frame;
-                // use versioned copies if later draws can write them.
-                auto [snapshot, fresh] = manager_snapshots.try_emplace(
-                    {observed.guest_base, observed.length});
-                if (fresh)
-                  copy_bounded_snapshot(observed.guest_base, observed.length,
-                                        3 * 1024 * 1024,
-                                        manager_snapshot_budget_bytes,
-                                        16ull * 1024 * 1024,
-                                        snapshot->second.bytes,
-                                        snapshot->second.status,
-                                        snapshot->second.hash);
-                observed.cpu_snapshot_status = snapshot->second.status;
-                observed.cpu_snapshot_hash = snapshot->second.hash;
-                if (observed.cpu_snapshot_status == 1)
-                  observed.cpu_snapshot_bytes = snapshot->second.bytes.data();
-              } else {
-                copy_bounded_snapshot(observed.guest_base, observed.length,
-                                      3 * 1024 * 1024,
-                                      manager_snapshot_budget_bytes,
-                                      1280ull * 1024 * 1024, bytes,
-                                      observed.cpu_snapshot_status,
-                                      observed.cpu_snapshot_hash);
-                if (observed.cpu_snapshot_status == 1)
-                  observed.cpu_snapshot_bytes = bytes.data();
-              }
-            } else if (snr03_probe_draw) {
-              copy_bounded_snapshot(observed.guest_base, observed.length,
-                                    3 * 1024 * 1024,
-                                    remaining_snapshot_budget_bytes,
-                                    512ull * 1024 * 1024, bytes,
-                                    observed.cpu_snapshot_status,
-                                    observed.cpu_snapshot_hash);
-              if (observed.cpu_snapshot_status == 1) {
-                observed.cpu_snapshot_bytes = bytes.data();
-              }
-            } else if (ordered_geometry_vertex) {
-              copy_bounded_snapshot(observed.guest_base, observed.length,
-                                    4 * 1024 * 1024,
-                                    ordered_snapshot_budget_bytes,
-                                    512ull * 1024 * 1024, bytes,
-                                    observed.cpu_snapshot_status,
-                                    observed.cpu_snapshot_hash);
-              if (observed.cpu_snapshot_status == 1) {
-                observed.cpu_snapshot_bytes = bytes.data();
-                observed.cpu_snapshot_length = observed.length;
-              }
-            } else {
-              static thread_local uint64_t budget_frame = 0;
-              static thread_local uint32_t vegetation_budget_bytes = 0;
-              static thread_local uint32_t item_budget_bytes = 0;
-              if (budget_frame != prepared_observation.frame_sequence) {
-                budget_frame = prepared_observation.frame_sequence;
-                vegetation_budget_bytes = 0;
-                item_budget_bytes = 0;
-              }
-              uint32_t& budget_bytes = snr02_item_vertex
-                  ? item_budget_bytes : vegetation_budget_bytes;
-              const uint32_t budget_limit =
-                  snr02_item_vertex ? 8 * 1024 * 1024 : 2 * 1024 * 1024;
-              if (observed.length > (snr02_item_vertex ? 256 * 1024 : 32768)) {
-                observed.cpu_snapshot_status = 3;
-              } else if (budget_bytes > budget_limit ||
-                         observed.length > budget_limit - budget_bytes) {
-                observed.cpu_snapshot_status = 4;
-              } else {
-                budget_bytes += observed.length;
-                bytes.resize(observed.length);
-                if (shared_memory_->CopyCpuSnapshot(observed.guest_base, bytes)) {
-                  observed.cpu_snapshot_status = 1;
-                  observed.cpu_snapshot_bytes = bytes.data();
-                  observed.cpu_snapshot_hash = Fh1SnapshotHash(bytes);
-                } else {
-                  observed.cpu_snapshot_status = 2;
-                }
-              }
-            }
-          }
-        }
-        ++prepared_observation.vertex_fetch_count;
-      }
-      prepared_observation.vertex_fetches = vertex_fetches.data();
-      prepared_observation.vertex_fetch_capacity = uint32_t(vertex_fetches.size());
-      const bool snr03_manager_draw = Fh1SnrProbeOutputFrame(
-          Fh1Snr03ProbeFrame(), prepared_observation.frame_sequence) &&
-          fh1_vertex_hash == 0xB8489164D5A86043ull;
-      const bool ordered_geometry_index =
-          (ray_trace_frame || ray_ordered_producer) &&
-          !ray_ui_draw && !snr02_track_draw && !snr03_manager_draw &&
-          !snr03_probe_draw && prepared_observation.index_buffer_type;
-      if (!prepared_observation.index_cpu_snapshot_status &&
-          ((ray_ui_draw &&
-           (prepared_observation.index_buffer_type == 1 ||
-            prepared_observation.index_buffer_type == 2)) ||
-          (((snr02_track_draw || snr03_manager_draw) &&
-           prepared_observation.index_buffer_type == 1) ||
-          (snr03_probe_draw &&
-           (prepared_observation.index_buffer_type == 1 ||
-            prepared_observation.index_buffer_type == 2))) ||
-          ordered_geometry_index)) {
-        if (snr03_manager_draw && Fh1NativeRaceCaptureStartFrame()) {
-          auto [snapshot, fresh] = manager_snapshots.try_emplace(
-              {prepared_observation.index_buffer_guest_base,
-               prepared_observation.index_buffer_length});
-          if (fresh)
-            copy_bounded_snapshot(prepared_observation.index_buffer_guest_base,
-                                  prepared_observation.index_buffer_length,
-                                  128 * 1024, manager_snapshot_budget_bytes,
-                                  16ull * 1024 * 1024,
-                                  snapshot->second.bytes,
-                                  snapshot->second.status,
-                                  snapshot->second.hash);
-          prepared_observation.index_cpu_snapshot_status = snapshot->second.status;
-          prepared_observation.index_cpu_snapshot_hash = snapshot->second.hash;
-          if (snapshot->second.status == 1)
-            prepared_observation.index_cpu_snapshot_bytes =
-                snapshot->second.bytes.data();
-        } else if (ordered_geometry_index) {
-          copy_bounded_snapshot(prepared_observation.index_buffer_guest_base,
-                                prepared_observation.index_buffer_length,
-                                4 * 1024 * 1024,
-                                ordered_snapshot_budget_bytes,
-                                512ull * 1024 * 1024, index_snapshot_bytes,
-                                prepared_observation.index_cpu_snapshot_status,
-                                prepared_observation.index_cpu_snapshot_hash);
-          if (prepared_observation.index_cpu_snapshot_status == 1)
-            prepared_observation.index_cpu_snapshot_bytes =
-                index_snapshot_bytes.data();
-        } else {
-          copy_bounded_snapshot(prepared_observation.index_buffer_guest_base,
-                              prepared_observation.index_buffer_length,
-                              ray_ui_draw ? 1024 * 1024 : 128 * 1024,
-                              ray_ui_draw ? ui_snapshot_budget_bytes
-                                  : snr02_track_draw ? track_snapshot_budget_bytes
-                                  : snr03_manager_draw ? manager_snapshot_budget_bytes
-                                                       : remaining_snapshot_budget_bytes,
-                              ray_ui_draw ? 128ull * 1024 * 1024
-                                  : snr02_track_draw ? 128ull * 1024 * 1024
-                                  : snr03_manager_draw ? 1280ull * 1024 * 1024
-                                                       : 512ull * 1024 * 1024,
-                              index_snapshot_bytes,
-                              prepared_observation.index_cpu_snapshot_status,
-                              prepared_observation.index_cpu_snapshot_hash);
-          if (prepared_observation.index_cpu_snapshot_status == 1)
-            prepared_observation.index_cpu_snapshot_bytes =
-                index_snapshot_bytes.data();
-        }
-      }
-      prepared_observation.vertex_float_constant_words =
-          regs.values + XE_GPU_REG_SHADER_CONSTANT_000_X;
-      const auto& vertex_constants = vertex_shader->constant_register_map();
-      prepared_observation.vertex_float_constant_bitmap =
-          vertex_constants.float_bitmap;
-      prepared_observation.vertex_float_constant_count =
-          vertex_constants.float_count;
-      if (pixel_shader) {
-        const auto& pixel_constants = pixel_shader->constant_register_map();
-        prepared_observation.pixel_float_constant_bitmap =
-            pixel_constants.float_bitmap;
-        prepared_observation.pixel_float_constant_count =
-            pixel_constants.float_count;
-      }
-      for (uint32_t i = 0; i < 32; ++i) {
-        if (!(used_texture_mask & (uint32_t(1) << i))) {
-          continue;
-        }
-        const auto fetch = regs.GetTextureFetch(i);
-        const bool size_2d = fetch.dimension == xenos::DataDimension::k2DOrStacked ||
-                             fetch.dimension == xenos::DataDimension::kCube;
-        texture_fetches[prepared_observation.texture_fetch_count++] = {
-            i, uint32_t(fetch.type), uint32_t(fetch.base_address) << 12,
-            uint32_t(fetch.mip_address) << 12, uint32_t(fetch.format),
-            uint32_t(fetch.dimension),
-            size_2d ? uint32_t(fetch.size_2d.width) + 1 : 0,
-            size_2d ? uint32_t(fetch.size_2d.height) + 1 : 0,
-            size_2d ? uint32_t(fetch.size_2d.stack_depth) + 1 : 0};
-      }
-      prepared_observation.texture_fetches = texture_fetches.data();
-      if (time_fh1_draw) PERF_counter_add(kFh1PreparedSnapshotCpuTimeNs,
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now() - snapshot_begin).count());
-      const auto observer_begin = time_fh1_draw
-          ? std::chrono::steady_clock::now()
-          : std::chrono::steady_clock::time_point{};
-      prepared_draw_observer(prepared_observation);
-      ray_prepared_observed = true;
-      if (time_fh1_draw) PERF_counter_add(kFh1PreparedObserverCpuTimeNs,
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now() - observer_begin).count());
-    }
-  }
-
-  const D3D12Shader::TextureBinding* fh1_tonemap_source = nullptr;
-  DXGI_FORMAT fh1_tonemap_target_format = DXGI_FORMAT_UNKNOWN;
-  // The native executor replays the guest tone-map draw this replaces.
-  if (!fh1_native_executor_ &&
-      prepared_observation.fh1_execution_key.identity == 0xA20B16064DBF09DFull &&
-      prepared_observation.fh1_execution_mode ==
-          system::GraphicsFh1ExecutionMode::kCoveredInPlace &&
-      vertex_shader->ucode_data_hash() == 0xA2FC50159EB69BA2ull &&
-      pixel_shader &&
-      pixel_shader->ucode_data_hash() == 0x618DD627F3D3B9A4ull &&
-      index_count == 24 && !memexport_used && host_render_targets_used &&
-      is_rasterization_done &&
-      regs.Get<reg::RB_SURFACE_INFO>().msaa_samples ==
-          xenos::MsaaSamples::k1X &&
-      (bound_depth_and_color_render_target_bits & 2)) {
-    const auto& vertex_bindings = vertex_shader->vertex_bindings();
-    if (vertex_bindings.size() == 1 &&
-        vertex_bindings.front().fetch_constant == 95 &&
-        vertex_bindings.front().stride_words == 4) {
-      const auto fetch = regs.GetVertexFetch(95);
-      const uint32_t address = fetch.address << 2;
-      const uint32_t size = fetch.size << 2;
-      const uint32_t* words = reinterpret_cast<const uint32_t*>(
-          memory_->TranslatePhysical(address));
-      uint64_t geometry = 0xCBF29CE484222325ull;
-      if (address == 0x132C7FA0 && size == 384 &&
-          fetch.endian == xenos::Endian::k8in32 && words) {
-        for (uint32_t i = 0; i < size / sizeof(uint32_t); ++i) {
-          geometry = HashFh1ExecutionValue(geometry, words[i]);
-        }
-      }
-      if (geometry == 0xB3B603527C3B8E5Bull) {
-        const auto& texture_bindings =
-            pixel_shader->GetTextureBindingsAfterTranslation();
-        for (const auto& binding : texture_bindings) {
-          if (binding.fetch_constant == 0 &&
-              binding.dimension == xenos::FetchOpDimension::k2D &&
-              !binding.is_signed) {
-            if (fh1_tonemap_source) {
-              fh1_tonemap_source = nullptr;
-              break;
-            }
-            fh1_tonemap_source = &binding;
-          }
-        }
-        if (fh1_tonemap_source) {
-          fh1_tonemap_target_format = DXGI_FORMAT(
-              bound_depth_and_color_render_target_formats[1]);
-        }
-      }
-    }
-  }
-
-  const D3D12Shader::TextureBinding* fh1_velocity_dilate_source = nullptr;
-  DXGI_FORMAT fh1_velocity_dilate_target_format = DXGI_FORMAT_UNKNOWN;
-  auto& fh1_key = prepared_observation.fh1_execution_key;
-  // Native admission is fully specified below, independently of the guest
-  // prewarm catalog. The family hash added no check beyond these three keys.
-  if (fh1_key.shader_state == 0xE4ED1EE434D8FCE7ull &&
-      fh1_key.pipeline_state == 0x6E456C111D3FA84Dull &&
-      fh1_key.attachment_state == 0xBD706BD142DBDE84ull &&
-      fh1_key.resource_state == 0x31081AC1C2066568ull &&
-      fh1_key.operation_state == 0xB5D205630ADE9126ull &&
-      fh1_key.hazard_flags == 0 && fh1_key.flags == 3 &&
-      vertex_shader->ucode_data_hash() == 0xC7D52884ECA9A039ull &&
-      pixel_shader &&
-      pixel_shader->ucode_data_hash() == 0xECE830AC0333767Full &&
-      used_texture_mask == (uint32_t(1) << 3) && index_count == 3 &&
-      !memexport_used && host_render_targets_used && is_rasterization_done &&
-      regs.Get<reg::RB_SURFACE_INFO>().value == 0x14000500 &&
-      bound_depth_and_color_render_target_bits == 2 &&
-      bound_depth_and_color_render_target_formats[1] ==
-          uint32_t(xenos::ColorRenderTargetFormat::k_8_8_8_8) &&
-      regs[XE_GPU_REG_SHADER_CONSTANT_255_X] == 0x3F000000 &&
-      regs[XE_GPU_REG_SHADER_CONSTANT_255_Y] == 0xBF000000 &&
-      regs[XE_GPU_REG_SHADER_CONSTANT_255_Z] == 0 &&
-      regs[XE_GPU_REG_SHADER_CONSTANT_255_W] == 0 &&
-      regs[XE_GPU_REG_SHADER_CONSTANT_511_X] == 0x3C23D70A &&
-      regs[XE_GPU_REG_SHADER_CONSTANT_511_Y] == 0 &&
-      regs[XE_GPU_REG_SHADER_CONSTANT_511_Z] == 0 &&
-      regs[XE_GPU_REG_SHADER_CONSTANT_511_W] == 0) {
-    const auto& vertex_bindings = vertex_shader->vertex_bindings();
-    const auto vertex_fetch = regs.GetVertexFetch(95);
-    if (vertex_bindings.size() == 1 &&
-        vertex_bindings.front().fetch_constant == 95 &&
-        vertex_bindings.front().stride_words == 2 &&
-        vertex_fetch.endian == xenos::Endian::k8in32) {
-      // The exact shader pair above samples fetch 3 as unsigned 2D. Its
-      // native binding does not need the translated shader's descriptor table.
-      // Live resource validity and signs are still checked by the texture cache.
-      static constexpr D3D12Shader::TextureBinding native_source{
-          0, 3, xenos::FetchOpDimension::k2D, false};
-      fh1_velocity_dilate_source = &native_source;
-      fh1_velocity_dilate_target_format =
-          render_target_cache_->GetColorDrawDXGIFormat(
-              xenos::ColorRenderTargetFormat(
-                  bound_depth_and_color_render_target_formats[1]));
-    }
-  }
 
   // Update the textures - this may bind pipelines.
   // Qualified at 1x/2x; unsupported texture layouts retain the normal load path.
@@ -4867,12 +2595,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   if (fh1_video_textures) {
     texture_cache_->RequestFh1VideoTextures(used_texture_mask);
-  } else if (root_signature_fh1_layered_ && root_signature == root_signature_fh1_layered_) {
-    texture_cache_->RequestFh1Textures(used_texture_mask);
   } else {
     texture_cache_->RequestTextures(used_texture_mask);
   }
-  if (fh1_native_executor_) {
+  {
     // Frame dumps: the guest ranges the draw reads.
     const bool guest_dma_indices = primitive_processing_result.index_buffer_type ==
                                    PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA;
@@ -4893,11 +2619,6 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             std::chrono::steady_clock::now() - texture_request_start).count());
     PERF_counter_inc(kTextureRequestTimingSamples);
   }
-  if (fh1_velocity_dilate_source &&
-      texture_cache_->GetActiveTextureSwizzledSigns(3) != 0) {
-    fh1_velocity_dilate_source = nullptr;
-  }
-
 
   // Bind the pipeline after configuring it and doing everything that may bind
   // other pipelines.
@@ -4955,303 +2676,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // Update viewport, scissor, blend factor and stencil reference.
   UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal, normalized_depth_control);
 
-  // Native full-screen draws use their own roots and SV_VertexID geometry.
-  // Submit before guest constant uploads and vertex-buffer residency work.
-  if (fh1_velocity_dilate_source) {
-    deferred_command_list_.BeginDebugMarker(
-        "PinyonShift V5 native FH1 velocity dilation");
-    const bool native_velocity_dilate_drawn = DrawFh1VelocityDilate(
-        *fh1_velocity_dilate_source, fh1_velocity_dilate_target_format);
-    deferred_command_list_.EndDebugMarker();
-    if (native_velocity_dilate_drawn) {
-      ++fh1_velocity_dilate_native_draws_;
-      if (fh1_velocity_dilate_native_draws_ == 1) {
-        REXGPU_INFO(
-            "FH1 V5 native velocity-dilate draws 1 (guest VS translated {}, PS translated {}, prewarm manifest {})",
-            vertex_shader_translation->is_translated(), pixel_shader_translation->is_translated(),
-            pipeline_cache_->IsFh1PrewarmManifestLoaded());
-        REXGPU_INFO(
-            "FH1 native velocity primitive initiator {:08X}, output path {:08X}, "
-            "guest {}, host {}, index buffer {}, vertices {}, native preparation {}",
-            regs.Get<reg::VGT_DRAW_INITIATOR>().value,
-            regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().value,
-            uint32_t(primitive_processing_result.guest_primitive_type),
-            uint32_t(primitive_processing_result.host_primitive_type),
-            uint32_t(primitive_processing_result.index_buffer_type),
-            primitive_processing_result.host_draw_vertex_count, native_primitive_prepared);
-      }
-      return finish_draw(true);
-    }
-  }
   // Update system constants before uploading them.
   // TODO(Triang3l): With ROV, pass the disabled render target mask for safety.
   UpdateSystemConstantValues(memexport_used, primitive_polygonal,
                              primitive_processing_result.line_loop_closing_index,
                              primitive_processing_result.host_shader_index_endian, viewport_info,
                              used_texture_mask, normalized_depth_control, normalized_color_mask);
-  // A qualified clear replaces rasterization, not render-target ownership or
-  // transfer preparation. Reject query draws and non-CPU-authoritative input.
-  if (!fh1_native_executor_ && fh1_vertex_hash == 0x1E6883FCCDE1F688ull && !memexport_used &&
-      !active_occlusion_query_.valid && !zpd_lifecycle_.active_report() &&
-      modern_occlusion_query_active_index_ == UINT32_MAX &&
-      (index_count == 3 || index_count == 6) &&
-      primitive_processing_result.index_buffer_type == PrimitiveProcessor::ProcessedIndexBufferType::kNone &&
-      primitive_processing_result.guest_primitive_type == xenos::PrimitiveType::kRectangleList &&
-      primitive_processing_result.host_draw_vertex_count == index_count &&
-      !regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable &&
-      pipeline_cache_->IsFh1ClearPipeline(pipeline_handle)) {
-    const auto try_clear = [&]() {
-      std::array<uint32_t, 120> system{};
-      static_assert(sizeof(system_constants_) <= sizeof(system));
-      std::memcpy(system.data(), &system_constants_, sizeof(system_constants_));
-      if ((system[0] & 1u) || system[4] || system[5] || system[6] ||
-          system[7] < index_count - 1 || (system[3] && system[3] < index_count)) return false;
-      if (normalized_color_mask && normalized_color_mask != 15) return false;
-      if (normalized_depth_control.backface_enable && normalized_depth_control.stencil_enable &&
-          regs.Get<reg::RB_STENCILREFMASK>().stencilref !=
-          regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF).stencilref) return false;
-      const uint32_t fetch_address = regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0];
-      const uint32_t fetch_size = regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_1];
-      if ((fetch_address & 3u) != 3u) return false;
-      std::array<uint8_t, 168> bytes;
-      if (!shared_memory_->CopyCpuSnapshot(fetch_address & ~3u,
-          std::span<uint8_t>(bytes).first(index_count * 28))) return false;
-      std::array<Fh1ClearRectangle, 2> rectangles;
-      std::array<std::array<float, 4>, 2> colors{};
-      const uint32_t count = index_count / 3;
-      for (uint32_t i = 0; i < count; ++i) {
-        std::array<std::array<float, 4>, 3> vertices;
-        for (uint32_t j = 0; j < 3; ++j) {
-          const auto vertex = fh1_clear_vertex(
-              std::span<const uint8_t, 28>(bytes.data() + (i * 3 + j) * 28, 28),
-              fetch_size & 3u, system, pixel_shader != nullptr);
-          if (!vertex) return false;
-          std::copy_n(vertex->begin(), 4, vertices[j].begin());
-          if (!j) std::copy_n(vertex->begin() + 4, 4, colors[i].begin());
-          else if (std::memcmp(colors[i].data(), vertex->data() + 4, 16)) return false;
-        }
-        auto rectangle = fh1_clear_rectangle(vertices,
-            {viewport_info.xy_offset[0], viewport_info.xy_offset[1], viewport_info.xy_extent[0], viewport_info.xy_extent[1]},
-            {viewport_info.z_min, viewport_info.z_max},
-            {scissor.offset[0], scissor.offset[1], scissor.extent[0], scissor.extent[1]});
-        if (!rectangle || (convert_z_to_float24 && rectangle->depth != 0)) return false;
-        rectangles[i] = *rectangle;
-        for (float& component : colors[i]) {
-          component *= system_constants_.color_exp_bias[0];
-          if (!std::isfinite(component)) return false;
-        }
-      }
-      deferred_command_list_.BeginDebugMarker("PinyonShift native FH1 rectangle clear");
-      const bool cleared = render_target_cache_->ClearFh1Rectangles(
-          std::span<const Fh1ClearRectangle>(rectangles).first(count),
-          std::span<const std::array<float, 4>>(colors).first(count), normalized_color_mask != 0,
-          normalized_depth_control.z_enable && normalized_depth_control.z_write_enable,
-          normalized_depth_control.stencil_enable, uint8_t(ff_stencil_ref_));
-      deferred_command_list_.EndDebugMarker();
-      if (cleared)
-        report_clear(0,
-                     (normalized_color_mask ? 1u : 0u) |
-                     (normalized_depth_control.z_enable &&
-                              normalized_depth_control.z_write_enable ? 2u : 0u) |
-                     (normalized_depth_control.stencil_enable ? 4u : 0u),
-                     uint8_t(ff_stencil_ref_),
-                     std::span<const Fh1ClearRectangle>(rectangles).first(count),
-                     std::span<const std::array<float, 4>>(colors).first(count));
-      return cleared;
-    };
-    if (try_clear()) return finish_draw(true);
-  }
 
-  if (fh1_tonemap_source) {
-    deferred_command_list_.BeginDebugMarker(
-        "PinyonShift V5 native FH1 tone map");
-    const bool native_tonemap_drawn = DrawFh1ToneMap(
-        *fh1_tonemap_source, fh1_tonemap_target_format,
-        system_constants_.color_exp_bias[0]);
-    deferred_command_list_.EndDebugMarker();
-    if (native_tonemap_drawn) {
-      ++fh1_tonemap_native_draws_;
-      if (fh1_tonemap_native_draws_ == 1) {
-        REXGPU_INFO("FH1 V5 native tone-map draws 1");
-      }
-      return finish_draw(true);
-    }
-  }
-
-  if (!pipeline_handle) {
-    if (!configure_guest_pipeline()) {
-      return finish_draw(false);
-    }
-    if (REXCVAR_GET(async_shader_compilation) &&
-        pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
-      return finish_draw(true);
-    }
-  }
   bind_prepared_guest_pipeline();
-
-  D3D12_GPU_VIRTUAL_ADDRESS depth_index_address = 0;
-  // Blended/lit use fixed materials; shadow/packed world retain pixel tables.
-  const auto fh1_mesh_root = fh1_scene_stride == 32 ? root_signature_fh1_skinned_ :
-      fh1_scene_stride == 16 || fh1_scene_stride == 20
-      ? root_signature_fh1_layered_ : root_signature_fh1_depth_;
-  if (fh1_depth_indices && (fh1_depth_stride ||
-          (fh1_scene_stride && fh1_mesh_root && root_signature == fh1_mesh_root) ||
-          (root_signature_fh1_terrain_ && root_signature == root_signature_fh1_terrain_)) &&
-      primitive_processing_result.index_buffer_type == PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA) {
-    const uint32_t index_width = primitive_processing_result.host_index_format ==
-        xenos::IndexFormat::kInt16 ? 2 : 4;
-    const uint64_t index_bytes = uint64_t(primitive_processing_result.host_draw_vertex_count) * index_width;
-    if (index_bytes && index_bytes <= SharedMemory::kBufferSize) {
-      depth_index_address = GetFh1OwnedGeometry(
-          primitive_processing_result.guest_index_base, uint32_t(index_bytes),
-          ((fh1_mesh_root && root_signature == fh1_mesh_root) ||
-           (root_signature_fh1_terrain_ && root_signature == root_signature_fh1_terrain_)) &&
-              index_bytes <= (1u << 20));
-      if (depth_index_address) {
-        // Geometry views retain low address bits in fetch constants; indices do not.
-        depth_index_address += primitive_processing_result.guest_index_base & 15;
-      }
-    }
-  }
-
-  D3D12_GPU_VIRTUAL_ADDRESS geometry_address = 0;
-  if (fh1_vertex_hash == 0x3BC346726C1C2535ull &&
-      root_signature_fh1_layered_ && root_signature == root_signature_fh1_layered_ &&
-      primitive_processing_result.index_buffer_type == PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
-    uint32_t system_words[8];
-    std::memcpy(system_words, &system_constants_, sizeof(system_words));
-    float scale;
-    std::memcpy(&scale, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 254 * 4], sizeof(scale));
-    const auto range = geometry_range(
-        std::span<const uint32_t, 8>(system_words), scale,
-        primitive_processing_result.host_draw_vertex_count,
-        regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 190],
-        regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 191]);
-    if (range) {
-      geometry_address = GetFh1OwnedGeometry(range->first, range->second);
-    }
-  }
-
-  // Bounds must describe the cached indices actually bound below. A vertex
-  // import can refresh an aliased cache window, so prove them again afterward.
-  if (depth_index_address && fh1_mesh_root && root_signature == fh1_mesh_root) {
-    const uint32_t width = primitive_processing_result.host_index_format ==
-        xenos::IndexFormat::kInt16 ? 2 : 4;
-    const uint64_t bytes = uint64_t(primitive_processing_result.host_draw_vertex_count) * width;
-    if (bytes && bytes <= (1u << 20)) {
-      uint32_t system_words[8];
-      std::memcpy(system_words, &system_constants_, sizeof(system_words));
-      const auto snapshot_range = [&]() -> std::optional<std::pair<uint32_t, uint32_t>> {
-        return GetFh1DepthGeometryRange(
-            primitive_processing_result.guest_index_base, uint32_t(bytes),
-            std::span<const uint32_t, 8>(system_words), width, fh1_scene_stride ? fh1_scene_stride : fh1_depth_stride,
-            regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 190],
-            regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 191],
-            primitive_processing_result.host_primitive_reset_enabled,
-            fh1_scene_stride ? fh1_scene_stride : 12);
-      };
-      if (const auto range = snapshot_range()) {
-        const uint64_t imports_before = fh1_geometry_imports_;
-        geometry_address = GetFh1OwnedGeometry(range->first, range->second);
-        if (geometry_address && fh1_geometry_imports_ != imports_before) {
-          const auto current = snapshot_range();
-          if (!current || current->first != range->first || current->second > range->second)
-            geometry_address = 0;
-        }
-      }
-    }
-  }
-
-  if (fh1_scene_stride && !geometry_address) depth_index_address = 0;
-
-  std::array<D3D12_GPU_VIRTUAL_ADDRESS, 2> terrain_addresses{};
-  const bool fh1_skinned = root_signature_fh1_skinned_ && root_signature == root_signature_fh1_skinned_;
-  if (fh1_skinned && geometry_address && depth_index_address) {
-    float offset;
-    std::memcpy(&offset, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 156 * 4], sizeof(offset));
-    const auto palette = skinned_transform_range(offset,
-        regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 188],
-        regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 189]);
-    const uint32_t width = primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16 ? 2 : 4;
-    const uint32_t bytes = primitive_processing_result.host_draw_vertex_count * width;
-    uint32_t system[8];
-    std::memcpy(system, &system_constants_, sizeof(system));
-    const auto primary_range = [&]() {
-      return GetFh1DepthGeometryRange(primitive_processing_result.guest_index_base, bytes,
-          system, width, 32, regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 190],
-          regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 191],
-          primitive_processing_result.host_primitive_reset_enabled, 32);
-    };
-    const auto before = primary_range();
-    if (palette && before) {
-      const uint64_t imports_before = fh1_geometry_imports_;
-      terrain_addresses[0] = GetFh1OwnedGeometry(palette->first, palette->second);
-      // An aliased import can refresh the immutable index snapshot.
-      if (terrain_addresses[0] && fh1_geometry_imports_ != imports_before &&
-          primary_range() != before) terrain_addresses[0] = 0;
-    }
-    if (!terrain_addresses[0]) geometry_address = depth_index_address = 0;
-  }
-
-  if (fh1_terrain_depth && depth_index_address && root_signature_fh1_terrain_ &&
-      root_signature == root_signature_fh1_terrain_) {
-    const auto& map = vertex_shader->constant_register_map();
-    const uint32_t width = primitive_processing_result.host_index_format ==
-        xenos::IndexFormat::kInt16 ? 2 : 4;
-    const uint64_t bytes = uint64_t(primitive_processing_result.host_draw_vertex_count) * width;
-    if (bytes && bytes <= (1u << 20) && !map.float_dynamic_addressing &&
-        map.float_count >= 10 && map.float_count <= 11) {
-      // Match UpdateBindings' ascending register-map packing exactly.
-      float constants[44]{};
-      uint32_t count = 0;
-      for (uint32_t i = 0; i < 4; ++i) {
-        uint64_t bits = map.float_bitmap[i];
-        uint32_t index;
-        while (rex::bit_scan_forward(bits, &index)) {
-          bits &= ~(uint64_t(1) << index);
-          if (count < 11) std::memcpy(constants + count * 4,
-              &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8) + (index << 2)], 4 * sizeof(float));
-          ++count;
-        }
-      }
-      if (count == map.float_count) {
-        uint32_t system_words[8], fetches[6];
-        std::memcpy(system_words, &system_constants_, sizeof(system_words));
-        const uint32_t streams[] = {95, 90, 89};
-        for (uint32_t i = 0; i < 3; ++i) std::memcpy(fetches + i * 2,
-            &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + streams[i] * 2], 2 * sizeof(uint32_t));
-        const auto snapshot_ranges = [&]() {
-          return GetFh1TerrainGeometryRanges(primitive_processing_result.guest_index_base,
-              uint32_t(bytes), system_words, width,
-              primitive_processing_result.host_primitive_reset_enabled, constants, fetches);
-        };
-        if (const auto ranges = snapshot_ranges()) {
-          const uint64_t imports_before = fh1_geometry_imports_;
-          std::array<D3D12_GPU_VIRTUAL_ADDRESS, 3> addresses{};
-          bool complete = true;
-          for (uint32_t i = 0; i < 3; ++i) {
-            if (!(*ranges)[i].second) continue;
-            addresses[i] = GetFh1OwnedGeometry((*ranges)[i].first, (*ranges)[i].second);
-            if (!addresses[i]) { complete = false; break; }
-          }
-          if (complete && fh1_geometry_imports_ != imports_before) {
-            const auto current = snapshot_ranges();
-            complete = bool(current);
-            if (current) for (uint32_t i = 0; i < 3; ++i) {
-              if ((*current)[i].first != (*ranges)[i].first ||
-                  (*current)[i].second > (*ranges)[i].second) complete = false;
-            }
-          }
-          if (complete) {
-            geometry_address = addresses[0];
-            terrain_addresses = {addresses[1], addresses[2]};
-          }
-        }
-      }
-    }
-    // Partial terrain ownership returns every input to shared memory.
-    if (!geometry_address) depth_index_address = 0;
-  }
 
   // Ensure vertex buffers are resident.
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
@@ -5278,16 +2710,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
               "This is incorrect behavior, but you can try bypassing this by "
               "launching Xenia with --gpu_allow_invalid_fetch_constants=true.",
               vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
-          return finish_draw(false);
+          return false;
         default:
           REXGPU_WARN("Vertex fetch constant {} ({:08X} {:08X}) is completely invalid!",
                       vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
-          return finish_draw(false);
+          return false;
       }
-      // The native layered root reads fetch 95 from the owned buffer.
-      if (geometry_address && (vfetch_index == 95 ||
-          (terrain_addresses[1] && (vfetch_index == 89 || vfetch_index == 90)) ||
-          (fh1_skinned && terrain_addresses[0] && vfetch_index == 94))) continue;
       VertexBufferState& state = vertex_buffer_states_[vfetch_index];
       if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
@@ -5298,7 +2726,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
             "shared memory",
             vfetch_constant.address << 2, vfetch_constant.size << 2);
-        return finish_draw(false);
+        return false;
       }
       state.address = vfetch_constant.address;
       state.size = vfetch_constant.size;
@@ -5307,207 +2735,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
 
   // Update constant buffers, descriptors and root parameters.
-  const auto binding_begin = time_fh1_draw
-      ? std::chrono::steady_clock::now()
-      : std::chrono::steady_clock::time_point{};
-  const bool bindings_ready = UpdateBindings(vertex_shader, pixel_shader,
-      root_signature, memexport_used, geometry_address, terrain_addresses);
-  if (time_fh1_draw) PERF_counter_add(kFh1BindingCpuTimeNs,
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::steady_clock::now() - binding_begin).count());
-  if (!bindings_ready) {
-    return finish_draw(false);
-  }
-  const bool fh1_car_presentation_material =
-      fh1_vertex_hash == 0x0DF9CA19A93A75D9ull &&
-      fh1_pixel_hash == 0xE349204378CA1591ull;
-  const bool fh1_car_body_material =
-      fh1_vertex_hash == 0xD34A83D9E6B3A399ull &&
-      fh1_pixel_hash == 0xE9CD565D9C61D037ull &&
-      vertex_shader_modification.value == 0x3Full &&
-      pixel_shader_modification.value == 0x16003Full;
-  const bool fh1_car_glass_material =
-      fh1_vertex_hash == 0x2E5E0A854BE00027ull &&
-      fh1_pixel_hash == 0xBDFFA72B7ED2FBA4ull &&
-      pixel_shader_modification.value == 0x16003Full;
-  const bool fh1_manager_material =
-      fh1_vertex_hash == 0xB8489164D5A86043ull &&
-      fh1_pixel_hash == 0x68150A8E959006CDull &&
-      pixel_shader_modification.value == 0x15001Full;
-  const bool fh1_track_structure_material = snr02_track_draw && (
-      (((fh1_vertex_hash == 0x0CBC533419F61E0Dull &&
-         (fh1_pixel_hash == 0xEFCA69AA2BEE366Bull ||
-          fh1_pixel_hash == 0x56D45C45966FD938ull)) ||
-        (fh1_vertex_hash == 0x5DB1ECF39EA11DB0ull &&
-         fh1_pixel_hash == 0x6508BAC22C4E1720ull)) &&
-       pixel_shader_modification.value == 0x4000002B003Full) ||
-      (fh1_vertex_hash == 0x6934E161812AB10Bull &&
-       fh1_pixel_hash == 0xB98566FB7CE14699ull &&
-       pixel_shader_modification.value == 0x4000005B007Full));
-  const bool fh1_sampled_native_material =
-      (snr02_track_draw &&
-       ((fh1_vertex_hash == 0xD7F57566A51FA243ull &&
-         fh1_pixel_hash == 0x175C1F483406F7FDull &&
-         vertex_shader_modification.value == 0x3FFull) ||
-        (fh1_vertex_hash == 0x07425D208E8BD688ull &&
-         fh1_pixel_hash == 0x6F7CDE74CDACCB08ull &&
-         vertex_shader_modification.value == 0x7Full) ||
-        (fh1_vertex_hash == 0x1193B16753866698ull &&
-         (fh1_pixel_hash == 0x93961AB9BDF347DDull ||
-          fh1_pixel_hash == 0xA47DB20460BADDDFull) &&
-         vertex_shader_modification.value == 0x3FFull))) ||
-      (fh1_vertex_hash == 0x5834939992FFC765ull &&
-       pixel_shader_modification.value == 0x1A001Full) ||
-      fh1_car_presentation_material || fh1_car_body_material ||
-      fh1_car_glass_material || fh1_track_structure_material ||
-      fh1_manager_material;
-  const bool ray_ui_material = ray_ui_draw &&
-      (fh1_pixel_hash == 0xCAE1DB68AFFA9D3Cull ||
-       fh1_pixel_hash == 0x6FDA0F1CDE67D12Full);
-  if (prepared_draw_observer && observation_frame_sequence_ > 1 &&
-      (ray_trace_frame || ray_ordered_producer || ray_ui_material ||
-       ((ray_shadow_frame ||
-         fh1_native_race_requested.load(std::memory_order_acquire)) &&
-        fh1_sampled_native_material))) {
-    for (uint32_t material_fetch = 0;
-         material_fetch < ((ray_trace_frame || ray_ordered_producer) ? 32u :
-                           (fh1_car_body_material || fh1_car_glass_material ||
-                            fh1_track_structure_material ||
-                            fh1_manager_material ? 14u : 2u));
-         ++material_fetch) {
-      if (!(used_texture_mask & (1u << material_fetch)) ||
-          (!ray_trace_frame && !ray_ordered_producer && !ray_ui_material &&
-           !fh1_car_body_material &&
-           !fh1_car_glass_material && !fh1_track_structure_material &&
-           !fh1_manager_material && material_fetch != 0) ||
-          (fh1_manager_material && material_fetch != 0 &&
-           material_fetch != 13))
-        continue;
-      const auto identity =
-          texture_cache_->GetActiveNativeTextureIdentity(material_fetch);
-      if (identity.allocation_id && identity.payload_generation &&
-          !identity.outdated_mask) {
-        std::array<uint32_t, 6> fetch_words;
-        std::copy_n(identity.fetch_words, fetch_words.size(),
-                    fetch_words.begin());
-        auto& frame = fh1_native_material_frames_[observation_frame_sequence_];
-        const auto key = std::tuple{fetch_words, identity.allocation_id,
-                                    identity.payload_generation};
-        const uint64_t byte_limit = ray_trace_frame
-            ? 512ull * 1024 * 1024 : 96ull * 1024 * 1024;
-        const size_t material_limit = ray_trace_frame ? 1024 : 256;
-        if (!frame.materials.contains(key) &&
-            frame.materials.size() < material_limit &&
-            frame.bytes < byte_limit) {
-          auto it = frame.materials.try_emplace(key).first;
-          // The pinned copy is immutable for this exact texture version.
-          for (uint64_t lag = 1; lag <= 2 &&
-               observation_frame_sequence_ >= lag; ++lag) {
-            const auto previous = fh1_native_material_frames_.find(
-                observation_frame_sequence_ - lag);
-            if (previous == fh1_native_material_frames_.end()) continue;
-            const auto material = previous->second.materials.find(key);
-            if (material == previous->second.materials.end() ||
-                !material->second.snapshot ||
-                material->second.bytes > byte_limit - frame.bytes) continue;
-            it->second = material->second;
-            frame.bytes += material->second.bytes;
-            break;
-          }
-          if (it->second.snapshot) continue;
-          uint64_t bytes = 0;
-          const auto snapshot_begin = time_fh1_draw
-              ? std::chrono::steady_clock::now()
-              : std::chrono::steady_clock::time_point{};
-          const bool snapshot_ready = texture_cache_->SnapshotActiveNativeTexture(
-                  material_fetch, byte_limit - frame.bytes,
-                  it->second.source, it->second.snapshot, it->second.view, bytes);
-          if (time_fh1_draw) {
-            PERF_counter_add(kFh1MaterialSnapshotCpuTimeNs,
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - snapshot_begin).count());
-            PERF_counter_inc(kFh1MaterialSnapshotCalls);
-          }
-          if (snapshot_ready) {
-            it->second.bytes = bytes;
-            frame.bytes += bytes;
-          } else {
-            frame.materials.erase(it);
-            if (ray_trace_frame) {
-              ++frame.trace_failed;
-              REXGPU_WARN("FH1 RAY00 texture snapshot rejected frame={} "
-                          "fetch={} words={}:{}:{}:{}:{}:{} allocation={} "
-                          "generation={}", observation_frame_sequence_,
-                          material_fetch, fetch_words[0], fetch_words[1],
-                          fetch_words[2], fetch_words[3], fetch_words[4],
-                          fetch_words[5], identity.allocation_id,
-                          identity.payload_generation);
-            }
-          }
-        } else if (!frame.materials.contains(key)) {
-          if (ray_trace_frame) ++frame.trace_limited;
-          static thread_local bool reported_native_material_limit = false;
-          if (!reported_native_material_limit) {
-            REXGPU_WARN("FH1 native material snapshot limit frame={} "
-                        "fetch={} materials={} bytes={}",
-                        observation_frame_sequence_, material_fetch,
-                        frame.materials.size(), frame.bytes);
-            reported_native_material_limit = true;
-          }
-        }
-      }
-    }
-  }
-  if ((!Fh1NativeRaceCaptureStartFrame() || prepared_draw_observer) &&
-      (snr02_track_draw ||
-      Fh1SnrProbeOutputFrame(Fh1Snr03ProbeFrame(),
-                             observation_frame_sequence_) ||
-      ray_trace_frame || ray_ordered_producer || ray_shadow_frame ||
-      (Fh1SnrProbeOutputFrame(Fh1Snr02ItemProbeFrame(),
-                              observation_frame_sequence_) &&
-       Fh1Snr02ItemShader(fh1_vertex_hash)))) {
-    if (auto observer = fh1_native_presents ? nullptr
-                                             : graphics_system_->final_draw_state_observer()) {
-      std::array<uint32_t, 64> system_words;
-      std::array<system::GraphicsFinalDrawTextureIdentity, 32> textures;
-      uint32_t texture_count = 0;
-      if (snr02_track_draw ||
-          fh1_vertex_hash == 0x5834939992FFC765ull ||
-          fh1_car_presentation_material || fh1_car_body_material ||
-          ray_trace_frame || ray_ordered_producer || ray_shadow_frame) {
-        for (uint32_t fetch = 0; fetch < 32; ++fetch) {
-          if ((used_texture_mask & (uint32_t(1) << fetch)) &&
-              (!fh1_car_presentation_material || !fetch))
-            textures[texture_count++] =
-                texture_cache_->GetActiveNativeTextureIdentity(fetch);
-        }
-      }
-      const std::array<float, 6> viewport{
-          ff_viewport_.TopLeftX, ff_viewport_.TopLeftY,
-          ff_viewport_.Width, ff_viewport_.Height,
-          ff_viewport_.MinDepth, ff_viewport_.MaxDepth};
-      const std::array<int32_t, 4> scissor{
-          ff_scissor_.left, ff_scissor_.top,
-          ff_scissor_.right, ff_scissor_.bottom};
-      static_assert(sizeof(system_constants_) >= sizeof(system_words));
-      std::memcpy(system_words.data(), &system_constants_, sizeof(system_words));
-      observer({observation_frame_sequence_, fh1_scene_draw_sequence_,
-                observation_draw_packet_address_,
-                prepared_observation.fh1_execution_key.dynamic_state,
-                system_words.data(), uint32_t(system_words.size()),
-                regs.values + XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 47 * 4,
-                regs.values + XE_GPU_REG_SHADER_CONSTANT_000_X,
-                snr02_bound_vertex_constants_.data(),
-                snr02_bound_vertex_constant_count_,
-                regs.Get<reg::PA_SU_SC_MODE_CNTL>().value,
-                regs.Get<reg::PA_CL_CLIP_CNTL>().value,
-                normalized_depth_control.value,
-                viewport.data(), scissor.data(),
-                regs.values + XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0, 192,
-                textures.data(), texture_count,
-                regs.values + XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031, 40});
-      ray_final_observed = true;
-    }
+  if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
+    return false;
   }
 
   // Must not call anything that can change the descriptor heap from now on!
@@ -5529,7 +2758,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           "Failed to request memexport stream at 0x{:08X} (size {}) in the "
           "shared memory",
           memexport_range.base_address_dwords << 2, memexport_range.size_bytes);
-      return finish_draw(false);
+      return false;
     }
   }
   if (memexport_used && memexport_ranges_.empty()) {
@@ -5537,7 +2766,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       REXGPU_ERROR(
           "Failed to request full shared memory residency for unresolved "
           "memexport destinations");
-      return finish_draw(false);
+      return false;
     }
   }
 
@@ -5570,7 +2799,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             "processor is not supported by the Direct3D 12 command processor",
             uint32_t(primitive_processing_result.host_primitive_type));
         assert_unhandled_case(primitive_processing_result.host_primitive_type);
-        return finish_draw(false);
+        return false;
     }
   } else {
     switch (primitive_processing_result.host_primitive_type) {
@@ -5599,53 +2828,38 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             "supported by the Direct3D 12 command processor",
             uint32_t(primitive_processing_result.host_primitive_type));
         assert_unhandled_case(primitive_processing_result.host_primitive_type);
-        return finish_draw(false);
+        return false;
     }
   }
   SetPrimitiveTopology(primitive_topology);
   // Must not call anything that may change the primitive topology from now on!
 
-  const uint64_t snr03_probe_frame = Fh1Snr03ProbeFrame();
-  const bool snr04_mark_foliage =
-      snr03_probe_frame && debug_markers_enabled_ &&
-      fh1_vertex_hash == 0x5834939992FFC765ull;
-  char marker[96];
-  if (snr04_mark_foliage) {
-    std::snprintf(marker, sizeof(marker), "SNR04 foliage output=%llu draw=%llu",
-                  static_cast<unsigned long long>(observation_frame_sequence_),
-                  static_cast<unsigned long long>(fh1_scene_draw_sequence_));
-  }
+  Fh1NativeDrawInfo native_draw;
+  native_draw.memexport = memexport_used;
+  native_draw.occlusion_query_active = active_occlusion_query_.valid ||
+                                       zpd_lifecycle_.active_report() ||
+                                       modern_occlusion_query_active_index_ != UINT32_MAX;
+  native_draw.rasterization_done = is_rasterization_done;
+  native_draw.normalized_depth_control = normalized_depth_control;
+  native_draw.normalized_color_mask = normalized_color_mask;
+  native_draw.vertex_shader = vertex_shader;
+  native_draw.pixel_shader = pixel_shader;
 
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
       PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
     if (memexport_used) {
       shared_memory_->UseForWriting();
-    } else if (!geometry_address) {
-      // The owned layered draw has no shared vertex, pixel or index reads.
+    } else {
       shared_memory_->UseForReading();
     }
     SubmitBarriers();
     bind_prepared_guest_pipeline();
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
-    if (snr04_mark_foliage) deferred_command_list_.BeginDebugMarker(marker);
     deferred_command_list_.D3DDrawInstanced(
         primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
-    if (fh1_native_executor_) {
-      Fh1NativeDrawInfo native_draw;
-      native_draw.memexport = memexport_used;
-      native_draw.occlusion_query_active = active_occlusion_query_.valid ||
-                                           zpd_lifecycle_.active_report() ||
-                                           modern_occlusion_query_active_index_ != UINT32_MAX;
-      native_draw.rasterization_done = is_rasterization_done;
-      native_draw.normalized_depth_control = normalized_depth_control;
-      native_draw.normalized_color_mask = normalized_color_mask;
-      native_draw.vertex_shader = vertex_shader;
-      native_draw.pixel_shader = pixel_shader;
-      fh1_native_executor_->NativeDrawIssued(native_draw);
-    }
-    if (snr04_mark_foliage) deferred_command_list_.EndDebugMarker();
+    fh1_native_executor_->NativeDrawIssued(native_draw);
   } else {
     D3D12_INDEX_BUFFER_VIEW index_buffer_view;
     index_buffer_view.SizeInBytes = primitive_processing_result.host_draw_vertex_count;
@@ -5659,14 +2873,6 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     ID3D12Resource* scratch_index_buffer = nullptr;
     switch (primitive_processing_result.index_buffer_type) {
       case PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA: {
-        if (depth_index_address) {
-          index_buffer_view.BufferLocation = depth_index_address;
-          break;
-        }
-        if (fh1_depth_indices && !shared_memory_->RequestRange(
-                primitive_processing_result.guest_index_base, index_buffer_view.SizeInBytes)) {
-          return finish_draw(false);
-        }
         if (memexport_used) {
           // If the shared memory is a UAV, it can't be used as an index buffer
           // (UAV is a read/write state, index buffer is a read-only state).
@@ -5674,7 +2880,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           scratch_index_buffer = RequestScratchGPUBuffer(index_buffer_view.SizeInBytes,
                                                          D3D12_RESOURCE_STATE_COPY_DEST);
           if (scratch_index_buffer == nullptr) {
-            return finish_draw(false);
+            return false;
           }
           shared_memory_->UseAsCopySource();
           SubmitBarriers();
@@ -5700,41 +2906,25 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         break;
       default:
         assert_unhandled_case(primitive_processing_result.index_buffer_type);
-        return finish_draw(false);
+        return false;
     }
     deferred_command_list_.D3DIASetIndexBuffer(&index_buffer_view);
     if (memexport_used) {
       shared_memory_->UseForWriting();
-    } else if (!geometry_address || !depth_index_address) {
-      // Fully owned depth draws have no remaining shared-buffer reads.
+    } else {
       shared_memory_->UseForReading();
     }
     SubmitBarriers();
     bind_prepared_guest_pipeline();
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
-    if (snr04_mark_foliage) deferred_command_list_.BeginDebugMarker(marker);
     deferred_command_list_.D3DDrawIndexedInstanced(
         primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
-    if (fh1_native_executor_) {
-      Fh1NativeDrawInfo native_draw;
-      native_draw.memexport = memexport_used;
-      native_draw.occlusion_query_active = active_occlusion_query_.valid ||
-                                           zpd_lifecycle_.active_report() ||
-                                           modern_occlusion_query_active_index_ != UINT32_MAX;
-      native_draw.rasterization_done = is_rasterization_done;
-      native_draw.normalized_depth_control = normalized_depth_control;
-      native_draw.normalized_color_mask = normalized_color_mask;
-      native_draw.vertex_shader = vertex_shader;
-      native_draw.pixel_shader = pixel_shader;
-      fh1_native_executor_->NativeDrawIssued(native_draw);
-    }
-    if (snr04_mark_foliage) deferred_command_list_.EndDebugMarker();
+    fh1_native_executor_->NativeDrawIssued(native_draw);
     if (scratch_index_buffer != nullptr) {
       ReleaseScratchGPUBuffer(scratch_index_buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
     }
   }
-
 
   if (memexport_used) {
     PROFILE_MEMEXPORT_DRAW();
@@ -5756,88 +2946,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
-  return finish_draw(true);
-}
-
-void D3D12CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
-  const auto fallback = [&] { CommandProcessor::ExecuteIndirectBuffer(ptr, count); };
-  if (!REXCVAR_GET(fh1_native_reflection_mips) || fh1_native_executor_ ||
-      count != Fh1MipChain::kCommandBytes / 4 ||
-      !Fh1MipPhysicalRange(ptr, Fh1MipChain::kCommandBytes)) {
-    fallback();
-    return;
-  }
-  ++fh1_mip_candidates_;
-  if (fh1_mip_replacement_active_ || active_occlusion_query_.valid ||
-      !Fh1MipInheritedState(register_file_->values[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_TL],
-                            register_file_->values[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR],
-                            register_file_->values[XE_GPU_REG_VGT_MIN_VTX_INDX],
-                            register_file_->values[XE_GPU_REG_VGT_MAX_VTX_INDX],
-                            register_file_->values[XE_GPU_REG_SQ_VS_CONST],
-                            register_file_->values[XE_GPU_REG_SQ_PS_CONST]) ||
-      modern_occlusion_query_active_index_ != UINT32_MAX ||
-      modern_occlusion_query_active_report_ != ZPDLifecycle::kInvalidReportHandle ||
-      !(bin_select_ & bin_mask_) ||
-      register_file_->Get<reg::RB_MODECONTROL>().edram_mode != xenos::EdramMode::kColorDepth ||
-      render_target_cache_->GetPath() != RenderTargetCache::Path::kHostRenderTargets) {
-    ++fh1_mip_rejections_[1];
-    fallback();
-    return;
-  }
-  // Re-read current allocation contents; no pointer/handle is a cache identity.
-  const bool probe = REXCVAR_GET(fh1_mip_decode_probe);
-  const auto contract_start = probe ? std::chrono::steady_clock::now()
-                                    : std::chrono::steady_clock::time_point{};
-  std::array<unsigned char, Fh1MipChain::kCommandBytes> commands;
-  Fh1MipChain chain;
-  const auto copy = [&](uint32_t address, std::span<uint8_t> bytes) {
-    return shared_memory_->CopyCpuSnapshot(address, bytes);
-  };
-  if (!copy(ptr, commands) || !ParseFh1MipChain(commands, chain) ||
-      !(ptr + commands.size() <= chain.base || ptr >= chain.base + Fh1MipChain::kTotalBytes) ||
-      !CheckFh1MipInputs(chain, copy)) {
-    ++fh1_mip_rejections_[2];
-    fallback();
-    return;
-  }
-  const auto native_start = probe ? std::chrono::steady_clock::now()
-                                  : std::chrono::steady_clock::time_point{};
-  const uint32_t face = chain.face;
-  if (!BeginSubmission(true) || !texture_cache_->GenerateFh1ReflectionMips(chain.base, face)) {
-    ++fh1_mip_rejections_[3];
-    fallback();
-    return;
-  }
-  const auto replay_start = probe ? std::chrono::steady_clock::now()
-                                  : std::chrono::steady_clock::time_point{};
-  fh1_mip_skipped_draws_ = fh1_mip_skipped_copies_ = 0;
-  fh1_mip_replacement_active_ = true;
-  memory::RingBuffer reader(commands.data(), commands.size());
-  reader.set_write_offset(commands.size());
-  bool succeeded = true;
-  do {
-    if (!ExecutePacket(&reader)) {
-      succeeded = false;
-      break;
-    }
-  } while (reader.read_count());
-  fh1_mip_replacement_active_ = false;
-  if (!succeeded || fh1_mip_skipped_draws_ != 8 || fh1_mip_skipped_copies_ != 8) {
-    REXGPU_ERROR("FH1 native reflection mip contract execution failed");
-    assert_always();
-  } else {
-    ++fh1_mip_native_faces_;
-    if (probe) {
-      const auto end = std::chrono::steady_clock::now();
-      ++fh1_mip_probe_faces_;
-      fh1_mip_probe_contract_ns_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-          native_start - contract_start).count());
-      fh1_mip_probe_native_ns_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-          replay_start - native_start).count());
-      fh1_mip_probe_replay_ns_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-          end - replay_start).count());
-    }
-  }
+  return true;
 }
 
 bool D3D12CommandProcessor::IssueCopy() {
@@ -5849,18 +2958,8 @@ bool D3D12CommandProcessor::IssueCopy() {
   }
   uint32_t written_address = 0;
   uint32_t written_length = 0;
-  BeginFh1GpuPassTimingCopy();
-  if (fh1_native_executor_) fh1_native_executor_->RecordCopyInputs();
-  const bool fh1_native_presents = fh1_native_executor_ != nullptr;
-  bool copy_succeeded;
-  if (fh1_native_presents) {
-    copy_succeeded = fh1_native_executor_->NativeResolve(written_address, written_length);
-  } else {
-    copy_succeeded =
-        render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                      written_address, written_length,
-                                      fh1_mip_replacement_active_);
-  }
+  fh1_native_executor_->RecordCopyInputs();
+  const bool copy_succeeded = fh1_native_executor_->NativeResolve(written_address, written_length);
   if (Fh1FrameCensus::Enabled()) {
     Fh1FrameCensus::ObserveCopy(*register_file_, observation_frame_sequence_,
                                 written_address, written_length, copy_succeeded);
@@ -5876,132 +2975,8 @@ bool D3D12CommandProcessor::IssueCopy() {
         register_file_->Get<reg::RB_COPY_DEST_PITCH>().value,
         register_file_->Get<reg::RB_SURFACE_INFO>().value);
   }
-  if (fh1_mip_replacement_active_ && copy_succeeded)
-    ++fh1_mip_skipped_copies_;
   if (copy_succeeded && written_length && !REXCVAR_GET(fh1_resolve_dump_dir).empty()) {
     DumpResolveOutput(written_address, written_length);
-  }
-
-  auto copy_observer = graphics_system_->copy_observer();
-  if (!Fh1ObserveCorpusFrame(observation_frame_sequence_) || fh1_native_presents) {
-    copy_observer = nullptr;
-  }
-  if (copy_observer) {
-    system::GraphicsCopyObservation observation;
-    observation.frame_sequence = observation_frame_sequence_;
-    observation.copy_sequence = ++observation_copy_sequence_;
-    observation.draw_sequence = fh1_scene_draw_sequence_;
-    observation.current_submission = GetCurrentSubmission();
-    observation.completed_submission = submission_completed_;
-    observation.written_address = written_address;
-    observation.written_length = written_length;
-    observation.rb_copy_control = register_file_->Get<reg::RB_COPY_CONTROL>().value;
-    observation.rb_copy_dest_base = (*register_file_)[XE_GPU_REG_RB_COPY_DEST_BASE];
-    observation.rb_copy_dest_info = register_file_->Get<reg::RB_COPY_DEST_INFO>().value;
-    observation.rb_copy_dest_pitch = register_file_->Get<reg::RB_COPY_DEST_PITCH>().value;
-    observation.surface_info = register_file_->Get<reg::RB_SURFACE_INFO>().value;
-    for (uint32_t i = 0; i < 4; ++i) {
-      observation.color_info[i] =
-          (*register_file_)[reg::RB_COLOR_INFO::rt_register_indices[i]];
-    }
-    observation.depth_info = register_file_->Get<reg::RB_DEPTH_INFO>().value;
-    render_target_cache_->PopulateCopySourceTopology(observation);
-    observation.succeeded = copy_succeeded;
-    if (copy_succeeded && observation.rb_copy_dest_base == 497831936 &&
-        observation.rb_copy_control == 4 &&
-        observation.surface_info == 0x14000500 &&
-        observation.depth_info == 0x00010000 &&
-        observation.source_target_available &&
-        observation.source_target_base_tiles == 0 &&
-        observation.source_target_pitch_tiles_at_32bpp == 16 &&
-        observation.source_guest_msaa_samples == 1 &&
-        observation.source_resource_width == 1280 &&
-        observation.source_resource_height == 2048 &&
-        observation.resolve_guest_width == 1280 &&
-        observation.resolve_guest_height == 720 &&
-        (observation.frame_sequence == std::strtoull(
-             rex::cvar::GetFlagByName(
-                 "pinyon_shift_snr01_trace_source_frame").c_str(),
-             nullptr, 10) ||
-         Fh1RayOrderedLiveFrame(observation.frame_sequence))) {
-      auto snapshot = render_target_cache_->SnapshotFh1InitialColorDepth();
-      if (snapshot) {
-        fh1_initial_color_depth_frames_[observation.frame_sequence] =
-            std::move(snapshot);
-        REXGPU_WARN("FH1 RAY01 initial color depth snapshot frame={} "
-                    "sequence={}", observation.frame_sequence,
-                    observation.draw_sequence);
-      }
-    }
-    auto& fh1_key = observation.fh1_execution_key;
-    fh1_key.kind = system::GraphicsFh1ExecutionKind::kCopyResolve;
-    const auto append = [](uint64_t& hash, uint64_t value) {
-      hash = HashFh1ExecutionValue(hash, value);
-    };
-    fh1_key.attachment_state = 0xCBF29CE484222325ull;
-    append(fh1_key.attachment_state, observation.surface_info);
-    for (uint32_t color_info : observation.color_info) {
-      append(fh1_key.attachment_state, color_info);
-    }
-    append(fh1_key.attachment_state, observation.depth_info);
-    for (uint64_t value :
-         {uint64_t(observation.source_target_base_tiles),
-          uint64_t(observation.source_target_pitch_tiles_at_32bpp),
-          uint64_t(observation.resolve_source_base_tiles),
-          uint64_t(observation.resolve_source_pitch_tiles),
-          uint64_t(observation.resolve_source_format),
-          uint64_t(observation.resolve_source_guest_msaa_samples)}) {
-      append(fh1_key.attachment_state, value);
-    }
-    fh1_key.resource_state = 0xCBF29CE484222325ull;
-    for (uint64_t value :
-         {uint64_t(observation.rb_copy_dest_base),
-          uint64_t(observation.rb_copy_dest_info),
-          uint64_t(observation.rb_copy_dest_pitch),
-          uint64_t(observation.written_address),
-          uint64_t(observation.written_length)}) {
-      append(fh1_key.resource_state, value);
-    }
-    fh1_key.dynamic_state = 0xCBF29CE484222325ull;
-    for (uint64_t value :
-         {uint64_t(observation.rb_copy_control),
-          uint64_t(observation.source_resource_width),
-          uint64_t(observation.source_resource_height),
-          uint64_t(observation.source_resource_format),
-          uint64_t(observation.source_sample_count),
-          uint64_t(observation.source_sample_quality),
-          uint64_t(observation.source_guest_msaa_samples),
-          uint64_t(observation.draw_resolution_scale_x),
-          uint64_t(observation.draw_resolution_scale_y)}) {
-      append(fh1_key.dynamic_state, value);
-    }
-    fh1_key.operation_state = 0xCBF29CE484222325ull;
-    for (uint64_t value :
-         {uint64_t(observation.resolve_guest_offset_x),
-          uint64_t(observation.resolve_guest_offset_y),
-          uint64_t(observation.resolve_guest_width),
-          uint64_t(observation.resolve_guest_height),
-          uint64_t(observation.resolve_physical_offset_x),
-          uint64_t(observation.resolve_physical_offset_y),
-          uint64_t(observation.resolve_physical_width),
-          uint64_t(observation.resolve_physical_height),
-          uint64_t(observation.resolve_dest_offset_x),
-          uint64_t(observation.resolve_dest_offset_y),
-          uint64_t(observation.resolve_dest_pitch),
-          uint64_t(observation.resolve_dest_height),
-          uint64_t(observation.resolve_sample_select)}) {
-      append(fh1_key.operation_state, value);
-    }
-    fh1_key.hazard_flags = uint32_t(!observation.resolve_info_valid) |
-                           (uint32_t(!observation.source_target_available)
-                            << 1);
-    fh1_key.flags = uint32_t(observation.succeeded) |
-                    (uint32_t(observation.native_2x_msaa) << 1);
-    fh1_key.identity = fh1_key.ComputeIdentity();
-    ObserveFh1GpuPassTimingCopy(fh1_key, observation.frame_sequence);
-    if (copy_observer) {
-      copy_observer(observation);
-    }
   }
   return copy_succeeded;
 }
@@ -6152,8 +3127,6 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission,
 
   shared_memory_->CompletedSubmissionUpdated();
 
-  if (!render_target_cache_->fh1_config_only()) render_target_cache_->CompletedSubmissionUpdated();
-
   primitive_processor_->CompletedSubmissionUpdated();
 
   texture_cache_->CompletedSubmissionUpdated(submission_completed_);
@@ -6294,8 +3267,6 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     }
     primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
 
-    if (!render_target_cache_->fh1_config_only()) render_target_cache_->BeginSubmission();
-
     primitive_processor_->BeginSubmission();
 
     texture_cache_->BeginSubmission(submission_current_);
@@ -6342,73 +3313,6 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   }
 
   return true;
-}
-
-void D3D12CommandProcessor::FlushSnr04Bc3Readbacks(uint64_t submission) {
-  if (snr04_bc3_readbacks_.empty()) {
-    return;
-  }
-  std::vector<Snr04Bc3Readback> readbacks;
-  readbacks.swap(snr04_bc3_readbacks_);
-  if (!AwaitFence(submission_fence_, submission, true)) {
-    REXGPU_ERROR("FH1 SNR04 BC3 guest submission {} did not complete", submission);
-    return;
-  }
-  const auto& output_dir = Fh1Snr04Bc3OutputDir();
-  if (output_dir.empty()) {
-    REXGPU_ERROR("FH1 SNR04 BC3 output directory disappeared");
-    return;
-  }
-  std::error_code error;
-  std::filesystem::create_directories(output_dir, error);
-  if (error) {
-    REXGPU_ERROR("FH1 SNR04 BC3 output directory failed: {}", error.message());
-    return;
-  }
-  for (auto& entry : readbacks) {
-    if (entry.submission != submission) {
-      REXGPU_ERROR("FH1 SNR04 BC3 submission mismatch");
-      continue;
-    }
-    D3D12_RANGE range{0, static_cast<SIZE_T>(entry.bytes)};
-    void* mapped = nullptr;
-    if (FAILED(entry.buffer->Map(0, &range, &mapped))) {
-      REXGPU_ERROR("FH1 SNR04 BC3 readback map failed srv={}", entry.descriptor);
-      continue;
-    }
-    std::ostringstream name;
-    name << "snr04-bc3-frame" << entry.frame << "-submission"
-         << submission << "-srv" << entry.descriptor << ".bc3";
-    const auto path = std::filesystem::path(output_dir) / name.str();
-    std::ofstream file(path, std::ios::binary);
-    file.write(static_cast<const char*>(mapped), 65536);
-    file.close();
-    const bool written = file.good();
-    auto mip_path = path;
-    mip_path.replace_extension(".bc3mips");
-    std::ofstream mip_file(mip_path, std::ios::binary);
-    for (uint32_t mip = 0; mip < entry.footprints.size(); ++mip) {
-      const uint32_t size = std::max(1u, 256u >> mip);
-      const uint32_t row_bytes = ((size + 3) / 4) * 16;
-      const uint32_t rows = (size + 3) / 4;
-      const auto& footprint = entry.footprints[mip];
-      for (uint32_t row = 0; row < rows; ++row) {
-        mip_file.write(static_cast<const char*>(mapped) + footprint.Offset +
-                           row * footprint.Footprint.RowPitch,
-                       row_bytes);
-      }
-    }
-    mip_file.close();
-    const bool mips_written = mip_file.good();
-    D3D12_RANGE no_write{0, 0};
-    entry.buffer->Unmap(0, &no_write);
-    REXGPU_INFO("FH1 SNR04 BC3 readback frame={} submission={} srv={} "
-                "written={} path={}", entry.frame, submission, entry.descriptor,
-                written, path.string());
-    REXGPU_INFO("FH1 SNR04 BC3 mip chain frame={} submission={} srv={} "
-                "written={} path={}", entry.frame, submission, entry.descriptor,
-                mips_written, mip_path.string());
-  }
 }
 
 bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
@@ -6496,7 +3400,6 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     }
 
     direct_queue->Signal(submission_fence_, submission_current_++);
-    FlushSnr04Bc3Readbacks(traced_submission);
     perf::TraceCriticalPath("submission_end",
                             perf::GetTotalCounter(perf::CounterId::kSourceFrameCount),
                             int64_t(traced_submission), is_closing_frame ? 1 : 0);
@@ -6520,7 +3423,6 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       cache_clear_requested_ = false;
 
       ClearCommandAllocatorCache();
-      ClearFh1OwnedGeometry();
 
       ui::d3d12::util::ReleaseAndNull(scratch_buffer_);
       scratch_buffer_size_ = 0;
@@ -6544,8 +3446,6 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       // which are not destroyed.
 
       primitive_processor_->ClearCache();
-
-      if (!render_target_cache_->fh1_config_only()) render_target_cache_->ClearCache();
 
       shared_memory_->ClearCache();
     }
@@ -7072,9 +3972,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
 bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
                                            const D3D12Shader* pixel_shader,
                                            ID3D12RootSignature* root_signature,
-                                           bool shared_memory_is_uav,
-                                           D3D12_GPU_VIRTUAL_ADDRESS geometry_address,
-                                           const std::array<D3D12_GPU_VIRTUAL_ADDRESS, 2>& terrain_addresses) {
+                                           bool shared_memory_is_uav) {
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
   const RegisterFile& regs = *register_file_;
@@ -7082,28 +3980,6 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-
-  const bool native_layered = root_signature_fh1_layered_ &&
-                              root_signature == root_signature_fh1_layered_;
-
-  const bool native_terrain = root_signature_fh1_terrain_ &&
-                              root_signature == root_signature_fh1_terrain_;
-
-  const bool native_skinned = root_signature_fh1_skinned_ && root_signature == root_signature_fh1_skinned_;
-  uint32_t skinned_origin = 0;
-  if (native_skinned && terrain_addresses[0]) {
-    float offset;
-    std::memcpy(&offset, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 156 * 4], sizeof(offset));
-    const auto range = skinned_transform_range(offset,
-        regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 188],
-        regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 189]);
-    if (!range) return false;
-    skinned_origin = range->first & ~15u;
-  }
-  if (current_fh1_skinned_origin_ != skinned_origin) {
-    current_fh1_skinned_origin_ = skinned_origin;
-    cbuffer_binding_fetch_.up_to_date = false;
-  }
 
   // Set the new root signature.
   if (current_graphics_root_signature_ != root_signature) {
@@ -7136,26 +4012,6 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
   uint32_t root_parameter_shared_memory_and_bindful_edram =
       bindless_resources_used_ ? kRootParameter_Bindless_SharedMemory
                                : kRootParameter_Bindful_SharedMemoryAndEdram;
-
-  // An owned geometry fetch is rebased to its aligned view. Switching ownership
-  // changes its constant bytes; register changes track the remaining low offset.
-  if (current_fh1_geometry_address_ != geometry_address) {
-    if (bool(current_fh1_geometry_address_) != bool(geometry_address)) {
-      cbuffer_binding_fetch_.up_to_date = false;
-    }
-    current_fh1_geometry_address_ = geometry_address;
-    current_graphics_root_up_to_date_ &= ~(1u << root_parameter_shared_memory_and_bindful_edram);
-  }
-
-  if (current_fh1_terrain_addresses_ != terrain_addresses) {
-    if (bool(current_fh1_terrain_addresses_[1]) != bool(terrain_addresses[1]) ||
-        bool(current_fh1_terrain_addresses_[0]) != bool(terrain_addresses[0])) {
-      cbuffer_binding_fetch_.up_to_date = false;
-    }
-    current_fh1_terrain_addresses_ = terrain_addresses;
-    current_graphics_root_up_to_date_ &= ~((1u << kRootParameter_Bindless_DescriptorIndicesVertex) |
-                                         (1u << kRootParameter_Bindless_DescriptorIndicesPixel));
-  }
 
   //
   // Update root constant buffers that are common for bindful and bindless.
@@ -7223,7 +4079,6 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     if (float_constants == nullptr) {
       return false;
     }
-    uint8_t* const float_constants_begin = float_constants;
     for (uint32_t i = 0; i < 4; ++i) {
       uint64_t float_constant_map_entry = float_constant_map_vertex.float_bitmap[i];
       uint32_t float_constant_index;
@@ -7235,13 +4090,6 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
             4 * sizeof(float));
         float_constants += 4 * sizeof(float);
       }
-    }
-    if (Fh1Snr02ItemProbeFrame() || Fh1Snr02TrackProbeEnabled() ||
-        Fh1SnrProbeOutputFrame(Fh1Snr03ProbeFrame(),
-                               observation_frame_sequence_)) {
-      snr02_bound_vertex_constant_count_ = float_constant_count_vertex;
-      std::memcpy(snr02_bound_vertex_constants_.data(), float_constants_begin,
-                  float_constant_count_vertex * 4 * sizeof(uint32_t));
     }
     cbuffer_binding_float_vertex_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_float_constants_vertex);
@@ -7295,17 +4143,6 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       return false;
     }
     std::memcpy(fetch_constants, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], kFetchConstantsSize);
-    if (geometry_address) {
-      const uint32_t rebased = regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 190] & 15u;
-      std::memcpy(fetch_constants + 190 * sizeof(uint32_t), &rebased, sizeof(rebased));
-    }
-    for (uint32_t i = 0; i < 2; ++i) {
-      if (!terrain_addresses[i]) continue;
-      const uint32_t fetch = native_skinned ? 94 : (i == 0 ? 90 : 89);
-      const uint32_t original = regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch * 2];
-      const uint32_t rebased = native_skinned ? original - skinned_origin : original & 15u;
-      std::memcpy(fetch_constants + fetch * 2 * sizeof(uint32_t), &rebased, sizeof(rebased));
-    }
     cbuffer_binding_fetch_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_fetch_constants);
   }
@@ -7396,13 +4233,10 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     // Bindless descriptors path.
     //
 
-    // Native fixed bindings may have current layouts without an index upload.
-    if (!native_layered) {
-      if (!cbuffer_binding_descriptor_indices_vertex_.address)
-        cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
-      if (!cbuffer_binding_descriptor_indices_pixel_.address)
-        cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
-    }
+    if (!cbuffer_binding_descriptor_indices_vertex_.address)
+      cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
+    if (!cbuffer_binding_descriptor_indices_pixel_.address)
+      cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
 
     // Check if need to write new descriptor indices.
     // Samplers have already been checked.
@@ -7527,22 +4361,17 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     }
 
     if (!cbuffer_binding_descriptor_indices_vertex_.up_to_date) {
-      uint32_t* descriptor_indices = nullptr;
-      if (native_layered) {
-        cbuffer_binding_descriptor_indices_vertex_.address = 0;
-      } else {
-        descriptor_indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
-            frame_current_,
-            std::max(texture_count_vertex + sampler_count_vertex, size_t(1)) * sizeof(uint32_t),
-            D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr, nullptr,
-            &cbuffer_binding_descriptor_indices_vertex_.address));
-        if (!descriptor_indices) {
-          return false;
-        }
+      uint32_t* descriptor_indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
+          frame_current_,
+          std::max(texture_count_vertex + sampler_count_vertex, size_t(1)) * sizeof(uint32_t),
+          D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr, nullptr,
+          &cbuffer_binding_descriptor_indices_vertex_.address));
+      if (!descriptor_indices) {
+        return false;
       }
       for (size_t i = 0; i < texture_count_vertex; ++i) {
         const D3D12Shader::TextureBinding& texture = textures_vertex[i];
-        if (descriptor_indices) descriptor_indices[texture.bindless_descriptor_index] =
+        descriptor_indices[texture.bindless_descriptor_index] =
             texture_cache_->GetActiveTextureBindlessSRVIndex(texture) -
             uint32_t(SystemBindlessView::kUnboundedSRVsStart);
       }
@@ -7555,7 +4384,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       }
       // Current samplers have already been updated.
       for (size_t i = 0; i < sampler_count_vertex; ++i) {
-        if (descriptor_indices) descriptor_indices[samplers_vertex[i].bindless_descriptor_index] =
+        descriptor_indices[samplers_vertex[i].bindless_descriptor_index] =
             current_sampler_bindless_indices_vertex_[i];
       }
       cbuffer_binding_descriptor_indices_vertex_.up_to_date = true;
@@ -7563,22 +4392,17 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     }
 
     if (!cbuffer_binding_descriptor_indices_pixel_.up_to_date) {
-      uint32_t* descriptor_indices = nullptr;
-      if (native_layered) {
-        cbuffer_binding_descriptor_indices_pixel_.address = 0;
-      } else {
-        descriptor_indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
-            frame_current_,
-            std::max(texture_count_pixel + sampler_count_pixel, size_t(1)) * sizeof(uint32_t),
-            D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr, nullptr,
-            &cbuffer_binding_descriptor_indices_pixel_.address));
-        if (!descriptor_indices) {
-          return false;
-        }
+      uint32_t* descriptor_indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
+          frame_current_,
+          std::max(texture_count_pixel + sampler_count_pixel, size_t(1)) * sizeof(uint32_t),
+          D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr, nullptr,
+          &cbuffer_binding_descriptor_indices_pixel_.address));
+      if (!descriptor_indices) {
+        return false;
       }
       for (size_t i = 0; i < texture_count_pixel; ++i) {
         const D3D12Shader::TextureBinding& texture = (*textures_pixel)[i];
-        if (descriptor_indices) descriptor_indices[texture.bindless_descriptor_index] =
+        descriptor_indices[texture.bindless_descriptor_index] =
             texture_cache_->GetActiveTextureBindlessSRVIndex(texture) -
             uint32_t(SystemBindlessView::kUnboundedSRVsStart);
       }
@@ -7591,82 +4415,11 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       }
       // Current samplers have already been updated.
       for (size_t i = 0; i < sampler_count_pixel; ++i) {
-        if (descriptor_indices) descriptor_indices[(*samplers_pixel)[i].bindless_descriptor_index] =
+        descriptor_indices[(*samplers_pixel)[i].bindless_descriptor_index] =
             current_sampler_bindless_indices_pixel_[i];
       }
       cbuffer_binding_descriptor_indices_pixel_.up_to_date = true;
-      if (!native_layered) {
-        current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_DescriptorIndicesPixel);
-      }
-    }
-    if (Fh1Snr03ProbeFrame() &&
-        (Fh1SnrProbeOutputFrame(Fh1Snr03ProbeFrame(),
-                                observation_frame_sequence_) ||
-         (Fh1Snr04Bc3RebindFrame() &&
-          observation_frame_sequence_ == Fh1Snr04Bc3RebindFrame() + 1)) &&
-        vertex_shader->ucode_data_hash() == 0x5834939992FFC765ull &&
-        pixel_shader &&
-        pixel_shader->ucode_data_hash() == 0xC2F1242C2535A57Eull) {
-      for (const auto& texture : *textures_pixel) {
-        const uint32_t absolute =
-            texture_cache_->GetActiveTextureBindlessSRVIndex(texture);
-        REXGPU_INFO("FH1 SNR04 bound pixel {{\"frame\":{},\"packet\":{},"
-                    "\"fetch\":{},\"signed\":{},\"binding\":{},"
-                    "\"absolute\":{},\"relative\":{}}}",
-                    observation_frame_sequence_, observation_draw_packet_address_,
-                    texture.fetch_constant, texture.is_signed,
-                    texture.bindless_descriptor_index, absolute,
-                    absolute - uint32_t(SystemBindlessView::kUnboundedSRVsStart));
-        if (Fh1Snr04Bc3OutputDir().empty() || texture.fetch_constant != 0 ||
-            texture.is_signed || absolute ==
-                uint32_t(SystemBindlessView::kUnboundedSRVsStart) ||
-            std::any_of(snr04_bc3_readbacks_.begin(), snr04_bc3_readbacks_.end(),
-                        [this, absolute](const Snr04Bc3Readback& entry) {
-                          return entry.submission == submission_current_ &&
-                                 entry.descriptor == absolute;
-                        })) {
-          continue;
-        }
-        if (snr04_bc3_readbacks_.size() >= 8) {
-          REXGPU_ERROR("FH1 SNR04 BC3 capture exceeded eight resources");
-          continue;
-        }
-        D3D12_RESOURCE_DESC texture_desc{};
-        texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        texture_desc.Width = texture_desc.Height = 256;
-        texture_desc.DepthOrArraySize = 1;
-        texture_desc.MipLevels = 9;
-        texture_desc.Format = DXGI_FORMAT_BC3_UNORM;
-        texture_desc.SampleDesc.Count = 1;
-        std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 9> footprints{};
-        UINT64 bytes = 0;
-        GetD3D12Provider().GetDevice()->GetCopyableFootprints(
-            &texture_desc, 0, 9, 0, footprints.data(), nullptr, nullptr, &bytes);
-        if (bytes > 131072 || footprints[0].Offset != 0 ||
-            footprints[0].Footprint.RowPitch != 1024) {
-          REXGPU_ERROR("FH1 SNR04 BC3 unexpected copy footprint");
-          continue;
-        }
-        D3D12_RESOURCE_DESC buffer_desc;
-        ui::d3d12::util::FillBufferResourceDesc(buffer_desc, bytes,
-                                                D3D12_RESOURCE_FLAG_NONE);
-        Microsoft::WRL::ComPtr<ID3D12Resource> readback;
-        if (FAILED(GetD3D12Provider().GetDevice()->CreateCommittedResource(
-                &ui::d3d12::util::kHeapPropertiesReadback,
-                GetD3D12Provider().GetHeapFlagCreateNotZeroed(),
-                &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                IID_PPV_ARGS(&readback))) ||
-            !texture_cache_->CopyFh1Snr04Bc3Mips(
-                texture.fetch_constant, readback.Get(), footprints)) {
-          REXGPU_ERROR("FH1 SNR04 BC3 copy rejected frame={} packet={} srv={}",
-                       observation_frame_sequence_, observation_draw_packet_address_,
-                       absolute);
-          continue;
-        }
-        snr04_bc3_readbacks_.push_back({observation_frame_sequence_,
-                                       submission_current_, absolute,
-                                       std::move(readback), footprints, bytes});
-      }
+      current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_DescriptorIndicesPixel);
     }
   } else {
     //
@@ -7856,24 +4609,6 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     }
   }
 
-  // Texture dirtiness need not rebind an unchanged signed view or sampler.
-  // Root/heap changes still clear the existing root validity bits.
-  if (native_layered) {
-    assert_true(texture_count_pixel == 2 && sampler_count_pixel == 1);
-    const uint32_t indices[] = {
-        texture_cache_->GetActiveTextureBindlessSRVIndex((*textures_pixel)[0]),
-        texture_cache_->GetActiveTextureBindlessSRVIndex((*textures_pixel)[1]),
-        current_sampler_bindless_indices_pixel_[0]};
-    const uint32_t slots[] = {kRootParameter_Bindless_ViewHeap,
-        kRootParameter_Bindless_DescriptorIndicesPixel, kRootParameter_Bindless_SamplerHeap};
-    for (uint32_t i = 0; i < 3; ++i) {
-      if (fh1_fixed_descriptor_indices_[i] != indices[i]) {
-        fh1_fixed_descriptor_indices_[i] = indices[i];
-        current_graphics_root_up_to_date_ &= ~(1u << slots[i]);
-      }
-    }
-  }
-
   // Update the root parameters.
   if (!(current_graphics_root_up_to_date_ & (1u << root_parameter_fetch_constants))) {
     deferred_command_list_.D3DSetGraphicsRootConstantBufferView(root_parameter_fetch_constants,
@@ -7902,78 +4637,46 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
   }
   if (!(current_graphics_root_up_to_date_ &
         (1u << root_parameter_shared_memory_and_bindful_edram))) {
-    if (current_graphics_root_signature_ == root_signature_fh1_layered_ ||
-        current_graphics_root_signature_ == root_signature_fh1_depth_ || native_terrain || native_skinned) {
-      assert_false(shared_memory_is_uav);
-      deferred_command_list_.D3DSetGraphicsRootShaderResourceView(
-          root_parameter_shared_memory_and_bindful_edram,
-          geometry_address ? geometry_address : shared_memory_->GetGPUAddress());
+    assert_true(current_shared_memory_binding_is_uav_.has_value());
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_shared_memory_and_bindful_edram;
+    if (bindless_resources_used_) {
+      gpu_handle_shared_memory_and_bindful_edram = provider.OffsetViewDescriptor(
+          view_bindless_heap_gpu_start_,
+          uint32_t(current_shared_memory_binding_is_uav_.value()
+                       ? SystemBindlessView ::kNullRawSRVAndSharedMemoryRawUAVStart
+                       : SystemBindlessView ::kSharedMemoryRawSRVAndNullRawUAVStart));
     } else {
-      assert_true(current_shared_memory_binding_is_uav_.has_value());
-      D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_shared_memory_and_bindful_edram;
-      if (bindless_resources_used_) {
-        gpu_handle_shared_memory_and_bindful_edram = provider.OffsetViewDescriptor(
-            view_bindless_heap_gpu_start_,
-            uint32_t(current_shared_memory_binding_is_uav_.value()
-                         ? SystemBindlessView ::kNullRawSRVAndSharedMemoryRawUAVStart
-                         : SystemBindlessView ::kSharedMemoryRawSRVAndNullRawUAVStart));
-      } else {
-        gpu_handle_shared_memory_and_bindful_edram = current_shared_memory_binding_is_uav_.value()
-                                                         ? gpu_handle_shared_memory_uav_and_edram_
-                                                         : gpu_handle_shared_memory_srv_and_edram_;
-      }
-      deferred_command_list_.D3DSetGraphicsRootDescriptorTable(
-          root_parameter_shared_memory_and_bindful_edram, gpu_handle_shared_memory_and_bindful_edram);
+      gpu_handle_shared_memory_and_bindful_edram = current_shared_memory_binding_is_uav_.value()
+                                                       ? gpu_handle_shared_memory_uav_and_edram_
+                                                       : gpu_handle_shared_memory_srv_and_edram_;
     }
+    deferred_command_list_.D3DSetGraphicsRootDescriptorTable(
+        root_parameter_shared_memory_and_bindful_edram, gpu_handle_shared_memory_and_bindful_edram);
     current_graphics_root_up_to_date_ |= 1u << root_parameter_shared_memory_and_bindful_edram;
   }
   if (bindless_resources_used_) {
     if (!(current_graphics_root_up_to_date_ &
           (1u << kRootParameter_Bindless_DescriptorIndicesPixel))) {
-      if (native_terrain) {
-        deferred_command_list_.D3DSetGraphicsRootShaderResourceView(
-            kRootParameter_Bindless_DescriptorIndicesPixel,
-            terrain_addresses[1] ? terrain_addresses[1] : shared_memory_->GetGPUAddress());
-      } else if (current_graphics_root_signature_ == root_signature_fh1_layered_) {
-        assert_true(texture_count_pixel == 2 && sampler_count_pixel == 1);
-        deferred_command_list_.D3DSetGraphicsRootDescriptorTable(
-            kRootParameter_Bindless_DescriptorIndicesPixel,
-            provider.OffsetViewDescriptor(view_bindless_heap_gpu_start_,
-                fh1_fixed_descriptor_indices_[1]));
-      } else {
-        deferred_command_list_.D3DSetGraphicsRootConstantBufferView(
-            kRootParameter_Bindless_DescriptorIndicesPixel,
-            cbuffer_binding_descriptor_indices_pixel_.address);
-      }
+      deferred_command_list_.D3DSetGraphicsRootConstantBufferView(
+          kRootParameter_Bindless_DescriptorIndicesPixel,
+          cbuffer_binding_descriptor_indices_pixel_.address);
       current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_DescriptorIndicesPixel;
     }
-    if (!native_layered && !(current_graphics_root_up_to_date_ &
+    if (!(current_graphics_root_up_to_date_ &
           (1u << kRootParameter_Bindless_DescriptorIndicesVertex))) {
-      if (native_terrain || native_skinned) {
-        deferred_command_list_.D3DSetGraphicsRootShaderResourceView(
-            kRootParameter_Bindless_DescriptorIndicesVertex,
-            terrain_addresses[0] ? terrain_addresses[0] : shared_memory_->GetGPUAddress());
-      } else {
-        deferred_command_list_.D3DSetGraphicsRootConstantBufferView(
-            kRootParameter_Bindless_DescriptorIndicesVertex,
-            cbuffer_binding_descriptor_indices_vertex_.address);
-      }
+      deferred_command_list_.D3DSetGraphicsRootConstantBufferView(
+          kRootParameter_Bindless_DescriptorIndicesVertex,
+          cbuffer_binding_descriptor_indices_vertex_.address);
       current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_DescriptorIndicesVertex;
     }
     if (!(current_graphics_root_up_to_date_ & (1u << kRootParameter_Bindless_SamplerHeap))) {
       deferred_command_list_.D3DSetGraphicsRootDescriptorTable(kRootParameter_Bindless_SamplerHeap,
-          current_graphics_root_signature_ == root_signature_fh1_layered_
-              ? provider.OffsetSamplerDescriptor(sampler_bindless_heap_gpu_start_,
-                                                  fh1_fixed_descriptor_indices_[2])
-              : sampler_bindless_heap_gpu_start_);
+                                                               sampler_bindless_heap_gpu_start_);
       current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_SamplerHeap;
     }
     if (!(current_graphics_root_up_to_date_ & (1u << kRootParameter_Bindless_ViewHeap))) {
       deferred_command_list_.D3DSetGraphicsRootDescriptorTable(kRootParameter_Bindless_ViewHeap,
-          current_graphics_root_signature_ == root_signature_fh1_layered_
-              ? provider.OffsetViewDescriptor(view_bindless_heap_gpu_start_,
-                    fh1_fixed_descriptor_indices_[0])
-              : view_bindless_heap_gpu_start_);
+                                                               view_bindless_heap_gpu_start_);
       current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_ViewHeap;
     }
   } else {
@@ -8019,9 +4722,6 @@ bool D3D12CommandProcessor::InitializeNativeGuestOutputGpuTiming() {
   native_guest_output_gpu_timing_slots_ = {};
   native_guest_output_gpu_timing_active_ = false;
   fh1_gpu_pass_timing_slots_ = {};
-  fh1_gpu_pass_timing_active_ = {};
-  fh1_gpu_pass_timing_aggregates_.clear();
-  fh1_gpu_pass_family_timing_aggregates_.clear();
   fh1_gpu_pass_timing_drops_ = 0;
   fh1_gpu_pass_timing_busy_drops_ = 0;
   fh1_gpu_pass_timing_capacity_drops_ = 0;
@@ -8095,32 +4795,10 @@ void D3D12CommandProcessor::ShutdownNativeGuestOutputGpuTiming() {
   native_guest_output_gpu_timing_slots_ = {};
   native_guest_output_gpu_timing_active_ = false;
   fh1_gpu_pass_timing_slots_ = {};
-  fh1_gpu_pass_timing_active_ = {};
-  fh1_gpu_pass_timing_aggregates_.clear();
-  fh1_gpu_pass_family_timing_aggregates_.clear();
 }
 
 void D3D12CommandProcessor::LogFh1GpuPassTimings() {
-  std::vector<std::pair<uint64_t, Fh1GpuPassTimingAggregate>> ranked(
-      fh1_gpu_pass_timing_aggregates_.begin(),
-      fh1_gpu_pass_timing_aggregates_.end());
-  std::sort(ranked.begin(), ranked.end(), [](const auto& left,
-                                             const auto& right) {
-    return left.second.total_ns > right.second.total_ns;
-  });
-  for (size_t index = 0; index < std::min<size_t>(ranked.size(), 20);
-       ++index) {
-    const auto& [signature, timing] = ranked[index];
-    REXGPU_INFO(
-        "FH1 V4 pass timing {:016X}: samples {}, total {} ns, average {} "
-        "ns, maximum {} ns",
-        signature, timing.samples, timing.total_ns,
-        timing.samples ? timing.total_ns / timing.samples : 0,
-        timing.maximum_ns);
-  }
-  if (!ranked.empty() || fh1_gpu_pass_timing_drops_) {
-    REXGPU_INFO("FH1 V4 pass timing signatures {}, dropped samples {}",
-                ranked.size(), fh1_gpu_pass_timing_drops_);
+  if (fh1_gpu_pass_timing_drops_) {
     // Counts are loss events, not unique samples: interrupted endpoints may
     // subsequently retire as invalid records.
     REXGPU_INFO("FH1 timing loss reasons {{\"busy\":{},\"capacity\":{},"
@@ -8129,49 +4807,6 @@ void D3D12CommandProcessor::LogFh1GpuPassTimings() {
                 fh1_gpu_pass_timing_capacity_drops_,
                 fh1_gpu_pass_timing_interrupted_drops_,
                 fh1_gpu_pass_timing_invalid_drops_);
-  }
-  std::vector<std::pair<uint64_t, Fh1GpuPassTimingAggregate>> ranked_families(
-      fh1_gpu_pass_family_timing_aggregates_.begin(),
-      fh1_gpu_pass_family_timing_aggregates_.end());
-  std::sort(ranked_families.begin(), ranked_families.end(),
-            [](const auto& left, const auto& right) {
-              return left.second.total_ns > right.second.total_ns;
-            });
-  for (size_t index = 0;
-       index < std::min<size_t>(ranked_families.size(),
-                                kFh1GpuPassTimingCapacity);
-       ++index) {
-    const auto& [family, timing] = ranked_families[index];
-    REXGPU_INFO(
-        "FH1 V5 pass family {:016X}: attachment {:016X}, first family "
-        "{:016X}, first draw {:016X}, copy {:016X}, samples {}, draws "
-        "{}-{} (average {}), total {} ns, average {} ns, maximum {} ns, "
-        "average draw {} ns, average resolve {} ns, maximum resolve {} ns",
-        family, timing.attachment_state, timing.first_draw_family,
-        timing.first_draw_identity, timing.terminal_copy_state,
-        timing.samples, timing.minimum_draw_count, timing.maximum_draw_count,
-        timing.samples ? timing.total_draws / timing.samples : 0,
-        timing.total_ns,
-        timing.samples ? timing.total_ns / timing.samples : 0,
-        timing.maximum_ns,
-        timing.samples ? timing.total_draw_ns / timing.samples : 0,
-        timing.samples ? timing.total_resolve_ns / timing.samples : 0,
-        timing.maximum_resolve_ns);
-  }
-  if (!ranked_families.empty()) {
-    REXGPU_INFO("FH1 V5 pass timing families {}", ranked_families.size());
-  }
-  if (fh1_tonemap_native_draws_) {
-    REXGPU_INFO(
-        "FH1 V5 native tone-map draws {}, equivalent Xenos draws removed {}",
-        fh1_tonemap_native_draws_, fh1_tonemap_native_draws_);
-  }
-  if (fh1_velocity_dilate_native_draws_) {
-    REXGPU_INFO(
-        "FH1 V5 native velocity-dilate draws {}, equivalent Xenos draws "
-        "removed {}",
-        fh1_velocity_dilate_native_draws_,
-        fh1_velocity_dilate_native_draws_);
   }
 }
 
@@ -8183,7 +4818,6 @@ void D3D12CommandProcessor::BeginNativeGuestOutputGpuTimingFrame() {
   auto& fh1_slot = fh1_gpu_pass_timing_slots_[slot_index];
   if (!fh1_slot.submission) {
     fh1_slot = {};
-    fh1_gpu_pass_timing_active_ = {};
   } else {
     ++fh1_gpu_pass_timing_drops_;
     ++fh1_gpu_pass_timing_busy_drops_;
@@ -8307,174 +4941,12 @@ void D3D12CommandProcessor::AdvanceFh1GpuWorkTiming(
   record.work_complete = finish;
 }
 
-void D3D12CommandProcessor::ObserveFh1GpuPassTimingDraw(
-    const system::GraphicsFh1ExecutionKey& key, uint64_t frame,
-    uint64_t prepare_cpu_time_ns) {
-  if (!Fh1GpuCorpusEnabled() ||
-      !native_guest_output_gpu_query_heap_ ||
-      key.kind != system::GraphicsFh1ExecutionKind::kDraw || frame % 60) {
-    return;
-  }
-  if (fh1_gpu_pass_timing_active_.draw_count &&
-      (fh1_gpu_pass_timing_active_.frame != frame ||
-       fh1_gpu_pass_timing_active_.attachment_state !=
-           key.attachment_state)) {
-    FinishFh1GpuPassTiming(0);
-  }
-  uint64_t draw_family = UINT64_C(0xCBF29CE484222325);
-  draw_family = HashFh1ExecutionValue(draw_family, key.shader_state);
-  draw_family = HashFh1ExecutionValue(draw_family, key.pipeline_state);
-  draw_family = HashFh1ExecutionValue(draw_family, key.operation_state);
-  if (!fh1_gpu_pass_timing_active_.draw_count) {
-    fh1_gpu_pass_timing_active_.frame = frame;
-    fh1_gpu_pass_timing_active_.slot_index =
-        uint32_t(frame_current_ % kQueueFrames);
-    fh1_gpu_pass_timing_active_.attachment_state = key.attachment_state;
-    fh1_gpu_pass_timing_active_.first_draw_family = draw_family;
-    fh1_gpu_pass_timing_active_.first_draw_identity = key.identity;
-    fh1_gpu_pass_timing_active_.running_signature =
-        UINT64_C(0xCBF29CE484222325);
-    fh1_gpu_pass_timing_active_.running_signature = HashFh1ExecutionValue(
-        fh1_gpu_pass_timing_active_.running_signature,
-        key.attachment_state);
-
-    auto& slot = fh1_gpu_pass_timing_slots_[frame_current_ % kQueueFrames];
-    if (!slot.submission &&
-        slot.record_count < kFh1GpuPassTimingCapacity) {
-      const uint32_t record_index = slot.record_count++;
-      auto& record = slot.records[record_index];
-      record = {};
-      record.query_offset = kNativeGuestOutputGpuQueriesPerFrame +
-                            record_index * 3;
-      fh1_gpu_pass_timing_active_.record_index = record_index;
-      record.begin_submission = submission_current_;
-      record.recording_start_ns = uint64_t(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now().time_since_epoch()).count());
-      deferred_command_list_.D3DEndQuery(
-          native_guest_output_gpu_query_heap_.Get(),
-          D3D12_QUERY_TYPE_TIMESTAMP,
-          uint32_t(frame_current_ % kQueueFrames) *
-                  kGpuTimingQueriesPerFrame +
-              record.query_offset);
-    } else {
-      ++fh1_gpu_pass_timing_drops_;
-      if (slot.submission) {
-        ++fh1_gpu_pass_timing_busy_drops_;
-      } else {
-        ++fh1_gpu_pass_timing_capacity_drops_;
-      }
-    }
-  }
-  fh1_gpu_pass_timing_active_.running_signature = HashFh1ExecutionValue(
-      fh1_gpu_pass_timing_active_.running_signature, draw_family);
-  fh1_gpu_pass_timing_active_.prepare_cpu_time_ns += prepare_cpu_time_ns;
-  ++fh1_gpu_pass_timing_active_.draw_count;
-  fh1_gpu_pass_timing_active_.hazard_flags |= key.hazard_flags;
-}
-
-void D3D12CommandProcessor::ObserveFh1GpuPassTimingCopy(
-    const system::GraphicsFh1ExecutionKey& key, uint64_t frame) {
-  if (key.kind != system::GraphicsFh1ExecutionKind::kCopyResolve ||
-      !fh1_gpu_pass_timing_active_.draw_count ||
-      fh1_gpu_pass_timing_active_.frame != frame) {
-    return;
-  }
-  uint64_t terminal_copy_state = UINT64_C(0xCBF29CE484222325);
-  terminal_copy_state = HashFh1ExecutionValue(terminal_copy_state,
-                                               key.attachment_state);
-  terminal_copy_state = HashFh1ExecutionValue(terminal_copy_state,
-                                               key.operation_state);
-  fh1_gpu_pass_timing_active_.hazard_flags |= key.hazard_flags;
-  FinishFh1GpuPassTiming(terminal_copy_state);
-}
-
-void D3D12CommandProcessor::BeginFh1GpuPassTimingCopy() {
-  if (!fh1_gpu_pass_timing_active_.draw_count ||
-      fh1_gpu_pass_timing_active_.record_index == UINT32_MAX) {
-    return;
-  }
-  auto& record = fh1_gpu_pass_timing_slots_[
-                     fh1_gpu_pass_timing_active_.slot_index]
-                     .records[fh1_gpu_pass_timing_active_.record_index];
-  deferred_command_list_.D3DEndQuery(
-      native_guest_output_gpu_query_heap_.Get(),
-      D3D12_QUERY_TYPE_TIMESTAMP,
-      fh1_gpu_pass_timing_active_.slot_index * kGpuTimingQueriesPerFrame +
-          record.query_offset + 1);
-  record.copy_started = true;
-}
-
-void D3D12CommandProcessor::FinishFh1GpuPassTiming(
-    uint64_t terminal_copy_state) {
-  if (!fh1_gpu_pass_timing_active_.draw_count) {
-    return;
-  }
-  if (fh1_gpu_pass_timing_active_.record_index != UINT32_MAX) {
-    auto& slot = fh1_gpu_pass_timing_slots_[
-        fh1_gpu_pass_timing_active_.slot_index];
-    auto& record =
-        slot.records[fh1_gpu_pass_timing_active_.record_index];
-    if (terminal_copy_state &&
-        !fh1_gpu_pass_timing_active_.hazard_flags) {
-      record.signature = HashFh1ExecutionValue(
-          fh1_gpu_pass_timing_active_.running_signature,
-          terminal_copy_state);
-      if (!record.signature) {
-        record.signature = 1;
-      }
-    }
-    record.family = UINT64_C(0xCBF29CE484222325);
-    record.family = HashFh1ExecutionValue(
-        record.family, fh1_gpu_pass_timing_active_.attachment_state);
-    record.family = HashFh1ExecutionValue(
-        record.family, fh1_gpu_pass_timing_active_.first_draw_family);
-    record.family = HashFh1ExecutionValue(
-        record.family, fh1_gpu_pass_timing_active_.first_draw_identity);
-    record.family = HashFh1ExecutionValue(record.family,
-                                           terminal_copy_state);
-    record.family = HashFh1ExecutionValue(
-        record.family, fh1_gpu_pass_timing_active_.hazard_flags);
-    if (!record.family) {
-      record.family = 1;
-    }
-    record.prepare_cpu_time_ns = fh1_gpu_pass_timing_active_.prepare_cpu_time_ns;
-    record.frame = fh1_gpu_pass_timing_active_.frame;
-    record.attachment_state = fh1_gpu_pass_timing_active_.attachment_state;
-    record.first_draw_family =
-        fh1_gpu_pass_timing_active_.first_draw_family;
-    record.first_draw_identity =
-        fh1_gpu_pass_timing_active_.first_draw_identity;
-    record.terminal_copy_state = terminal_copy_state;
-    record.draw_count = fh1_gpu_pass_timing_active_.draw_count;
-    record.end_submission = submission_current_;
-    record.recording_wall_ns = uint64_t(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count()) -
-        record.recording_start_ns;
-    if (!record.copy_started) {
-      deferred_command_list_.D3DEndQuery(
-          native_guest_output_gpu_query_heap_.Get(),
-          D3D12_QUERY_TYPE_TIMESTAMP,
-          fh1_gpu_pass_timing_active_.slot_index * kGpuTimingQueriesPerFrame +
-              record.query_offset + 1);
-    }
-    deferred_command_list_.D3DEndQuery(
-        native_guest_output_gpu_query_heap_.Get(),
-        D3D12_QUERY_TYPE_TIMESTAMP,
-        fh1_gpu_pass_timing_active_.slot_index * kGpuTimingQueriesPerFrame +
-            record.query_offset + 2);
-  }
-  fh1_gpu_pass_timing_active_ = {};
-}
-
 void D3D12CommandProcessor::EndFh1GpuPassTimingFrame() {
   if (!Fh1GpuCorpusEnabled() ||
       !native_guest_output_gpu_query_heap_ ||
       !native_guest_output_gpu_query_readback_) {
     return;
   }
-  FinishFh1GpuPassTiming(0);
   const uint32_t slot_index = uint32_t(frame_current_ % kQueueFrames);
   auto& slot = fh1_gpu_pass_timing_slots_[slot_index];
   if (!slot.record_count || slot.submission) {
@@ -8571,53 +5043,8 @@ void D3D12CommandProcessor::RetireNativeGuestOutputGpuTimings() {
         }
         continue;
       }
-      if (!record.family || copy_start < start || end < copy_start) {
-        ++fh1_gpu_pass_timing_drops_;
-        ++fh1_gpu_pass_timing_invalid_drops_;
-        continue;
-      }
-      const uint64_t duration_ns = uint64_t(ticks_to_ns(end - start));
-      const uint64_t draw_ns = uint64_t(ticks_to_ns(copy_start - start));
-      const uint64_t resolve_ns =
-          record.copy_started ? uint64_t(ticks_to_ns(end - copy_start)) : 0;
-      REXGPU_INFO(
-          "FH1 V5 pass sample {{\"frame\":{},\"submission\":{},\"record\":{},"
-          "\"family\":\"{:016X}\",\"first_draw\":\"{:016X}\",\"draws\":{},"
-          "\"total_ns\":{},\"draw_ns\":{},\"resolve_ns\":{},\"prepare_cpu_ns\":{},"
-          "\"recording_wall_ns\":{},\"begin_submission\":{},\"end_submission\":{}}}",
-          record.frame, slot.submission, record_index, record.family,
-          record.first_draw_identity, record.draw_count, duration_ns, draw_ns,
-          resolve_ns, record.prepare_cpu_time_ns, record.recording_wall_ns,
-          record.begin_submission, record.end_submission);
-      if (record.signature) {
-        auto& aggregate = fh1_gpu_pass_timing_aggregates_[record.signature];
-        ++aggregate.samples;
-        aggregate.total_ns += duration_ns;
-        aggregate.maximum_ns = std::max(aggregate.maximum_ns, duration_ns);
-        aggregate.total_draw_ns += draw_ns;
-        aggregate.total_resolve_ns += resolve_ns;
-        aggregate.maximum_resolve_ns =
-            std::max(aggregate.maximum_resolve_ns, resolve_ns);
-      }
-      auto& family = fh1_gpu_pass_family_timing_aggregates_[record.family];
-      if (!family.samples) {
-        family.attachment_state = record.attachment_state;
-        family.first_draw_family = record.first_draw_family;
-        family.first_draw_identity = record.first_draw_identity;
-        family.terminal_copy_state = record.terminal_copy_state;
-      }
-      ++family.samples;
-      family.total_ns += duration_ns;
-      family.maximum_ns = std::max(family.maximum_ns, duration_ns);
-      family.total_draw_ns += draw_ns;
-      family.total_resolve_ns += resolve_ns;
-      family.maximum_resolve_ns =
-          std::max(family.maximum_resolve_ns, resolve_ns);
-      family.total_draws += record.draw_count;
-      family.minimum_draw_count =
-          std::min(family.minimum_draw_count, record.draw_count);
-      family.maximum_draw_count =
-          std::max(family.maximum_draw_count, record.draw_count);
+      ++fh1_gpu_pass_timing_drops_;
+      ++fh1_gpu_pass_timing_invalid_drops_;
     }
     slot = {};
   }
@@ -8773,10 +5200,7 @@ void D3D12CommandProcessor::RunRequestedFrameReplay() {
   const int exit_code =
       Fh1FrameDump::RunRequestedReplay(*this, *register_file_, *memory_, *shared_memory_);
   if (exit_code < 0) return;
-  if (fh1_native_executor_) fh1_native_executor_->LogStats(0);
-  const auto work = render_target_cache_->fh1_work_counters();
-  REXGPU_INFO("FH1 frame replay: xenos edram updates={} resolves={}", work.updates,
-              work.resolves);
+  fh1_native_executor_->LogStats(0);
   // A replay is a tool run with the title suspended: end the process here.
   rex::FlushLogging();
   std::_Exit(exit_code);

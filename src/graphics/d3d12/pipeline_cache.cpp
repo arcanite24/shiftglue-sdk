@@ -38,7 +38,6 @@
 #include <rex/perf/counter.h>
 #include <rex/filesystem.h>
 #include <rex/graphics/d3d12/command_processor.h>
-#include <rex/graphics/d3d12/fh1_native_executor.h>
 #include <rex/graphics/d3d12/pipeline_cache.h>
 #include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/flags.h>
@@ -1883,21 +1882,11 @@ bool PipelineCache::IsFh1NativeShadowVertex(uint64_t hash, uint64_t modification
 }
 
 bool PipelineCache::IsFh1NativeStandaloneVertex(uint64_t hash, uint64_t modification) const {
-  // With the native executor both renderers draw the translated guest shaders,
-  // at runtime and when prewarming catalog pipelines.
-  if (Fh1NativeExecutor::Enabled()) return false;
-  return IsFh1NativeShadowVertex(hash, modification) ||
-      (hash == 0xB8489164D5A86043ull && modification == 0x1Full &&
-       bindless_resources_used_ &&
-       render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
-       render_target_cache_.draw_resolution_scale_x() == 2 &&
-       render_target_cache_.draw_resolution_scale_y() == 2) ||
-      (hash == 0x1E6883FCCDE1F688ull && modification <= 1ull &&
-       bindless_resources_used_ &&
-       render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
-       (render_target_cache_.draw_resolution_scale_x() == 1 ||
-        render_target_cache_.draw_resolution_scale_x() == 2) &&
-       render_target_cache_.draw_resolution_scale_y() == render_target_cache_.draw_resolution_scale_x());
+  // The native executor draws the translated guest shaders, at runtime and
+  // when prewarming catalog pipelines.
+  (void)hash;
+  (void)modification;
+  return false;
 }
 
 bool PipelineCache::IsFh1NativeShadowPipeline(const PipelineDescription& description) const {
@@ -1922,49 +1911,9 @@ bool PipelineCache::IsFh1NativePositionPipeline(const PipelineDescription& descr
 }
 
 bool PipelineCache::IsFh1NativeScenePipeline(const PipelineDescription& description) const {
-  if (Fh1NativeExecutor::Enabled()) return false;
-  if (IsFh1NativeShadowPipeline(description) || IsFh1NativePositionPipeline(description)) return true;
-  if (!bindless_resources_used_ ||
-      render_target_cache_.GetPath() != RenderTargetCache::Path::kHostRenderTargets) {
-    return false;
-  }
-  if (description.vertex_shader_hash == 0x6934E161812AB10Bull &&
-      description.vertex_shader_modification == 0x7Full &&
-      description.pixel_shader_modification == 0x00004000005B007Full &&
-      !GetFh1PackedWorldTextureFetches(description.pixel_shader_hash).empty()) {
-    return true;
-  }
-  const bool blended = description.vertex_shader_hash == 0x8D8A197476841A9Aull &&
-                       description.pixel_shader_hash == 0xBA6A2871A980A4E8ull;
-  const bool lit = description.vertex_shader_hash == 0xAD2C355A6BE1EE87ull &&
-                   description.pixel_shader_hash == 0x2F2137BF953DA7AFull;
-  const bool layered = description.vertex_shader_hash == 0x3BC346726C1C2535ull &&
-                       description.pixel_shader_hash == 0x9584B309533EF6C9ull;
-  const bool depth24 = description.vertex_shader_hash == 0xC8C39E5AE1B08DE6ull &&
-                       !description.pixel_shader_hash;
-  const bool depth20 = description.vertex_shader_hash == 0x9BF2991815B941B9ull && !description.pixel_shader_hash;
-  const bool depth28 = description.vertex_shader_hash == 0xB646F85EF69A57E0ull && !description.pixel_shader_hash;
-  const bool depth32 = description.vertex_shader_hash == 0xD0C40C04F166092Eull && !description.pixel_shader_hash;
-  const bool terrain = description.vertex_shader_hash == 0x5A28C7FAFD86F112ull && !description.pixel_shader_hash;
-  const bool terrain_ca = description.vertex_shader_hash == 0xCA293E0A1CB4B416ull && !description.pixel_shader_hash;
-  const bool terrain_4e = description.vertex_shader_hash == 0x4E1DA281CC3D7EDBull && !description.pixel_shader_hash;
-  const bool constant = description.vertex_shader_hash == 0xB6C9863F710683ECull && !description.pixel_shader_hash;
-  if (!blended && !lit && !layered && !depth24 && !depth20 && !depth28 && !depth32 && !terrain && !terrain_ca && !terrain_4e && !constant) {
-    return false;
-  }
-  const uint64_t hash = XXH3_64bits(&description, sizeof(description));
-  return (blended && (hash == 0x5F7B3365E7F062BDull || hash == 0x3FB9D30370C455D8ull)) ||
-         (lit && hash == 0xB673641288F80E60ull) ||
-         (layered && hash == 0xAF2C95BF6EF10882ull) ||
-         (depth24 && (hash == 0x53BA06CDA0AF43C1ull || hash == 0x864862F2FDCC2307ull)) ||
-         (depth20 && (hash == 0x9CE112156F9A2FE7ull || hash == 0x0D0C6B5516E60BB8ull)) ||
-         (depth28 && (hash == 0x4FAB5D009EDC7575ull || hash == 0xB11F709480BB88C7ull || hash == 0x0462A10067F56C6Cull)) ||
-         (depth32 && (hash == 0xDAA16CBF4502F6F6ull || hash == 0xEEA552E1610954A1ull)) ||
-         (terrain && (hash == 0x034B44F468DEC548ull || hash == 0x2370BFB73FCCFD27ull)) ||
-         (terrain_ca && hash == 0x6C161CE29479E1BFull) ||
-         (terrain_4e && hash == 0xD7F8863A6EEF08ABull) ||
-         (constant && (hash == 0xFB9F7AF89FA5E129ull || hash == 0xE09E8BD845D68BDDull ||
-                       hash == 0x38DC022591899969ull || hash == 0x544EA3FFE46CB7B3ull));
+  // The native executor replays the pack's translated shaders.
+  (void)description;
+  return false;
 }
 
 bool PipelineCache::PrepareFh1SceneBindings(D3D12Shader& vertex, D3D12Shader* pixel) {
@@ -4069,9 +4018,9 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
 
   D3D12_GRAPHICS_PIPELINE_STATE_DESC state_desc;
   std::memset(&state_desc, 0, sizeof(state_desc));
-  // Hand-written FH1 family replacements for guest shaders. Off with the FH1
-  // native executor, which replays the pack's translated shaders.
-  const bool fh1_families = !Fh1NativeExecutor::Enabled();
+  // Hand-written FH1 family replacements for guest shaders. Off: the FH1
+  // native executor replays the pack's translated shaders.
+  constexpr bool fh1_families = false;
   // This straight-line program preserves the seven-interpolator guest variant.
   const bool fh1_shadow_mask_pixel = fh1_families &&
       IsFh1NativeShadowPipeline(description);
@@ -4173,23 +4122,10 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
       (fh1_vertex_shader_hash == 0xAD2C355A6BE1EE87ull ||
        fh1_vertex_shader_hash == 0x8D8A197476841A9Aull);
   // Disabled: the 2026-09-07 ownership ABBA regressed frame and CPU time.
-  // Keep the qualified native vertex program on its original shared bindings.
-  const bool fh1_skinned_geometry = false && fh1_standalone_vertex &&
-      fh1_vertex_shader_hash == 0xB8489164D5A86043ull &&
-      description.pixel_shader_hash == 0x68150A8E959006CDull &&
-      !runtime_description.vertex_shader->shader().memexport_eM_written() &&
-      runtime_description.pixel_shader && !runtime_description.pixel_shader->shader().memexport_eM_written() &&
-      command_processor_.GetFh1SkinnedRootSignature();
-  // Root signature.
+  constexpr bool fh1_skinned_geometry = false;
+  // Root signature. The FH1 family root signatures were removed with the
+  // Xenos renderer; the families above are all off.
   state_desc.pRootSignature = runtime_description.root_signature;
-  if (fh1_skinned_geometry) state_desc.pRootSignature = command_processor_.GetFh1SkinnedRootSignature();
-  if (fh1_native_terrain) state_desc.pRootSignature = command_processor_.GetFh1TerrainRootSignature();
-  if (fh1_native_depth || fh1_packed_world_geometry || fh1_shadow_geometry) state_desc.pRootSignature = command_processor_.GetFh1DepthRootSignature();
-  if (fh1_native_scene_geometry) state_desc.pRootSignature = command_processor_.GetFh1LayeredRootSignature();
-  if (fh1_native_scene && description.vertex_shader_hash == 0x3BC346726C1C2535ull &&
-      command_processor_.GetFh1LayeredRootSignature()) {
-    state_desc.pRootSignature = command_processor_.GetFh1LayeredRootSignature();
-  }
 
   // Index buffer strip cut value.
   switch (description.strip_cut_index) {
@@ -4686,16 +4622,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
   // Create the D3D12 pipeline state object.
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
   ID3D12PipelineState* state = nullptr;
-  // Fixed layered texture slots require their own root. A generic unbounded
-  // root would accept this shader but bind unrelated heap entries at t0/t1/s0.
-  HRESULT create_result =
-      ((fh1_native_scene && fh1_vertex_shader_hash == 0x3BC346726C1C2535ull &&
-        !command_processor_.GetFh1LayeredRootSignature()) ||
-       ((fh1_native_depth || fh1_packed_world_geometry || fh1_shadow_geometry) && !command_processor_.GetFh1DepthRootSignature()) ||
-       (fh1_native_scene_geometry && !command_processor_.GetFh1LayeredRootSignature()) ||
-       (fh1_native_terrain && !command_processor_.GetFh1TerrainRootSignature()))
-          ? E_FAIL
-          : device->CreateGraphicsPipelineState(&state_desc, IID_PPV_ARGS(&state));
+  HRESULT create_result = device->CreateGraphicsPipelineState(&state_desc, IID_PPV_ARGS(&state));
   if (FAILED(create_result) && (fh1_video_pixel || fh1_postprocess_center || fh1_rms_downsample || fh1_standalone_vertex || fh1_shadow_mask_pixel || fh1_packed_world_vertex || fh1_world_lit_vertex ||
                                 fh1_world_lit_uv2_vertex ||
                                 fh1_depth_mesh_vertex || fh1_native_scene)) {
@@ -4783,10 +4710,6 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
         fmt::format("VS {:016X}", runtime_description.vertex_shader->shader().ucode_data_hash()));
   }
   state->SetName(reinterpret_cast<LPCWSTR>(name.c_str()));
-  if (fh1_native_scene && description.vertex_shader_hash == 0x3BC346726C1C2535ull) {
-    REXGPU_INFO("FH1 layered pipeline root uses direct geometry SRV: {}",
-                state_desc.pRootSignature == command_processor_.GetFh1LayeredRootSignature());
-  }
   // Publish the root actually used, including a restored guest root on fallback,
   // before the caller publishes the completed PSO to other threads.
   pipeline->root_signature.store(state_desc.pRootSignature, std::memory_order_release);

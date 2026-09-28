@@ -59,8 +59,8 @@ struct Fh1NativeExecutorConfig {
   D3D12TextureCache* textures = nullptr;
 };
 
-// XR-02/03/04 native executor: the FH1 session renderer (fh1_renderer =
-// native). The command processor draws every consumed guest draw into native
+// XR-02/03/04 native executor: the FH1 renderer. The command processor draws
+// every consumed guest draw into native
 // render surfaces whose EDRAM tile ownership, clears and resolves the executor
 // tracks from the guest registers, using the command processor's guest-memory
 // mirror and texture cache. Resolves write the guest texture layout into the
@@ -72,9 +72,6 @@ class Fh1NativeExecutor {
   Fh1NativeExecutor(D3D12CommandProcessor& command_processor, const RegisterFile& register_file,
                     memory::Memory& memory);
   ~Fh1NativeExecutor();
-
-  // Session renderer (fh1_renderer = native at a supported resolution scale).
-  static bool Enabled();
 
   bool Initialize(const Fh1NativeExecutorConfig& config);
   void Shutdown();

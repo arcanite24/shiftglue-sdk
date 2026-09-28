@@ -24,7 +24,6 @@
 
 #include <rex/assert.h>
 #include <rex/graphics/d3d12/shared_memory.h>
-#include <rex/graphics/d3d12/fh1_clear.h>
 #include <rex/graphics/d3d12/texture_cache.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
@@ -66,19 +65,6 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
 
-  bool ClearFh1OwnedDepth(std::span<const Fh1ClearRectangle> rectangles);
-  bool ClearFh1OwnedDepthTiles(std::span<const Fh1ClearRectangle> rectangles);
-
-  // Called only after Update has established ownership and transferred contents.
-  bool ClearFh1Rectangles(std::span<const Fh1ClearRectangle> rectangles,
-                         std::span<const std::array<float, 4>> colors,
-                         bool color, bool depth, bool stencil, uint8_t reference);
-  bool ClearFh1UiOutput(const float color[4]);
-  ID3D12Resource* GetFh1UiOutputTarget() const;
-
-  Microsoft::WRL::ComPtr<ID3D12Resource> SnapshotFh1InitialColorDepth();
-  void RestoreFh1UiOutputTargets();
-
   void InvalidateCommandListRenderTargets() {
     are_current_command_list_render_targets_valid_ = false;
   }
@@ -97,7 +83,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // frame for calling.
   bool Resolve(const memory::Memory& memory, D3D12SharedMemory& shared_memory,
                D3D12TextureCache& texture_cache, uint32_t& written_address_out,
-               uint32_t& written_length_out, bool native_mip_copy = false);
+               uint32_t& written_length_out);
 
   // For host render targets.
 
@@ -114,9 +100,6 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   bool depth_float24_convert_in_pixel_shader() const {
     return depth_float24_convert_in_pixel_shader_;
   }
-
-  void PopulateCopySourceTopology(
-      system::GraphicsCopyObservation& observation) const;
 
   DXGI_FORMAT GetColorResourceDXGIFormat(xenos::ColorRenderTargetFormat format) const;
   DXGI_FORMAT GetColorDrawDXGIFormat(xenos::ColorRenderTargetFormat format) const;
@@ -719,8 +702,6 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // buffer. May be null if failed to create.
   std::unordered_map<DumpPipelineKey, ID3D12PipelineState*, DumpPipelineKey::Hasher>
       dump_pipelines_;
-  draw_util::ResolveInfo copy_observation_resolve_info_{};
-  bool copy_observation_resolve_info_valid_ = false;
 
   // Parameter 0 - 2 root constants (red, green).
   ID3D12RootSignature* uint32_rtv_clear_root_signature_ = nullptr;

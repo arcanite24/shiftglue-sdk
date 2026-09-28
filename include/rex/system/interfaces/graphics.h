@@ -43,36 +43,15 @@ enum class NativeGuestOutputBackend : uint32_t {
 };
 
 enum class NativeGuestOutputPhase : uint32_t {
-  kNativeAttempt = 0,
+  // The guest output has been presented (the only notification).
   kPresented = 1,
-  // Notification before the first validated guest UI draw. The bounded
-  // clear_color probe may write the target; no resource handle is exposed.
-  kBeforeUi = 2,
 };
 
 // Which renderer produced the guest output of a kPresented notification.
 enum class NativeGuestOutputPresenter : uint32_t {
-  // The Xenos-emulating backend (fh1_renderer xenos).
-  kXenos = 0,
-  // The frozen six-family pilot, through this renderer callback.
-  kPilot = 1,
-  // The FH1 native executor (fh1_renderer native).
+  // The FH1 native executor, the only renderer.
   kNativeExecutor = 2,
 };
-
-using NativeGuestOutputClearColor = bool (*)(
-    const NativeGuestOutputRenderContext& context, const float color[4]);
-using NativeGuestOutputShader = bool (*)(
-    const NativeGuestOutputRenderContext& context, uint32_t stage,
-    uint64_t guest_hash, uint64_t modification,
-    const uint8_t** bytecode, size_t* bytecode_size);
-// D3D12 only. The view output is a D3D12_SHADER_RESOURCE_VIEW_DESC; the
-// resource is borrowed until the callback returns unless retained by caller.
-// immutable is true when the resource is a pinned source-draw version.
-using NativeGuestOutputTexture = bool (*)(
-    const NativeGuestOutputRenderContext& context, const uint32_t fetch[6],
-    uint64_t allocation_id, uint64_t payload_generation,
-    void** resource, void* view, bool* immutable);
 
 struct NativeGuestOutputRenderContext {
   NativeGuestOutputBackend backend = NativeGuestOutputBackend::kUnsupported;
@@ -84,32 +63,18 @@ struct NativeGuestOutputRenderContext {
   uint32_t output_format = 0;
   void* device = nullptr;
   void* command_context = nullptr;
-  // D3D12 DeferredCommandList during kNativeAttempt or kBeforeUi. Native draws must
-  // restore guest_output_state and retain referenced resources until the
-  // submission completes.
-  void* deferred_command_list = nullptr;
   void* guest_output = nullptr;
   uint32_t guest_output_state = 0;
-  // D3D12-only owned copy of the FH1 initial color producer's 1x depth
-  // input. Borrowed through the callback; initially in COPY_DEST state.
-  void* fh1_initial_color_depth = nullptr;
   uint64_t submission = 0;
   uint64_t completed_submission = 0;
   uint64_t frame_sequence = 0;
   bool use_pwl_gamma_ramp = false;
-  bool xenos_fxaa_applied = false;
-  NativeGuestOutputClearColor clear_color = nullptr;
-  // Valid during kNativeAttempt or kBeforeUi; stage 0 is vertex, 1 is pixel.
-  NativeGuestOutputShader shader = nullptr;
-  NativeGuestOutputTexture texture = nullptr;
-  // Valid during kPresented.
-  NativeGuestOutputPresenter presenter = NativeGuestOutputPresenter::kXenos;
+  NativeGuestOutputPresenter presenter = NativeGuestOutputPresenter::kNativeExecutor;
 };
 
-// Returning false yields without modifying guest output. Commands targeting
-// separately owned shadow resources may be recorded before returning false;
-// their resources must remain alive until the submission completes. A callback
-// that has recorded any guest-output command must return true.
+// Notified after the guest output has been presented. The callback observes
+// the presented frame and must not modify the guest output; the return value
+// is ignored.
 using NativeGuestOutputRenderer = bool (*)(
     const NativeGuestOutputRenderContext& context);
 
@@ -236,73 +201,6 @@ struct GraphicsFh1ExecutionKey {
   }
 };
 
-struct GraphicsCopyObservation {
-  GraphicsFh1ExecutionKey fh1_execution_key;
-  uint64_t frame_sequence = 0;
-  uint64_t copy_sequence = 0;
-  // IssueDraw ordinal shared with GraphicsPreparedDrawObservation::draw_sequence.
-  // Includes copy-mode draws, so draw and resolve events can be interleaved.
-  uint64_t draw_sequence = 0;
-  uint64_t current_submission = 0;
-  uint64_t completed_submission = 0;
-  uint32_t written_address = 0;
-  uint32_t written_length = 0;
-  uint32_t rb_copy_control = 0;
-  uint32_t rb_copy_dest_base = 0;
-  uint32_t rb_copy_dest_info = 0;
-  uint32_t rb_copy_dest_pitch = 0;
-  uint32_t surface_info = 0;
-  uint32_t color_info[4] = {};
-  uint32_t depth_info = 0;
-  uint32_t source_resource_width = 0;
-  uint32_t source_resource_height = 0;
-  uint32_t source_resource_format = 0;
-  uint32_t source_sample_count = 0;
-  uint32_t source_sample_quality = 0;
-  uint32_t source_guest_msaa_samples = 0;
-  uint32_t draw_resolution_scale_x = 0;
-  uint32_t draw_resolution_scale_y = 0;
-  uint32_t source_target_base_tiles = 0;
-  uint32_t source_target_pitch_tiles_at_32bpp = 0;
-  uint32_t resolve_source_base_tiles = 0;
-  uint32_t resolve_source_pitch_tiles = 0;
-  uint32_t resolve_source_format = 0;
-  uint32_t resolve_source_guest_msaa_samples = 0;
-  uint32_t resolve_guest_offset_x = 0;
-  uint32_t resolve_guest_offset_y = 0;
-  uint32_t resolve_guest_width = 0;
-  uint32_t resolve_guest_height = 0;
-  uint32_t resolve_physical_offset_x = 0;
-  uint32_t resolve_physical_offset_y = 0;
-  uint32_t resolve_physical_width = 0;
-  uint32_t resolve_physical_height = 0;
-  uint32_t resolve_dest_offset_x = 0;
-  uint32_t resolve_dest_offset_y = 0;
-  uint32_t resolve_dest_pitch = 0;
-  uint32_t resolve_dest_height = 0;
-  uint32_t resolve_sample_select = 0;
-  bool resolve_info_valid = false;
-  bool source_target_available = false;
-  bool native_2x_msaa = false;
-  bool succeeded = false;
-};
-
-using GraphicsCopyObserver = void (*)(const GraphicsCopyObservation& observation);
-
-// An optimized FH1 rectangle clear replaces an IssueDraw command. Borrowed
-// values are valid only during the callback.
-struct GraphicsFh1ClearObservation {
-  uint64_t frame_sequence = 0;
-  uint64_t draw_sequence = 0;
-  uint32_t surface_info = 0, color_info = 0, depth_info = 0;
-  // 0=regular target, 1=owned depth, 2=owned depth tiles.
-  uint32_t mode = 0, flags = 0, stencil_reference = 0, rectangle_count = 0;
-  int32_t bounds[2][4] = {};
-  float depth[2] = {};
-  float colors[2][4] = {};
-};
-using GraphicsFh1ClearObserver = void (*)(
-    const GraphicsFh1ClearObservation& observation);
 
 enum class GraphicsShaderStage : uint32_t {
   kVertex = 1,
@@ -351,50 +249,6 @@ struct GraphicsShaderTranslationObservation {
 using GraphicsShaderTranslationObserver = void (*)(
     const GraphicsShaderTranslationObservation& observation);
 
-enum class GraphicsFh1ExecutionMode : uint32_t {
-  kCompatibility = 0,
-  kCoveredInPlace = 1,
-};
-
-enum class GraphicsFh1FallbackReason : uint32_t {
-  kNone = 0,
-  kManifestUnavailable = 1,
-  kExecutionKeyNotCaptured = 2,
-  kHazardousDraw = 3,
-  kPipelineNotPrewarmed = 4,
-};
-
-struct GraphicsPreparedDrawVertexFetch {
-  uint32_t fetch_constant = 0;
-  uint32_t stride_words = 0;
-  uint32_t guest_base = 0;
-  uint32_t length = 0;
-  uint32_t type = 0;
-  uint32_t source_packet_physical_0 = 0;
-  uint32_t source_packet_physical_1 = 0;
-  uint64_t source_execution_0 = 0;
-  uint64_t source_execution_1 = 0;
-  // SNR03 probe: 0=not attempted, 1=CPU snapshot, 2=non-CPU/rejected,
-  // 3=per-range limit, 4=per-frame limit.
-  uint32_t cpu_snapshot_status = 0;
-  uint64_t cpu_snapshot_hash = 0;
-  uint32_t cpu_snapshot_length = 0;
-  // Borrowed until the prepared-draw observer returns; valid only on success.
-  const uint8_t* cpu_snapshot_bytes = nullptr;
-};
-
-struct GraphicsPreparedDrawTextureFetch {
-  uint32_t fetch_constant = 0;
-  uint32_t type = 0;
-  uint32_t base_address = 0;
-  uint32_t mip_address = 0;
-  uint32_t format = 0;
-  uint32_t dimension = 0;
-  uint32_t width = 0;
-  uint32_t height = 0;
-  uint32_t stack_depth = 0;
-};
-
 struct GraphicsFinalDrawTextureIdentity {
   uint32_t fetch_constant = 0;
   uint32_t fetch_words[6] = {};
@@ -403,120 +257,6 @@ struct GraphicsFinalDrawTextureIdentity {
   uint32_t outdated_mask = 0;
 };
 
-struct GraphicsPreparedDrawObservation {
-  GraphicsFh1ExecutionKey fh1_execution_key;
-  GraphicsFh1ExecutionMode fh1_execution_mode =
-      GraphicsFh1ExecutionMode::kCompatibility;
-  GraphicsFh1FallbackReason fh1_fallback_reason =
-      GraphicsFh1FallbackReason::kManifestUnavailable;
-  uint64_t fh1_runtime_shader_translations = 0;
-  uint64_t fh1_runtime_sync_pipeline_creations = 0;
-  uint64_t fh1_prepare_cpu_time_ns = 0;
-  uint64_t frame_sequence = 0;
-  uint64_t draw_sequence = 0;
-  uint64_t indirect_buffer_execution_id = 0;
-  uint64_t indirect_buffer_parent_execution_id = 0;
-  uint32_t indirect_dispatch_packet_physical_address = 0;
-  uint32_t draw_packet_physical_address = 0;
-  uint32_t command_buffer_physical_address = 0;
-  uint32_t command_buffer_bytes = 0;
-  uint32_t command_buffer_end_offset = 0;
-  uint64_t vertex_shader_hash = 0;
-  uint64_t pixel_shader_hash = 0;
-  uint64_t vertex_specialization_mask = 0;
-  uint64_t pixel_specialization_mask = 0;
-  uint32_t guest_primitive_type = 0;
-  uint32_t host_primitive_type = 0;
-  uint32_t host_vertex_shader_type = 0;
-  uint32_t tessellation_mode = 0;
-  uint32_t index_buffer_type = 0;
-  uint32_t host_index_format = 0;
-  uint32_t host_primitive_reset_enabled = 0;
-  uint32_t index_count = 0;
-  uint32_t index_buffer_guest_base = 0;
-  uint32_t index_buffer_length = 0;
-  uint32_t index_buffer_guest_endianness = 0;
-  uint32_t host_shader_index_endianness = 0;
-  uint32_t guest_primitive_reset_index = 0;
-  // Borrowed until the prepared-draw observer returns; diagnostic only.
-  uint32_t index_cpu_snapshot_status = 0;
-  uint64_t index_cpu_snapshot_hash = 0;
-  const uint8_t* index_cpu_snapshot_bytes = nullptr;
-  // Borrowed for the duration of the callback; count may exceed the
-  // diagnostic array capacity, in which case only the first entries exist.
-  const GraphicsPreparedDrawVertexFetch* vertex_fetches = nullptr;
-  uint32_t vertex_fetch_count = 0;
-  uint32_t vertex_fetch_capacity = 0;
-  // First of 512 float4 registers, borrowed until the observer returns.
-  const uint32_t* vertex_float_constant_words = nullptr;
-  // Vertex shader's 256-register bitmap, borrowed until the observer returns.
-  const uint64_t* vertex_float_constant_bitmap = nullptr;
-  uint32_t vertex_float_constant_count = 0;
-  // Pixel shader's 256-register bitmap; indexes address the second half of
-  // vertex_float_constant_words. Borrowed until the observer returns.
-  const uint64_t* pixel_float_constant_bitmap = nullptr;
-  uint32_t pixel_float_constant_count = 0;
-  const GraphicsPreparedDrawTextureFetch* texture_fetches = nullptr;
-  uint32_t texture_fetch_count = 0;
-  uint32_t normalized_depth_control = 0;
-  uint32_t normalized_color_mask = 0;
-  uint32_t bound_render_target_bits = 0;
-  uint32_t bound_render_target_formats[5] = {};
-  uint32_t surface_info = 0;
-  uint32_t color_info[4] = {};
-  uint32_t depth_info = 0;
-  uint32_t flags = 0;
-};
-
-using GraphicsPreparedDrawObserver = void (*)(
-    const GraphicsPreparedDrawObservation& observation);
-using GraphicsPreparedDrawSnapshotSelector = bool (*)(
-    uint64_t frame_sequence, uint32_t command_buffer_physical_address);
-using GraphicsPreparedDrawFrameSelector = bool (*)(uint64_t frame_sequence);
-
-// Borrowed only during the callback, after the draw's constant buffers have
-// been bound and before the draw command is recorded.
-struct GraphicsFinalDrawStateObservation {
-  uint64_t frame_sequence = 0;
-  uint64_t draw_sequence = 0;
-  uint32_t draw_packet_physical_address = 0;
-  uint64_t dynamic_state = 0;
-  const uint32_t* system_constant_words = nullptr;
-  uint32_t system_constant_word_count = 0;
-  const uint32_t* fetch_47_words = nullptr;
-  const uint32_t* vertex_float_constant_words = nullptr;
-  const uint32_t* bound_vertex_float_constant_words = nullptr;
-  uint32_t bound_vertex_float_constant_count = 0;
-  uint32_t raster_mode_control = 0;
-  uint32_t clip_control = 0;
-  uint32_t normalized_depth_control = 0;
-  // Borrowed until the observer returns: XYWH, min/max depth, then LTRB.
-  const float* viewport = nullptr;
-  const int32_t* scissor = nullptr;
-  // Borrowed until the observer returns: 48 packed fetch constants (192 words).
-  const uint32_t* fetch_constant_words = nullptr;
-  uint32_t fetch_constant_word_count = 0;
-  // Borrowed until the observer returns, after texture bindings are prepared.
-  const GraphicsFinalDrawTextureIdentity* textures = nullptr;
-  uint32_t texture_count = 0;
-  // Borrowed until the observer returns: 8 bool and 32 loop words.
-  const uint32_t* bool_loop_constant_words = nullptr;
-  uint32_t bool_loop_constant_word_count = 0;
-};
-using GraphicsFinalDrawStateObserver = void (*)(
-    const GraphicsFinalDrawStateObservation& observation);
-
-struct GraphicsIndirectBufferObservation {
-  uint64_t frame_sequence = 0;
-  uint64_t execution_id = 0;
-  uint64_t parent_execution_id = 0;
-  uint32_t dispatch_packet_physical_address = 0;
-  uint32_t command_buffer_physical_address = 0;
-  uint32_t command_buffer_bytes = 0;
-};
-
-using GraphicsIndirectBufferObserver = void (*)(
-    const GraphicsIndirectBufferObservation& observation);
 
 class IGraphicsSystem {
  public:
@@ -544,34 +284,10 @@ class IGraphicsSystem {
   virtual ui::GraphicsProvider* provider() const { return nullptr; }
   virtual ui::Presenter* presenter() const { return nullptr; }
 
-  // Optional read-only command-stream observation. Backends invoke this
-  // before draw submission and observers cannot alter draw behavior.
-  virtual void SetCopyObserver(GraphicsCopyObserver observer) {
-    (void)observer;
-  }
-  virtual void SetFh1ClearObserver(GraphicsFh1ClearObserver observer) {
-    (void)observer;
-  }
+  // Optional read-only shader translation observation; observers cannot alter
+  // translation or draw behavior.
   virtual void SetShaderTranslationObserver(
       GraphicsShaderTranslationObserver observer) {
-    (void)observer;
-  }
-  virtual void SetPreparedDrawObserver(GraphicsPreparedDrawObserver observer) {
-    (void)observer;
-  }
-  virtual void SetPreparedDrawSnapshotSelector(
-      GraphicsPreparedDrawSnapshotSelector selector) {
-    (void)selector;
-  }
-  virtual void SetPreparedDrawFrameSelector(
-      GraphicsPreparedDrawFrameSelector selector) {
-    (void)selector;
-  }
-  virtual void SetFinalDrawStateObserver(GraphicsFinalDrawStateObserver observer) {
-    (void)observer;
-  }
-  virtual void SetIndirectBufferObserver(
-      GraphicsIndirectBufferObserver observer) {
     (void)observer;
   }
   virtual void SetNativeGuestOutputRenderer(NativeGuestOutputRenderer renderer) {

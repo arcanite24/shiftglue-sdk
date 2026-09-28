@@ -75,9 +75,6 @@ class D3D12CommandProcessor : public CommandProcessor {
     assert_true(submission_open_);
     return deferred_command_list_;
   }
-  bool ClearFh1UiOutput(const float color[4]) {
-    return render_target_cache_ && render_target_cache_->ClearFh1UiOutput(color);
-  }
 
   bool IsShutdownRequested() const { return !worker_running_.load(); }
 
@@ -105,12 +102,6 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Finds or creates root signature for a pipeline.
   ID3D12RootSignature* GetRootSignature(const DxbcShader* vertex_shader,
                                         const DxbcShader* pixel_shader, bool tessellated);
-  ID3D12RootSignature* GetFh1SkinnedRootSignature() const { return root_signature_fh1_skinned_; }
-  ID3D12RootSignature* GetFh1TerrainRootSignature() const { return root_signature_fh1_terrain_; }
-  ID3D12RootSignature* GetFh1DepthRootSignature() const { return root_signature_fh1_depth_; }
-  ID3D12RootSignature* GetFh1LayeredRootSignature() const {
-    return root_signature_fh1_layered_;
-  }
 
   ui::d3d12::D3D12UploadBufferPool& GetConstantBufferPool() const { return *constant_buffer_pool_; }
 
@@ -256,18 +247,6 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   void OnPrimaryBufferEnd() override;
   void FlushCpuVisibleResults() override;
-  void ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) override;
-  // Scoped to one fully validated list; state packets and scratch clears still execute.
-  bool fh1_mip_replacement_active_ = false;
-  uint64_t fh1_mip_candidates_ = 0, fh1_mip_native_faces_ = 0;
-  // Rejection breakdown of fh1_mip_candidates_: guard, inherited state, command
-  // contract, native publication.
-  uint64_t fh1_mip_rejections_[4] = {};
-  uint32_t fh1_mip_skipped_draws_ = 0, fh1_mip_skipped_copies_ = 0;
-  uint64_t fh1_mip_probe_faces_ = 0;
-  uint64_t fh1_mip_probe_contract_ns_ = 0;
-  uint64_t fh1_mip_probe_native_ns_ = 0;
-  uint64_t fh1_mip_probe_replay_ns_ = 0;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -423,25 +402,12 @@ class D3D12CommandProcessor : public CommandProcessor {
                                   reg::RB_DEPTHCONTROL normalized_depth_control,
                                   uint32_t normalized_color_mask);
   bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
-                      ID3D12RootSignature* root_signature, bool shared_memory_is_uav,
-                      D3D12_GPU_VIRTUAL_ADDRESS geometry_address,
-                      const std::array<D3D12_GPU_VIRTUAL_ADDRESS, 2>& terrain_addresses);
-  bool DrawFh1ToneMap(const D3D12Shader::TextureBinding& source,
-                      DXGI_FORMAT render_target_format, float exposure);
-  bool DrawFh1VelocityDilate(const D3D12Shader::TextureBinding& source,
-                             DXGI_FORMAT render_target_format);
+                      ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
 
   bool InitializeNativeGuestOutputGpuTiming();
   void ShutdownNativeGuestOutputGpuTiming();
   void BeginNativeGuestOutputGpuTimingFrame();
   void EndNativeGuestOutputGpuTimingFrame();
-  void ObserveFh1GpuPassTimingDraw(
-      const system::GraphicsFh1ExecutionKey& key, uint64_t frame,
-      uint64_t prepare_cpu_time_ns);
-  void BeginFh1GpuPassTimingCopy();
-  void ObserveFh1GpuPassTimingCopy(
-      const system::GraphicsFh1ExecutionKey& key, uint64_t frame);
-  void FinishFh1GpuPassTiming(uint64_t terminal_copy_state);
   void EndFh1GpuPassTimingFrame();
   void LogFh1GpuPassTimings();
   void RetireNativeGuestOutputGpuTimings();
@@ -598,11 +564,6 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Root signatures for different descriptor counts.
   std::unordered_map<uint32_t, ID3D12RootSignature*> root_signatures_bindful_;
   ID3D12RootSignature* root_signature_bindless_vs_ = nullptr;
-  ID3D12RootSignature* root_signature_fh1_layered_ = nullptr;
-  ID3D12RootSignature* root_signature_fh1_depth_ = nullptr;
-  ID3D12RootSignature* root_signature_fh1_skinned_ = nullptr;
-  uint32_t current_fh1_skinned_origin_ = 0;
-  ID3D12RootSignature* root_signature_fh1_terrain_ = nullptr;
   ID3D12RootSignature* root_signature_bindless_ds_ = nullptr;
 
   std::unique_ptr<D3D12PrimitiveProcessor> primitive_processor_;
@@ -610,16 +571,6 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::unique_ptr<PipelineCache> pipeline_cache_;
 
   std::unique_ptr<D3D12TextureCache> texture_cache_;
-  struct Snr04Bc3Readback {
-    uint64_t frame;
-    uint64_t submission;
-    uint32_t descriptor;
-    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
-    std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 9> footprints;
-    uint64_t bytes;
-  };
-  std::vector<Snr04Bc3Readback> snr04_bc3_readbacks_;
-  void FlushSnr04Bc3Readbacks(uint64_t submission);
 
   // Bytes 0x0...0x3FF - 256-entry gamma ramp table with B10G10R10X2 data (read
   // as R10G10B10X2 with swizzle).
@@ -666,88 +617,6 @@ class D3D12CommandProcessor : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fxaa_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fxaa_extreme_pipeline_;
 
-  Microsoft::WRL::ComPtr<ID3D12RootSignature> fh1_tonemap_root_signature_;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> fh1_tonemap_pipeline_;
-  DXGI_FORMAT fh1_tonemap_render_target_format_ = DXGI_FORMAT_UNKNOWN;
-  uint64_t fh1_tonemap_native_draws_ = 0;
-
-  struct Fh1Geometry {
-    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
-    SharedMemory::WatchHandle watch = nullptr;  // Protected by the global critical region.
-    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
-    uint64_t allocation_bytes = 0;
-    uint64_t last_submission = 0;
-    uint64_t last_frame = 0;
-    bool keep_cpu_snapshot = false;
-    std::vector<uint8_t> cpu_snapshot;
-    struct DepthBounds {
-      std::array<uint32_t, 16> key;
-      std::optional<std::pair<uint32_t, uint32_t>> range;
-    };
-    std::vector<DepthBounds> depth_bounds;
-    uint32_t next_depth_bound = 0;
-    struct TerrainBounds {
-      std::array<uint32_t, 33> key;
-      std::optional<uint32_t> maximum;
-      std::optional<std::array<std::pair<uint32_t, uint32_t>, 3>> ranges;
-    };
-    std::vector<TerrainBounds> terrain_bounds;
-    uint32_t next_terrain_bound = 0;
-  };
-  struct Fh1GeometryRejection {
-    uint64_t key = 0;
-    uint64_t frame = 0;
-    uint64_t completed_submission = 0;
-    uint64_t cache_generation = 0;
-    uint8_t reason = 0;
-  };
-  D3D12_GPU_VIRTUAL_ADDRESS GetFh1OwnedGeometry(uint32_t address, uint32_t size, bool keep_cpu_snapshot = false);
-  std::map<uint64_t, Fh1Geometry>::iterator FindFh1OwnedGeometry(uint32_t base, uint32_t size);
-  std::span<const uint8_t> GetFh1OwnedGeometryCpuRange(uint32_t address, uint32_t size);
-  std::optional<std::pair<uint32_t, uint32_t>> GetFh1DepthGeometryRange(
-      uint32_t address, uint32_t size, std::span<const uint32_t, 8> system,
-      uint32_t width, uint32_t stride, uint32_t fetch_address, uint32_t fetch_size,
-      bool primitive_reset, uint32_t vertex_bytes = 12);
-  std::optional<std::array<std::pair<uint32_t, uint32_t>, 3>> GetFh1TerrainGeometryRanges(
-      uint32_t address, uint32_t size, std::span<const uint32_t, 8> system,
-      uint32_t width, bool primitive_reset, std::span<const float, 44> constants,
-      std::span<const uint32_t, 6> fetches);
-  void ClearFh1OwnedGeometry();  // GPU queue must be idle.
-  std::map<uint64_t, Fh1Geometry> fh1_geometry_;
-  uint64_t fh1_geometry_bytes_ = 0;
-  uint64_t fh1_geometry_imports_ = 0;
-  uint64_t fh1_geometry_cpu_imports_ = 0;
-  uint64_t fh1_geometry_allocations_ = 0;
-  uint64_t fh1_geometry_recycles_ = 0;
-  uint64_t fh1_geometry_contained_uses_ = 0;
-  uint64_t fh1_geometry_import_bytes_ = 0;
-  uint64_t fh1_geometry_hits_ = 0;
-  std::array<Fh1GeometryRejection, 64> fh1_geometry_rejections_{};
-  uint64_t fh1_geometry_cache_generation_ = 0;
-  uint64_t fh1_geometry_admission_attempts_ = 0;
-  uint64_t fh1_geometry_allocation_info_calls_ = 0;
-  uint64_t fh1_geometry_eviction_scans_ = 0;
-  uint64_t fh1_geometry_rejected_in_flight_ = 0;
-  uint64_t fh1_geometry_rejected_recent_ = 0;
-  uint64_t fh1_geometry_rejection_hits_ = 0;
-  uint64_t fh1_geometry_peak_bytes_ = 0;
-  D3D12_GPU_VIRTUAL_ADDRESS current_fh1_geometry_address_ = 0;
-  std::array<D3D12_GPU_VIRTUAL_ADDRESS, 2> current_fh1_terrain_addresses_{};
-
-  Microsoft::WRL::ComPtr<ID3D12RootSignature>
-      fh1_velocity_dilate_root_signature_;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> fh1_velocity_dilate_pipeline_;
-  DXGI_FORMAT fh1_velocity_dilate_render_target_format_ =
-      DXGI_FORMAT_UNKNOWN;
-  uint64_t fh1_velocity_dilate_native_draws_ = 0;
-  uint64_t fh1_scene_draw_sequence_ = 0;
-  uint64_t fh1_ui_boundary_frame_ = 0;
-  uint64_t fh1_ui_injected_frame_ = 0;
-  uint64_t fh1_ui_last_frame_ = 0;
-  uint32_t fh1_ui_previous_color_ = 0;
-  uint64_t fh1_scene_followup_sequence_ = 0;
-  uint32_t fh1_scene_binding_records_ = 0;
-  std::unordered_set<uint64_t> fh1_scene_command_snapshots_;
 
   static constexpr uint32_t kNativeGuestOutputGpuQueriesPerFrame = 5;
   // Sampled gameplay exceeds 256 mixed pass/texture records. Keep a bounded
@@ -772,6 +641,7 @@ class D3D12CommandProcessor : public CommandProcessor {
       native_guest_output_gpu_timing_slots_{};
   bool native_guest_output_gpu_timing_active_ = false;
 
+  // A sampled texture load or render target transfer (corpus runs only).
   struct Fh1GpuPassTimingRecord {
     D3D12TextureCache::TextureKey texture_key;
     bool work_complete = false;
@@ -779,60 +649,15 @@ class D3D12CommandProcessor : public CommandProcessor {
     bool resolve_clear = false;
     uint32_t transfer_count = 0;
     uint64_t frame = 0;
-    uint64_t prepare_cpu_time_ns = 0;
-    uint64_t signature = 0;
-    uint64_t family = 0;
-    uint64_t attachment_state = 0;
-    uint64_t first_draw_family = 0;
-    uint64_t first_draw_identity = 0;
-    uint64_t terminal_copy_state = 0;
-    uint32_t draw_count = 0;
     uint32_t query_offset = 0;
-    bool copy_started = false;
-    uint64_t recording_start_ns = 0;
-    uint64_t recording_wall_ns = 0;
-    uint64_t begin_submission = 0;
-    uint64_t end_submission = 0;
   };
   struct Fh1GpuPassTimingSlot {
     uint64_t submission = 0;
     uint32_t record_count = 0;
     std::array<Fh1GpuPassTimingRecord, kFh1GpuPassTimingCapacity> records{};
   };
-  struct Fh1GpuPassTimingActive {
-    uint64_t frame = 0;
-    uint64_t prepare_cpu_time_ns = 0;
-    uint64_t attachment_state = 0;
-    uint64_t first_draw_family = 0;
-    uint64_t first_draw_identity = 0;
-    uint64_t running_signature = 0;
-    uint32_t slot_index = 0;
-    uint32_t draw_count = 0;
-    uint32_t hazard_flags = 0;
-    uint32_t record_index = UINT32_MAX;
-  };
-  struct Fh1GpuPassTimingAggregate {
-    uint64_t samples = 0;
-    uint64_t total_ns = 0;
-    uint64_t maximum_ns = 0;
-    uint64_t total_draw_ns = 0;
-    uint64_t total_resolve_ns = 0;
-    uint64_t maximum_resolve_ns = 0;
-    uint64_t total_draws = 0;
-    uint64_t attachment_state = 0;
-    uint64_t first_draw_family = 0;
-    uint64_t first_draw_identity = 0;
-    uint64_t terminal_copy_state = 0;
-    uint32_t minimum_draw_count = UINT32_MAX;
-    uint32_t maximum_draw_count = 0;
-  };
   std::array<Fh1GpuPassTimingSlot, kQueueFrames>
       fh1_gpu_pass_timing_slots_{};
-  Fh1GpuPassTimingActive fh1_gpu_pass_timing_active_{};
-  std::unordered_map<uint64_t, Fh1GpuPassTimingAggregate>
-      fh1_gpu_pass_timing_aggregates_;
-  std::unordered_map<uint64_t, Fh1GpuPassTimingAggregate>
-      fh1_gpu_pass_family_timing_aggregates_;
   uint64_t fh1_gpu_pass_timing_drops_ = 0;
   uint64_t fh1_gpu_pass_timing_busy_drops_ = 0;
   uint64_t fh1_gpu_pass_timing_capacity_drops_ = 0;
@@ -860,23 +685,6 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   // <Submission where requested, resource>, sorted by the submission number.
   std::deque<std::pair<uint64_t, ID3D12Resource*>> resources_for_deletion_;
-  struct Fh1NativeMaterial {
-    Microsoft::WRL::ComPtr<ID3D12Resource> source, snapshot;
-    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
-    uint64_t bytes = 0;
-  };
-  struct Fh1NativeMaterialFrame {
-    uint64_t bytes = 0;
-    uint32_t trace_failed = 0, trace_limited = 0;
-    bool trace_reported = false;
-    std::map<std::tuple<std::array<uint32_t, 6>, uint64_t, uint64_t>,
-             Fh1NativeMaterial> materials;
-  };
-  std::map<uint64_t, Fh1NativeMaterialFrame> fh1_native_material_frames_;
-  std::map<uint64_t, Microsoft::WRL::ComPtr<ID3D12Resource>>
-      fh1_initial_color_depth_frames_;
-  void ConfigureFh1NativeContext(system::NativeGuestOutputRenderContext& context);
-  void RestoreFh1AfterNativeUi();
 
   static constexpr uint32_t kScratchBufferSizeIncrement = 16 * 1024 * 1024;
   ID3D12Resource* scratch_buffer_ = nullptr;
@@ -954,9 +762,6 @@ class D3D12CommandProcessor : public CommandProcessor {
   };
   ConstantBufferBinding cbuffer_binding_system_;
   ConstantBufferBinding cbuffer_binding_float_vertex_;
-  // Diagnostic shadow of the actual packed vertex CBV bytes.
-  std::array<uint32_t, 1024> snr02_bound_vertex_constants_{};
-  uint32_t snr02_bound_vertex_constant_count_ = 0;
   ConstantBufferBinding cbuffer_binding_float_pixel_;
   ConstantBufferBinding cbuffer_binding_bool_loop_;
   ConstantBufferBinding cbuffer_binding_fetch_;
@@ -999,8 +804,6 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::vector<D3D12TextureCache::SamplerParameters> current_samplers_pixel_;
   std::vector<uint32_t> current_sampler_bindless_indices_vertex_;
   std::vector<uint32_t> current_sampler_bindless_indices_pixel_;
-  // Last unsigned view, signed view and sampler on the fixed material root.
-  std::array<uint32_t, 3> fh1_fixed_descriptor_indices_{};
 
   // Latest bindful descriptor handles used for handling Xenos draw calls.
   D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_shared_memory_srv_and_edram_;

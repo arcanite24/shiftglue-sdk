@@ -385,14 +385,6 @@ uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
 
 void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   RegisterFile& regs = *register_file_;
-  constexpr uint32_t kVertexFetchBase = XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
-  if (index >= kVertexFetchBase &&
-      index - kVertexFetchBase < observation_fetch_origins_.size() &&
-      graphics_system_->prepared_draw_observer()) {
-    observation_fetch_origins_[index - kVertexFetchBase] = {
-        observation_current_packet_address_,
-        observation_indirect_buffer_execution_id_};
-  }
   if (index >= RegisterFile::kRegisterCount) {
     auto [it, inserted] = extended_register_values_.insert_or_assign(index, value);
     (void)it;
@@ -765,12 +757,6 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
     REXGPU_WARN("GPU packet is CDCDCDCD - probably read uninitialized memory!");
   }
 
-  const bool observing = graphics_system_->prepared_draw_observer() != nullptr;
-  const uint32_t previous_packet_address = observation_current_packet_address_;
-  if (observing) {
-    observation_current_packet_address_ =
-        uint32_t(reader->buffer() - memory_->physical_membase()) + packet_offset;
-  }
   bool result = false;
   switch (packet_type) {
     case 0x00:
@@ -788,9 +774,6 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
     default:
       assert_unhandled_case(packet_type);
       break;
-  }
-  if (observing) {
-    observation_current_packet_address_ = previous_packet_address;
   }
   return result;
 }
@@ -844,15 +827,6 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   uint32_t opcode = (packet >> 8) & 0x7F;
   uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
   auto data_start_offset = reader->read_offset();
-  if ((opcode == PM4_DRAW_INDX || opcode == PM4_DRAW_INDX_2) &&
-      graphics_system_->prepared_draw_observer()) {
-    const uint32_t header_offset = data_start_offset
-                                       ? data_start_offset - sizeof(uint32_t)
-                                       : reader->capacity() - sizeof(uint32_t);
-    observation_draw_packet_address_ =
-        uint32_t(reader->buffer() - memory_->physical_membase()) +
-        header_offset;
-  }
 
   if (reader->read_count() < count * sizeof(uint32_t)) {
     REXGPU_ERROR("ExecutePacketType3 overflow (read count {:08X}, packet count {:08X})",
@@ -1084,7 +1058,6 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
   ++observation_frame_sequence_;
-  observation_copy_sequence_ = 0;
 
   ++counter_;
   return true;
@@ -1093,41 +1066,11 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* reader,
                                                           uint32_t packet, uint32_t count) {
   // indirect buffer dispatch
-  const uint32_t dispatch_header_offset = reader->read_offset()
-                                              ? reader->read_offset() - sizeof(uint32_t)
-                                              : reader->capacity() - sizeof(uint32_t);
-  const uint32_t dispatch_packet_physical_address =
-      uint32_t(reader->buffer() - memory_->physical_membase()) +
-      dispatch_header_offset;
   uint32_t list_ptr = CpuToGpu(reader->ReadAndSwap<uint32_t>());
   uint32_t list_length = reader->ReadAndSwap<uint32_t>();
   assert_zero(list_length & ~0xFFFFF);
   list_length &= 0xFFFFF;
-  const uint32_t target_physical_address = GpuToCpu(list_ptr);
-  const uint64_t previous_execution_id =
-      observation_indirect_buffer_execution_id_;
-  const uint64_t previous_parent_id =
-      observation_indirect_buffer_parent_execution_id_;
-  const uint32_t previous_dispatch_packet_physical_address =
-      observation_indirect_dispatch_packet_physical_address_;
-  observation_indirect_buffer_parent_execution_id_ = previous_execution_id;
-  observation_indirect_buffer_execution_id_ =
-      ++observation_indirect_buffer_sequence_;
-  observation_indirect_dispatch_packet_physical_address_ =
-      dispatch_packet_physical_address;
-  if (auto observer = graphics_system_->indirect_buffer_observer()) {
-    observer({observation_frame_sequence_,
-              observation_indirect_buffer_execution_id_,
-              observation_indirect_buffer_parent_execution_id_,
-              dispatch_packet_physical_address,
-              target_physical_address,
-              uint32_t(list_length * sizeof(uint32_t))});
-  }
-  ExecuteIndirectBuffer(target_physical_address, list_length);
-  observation_indirect_buffer_execution_id_ = previous_execution_id;
-  observation_indirect_buffer_parent_execution_id_ = previous_parent_id;
-  observation_indirect_dispatch_packet_physical_address_ =
-      previous_dispatch_packet_physical_address;
+  ExecuteIndirectBuffer(GpuToCpu(list_ptr), list_length);
   return true;
 }
 
@@ -1612,12 +1555,6 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 
       bool major_mode_explicit =
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
-      if (graphics_system_->prepared_draw_observer()) {
-        observation_draw_buffer_base_ =
-            uint32_t(reader->buffer() - memory_->physical_membase());
-        observation_draw_buffer_bytes_ = reader->capacity();
-        observation_draw_buffer_end_offset_ = reader->read_offset();
-      }
       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
       if (!draw_succeeded) {

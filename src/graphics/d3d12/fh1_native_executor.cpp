@@ -28,12 +28,6 @@
 #include <rex/ui/d3d12/d3d12_util.h>
 #include <rex/ui/graphics_util.h>
 
-REXCVAR_DEFINE_STRING(fh1_renderer, "xenos", "GPU/D3D12",
-                      "FH1 session renderer: xenos or native (the native executor renders and "
-                      "presents; the Xenos EDRAM emulation is not used)")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DECLARE(int32_t, draw_resolution_scale_x);
-REXCVAR_DECLARE(int32_t, draw_resolution_scale_y);
 REXCVAR_DEFINE_STRING(fh1_native_dump_frames, "", "GPU/D3D12",
                       "Comma-separated frames whose native front buffer is written as PPM")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -332,29 +326,6 @@ Fh1NativeExecutor::CpuTimer::~CpuTimer() {
   executor_.cpu_ns_[phase_] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::duration(
           std::chrono::steady_clock::now().time_since_epoch().count() - start_)).count());
-}
-
-namespace {
-// `native` runs at 1x and at symmetric 2x and 3x. Other scales keep the Xenos
-// backend.
-bool ResolutionScaleSupported() {
-  static const bool supported = [] {
-    const uint32_t x = REXCVAR_GET(draw_resolution_scale_x);
-    const uint32_t y = REXCVAR_GET(draw_resolution_scale_y);
-    if (x == y && x >= 1 && x <= 3) return true;
-    if (REXCVAR_GET(fh1_renderer) == "native") {
-      REXGPU_WARN("FH1 native renderer supports 1x, 2x and 3x; using Xenos at {}x{}", x, y);
-    }
-    return false;
-  }();
-  return supported;
-}
-}  // namespace
-
-bool Fh1NativeExecutor::Enabled() {
-  static const bool enabled =
-      REXCVAR_GET(fh1_renderer) == "native" && ResolutionScaleSupported();
-  return enabled;
 }
 
 bool Fh1NativeExecutor::Initialize(const Fh1NativeExecutorConfig& config) {
