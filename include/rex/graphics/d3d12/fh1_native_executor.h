@@ -453,6 +453,18 @@ class Fh1NativeExecutor {
   // EDRAM tile -> whether the low byte of its words (stencil when read as
   // depth) may be nonzero.
   std::vector<uint8_t> tile_stencil_nonzero_;
+  // Changes whenever tile ownership or a tile's stencil state could change, so
+  // a draw with the previous draw's targets and extent needs no work.
+  uint64_t tile_generation_ = 1;
+  struct PrepareSignature {
+    uint64_t generation = 0;
+    uint32_t used_bits = 0;
+    uint32_t length_tiles = 0;
+    bool stencil_written = false;
+    uint32_t keys[5] = {};
+    bool operator==(const PrepareSignature&) const = default;
+  };
+  PrepareSignature last_prepare_;
   void MarkTileStencil(uint32_t base, uint32_t length, bool nonzero);
   // Last claim per surface, so repeated draws to one pass do not rewalk tiles.
   std::map<uint32_t, std::pair<uint32_t, uint32_t>> last_claims_;

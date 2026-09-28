@@ -795,6 +795,7 @@ void Fh1NativeExecutor::ClaimTiles(uint32_t base, uint32_t length, uint32_t pack
   for (uint32_t i = 0; i < length; ++i) {
     uint32_t& owner = tile_owners_[(base + i) & (xenos::kEdramTileCount - 1)];
     if (owner == packed_key) continue;
+    ++tile_generation_;
     if (owner != kNoOwner) {
       if (!runs.empty() && runs.back().previous_owner == owner &&
           runs.back().first + runs.back().count == base + i) {
@@ -820,6 +821,7 @@ void Fh1NativeExecutor::ClaimTiles(uint32_t base, uint32_t length, uint32_t pack
 
 void Fh1NativeExecutor::MarkTileStencil(uint32_t base, uint32_t length, bool nonzero) {
   length = std::min(length, xenos::kEdramTileCount);
+  ++tile_generation_;
   for (uint32_t i = 0; i < length; ++i) {
     tile_stencil_nonzero_[(base + i) & (xenos::kEdramTileCount - 1)] = nonzero;
   }
@@ -974,6 +976,7 @@ void Fh1NativeExecutor::ClaimTileRect(const SurfaceKey& key, uint32_t column_fir
       tile(row, column) = packed_key;
     }
   }
+  ++tile_generation_;
   last_claims_.erase(packed_key);
   if (previous_owner == kNoOwner) return;
   last_claims_.erase(previous_owner);
@@ -1889,14 +1892,6 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1NativeDrawInfo& draw) {
   }
   if (!used_bits) return;
 
-  // Create the surfaces first so ownership transfers can write into them.
-  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
-    if ((used_bits & (1u << i)) && !GetOrCreateSurface(keys[i])) used_bits &= ~(1u << i);
-  }
-  const bool depth_stencil_written =
-      (used_bits & 1) && DrawMayWriteNonzeroStencil(draw.normalized_depth_control);
-  if (depth_stencil_written) FindSurface(keys[0].Pack())->stencil_nonzero = true;
-
   // Tiles each target covers, as far down as the draw can reach.
   const uint32_t msaa_y_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k2X));
   const uint32_t height_used =
@@ -1906,6 +1901,30 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1NativeDrawInfo& draw) {
   const uint32_t length_tiles_32bpp =
       ((height_used << msaa_y_log2) + xenos::kEdramTileHeightSamples - 1) /
       xenos::kEdramTileHeightSamples * pitch_tiles;
+  const bool depth_stencil_written =
+      (used_bits & 1) && DrawMayWriteNonzeroStencil(draw.normalized_depth_control);
+  // Most draws repeat the previous draw's targets: with no ownership or
+  // stencil change since, its claims still hold. Depth-overwriting draws claim
+  // by their rectangles and always take the full path.
+  const bool may_overwrite_depth =
+      used_bits == 1 && draw.normalized_depth_control.z_enable &&
+      draw.normalized_depth_control.z_write_enable &&
+      draw.normalized_depth_control.zfunc == xenos::CompareFunction::kAlways;
+  PrepareSignature signature;
+  signature.generation = tile_generation_;
+  signature.used_bits = used_bits;
+  signature.length_tiles = length_tiles_32bpp;
+  signature.stencil_written = depth_stencil_written;
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (used_bits & (1u << i)) signature.keys[i] = keys[i].Pack();
+  }
+  if (!may_overwrite_depth && signature == last_prepare_) return;
+
+  // Create the surfaces first so ownership transfers can write into them.
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if ((used_bits & (1u << i)) && !GetOrCreateSurface(keys[i])) used_bits &= ~(1u << i);
+  }
+  if (depth_stencil_written) FindSurface(keys[0].Pack())->stencil_nonzero = true;
   std::vector<std::pair<uint32_t, uint32_t>> bases;
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
     if (used_bits & (1u << i)) bases.emplace_back(keys[i].base_tiles, i);
@@ -1931,6 +1950,13 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1NativeDrawInfo& draw) {
     if (!key.is_depth || depth_stencil_written) MarkTileStencil(key.base_tiles, length, true);
   }
   FlushTransfers();
+  // A depth-overwriting draw may have claimed only its rectangles.
+  if (used_bits == signature.used_bits && !may_overwrite_depth) {
+    signature.generation = tile_generation_;
+    last_prepare_ = signature;
+  } else {
+    last_prepare_ = {};
+  }
 }
 
 void Fh1NativeExecutor::VerifyTargetsBeforeDraw(D3D12RenderTargetCache& render_target_cache,
