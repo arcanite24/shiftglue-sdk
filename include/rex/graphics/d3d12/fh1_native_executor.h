@@ -57,6 +57,9 @@ struct Fh1NativeExecutorConfig {
   bool gamma_as_unorm16 = false;
   bool bindless = true;
   bool depth_float24_round = false;
+  // 16_16[_16_16] host targets are snorm limited to -1...1
+  // (D3D12RenderTargetCache::IsFixed16TruncatedToMinus1To1).
+  bool fixed16_truncated = true;
   // `native` mode: the executor is the only renderer. It uses the command
   // processor's guest-memory mirror and texture cache instead of its own, binds
   // its surfaces for the command processor's draws, and performs every clear
@@ -168,6 +171,8 @@ class Fh1NativeExecutor {
     Microsoft::WRL::ComPtr<ID3D12Resource> resource;
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
     D3D12_CPU_DESCRIPTOR_HANDLE view = {};
+    // UINT render target view for formats kept as raw channel bits.
+    D3D12_CPU_DESCRIPTOR_HANDLE uint_view = {};
     DXGI_FORMAT view_format = DXGI_FORMAT_UNKNOWN;
     DXGI_FORMAT srv_format = DXGI_FORMAT_UNKNOWN;
     DXGI_FORMAT stencil_srv_format = DXGI_FORMAT_UNKNOWN;
@@ -220,14 +225,14 @@ class Fh1NativeExecutor {
     uint32_t previous_owner = kNoOwner;
   };
   struct TransferPipelineKey {
-    uint32_t dest_kind;  // 0 color, 1 depth, 2 + bit: stencil bit
+    uint32_t dest_kind;  // 0 color, 1 depth, 2 + bit: stencil bit, kTransferDestUint
     DXGI_FORMAT dest_format;
     uint32_t dest_samples;
     uint32_t sample_mask;
-    bool source_depth;
+    uint32_t source_kind;  // 0 color, 1 depth, 2 raw color bits
     bool source_msaa;
     auto tie() const {
-      return std::tie(dest_kind, dest_format, dest_samples, sample_mask, source_depth,
+      return std::tie(dest_kind, dest_format, dest_samples, sample_mask, source_kind,
                       source_msaa);
     }
     bool operator<(const TransferPipelineKey& other) const { return tie() < other.tie(); }
@@ -252,7 +257,8 @@ class Fh1NativeExecutor {
   // Splits the resolve's pixel rectangle into rectangles per owning surface.
   void GetResolveSources(const SurfaceKey& resolve_key, int32_t x0, int32_t y0, int32_t x1,
                          int32_t y1, std::vector<SourceRect>& sources_out);
-  ID3D12PipelineState* GetResolveMemoryPipeline(bool depth, bool msaa);
+  static constexpr uint32_t kTransferDestUint = 16;
+  ID3D12PipelineState* GetResolveMemoryPipeline(uint32_t source_kind, bool msaa);
   // Writes into the native mirror, or (for verification) from another host
   // resource of the owner's layout into `target`.
   bool ResolveToMemory(const SourceRect& source, const SurfaceKey& resolve_key,
@@ -347,7 +353,8 @@ class Fh1NativeExecutor {
   uint32_t pending_used_bits_ = 0;
   SurfaceKey pending_keys_[1 + xenos::kMaxColorRenderTargets];
   // [depth][msaa]
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> resolve_memory_pipelines_[2][2];
+  // [source kind: color, depth, raw color bits][msaa]
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> resolve_memory_pipelines_[3][2];
   std::map<uint32_t, Surface> surfaces_;
   // EDRAM tile -> packed key of the surface that last wrote it.
   std::vector<uint32_t> tile_owners_;

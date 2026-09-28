@@ -34,11 +34,17 @@ REXCVAR_DEFINE_STRING(fh1_renderer, "xenos", "GPU/D3D12",
 REXCVAR_DEFINE_BOOL(fh1_native_shadow, false, "GPU/D3D12",
                     "Same as fh1_renderer=native-shadow")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DECLARE(int32_t, draw_resolution_scale_x);
+REXCVAR_DECLARE(int32_t, draw_resolution_scale_y);
 REXCVAR_DEFINE_STRING(fh1_native_shadow_dump_frames, "", "GPU/D3D12",
                       "Comma-separated frames whose native front buffer is written as PPM")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(fh1_native_shadow_dump_dir, "", "GPU/D3D12",
                       "Directory for native front-buffer PPM dumps")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_native_shadow_verify_draws, false, "GPU/D3D12",
+                    "With fh1_native_shadow_verify, also compare every draw's targets before "
+                    "and after the draw on dump frames (slow; for locating a divergence)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_native_shadow_verify, false, "GPU/D3D12",
                     "On dump frames, compare every native resolve's guest-memory bytes with "
@@ -52,30 +58,56 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_resolve_memory_color_ms_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_resolve_memory_depth_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_resolve_memory_depth_ms_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_resolve_memory_uint_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_resolve_memory_uint_ms_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_color_from_color_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_color_from_color_ms_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_color_from_depth_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_color_from_depth_ms_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_color_from_uint_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_color_from_uint_ms_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_color_dms_from_color_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_color_dms_from_color_ms_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_color_dms_from_depth_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_color_dms_from_depth_ms_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_color_dms_from_uint_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_color_dms_from_uint_ms_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_depth_from_color_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_depth_from_color_ms_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_depth_from_depth_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_depth_from_depth_ms_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_depth_from_uint_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_depth_from_uint_ms_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_depth_dms_from_color_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_depth_dms_from_color_ms_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_depth_dms_from_depth_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_depth_dms_from_depth_ms_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_depth_dms_from_uint_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_depth_dms_from_uint_ms_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_stencil_from_color_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_stencil_from_color_ms_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_stencil_from_depth_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_stencil_from_depth_ms_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_stencil_from_uint_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_stencil_from_uint_ms_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_stencil_dms_from_color_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_stencil_dms_from_color_ms_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_stencil_dms_from_depth_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_stencil_dms_from_depth_ms_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_stencil_dms_from_uint_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_stencil_dms_from_uint_ms_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_uint_from_color_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_uint_from_color_ms_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_uint_from_depth_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_uint_from_depth_ms_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_uint_from_uint_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_uint_from_uint_ms_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_uint_dms_from_color_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_uint_dms_from_color_ms_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_uint_dms_from_depth_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_uint_dms_from_depth_ms_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_uint_dms_from_uint_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_uint_dms_from_uint_ms_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fullscreen_cw_vs.h"
 }  // namespace shaders
 
@@ -142,42 +174,117 @@ bool IsResolveColorFormatSupported(xenos::ColorRenderTargetFormat format) {
     case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
     case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
     case xenos::ColorRenderTargetFormat::k_32_FLOAT:
+    case xenos::ColorRenderTargetFormat::k_16_16:
+    case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
+    case xenos::ColorRenderTargetFormat::k_16_16_16_16:
+    case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
+    case xenos::ColorRenderTargetFormat::k_32_32_FLOAT:
       return true;
     default:
       return false;
   }
 }
 
-// [dest kind][dest msaa][source depth][source msaa]
-const D3D12_SHADER_BYTECODE kTransferShaders[3][2][2][2] = {
+// Formats whose guest EDRAM words are the host channel bits (16-bit or 32-bit
+// float channels besides 32_FLOAT): read and transferred through UINT views.
+DXGI_FORMAT ColorUintFormat(xenos::ColorRenderTargetFormat format) {
+  switch (format) {
+    case xenos::ColorRenderTargetFormat::k_16_16:
+    case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
+      return DXGI_FORMAT_R16G16_UINT;
+    case xenos::ColorRenderTargetFormat::k_16_16_16_16:
+    case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
+      return DXGI_FORMAT_R16G16B16A16_UINT;
+    case xenos::ColorRenderTargetFormat::k_32_32_FLOAT:
+      return DXGI_FORMAT_R32G32_UINT;
+    default:
+      return DXGI_FORMAT_UNKNOWN;
+  }
+}
+
+// IEEE half to float, for 16-bit float clear values.
+float HalfToFloat(uint16_t half) {
+  const uint32_t sign = uint32_t(half & 0x8000) << 16;
+  uint32_t exponent = (half >> 10) & 0x1F;
+  uint32_t mantissa = half & 0x3FF;
+  uint32_t bits;
+  if (!exponent) {
+    if (!mantissa) {
+      bits = sign;
+    } else {
+      // Denormal: normalize.
+      exponent = 113;
+      while (!(mantissa & 0x400)) {
+        mantissa <<= 1;
+        --exponent;
+      }
+      bits = sign | (exponent << 23) | ((mantissa & 0x3FF) << 13);
+    }
+  } else if (exponent == 0x1F) {
+    bits = sign | 0x7F800000 | (mantissa << 13);
+  } else {
+    bits = sign | ((exponent + 112) << 23) | (mantissa << 13);
+  }
+  float value;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+// Source variant of a surface: 0 color, 1 depth and stencil, 2 raw color bits.
+uint32_t SourceKind(bool is_depth, uint32_t format) {
+  if (is_depth) return 1;
+  return ColorUintFormat(xenos::ColorRenderTargetFormat(format)) != DXGI_FORMAT_UNKNOWN ? 2 : 0;
+}
+
+// [dest kind: color, depth, stencil bit, uint][dest msaa]
+// [source kind: color, depth, uint][source msaa]
+const D3D12_SHADER_BYTECODE kTransferShaders[4][2][3][2] = {
     {
         {
             {{shaders::fh1_native_transfer_color_from_color_ps, sizeof(shaders::fh1_native_transfer_color_from_color_ps)}, {shaders::fh1_native_transfer_color_from_color_ms_ps, sizeof(shaders::fh1_native_transfer_color_from_color_ms_ps)}},
             {{shaders::fh1_native_transfer_color_from_depth_ps, sizeof(shaders::fh1_native_transfer_color_from_depth_ps)}, {shaders::fh1_native_transfer_color_from_depth_ms_ps, sizeof(shaders::fh1_native_transfer_color_from_depth_ms_ps)}},
+            {{shaders::fh1_native_transfer_color_from_uint_ps, sizeof(shaders::fh1_native_transfer_color_from_uint_ps)}, {shaders::fh1_native_transfer_color_from_uint_ms_ps, sizeof(shaders::fh1_native_transfer_color_from_uint_ms_ps)}},
         },
         {
             {{shaders::fh1_native_transfer_color_dms_from_color_ps, sizeof(shaders::fh1_native_transfer_color_dms_from_color_ps)}, {shaders::fh1_native_transfer_color_dms_from_color_ms_ps, sizeof(shaders::fh1_native_transfer_color_dms_from_color_ms_ps)}},
             {{shaders::fh1_native_transfer_color_dms_from_depth_ps, sizeof(shaders::fh1_native_transfer_color_dms_from_depth_ps)}, {shaders::fh1_native_transfer_color_dms_from_depth_ms_ps, sizeof(shaders::fh1_native_transfer_color_dms_from_depth_ms_ps)}},
+            {{shaders::fh1_native_transfer_color_dms_from_uint_ps, sizeof(shaders::fh1_native_transfer_color_dms_from_uint_ps)}, {shaders::fh1_native_transfer_color_dms_from_uint_ms_ps, sizeof(shaders::fh1_native_transfer_color_dms_from_uint_ms_ps)}},
         },
     },
     {
         {
             {{shaders::fh1_native_transfer_depth_from_color_ps, sizeof(shaders::fh1_native_transfer_depth_from_color_ps)}, {shaders::fh1_native_transfer_depth_from_color_ms_ps, sizeof(shaders::fh1_native_transfer_depth_from_color_ms_ps)}},
             {{shaders::fh1_native_transfer_depth_from_depth_ps, sizeof(shaders::fh1_native_transfer_depth_from_depth_ps)}, {shaders::fh1_native_transfer_depth_from_depth_ms_ps, sizeof(shaders::fh1_native_transfer_depth_from_depth_ms_ps)}},
+            {{shaders::fh1_native_transfer_depth_from_uint_ps, sizeof(shaders::fh1_native_transfer_depth_from_uint_ps)}, {shaders::fh1_native_transfer_depth_from_uint_ms_ps, sizeof(shaders::fh1_native_transfer_depth_from_uint_ms_ps)}},
         },
         {
             {{shaders::fh1_native_transfer_depth_dms_from_color_ps, sizeof(shaders::fh1_native_transfer_depth_dms_from_color_ps)}, {shaders::fh1_native_transfer_depth_dms_from_color_ms_ps, sizeof(shaders::fh1_native_transfer_depth_dms_from_color_ms_ps)}},
             {{shaders::fh1_native_transfer_depth_dms_from_depth_ps, sizeof(shaders::fh1_native_transfer_depth_dms_from_depth_ps)}, {shaders::fh1_native_transfer_depth_dms_from_depth_ms_ps, sizeof(shaders::fh1_native_transfer_depth_dms_from_depth_ms_ps)}},
+            {{shaders::fh1_native_transfer_depth_dms_from_uint_ps, sizeof(shaders::fh1_native_transfer_depth_dms_from_uint_ps)}, {shaders::fh1_native_transfer_depth_dms_from_uint_ms_ps, sizeof(shaders::fh1_native_transfer_depth_dms_from_uint_ms_ps)}},
         },
     },
     {
         {
             {{shaders::fh1_native_transfer_stencil_from_color_ps, sizeof(shaders::fh1_native_transfer_stencil_from_color_ps)}, {shaders::fh1_native_transfer_stencil_from_color_ms_ps, sizeof(shaders::fh1_native_transfer_stencil_from_color_ms_ps)}},
             {{shaders::fh1_native_transfer_stencil_from_depth_ps, sizeof(shaders::fh1_native_transfer_stencil_from_depth_ps)}, {shaders::fh1_native_transfer_stencil_from_depth_ms_ps, sizeof(shaders::fh1_native_transfer_stencil_from_depth_ms_ps)}},
+            {{shaders::fh1_native_transfer_stencil_from_uint_ps, sizeof(shaders::fh1_native_transfer_stencil_from_uint_ps)}, {shaders::fh1_native_transfer_stencil_from_uint_ms_ps, sizeof(shaders::fh1_native_transfer_stencil_from_uint_ms_ps)}},
         },
         {
             {{shaders::fh1_native_transfer_stencil_dms_from_color_ps, sizeof(shaders::fh1_native_transfer_stencil_dms_from_color_ps)}, {shaders::fh1_native_transfer_stencil_dms_from_color_ms_ps, sizeof(shaders::fh1_native_transfer_stencil_dms_from_color_ms_ps)}},
             {{shaders::fh1_native_transfer_stencil_dms_from_depth_ps, sizeof(shaders::fh1_native_transfer_stencil_dms_from_depth_ps)}, {shaders::fh1_native_transfer_stencil_dms_from_depth_ms_ps, sizeof(shaders::fh1_native_transfer_stencil_dms_from_depth_ms_ps)}},
+            {{shaders::fh1_native_transfer_stencil_dms_from_uint_ps, sizeof(shaders::fh1_native_transfer_stencil_dms_from_uint_ps)}, {shaders::fh1_native_transfer_stencil_dms_from_uint_ms_ps, sizeof(shaders::fh1_native_transfer_stencil_dms_from_uint_ms_ps)}},
+        },
+    },
+    {
+        {
+            {{shaders::fh1_native_transfer_uint_from_color_ps, sizeof(shaders::fh1_native_transfer_uint_from_color_ps)}, {shaders::fh1_native_transfer_uint_from_color_ms_ps, sizeof(shaders::fh1_native_transfer_uint_from_color_ms_ps)}},
+            {{shaders::fh1_native_transfer_uint_from_depth_ps, sizeof(shaders::fh1_native_transfer_uint_from_depth_ps)}, {shaders::fh1_native_transfer_uint_from_depth_ms_ps, sizeof(shaders::fh1_native_transfer_uint_from_depth_ms_ps)}},
+            {{shaders::fh1_native_transfer_uint_from_uint_ps, sizeof(shaders::fh1_native_transfer_uint_from_uint_ps)}, {shaders::fh1_native_transfer_uint_from_uint_ms_ps, sizeof(shaders::fh1_native_transfer_uint_from_uint_ms_ps)}},
+        },
+        {
+            {{shaders::fh1_native_transfer_uint_dms_from_color_ps, sizeof(shaders::fh1_native_transfer_uint_dms_from_color_ps)}, {shaders::fh1_native_transfer_uint_dms_from_color_ms_ps, sizeof(shaders::fh1_native_transfer_uint_dms_from_color_ms_ps)}},
+            {{shaders::fh1_native_transfer_uint_dms_from_depth_ps, sizeof(shaders::fh1_native_transfer_uint_dms_from_depth_ps)}, {shaders::fh1_native_transfer_uint_dms_from_depth_ms_ps, sizeof(shaders::fh1_native_transfer_uint_dms_from_depth_ms_ps)}},
+            {{shaders::fh1_native_transfer_uint_dms_from_uint_ps, sizeof(shaders::fh1_native_transfer_uint_dms_from_uint_ps)}, {shaders::fh1_native_transfer_uint_dms_from_uint_ms_ps, sizeof(shaders::fh1_native_transfer_uint_dms_from_uint_ms_ps)}},
         },
     },
 };
@@ -216,14 +323,33 @@ Fh1NativeExecutor::CpuTimer::~CpuTimer() {
           std::chrono::steady_clock::now().time_since_epoch().count() - start_)).count());
 }
 
+namespace {
+// The executor's surfaces, transfers and resolves are 1x only so far; scaled
+// sessions keep the Xenos backend.
+bool ResolutionScaleSupported() {
+  static const bool supported = [] {
+    const bool unscaled =
+        REXCVAR_GET(draw_resolution_scale_x) == 1 && REXCVAR_GET(draw_resolution_scale_y) == 1;
+    if (!unscaled && REXCVAR_GET(fh1_renderer) != "xenos") {
+      REXGPU_WARN("FH1 native renderer supports 1x resolution only; using Xenos at {}x{}",
+                  REXCVAR_GET(draw_resolution_scale_x), REXCVAR_GET(draw_resolution_scale_y));
+    }
+    return unscaled;
+  }();
+  return supported;
+}
+}  // namespace
+
 bool Fh1NativeExecutor::Enabled() {
-  static const bool enabled = REXCVAR_GET(fh1_native_shadow) || Presents() ||
-                              REXCVAR_GET(fh1_renderer) == "native-shadow";
+  static const bool enabled = ResolutionScaleSupported() &&
+                              (REXCVAR_GET(fh1_native_shadow) || Presents() ||
+                               REXCVAR_GET(fh1_renderer) == "native-shadow");
   return enabled;
 }
 
 bool Fh1NativeExecutor::Presents() {
-  static const bool presents = REXCVAR_GET(fh1_renderer) == "native";
+  static const bool presents =
+      ResolutionScaleSupported() && REXCVAR_GET(fh1_renderer) == "native";
   return presents;
 }
 
@@ -552,7 +678,8 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
     desc.Format = ColorResourceFormat(format);
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     surface.view_format = ColorDrawFormat(format);
-    surface.srv_format = surface.view_format;
+    const DXGI_FORMAT uint_format = ColorUintFormat(format);
+    surface.srv_format = uint_format != DXGI_FORMAT_UNKNOWN ? uint_format : surface.view_format;
     surface.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
     clear_value.Format = surface.view_format;
   }
@@ -583,6 +710,13 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
     rtv.Format = surface.view_format;
     rtv.ViewDimension = msaa ? D3D12_RTV_DIMENSION_TEXTURE2DMS : D3D12_RTV_DIMENSION_TEXTURE2D;
     device->CreateRenderTargetView(surface.resource.Get(), &rtv, surface.view);
+    if (surface.srv_format != surface.view_format && rtv_used_ < kRtvCapacity) {
+      // Transfers write raw channel bits.
+      surface.uint_view = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+      surface.uint_view.ptr += SIZE_T(rtv_used_++) * rtv_size_;
+      rtv.Format = surface.srv_format;
+      device->CreateRenderTargetView(surface.resource.Get(), &rtv, surface.uint_view);
+    }
   }
   Count("surface_created");
   return &surfaces_.emplace(packed, std::move(surface)).first->second;
@@ -632,19 +766,19 @@ uint32_t Fh1NativeExecutor::LayoutConstant(const Surface& surface) const {
 ID3D12PipelineState* Fh1NativeExecutor::GetTransferPipeline(const TransferPipelineKey& key) {
   auto it = transfer_pipelines_.find(key);
   if (it != transfer_pipelines_.end()) return it->second.Get();
-  const uint32_t kind = std::min(key.dest_kind, 2u);
+  const uint32_t kind = key.dest_kind == kTransferDestUint ? 3 : std::min(key.dest_kind, 2u);
   D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
   desc.pRootSignature = transfer_root_signature_.Get();
   desc.VS.pShaderBytecode = shaders::fullscreen_cw_vs;
   desc.VS.BytecodeLength = sizeof(shaders::fullscreen_cw_vs);
-  desc.PS = kTransferShaders[kind][key.dest_samples > 1][key.source_depth][key.source_msaa];
+  desc.PS = kTransferShaders[kind][key.dest_samples > 1][key.source_kind][key.source_msaa];
   desc.SampleMask = key.sample_mask;
   desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
   desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
   desc.RasterizerState.DepthClipEnable = FALSE;
   desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   desc.SampleDesc.Count = key.dest_samples;
-  if (kind == 0) {
+  if (kind == 0 || kind == 3) {
     desc.NumRenderTargets = 1;
     desc.RTVFormats[0] = key.dest_format;
     desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
@@ -682,7 +816,6 @@ void Fh1NativeExecutor::TransferTiles(Surface& dest, const TileRun& run) {
   CpuTimer timer(*this, kCpuTransfers);
   Surface* source = FindSurface(run.previous_owner);
   if (!source) return Skip("transfer_source_missing");
-  if (dest.key.Is64bpp() || source->key.Is64bpp()) return Skip("transfer_64bpp");
   if ((!dest.key.is_depth &&
        !IsResolveColorFormatSupported(xenos::ColorRenderTargetFormat(dest.key.format))) ||
       (!source->key.is_depth &&
@@ -733,6 +866,7 @@ void Fh1NativeExecutor::TransferTiles(Surface& dest, const TileRun& run) {
 
   ui::d3d12::util::DescriptorCpuGpuHandlePair srvs[2];
   const bool source_depth = source->key.is_depth;
+  const uint32_t source_kind = SourceKind(source_depth, source->key.format);
   if (!command_processor_.RequestOneUseSingleViewDescriptors(source_depth ? 2 : 1, srvs)) {
     return Skip("transfer_descriptor");
   }
@@ -760,7 +894,8 @@ void Fh1NativeExecutor::TransferTiles(Surface& dest, const TileRun& run) {
 
   const uint32_t constants[3] = {
       LayoutConstant(dest), LayoutConstant(*source),
-      (config_.depth_float24_round ? 1u : 0u) | (config_.gamma_as_unorm16 ? 2u : 0u)};
+      (config_.depth_float24_round ? 1u : 0u) | (config_.gamma_as_unorm16 ? 2u : 0u) |
+      (config_.fixed16_truncated ? 0u : 4u)};
   const uint32_t sample_mask =
       dest.key.msaa == uint32_t(xenos::MsaaSamples::k2X) && dest.samples == 4 ? 0b1001u
                                                                              : UINT_MAX;
@@ -769,19 +904,20 @@ void Fh1NativeExecutor::TransferTiles(Surface& dest, const TileRun& run) {
   list.D3DSetGraphicsRootDescriptorTable(1, srvs[0].second);
   list.D3DSetGraphicsRootDescriptorTable(2, srvs[1].second);
   command_processor_.SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  const bool dest_uint = dest.uint_view.ptr != 0;
   if (dest.key.is_depth) {
     list.D3DOMSetRenderTargets(0, nullptr, FALSE, &dest.view);
   } else {
-    list.D3DOMSetRenderTargets(1, &dest.view, FALSE, nullptr);
+    list.D3DOMSetRenderTargets(1, dest_uint ? &dest.uint_view : &dest.view, FALSE, nullptr);
   }
   const uint32_t pass_count = dest.key.is_depth ? 9 : 1;
   for (uint32_t pass = 0; pass < pass_count; ++pass) {
     TransferPipelineKey key;
-    key.dest_kind = dest.key.is_depth ? (pass ? 1 + pass : 1) : 0;
-    key.dest_format = dest.view_format;
+    key.dest_kind = dest.key.is_depth ? (pass ? 1 + pass : 1) : (dest_uint ? kTransferDestUint : 0);
+    key.dest_format = dest_uint ? dest.srv_format : dest.view_format;
     key.dest_samples = dest.samples;
     key.sample_mask = sample_mask;
-    key.source_depth = source_depth;
+    key.source_kind = source_kind;
     key.source_msaa = source_msaa;
     ID3D12PipelineState* pipeline = GetTransferPipeline(key);
     if (!pipeline) return Skip("transfer_pipeline");
@@ -861,22 +997,27 @@ void Fh1NativeExecutor::GetResolveSources(const SurfaceKey& resolve_key, int32_t
   }
 }
 
-ID3D12PipelineState* Fh1NativeExecutor::GetResolveMemoryPipeline(bool depth, bool msaa) {
-  auto& pipeline = resolve_memory_pipelines_[depth][msaa];
+ID3D12PipelineState* Fh1NativeExecutor::GetResolveMemoryPipeline(uint32_t source_kind,
+                                                                 bool msaa) {
+  auto& pipeline = resolve_memory_pipelines_[source_kind][msaa];
   if (pipeline) return pipeline.Get();
+  static const D3D12_SHADER_BYTECODE kResolveShaders[3][2] = {
+      {{shaders::fh1_native_resolve_memory_color_cs,
+        sizeof(shaders::fh1_native_resolve_memory_color_cs)},
+       {shaders::fh1_native_resolve_memory_color_ms_cs,
+        sizeof(shaders::fh1_native_resolve_memory_color_ms_cs)}},
+      {{shaders::fh1_native_resolve_memory_depth_cs,
+        sizeof(shaders::fh1_native_resolve_memory_depth_cs)},
+       {shaders::fh1_native_resolve_memory_depth_ms_cs,
+        sizeof(shaders::fh1_native_resolve_memory_depth_ms_cs)}},
+      {{shaders::fh1_native_resolve_memory_uint_cs,
+        sizeof(shaders::fh1_native_resolve_memory_uint_cs)},
+       {shaders::fh1_native_resolve_memory_uint_ms_cs,
+        sizeof(shaders::fh1_native_resolve_memory_uint_ms_cs)}},
+  };
   D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
   desc.pRootSignature = resolve_memory_root_signature_.Get();
-  if (depth) {
-    desc.CS.pShaderBytecode = msaa ? shaders::fh1_native_resolve_memory_depth_ms_cs
-                                   : shaders::fh1_native_resolve_memory_depth_cs;
-    desc.CS.BytecodeLength = msaa ? sizeof(shaders::fh1_native_resolve_memory_depth_ms_cs)
-                                  : sizeof(shaders::fh1_native_resolve_memory_depth_cs);
-  } else {
-    desc.CS.pShaderBytecode = msaa ? shaders::fh1_native_resolve_memory_color_ms_cs
-                                   : shaders::fh1_native_resolve_memory_color_cs;
-    desc.CS.BytecodeLength = msaa ? sizeof(shaders::fh1_native_resolve_memory_color_ms_cs)
-                                  : sizeof(shaders::fh1_native_resolve_memory_color_cs);
-  }
+  desc.CS = kResolveShaders[source_kind][msaa];
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
   if (FAILED(device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline)))) {
     return nullptr;
@@ -1322,6 +1463,27 @@ void Fh1NativeExecutor::ClearSurfaceRect(Surface& surface, const D3D12_RECT& rec
     case xenos::ColorRenderTargetFormat::k_32_FLOAT:
       std::memcpy(&color[0], &clear_value, sizeof(float));
       break;
+    // 64bpp clears hold the low word in RB_COLOR_CLEAR_LO.
+    case xenos::ColorRenderTargetFormat::k_16_16:
+    case xenos::ColorRenderTargetFormat::k_16_16_16_16:
+    case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
+    case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT: {
+      const bool is_float =
+          surface.key.format == uint32_t(xenos::ColorRenderTargetFormat::k_16_16_FLOAT) ||
+          surface.key.format == uint32_t(xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT);
+      const uint32_t words[2] = {surface.key.Is64bpp() ? clear_value_lo : clear_value,
+                                 clear_value};
+      for (uint32_t i = 0; i < (surface.key.Is64bpp() ? 4u : 2u); ++i) {
+        const uint16_t bits = uint16_t(words[i >> 1] >> (16 * (i & 1)));
+        color[i] = is_float ? HalfToFloat(bits)
+                            : std::max(float(int16_t(bits)) / 32767.0f, -1.0f);
+      }
+      break;
+    }
+    case xenos::ColorRenderTargetFormat::k_32_32_FLOAT:
+      std::memcpy(&color[0], &clear_value_lo, sizeof(float));
+      std::memcpy(&color[1], &clear_value, sizeof(float));
+      break;
     default:
       if (clear_value || clear_value_lo) return Skip("clear_format");
       break;
@@ -1339,7 +1501,8 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   Surface& surface = *source.surface;
   const bool depth = surface.key.is_depth;
   const bool msaa = surface.samples > 1;
-  ID3D12PipelineState* pipeline = GetResolveMemoryPipeline(depth, msaa);
+  ID3D12PipelineState* pipeline =
+      GetResolveMemoryPipeline(SourceKind(depth, surface.key.format), msaa);
   if (!pipeline) {
     Skip("resolve_pipeline_create");
     return false;
@@ -1410,7 +1573,9 @@ bool Fh1NativeExecutor::PlanCopy(CopyPlan& plan) {
     plan.empty = true;
     return false;
   }
-  if (!draw_util::GetResolveInfo(regs, memory_, 1, 1, false, false, plan.info)) {
+  // As the render target cache does, so 16_16[_16_16] keep the guest's range.
+  if (!draw_util::GetResolveInfo(regs, memory_, 1, 1, config_.fixed16_truncated,
+                                 config_.fixed16_truncated, plan.info)) {
     plan.skip = "resolve_info";
     return false;
   }
@@ -1471,8 +1636,6 @@ bool Fh1NativeExecutor::PlanCopy(CopyPlan& plan) {
     plan.skip = "resolve_dest_array";
   } else if (uint32_t(dest_info.copy_dest_endian) > 3) {
     plan.skip = "resolve_dest_endian";
-  } else if (plan.resolve_key.Is64bpp()) {
-    plan.skip = "resolve_64bpp";
   } else if (!plan.copying_depth && !IsResolveColorFormatSupported(plan.color_info.color_format)) {
     plan.skip = "resolve_source_format";
   }
@@ -1482,7 +1645,8 @@ bool Fh1NativeExecutor::PlanCopy(CopyPlan& plan) {
                    (uint32_t(!plan.copying_depth && dest_info.copy_dest_swap) << 6) |
                    (uint32_t(config_.depth_float24_round) << 7) |
                    ((uint32_t(exp_bias) & 0xFF) << 8) | (bpb_log2 << 16) |
-                   (uint32_t(config_.gamma_as_unorm16) << 18);
+                   (uint32_t(config_.gamma_as_unorm16) << 18) |
+                   (uint32_t(!config_.fixed16_truncated) << 19);
   plan.dest_base = regs[XE_GPU_REG_RB_COPY_DEST_BASE];
   plan.dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>().copy_dest_pitch;
   plan.sample_select = uint32_t(plan.info.copy_dest_coordinate_info.copy_sample_select);
@@ -1649,11 +1813,6 @@ bool Fh1NativeExecutor::Resolve(D3D12RenderTargetCache* render_target_cache,
         continue;
       }
       const SurfaceKey& owner = source.surface->key;
-      if (owner.Is64bpp()) {
-        Skip("resolve_64bpp");
-        complete = false;
-        continue;
-      }
       if (!owner.is_depth &&
           !IsResolveColorFormatSupported(xenos::ColorRenderTargetFormat(owner.format))) {
         Skip("resolve_owner_format");

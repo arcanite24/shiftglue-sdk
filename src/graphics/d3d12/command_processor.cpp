@@ -1930,6 +1930,7 @@ bool D3D12CommandProcessor::SetupContext() {
     native_config.gamma_as_unorm16 = render_target_cache_->gamma_render_target_as_unorm16();
     native_config.bindless = bindless_resources_used_;
     native_config.depth_float24_round = render_target_cache_->depth_float24_round();
+    native_config.fixed16_truncated = render_target_cache_->IsFixed16TruncatedToMinus1To1();
     native_config.presents = Fh1NativeExecutor::Presents();
     if (native_config.presents) {
       native_config.memory = shared_memory_.get();

@@ -12,16 +12,17 @@ compile() {  # profile file name defines...
   "$FXC" //nologo //T "$profile" //E main //O3 "${args[@]}" //Vn "$name" \
     //Fh "bytecode/d3d12_5_1/$name.h" "$file" > /dev/null
 }
-for source_kind in color depth; do
+for source_kind in color depth uint; do
   source_defines=()
   [[ $source_kind == depth ]] && source_defines+=(FH1_SOURCE_DEPTH=1)
+  [[ $source_kind == uint ]] && source_defines+=(FH1_SOURCE_UINT=1)
   for source_msaa in "" _ms; do
     msaa_defines=("${source_defines[@]}")
     [[ -n $source_msaa ]] && msaa_defines+=(FH1_SOURCE_MSAA=1)
     compile cs_5_1 fh1_native_resolve_memory.cs.hlsl \
       "fh1_native_resolve_memory_${source_kind}${source_msaa}_cs" "${msaa_defines[@]}"
     dest_index=0
-    for dest_kind in color depth stencil; do
+    for dest_kind in color depth stencil uint; do
       for dest_msaa in "" _dms; do
         dest_defines=("${msaa_defines[@]}" "FH1_DEST_KIND=$dest_index")
         [[ -n $dest_msaa ]] && dest_defines+=(FH1_DEST_MSAA=1)

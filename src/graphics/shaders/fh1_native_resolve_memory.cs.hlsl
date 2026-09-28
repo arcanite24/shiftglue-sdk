@@ -24,7 +24,7 @@ cbuffer Fh1NativeResolveMemoryConstants : register(b0) {
   // pack 0:2 (0: 8_8_8_8, 1: 2_10_10_10, 2: 32_FLOAT, 3: 16_16_16_16_FLOAT,
   // 4: raw 32-bit word), endian 3:5, swap red/blue 6, float24 rounding 7,
   // exp bias 8:15 (signed), bytes per texel log2 16:17, gamma targets hold
-  // linear values 18.
+  // linear values 18, 16_16[_16_16] hosts keep the full range as snorm / 32 19.
   uint fh1_dest_info;
   uint fh1_dest_base;       // bytes
   uint fh1_dest_pitch;      // texels
@@ -57,10 +57,21 @@ uint EndianSwap32(uint value, uint endian) {
   return value;
 }
 
-uint LoadOwnerWord(uint2 pixel, uint sample) {
+uint LoadOwnerWord(uint2 pixel, uint sample, uint half) {
   uint flags = (((fh1_dest_info >> 7u) & 1u) ? FH1_FLAG_FLOAT24_ROUND : 0u) |
                (((fh1_dest_info >> 18u) & 1u) ? FH1_FLAG_GAMMA_UNORM16 : 0u);
-  return LoadSourceWord(fh1_resolve_layout, pixel, sample, fh1_owner_layout, flags);
+  return LoadSourceWord(fh1_resolve_layout, pixel, sample, half, fh1_owner_layout, flags);
+}
+
+float4 LoadOwnerColor(uint2 pixel, uint sample, uint format) {
+  uint low = LoadOwnerWord(pixel, sample, 0u);
+  float4 color;
+  [branch] if (LayoutIs64bpp(fh1_resolve_layout) != 0u) {
+    color = DecodeColor64(uint2(low, LoadOwnerWord(pixel, sample, 1u)), format);
+  } else {
+    color = DecodeColor(low, format);
+  }
+  return color;
 }
 
 [numthreads(8, 8, 1)]
@@ -70,6 +81,7 @@ void main(uint3 thread : SV_DispatchThreadID) {
     return;
   }
   uint2 pixel = uint2(fh1_rect_origin & 0xFFFFu, fh1_rect_origin >> 16u) + thread.xy;
+  fh1_fixed16_scale = ((fh1_dest_info >> 19u) & 1u) != 0u ? 32.0f : 1.0f;
 
   uint pack = fh1_dest_info & 7u;
   uint endian = (fh1_dest_info >> 3u) & 7u;
@@ -87,14 +99,14 @@ void main(uint3 thread : SV_DispatchThreadID) {
 
   if (pack == 4u) {
     // Depth: the EDRAM word itself.
-    fh1_memory.Store(address, EndianSwap32(LoadOwnerWord(pixel, first_sample), endian));
+    fh1_memory.Store(address, EndianSwap32(LoadOwnerWord(pixel, first_sample, 0u), endian));
     return;
   }
 
   float4 color = 0.0f;
   uint format = LayoutFormat(fh1_resolve_layout);
   for (uint i = 0u; i < sample_count; ++i) {
-    color += DecodeColor(LoadOwnerWord(pixel, first_sample + i), format);
+    color += LoadOwnerColor(pixel, first_sample + i, format);
   }
   color *= 1.0f / float(sample_count);
   int exp_bias = int(fh1_dest_info << 16u) >> 24;

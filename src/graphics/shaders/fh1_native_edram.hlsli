@@ -10,7 +10,13 @@
 // value as its guest word and decoding that word in the reader's format.
 //
 // Source textures: FH1_SOURCE_DEPTH selects depth and stencil sources instead
-// of a color source, FH1_SOURCE_MSAA multisampled ones.
+// of a color source, FH1_SOURCE_UINT a color source read as raw channel bits
+// (formats with 16-bit or 32-bit float channels, 32bpp or 64bpp, which the
+// guest stores as the host's bits), FH1_SOURCE_MSAA multisampled ones.
+//
+// A 64bpp sample takes two adjacent 32-bit EDRAM columns of an 80x16 tile,
+// the low half first, so a 64bpp surface row of tiles is twice its 32bpp
+// pitch.
 
 #ifndef FH1_NATIVE_EDRAM_HLSLI_
 #define FH1_NATIVE_EDRAM_HLSLI_
@@ -22,6 +28,12 @@ Texture2DMS<uint2> fh1_source_stencil : register(t1);
 #else
 Texture2D<float> fh1_source_depth : register(t0);
 Texture2D<uint2> fh1_source_stencil : register(t1);
+#endif
+#elif defined(FH1_SOURCE_UINT)
+#ifdef FH1_SOURCE_MSAA
+Texture2DMS<uint4> fh1_source_color : register(t0);
+#else
+Texture2D<uint4> fh1_source_color : register(t0);
 #endif
 #else
 #ifdef FH1_SOURCE_MSAA
@@ -36,9 +48,14 @@ Texture2D<float4> fh1_source_color : register(t0);
 #define FORMAT_8_8_8_8_GAMMA 1u
 #define FORMAT_2_10_10_10 2u
 #define FORMAT_2_10_10_10_FLOAT 3u
+#define FORMAT_16_16 4u
+#define FORMAT_16_16_16_16 5u
+#define FORMAT_16_16_FLOAT 6u
+#define FORMAT_16_16_16_16_FLOAT 7u
 #define FORMAT_2_10_10_10_AS_10_10_10_10 10u
 #define FORMAT_2_10_10_10_FLOAT_AS_16_16_16_16 12u
 #define FORMAT_32_FLOAT 14u
+#define FORMAT_32_32_FLOAT 15u
 // Guest DepthRenderTargetFormat values.
 #define DEPTH_D24S8 0u
 #define DEPTH_D24FS8 1u
@@ -46,6 +63,12 @@ Texture2D<float4> fh1_source_color : register(t0);
 // Flags shared by the shaders.
 #define FH1_FLAG_FLOAT24_ROUND 1u     // round float24 depth to nearest even
 #define FH1_FLAG_GAMMA_UNORM16 2u     // gamma targets hold linear unorm16 values
+#define FH1_FLAG_FIXED16_FULL_RANGE 4u  // 16_16[_16_16] snorm hosts hold guest / 32
+
+// Scale from a 16_16[_16_16] host snorm value to the guest value: 32 when the
+// host keeps the full -32...32 range as snorm / 32, 1 when it truncates to
+// -1...1 (the resolve's exponent bias then restores the range). Set by main.
+static float fh1_fixed16_scale = 32.0f;
 
 // Layouts: base_tiles 0:10, pitch_tiles (32bpp) 11:18, msaa 19:20,
 // is_64bpp 21, is_depth 22, guest format 23:26 (color or depth format),
@@ -161,6 +184,11 @@ float PWLGammaToLinear(float gamma) {
   return value * (1.0f / 1023.0f);
 }
 
+// A 16_16[_16_16] channel's guest value; both -1 snorm encodings decode to -1.
+float DecodeSnorm16(uint bits) {
+  return max(float(int(bits << 16u) >> 16) * (1.0f / 32767.0f), -1.0f) * fh1_fixed16_scale;
+}
+
 uint PackUnorm(float value, float scale) {
   return uint(saturate(value) * scale + 0.5f);
 }
@@ -204,6 +232,26 @@ float4 DecodeColor(uint word, uint format) {
                     float(word >> 30u) * (1.0f / 3.0f));
     case FORMAT_32_FLOAT:
       return float4(asfloat(word), 0.0f, 0.0f, 0.0f);
+    case FORMAT_16_16:
+      return float4(DecodeSnorm16(word), DecodeSnorm16(word >> 16u), 0.0f, 0.0f);
+    case FORMAT_16_16_FLOAT:
+      return float4(f16tof32(word), f16tof32(word >> 16u), 0.0f, 0.0f);
+    default:
+      return 0.0f;
+  }
+}
+
+// A 64bpp EDRAM sample (low word first) as a color.
+float4 DecodeColor64(uint2 words, uint format) {
+  switch (format) {
+    case FORMAT_16_16_16_16:
+      return float4(DecodeSnorm16(words.x), DecodeSnorm16(words.x >> 16u),
+                    DecodeSnorm16(words.y), DecodeSnorm16(words.y >> 16u));
+    case FORMAT_16_16_16_16_FLOAT:
+      return float4(f16tof32(words.x), f16tof32(words.x >> 16u), f16tof32(words.y),
+                    f16tof32(words.y >> 16u));
+    case FORMAT_32_32_FLOAT:
+      return float4(asfloat(words.x), asfloat(words.y), 0.0f, 0.0f);
     default:
       return 0.0f;
   }
@@ -232,24 +280,29 @@ uint GuestSample(uint host_sample, uint msaa, uint host_mode) {
 }
 
 // The source surface's guest EDRAM word at `pixel`, guest sample `sample` of
-// a reader with `reader_layout`. 32bpp layouts only.
-uint LoadSourceWord(uint reader_layout, uint2 pixel, uint sample, uint source_layout,
-                    uint flags) {
+// a reader with `reader_layout`; for a 64bpp reader, `half` selects the low
+// (0) or high (1) word of the sample.
+uint LoadSourceWord(uint reader_layout, uint2 pixel, uint sample, uint half,
+                    uint source_layout, uint flags) {
   uint reader_msaa = LayoutMsaa(reader_layout);
   uint rx = reader_msaa >= 2u ? 1u : 0u;
   uint ry = reader_msaa >= 1u ? 1u : 0u;
   uint sample_x = (pixel.x << rx) + (reader_msaa >= 2u ? (sample & 1u) : 0u);
   uint sample_y = (pixel.y << ry) +
                   (reader_msaa >= 2u ? (sample >> 1u) : (reader_msaa == 1u ? sample : 0u));
-  uint tile_column = sample_x / 80u;
-  uint tile_x = sample_x % 80u;
+  // 32-bit EDRAM column of the word.
+  uint column = LayoutIs64bpp(reader_layout) ? sample_x * 2u + half : sample_x;
+  uint tile_column = column / 80u;
+  uint tile_x = column % 80u;
   uint tile_row = sample_y >> 4u;
   uint tile_y = sample_y & 15u;
-  uint tile = (LayoutBase(reader_layout) + tile_row * LayoutPitch(reader_layout) + tile_column) &
+  uint tile = (LayoutBase(reader_layout) +
+               tile_row * (LayoutPitch(reader_layout) << LayoutIs64bpp(reader_layout)) +
+               tile_column) &
               2047u;
 
   uint source_local = (tile - LayoutBase(source_layout)) & 2047u;
-  uint source_pitch = LayoutPitch(source_layout);
+  uint source_pitch = LayoutPitch(source_layout) << LayoutIs64bpp(source_layout);
   uint source_column = source_local % source_pitch;
   uint source_row = source_local / source_pitch;
   if (LayoutIsDepth(source_layout) != LayoutIsDepth(reader_layout)) {
@@ -258,6 +311,11 @@ uint LoadSourceWord(uint reader_layout, uint2 pixel, uint sample, uint source_la
   }
   uint source_msaa = LayoutMsaa(source_layout);
   uint sx = source_column * 80u + tile_x;
+  uint source_half = 0u;
+  if (LayoutIs64bpp(source_layout) != 0u) {
+    source_half = sx & 1u;
+    sx >>= 1u;
+  }
   uint sy = source_row * 16u + tile_y;
   uint smx = source_msaa >= 2u ? 1u : 0u;
   uint smy = source_msaa >= 1u ? 1u : 0u;
@@ -284,6 +342,19 @@ uint LoadSourceWord(uint reader_layout, uint2 pixel, uint sample, uint source_la
     depth24 = min(uint(saturate(depth) * 16777215.0f + 0.5f), 0xFFFFFFu);
   }
   return (depth24 << 8u) | (stencil & 0xFFu);
+#elif defined(FH1_SOURCE_UINT)
+#ifdef FH1_SOURCE_MSAA
+  uint4 bits = fh1_source_color.Load(source_pixel, host_sample);
+#else
+  uint4 bits = fh1_source_color.Load(int3(source_pixel, 0));
+#endif
+  uint source_format = LayoutFormat(source_layout);
+  // 32-bit channels, one per word, or 16-bit channels, two per word.
+  bool channels_32 = source_format == FORMAT_32_FLOAT || source_format == FORMAT_32_32_FLOAT;
+  uint2 words = channels_32 ? bits.xy
+                            : uint2((bits.x & 0xFFFFu) | (bits.y << 16u),
+                                    (bits.z & 0xFFFFu) | (bits.w << 16u));
+  return source_half != 0u ? words.y : words.x;
 #else
 #ifdef FH1_SOURCE_MSAA
   float4 color = fh1_source_color.Load(source_pixel, host_sample);
