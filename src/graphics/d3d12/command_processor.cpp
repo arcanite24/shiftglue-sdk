@@ -3724,7 +3724,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       fh1_vertex_hash == 0x6934E161812AB10Bull ? 28 :
       fh1_vertex_hash == 0xAD2C355A6BE1EE87ull && fh1_pixel_hash == 0x2F2137BF953DA7AFull ? 20 :
       fh1_vertex_hash == 0x8D8A197476841A9Aull && fh1_pixel_hash == 0xBA6A2871A980A4E8ull ? 16 : 0;
-  const bool fh1_depth_indices = (((fh1_depth_stride || fh1_terrain_depth) && !pixel_shader) ||
+  // The owned geometry cache feeds the Xenos-side families only; with the
+  // native executor both renderers fetch guest indices and vertices as-is.
+  const bool fh1_depth_indices = !fh1_native_executor_ &&
+      (((fh1_depth_stride || fh1_terrain_depth) && !pixel_shader) ||
       fh1_scene_stride) && !memexport_used &&
       render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
   // With the native executor, Xenos renders these guest draws as-is so both

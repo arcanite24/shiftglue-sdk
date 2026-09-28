@@ -1814,6 +1814,9 @@ bool PipelineCache::IsFh1NativeShadowVertex(uint64_t hash, uint64_t modification
 }
 
 bool PipelineCache::IsFh1NativeStandaloneVertex(uint64_t hash, uint64_t modification) const {
+  // With the native executor both renderers draw the translated guest shaders,
+  // at runtime and when prewarming catalog pipelines.
+  if (Fh1NativeExecutor::Enabled()) return false;
   return IsFh1NativeShadowVertex(hash, modification) ||
       (hash == 0xB8489164D5A86043ull && modification == 0x1Full &&
        bindless_resources_used_ &&
@@ -1850,6 +1853,7 @@ bool PipelineCache::IsFh1NativePositionPipeline(const PipelineDescription& descr
 }
 
 bool PipelineCache::IsFh1NativeScenePipeline(const PipelineDescription& description) const {
+  if (Fh1NativeExecutor::Enabled()) return false;
   if (IsFh1NativeShadowPipeline(description) || IsFh1NativePositionPipeline(description)) return true;
   if (!bindless_resources_used_ ||
       render_target_cache_.GetPath() != RenderTargetCache::Path::kHostRenderTargets) {
