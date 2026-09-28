@@ -1361,6 +1361,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                                      D3D12TextureCache& texture_cache,
                                      uint32_t& written_address_out, uint32_t& written_length_out,
                                      bool native_mip_copy) {
+  ++fh1_work_counters_.resolves;
   written_address_out = 0;
   written_length_out = 0;
   copy_observation_resolve_info_valid_ = false;
@@ -4083,6 +4084,15 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
 
   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
+  for (uint32_t i = 0; i < render_target_count; ++i) {
+    if (!render_targets[i]) continue;
+    const uint32_t passes =
+        render_targets[i]->key().is_depth && !use_stencil_reference_output_ ? 9 : 1;
+    for (const Transfer& transfer : render_target_transfers[i]) {
+      fh1_work_counters_.transfer_tile_passes +=
+          uint64_t(transfer.end_tiles - transfer.start_tiles) * passes;
+    }
+  }
   D3D12CommandProcessor::Fh1GpuWorkTiming transfer_timing;
   if (command_processor_.IsFh1GpuWorkTimingSampleFrame()) {
     uint32_t transfer_count = 0;

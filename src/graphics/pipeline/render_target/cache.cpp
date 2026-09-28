@@ -396,6 +396,7 @@ void RenderTargetCache::BeginFrame() {
 bool RenderTargetCache::Update(bool is_rasterization_done,
                                reg::RB_DEPTHCONTROL normalized_depth_control,
                                uint32_t normalized_color_mask, const Shader& vertex_shader) {
+  ++fh1_work_counters_.updates;
   const RegisterFile& regs = register_file();
   bool interlock_barrier_only = GetPath() == Path::kPixelShaderInterlock;
 

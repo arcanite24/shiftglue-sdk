@@ -2984,6 +2984,15 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                                 frontbuffer_height,
                                 uint32_t(register_file_->GetTextureFetch(0).format));
   }
+  if (fh1_native_executor_ && observation_frame_sequence_ % 600 == 0) {
+    // Native mode: the EDRAM emulation must do no work at all. Shadow mode:
+    // Xenos's own work, for comparison with the executor's.
+    const auto work = render_target_cache_->fh1_work_counters();
+    REXGPU_INFO(
+        "FH1 xenos edram work: updates={} resolves={} render_targets={} "
+        "transfer_tile_passes={}",
+        work.updates, work.resolves, work.render_targets, work.transfer_tile_passes);
+  }
   if (fh1_native_executor_) {
     const xenos::TextureFormat front_format = register_file_->GetTextureFetch(0).format;
     const uint32_t* gamma_pwl =
@@ -4078,7 +4087,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     Fh1FrameCensus::ObserveDraw(regs, census);
   }
   auto prepared_draw_observer = graphics_system_->prepared_draw_observer();
-  if (!Fh1ObserveCorpusFrame(observation_frame_sequence_)) {
+  // The pilot's observers never run in FH1 native mode.
+  if (!Fh1ObserveCorpusFrame(observation_frame_sequence_) || fh1_native_presents) {
     prepared_draw_observer = nullptr;
   }
   if (prepared_draw_observer) {
@@ -5504,7 +5514,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       (Fh1SnrProbeOutputFrame(Fh1Snr02ItemProbeFrame(),
                               observation_frame_sequence_) &&
        Fh1Snr02ItemShader(fh1_vertex_hash)))) {
-    if (auto observer = graphics_system_->final_draw_state_observer()) {
+    if (auto observer = fh1_native_presents ? nullptr
+                                             : graphics_system_->final_draw_state_observer()) {
       std::array<uint32_t, 64> system_words;
       std::array<system::GraphicsFinalDrawTextureIdentity, 32> textures;
       uint32_t texture_count = 0;

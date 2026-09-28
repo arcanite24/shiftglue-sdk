@@ -127,6 +127,22 @@ class RenderTargetCache {
 
   virtual Path GetPath() const = 0;
 
+  // FH1: work done by the EDRAM emulation, which must stay zero while the
+  // FH1 native executor renders.
+  struct Fh1WorkCounters {
+    uint64_t updates = 0;
+    uint64_t resolves = 0;
+    uint64_t render_targets = 0;
+    // Transferred tiles, times their passes (depth: one plus eight stencil
+    // bits without stencil reference output).
+    uint64_t transfer_tile_passes = 0;
+  };
+  Fh1WorkCounters fh1_work_counters() const {
+    Fh1WorkCounters counters = fh1_work_counters_;
+    counters.render_targets = render_targets_.size();
+    return counters;
+  }
+
   // Resolution scaling on the EDRAM side is performed by multiplying the EDRAM
   // tile size by the resolution scale.
   // Note: Only integer scaling factors are provided because fractional ones,
@@ -183,6 +199,8 @@ class RenderTargetCache {
   uint32_t GetLastUpdateBoundRenderTargets(uint32_t* depth_and_color_formats_out = nullptr) const;
 
  protected:
+  Fh1WorkCounters fh1_work_counters_;
+
   RenderTargetCache(const RegisterFile& register_file, const memory::Memory& memory,
                     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y)
       : register_file_(register_file),
