@@ -72,6 +72,19 @@ Texture2D<float4> fh1_source_color : register(t0);
 // -1...1 (the resolve's exponent bias then restores the range). Set by main.
 static float fh1_fixed16_scale = 32.0f;
 
+// Resolution scale: every guest pixel is fh1_scale x fh1_scale host pixels.
+// Callers convert a host pixel with SetScaledPixel, which keeps its position
+// inside the guest pixel for the source lookup (the same subpixel of the
+// source's guest pixel, as both surfaces are at the same scale).
+#define FH1_FLAG_SCALE_SHIFT 12u  // transfer flags: resolution scale - 1, 12:13
+static uint fh1_scale = 1u;
+static uint2 fh1_subpixel = uint2(0u, 0u);
+void SetScaledPixel(inout uint2 pixel, uint scale) {
+  fh1_scale = scale;
+  fh1_subpixel = pixel % scale;
+  pixel /= scale;
+}
+
 // Layouts: base_tiles 0:10, pitch_tiles (32bpp) 11:18, msaa 19:20,
 // is_64bpp 21, is_depth 22, guest format 23:26 (color or depth format),
 // host sample mode 27:28 (0: as guest, 1: native 2x, 2: 2x stored as 4x).
@@ -322,7 +335,7 @@ uint LoadSourceWord(uint reader_layout, uint2 pixel, uint sample, uint half,
   uint sy = source_row * 16u + tile_y;
   uint smx = source_msaa >= 2u ? 1u : 0u;
   uint smy = source_msaa >= 1u ? 1u : 0u;
-  int2 source_pixel = int2(sx >> smx, sy >> smy);
+  int2 source_pixel = int2(sx >> smx, sy >> smy) * int(fh1_scale) + int2(fh1_subpixel);
   uint guest_sample = (sx & smx) | ((sy & smy) << smx);
   uint host_sample =
       HostSample(guest_sample, source_msaa, LayoutHostSampleMode(source_layout));

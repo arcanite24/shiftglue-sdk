@@ -255,7 +255,7 @@ class Fh1NativeExecutor {
   static SurfaceKey MakeDepthKey(uint32_t base, uint32_t pitch_tiles, uint32_t msaa,
                                  xenos::DepthRenderTargetFormat format);
   static uint32_t PitchTiles(uint32_t pitch_pixels, uint32_t msaa);
-  static uint32_t SurfaceHeight(uint32_t pitch_tiles, uint32_t msaa);
+  uint32_t SurfaceHeight(uint32_t pitch_tiles, uint32_t msaa) const;
   DXGI_FORMAT ColorResourceFormat(xenos::ColorRenderTargetFormat format) const;
   DXGI_FORMAT ColorDrawFormat(xenos::ColorRenderTargetFormat format) const;
   Surface* GetOrCreateSurface(const SurfaceKey& key);
@@ -457,6 +457,18 @@ class Fh1NativeExecutor {
   // EDRAM tile -> whether the low byte of its words (stencil when read as
   // depth) may be nonzero.
   std::vector<uint8_t> tile_stencil_nonzero_;
+  // Resolution scale (symmetric): surfaces hold scale x scale host pixels per
+  // guest pixel; rectangles are kept in guest pixels and scaled at use.
+  uint32_t scale_ = 1;
+  D3D12_RECT HostRect(const D3D12_RECT& rect) const {
+    return {LONG(rect.left * LONG(scale_)), LONG(rect.top * LONG(scale_)),
+            LONG(rect.right * LONG(scale_)), LONG(rect.bottom * LONG(scale_))};
+  }
+  // Flags shared by the transfer shaders.
+  uint32_t TransferFlags() const {
+    return (config_.depth_float24_round ? 1u : 0u) | (config_.gamma_as_unorm16 ? 2u : 0u) |
+           (config_.fixed16_truncated ? 0u : 4u) | ((scale_ - 1) << 12);
+  }
   // Changes whenever tile ownership or a tile's stencil state could change, so
   // a draw with the previous draw's targets and extent needs no work.
   uint64_t tile_generation_ = 1;

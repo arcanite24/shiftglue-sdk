@@ -7,12 +7,12 @@
 // fh1_native_edram.hlsli).
 
 cbuffer Fh1NativeTransferWordsConstants : register(b0) {
-  uint fh1_rect_origin;     // x | y << 16, destination pixels
+  uint fh1_rect_origin;     // x | y << 16, destination host pixels
   uint fh1_rect_size;       // width | height << 16
   uint fh1_dest_layout;     // Layout of the new owner, with its host sample mode.
   uint fh1_source_layout;   // Layout of the previous owner, with its host sample mode.
   uint fh1_flags;           // FH1_FLAG_*
-  uint fh1_dest_width;      // Destination surface width in pixels.
+  uint fh1_dest_width;      // Destination surface width in host pixels.
   uint fh1_dest_samples;    // Host samples per destination pixel.
   uint fh1_unused;
 };
@@ -33,8 +33,10 @@ void main(uint3 thread : SV_DispatchThreadID) {
   for (uint host_sample = 0u; host_sample < fh1_dest_samples; ++host_sample) {
     uint guest_sample = GuestSample(host_sample, LayoutMsaa(fh1_dest_layout),
                                     LayoutHostSampleMode(fh1_dest_layout));
+    uint2 guest_pixel = pixel;
+    SetScaledPixel(guest_pixel, ((fh1_flags >> FH1_FLAG_SCALE_SHIFT) & 3u) + 1u);
     fh1_words.Store((base + host_sample) * 4u,
-                    LoadSourceWord(fh1_dest_layout, pixel, guest_sample, 0u, fh1_source_layout,
-                                   fh1_flags));
+                    LoadSourceWord(fh1_dest_layout, guest_pixel, guest_sample, 0u,
+                                   fh1_source_layout, fh1_flags));
   }
 }

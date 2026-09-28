@@ -24,9 +24,11 @@ cbuffer Fh1NativeResolveMemoryConstants : register(b0) {
   // pack 0:2 (0: 8_8_8_8, 1: 2_10_10_10, 2: 32_FLOAT, 3: 16_16_16_16_FLOAT,
   // 4: raw 32-bit word), endian 3:5, swap red/blue 6, float24 rounding 7,
   // exp bias 8:15 (signed), bytes per texel log2 16:17, gamma targets hold
-  // linear values 18, 16_16[_16_16] hosts keep the full range as snorm / 32 19.
+  // linear values 18, 16_16[_16_16] hosts keep the full range as snorm / 32 19,
+  // resolution scale - 1 20:21 (the rectangle is then in host pixels and the
+  // destination is the texture cache's scaled resolve range).
   uint fh1_dest_info;
-  uint fh1_dest_base;       // bytes
+  uint fh1_dest_base;       // bytes (scaled: from the scaled range's base, unscaled)
   uint fh1_dest_pitch;      // texels
 };
 
@@ -43,6 +45,18 @@ int TiledOffset2D(int x, int y, uint pitch, uint bpb_log2) {
                ((y & 1) << 4);
   return ((offset & ~0x1FF) << 3) + ((y & 16) << 7) + ((offset & 0x1C0) << 2) +
          (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (offset & 0x3F);
+}
+
+// The texture cache's scaled resolve layout: each 16 bytes of the guest
+// texture become scale x scale groups of 16 bytes, each holding one host row
+// of the guest group's texels at scale, stored column-major by group.
+uint ScaledOffset(uint2 pixel, uint2 subpixel, uint pitch, uint bpb_log2, uint scale) {
+  uint guest = uint(TiledOffset2D(int(pixel.x), int(pixel.y), pitch, bpb_log2));
+  uint texels_per_group = 16u >> bpb_log2;
+  uint host_x = ((guest & 15u) >> bpb_log2) * scale + subpixel.x;
+  uint group_x = host_x / texels_per_group;
+  return (guest & ~15u) * scale * scale + ((group_x * scale + subpixel.y) << 4u) +
+         ((host_x % texels_per_group) << bpb_log2);
 }
 
 uint EndianSwap32(uint value, uint endian) {
@@ -82,12 +96,20 @@ void main(uint3 thread : SV_DispatchThreadID) {
   }
   uint2 pixel = uint2(fh1_rect_origin & 0xFFFFu, fh1_rect_origin >> 16u) + thread.xy;
   fh1_fixed16_scale = ((fh1_dest_info >> 19u) & 1u) != 0u ? 32.0f : 1.0f;
+  uint scale = ((fh1_dest_info >> 20u) & 3u) + 1u;
+  SetScaledPixel(pixel, scale);
 
   uint pack = fh1_dest_info & 7u;
   uint endian = (fh1_dest_info >> 3u) & 7u;
   uint bpb_log2 = (fh1_dest_info >> 16u) & 3u;
-  uint address = fh1_dest_base +
-                 uint(TiledOffset2D(int(pixel.x), int(pixel.y), fh1_dest_pitch, bpb_log2));
+  uint address;
+  [branch] if (scale > 1u) {
+    address = fh1_dest_base * scale * scale +
+              ScaledOffset(pixel, fh1_subpixel, fh1_dest_pitch, bpb_log2, scale);
+  } else {
+    address = fh1_dest_base +
+              uint(TiledOffset2D(int(pixel.x), int(pixel.y), fh1_dest_pitch, bpb_log2));
+  }
 
   uint first_sample, sample_count;
   switch (fh1_sample_select) {

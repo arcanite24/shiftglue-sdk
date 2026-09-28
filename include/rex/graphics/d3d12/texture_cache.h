@@ -173,6 +173,12 @@ class D3D12TextureCache final : public TextureCache {
   uint64_t GetCurrentScaledResolveRangeStartScaled() const {
     return scaled_resolve_current_range_start_scaled_;
   }
+  // GPU address of the current range's first byte, for raw views.
+  D3D12_GPU_VIRTUAL_ADDRESS GetCurrentScaledResolveRangeGPUAddress() {
+    return GetCurrentScaledResolveBuffer().resource()->GetGPUVirtualAddress() +
+           (scaled_resolve_current_range_start_scaled_ -
+            (uint64_t(GetCurrentScaledResolveBufferIndex()) << 30));
+  }
   uint64_t GetCurrentScaledResolveRangeLengthScaled() const {
     return scaled_resolve_current_range_length_scaled_;
   }

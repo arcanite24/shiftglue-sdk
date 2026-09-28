@@ -16,7 +16,7 @@
 cbuffer Fh1NativeTransferConstants : register(b0) {
   uint fh1_dest_layout;    // Layout of the new owner, with its host sample mode.
   uint fh1_source_layout;  // Layout of the previous owner, with its host sample mode.
-  uint fh1_flags;          // FH1_FLAG_*, stencil bit index 8:10.
+  uint fh1_flags;          // FH1_FLAG_*, stencil bit index 8:10, scale - 1 12:13.
 };
 
 #ifdef FH1_DEST_MSAA
@@ -28,8 +28,10 @@ cbuffer Fh1NativeTransferConstants : register(b0) {
 uint LoadWord(float4 position, uint host_sample, uint half) {
   uint guest_sample = GuestSample(host_sample, LayoutMsaa(fh1_dest_layout),
                                   LayoutHostSampleMode(fh1_dest_layout));
-  return LoadSourceWord(fh1_dest_layout, uint2(position.xy), guest_sample, half,
-                        fh1_source_layout, fh1_flags);
+  uint2 pixel = uint2(position.xy);
+  SetScaledPixel(pixel, ((fh1_flags >> FH1_FLAG_SCALE_SHIFT) & 3u) + 1u);
+  return LoadSourceWord(fh1_dest_layout, pixel, guest_sample, half, fh1_source_layout,
+                        fh1_flags);
 }
 
 #if FH1_DEST_KIND == 0

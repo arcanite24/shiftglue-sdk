@@ -341,17 +341,22 @@ Fh1NativeExecutor::CpuTimer::~CpuTimer() {
 }
 
 namespace {
-// The executor's surfaces, transfers and resolves are 1x only so far; scaled
-// sessions keep the Xenos backend.
+// `native` runs at 1x and at symmetric 2x and 3x; `native-shadow` compares
+// with the Xenos EDRAM at 1x only. Other scales keep the Xenos backend.
 bool ResolutionScaleSupported() {
   static const bool supported = [] {
-    const bool unscaled =
-        REXCVAR_GET(draw_resolution_scale_x) == 1 && REXCVAR_GET(draw_resolution_scale_y) == 1;
-    if (!unscaled && REXCVAR_GET(fh1_renderer) != "xenos") {
-      REXGPU_WARN("FH1 native renderer supports 1x resolution only; using Xenos at {}x{}",
-                  REXCVAR_GET(draw_resolution_scale_x), REXCVAR_GET(draw_resolution_scale_y));
+    const uint32_t x = REXCVAR_GET(draw_resolution_scale_x);
+    const uint32_t y = REXCVAR_GET(draw_resolution_scale_y);
+    if (x == 1 && y == 1) return true;
+    if (REXCVAR_GET(fh1_renderer) == "native" && !REXCVAR_GET(fh1_native_shadow) && x == y &&
+        x <= 3) {
+      return true;
     }
-    return unscaled;
+    if (REXCVAR_GET(fh1_renderer) != "xenos") {
+      REXGPU_WARN("FH1 native renderer supports 1x, 2x and 3x (native-shadow 1x only); "
+                  "using Xenos at {}x{}", x, y);
+    }
+    return false;
   }();
   return supported;
 }
@@ -365,8 +370,11 @@ bool Fh1NativeExecutor::Enabled() {
 }
 
 bool Fh1NativeExecutor::Presents() {
-  static const bool presents =
-      ResolutionScaleSupported() && REXCVAR_GET(fh1_renderer) == "native";
+  // An explicit shadow request (the legacy fh1_native_shadow switch) wins over
+  // the configured renderer, which is native by default.
+  static const bool presents = ResolutionScaleSupported() &&
+                               REXCVAR_GET(fh1_renderer) == "native" &&
+                               !REXCVAR_GET(fh1_native_shadow);
   return presents;
 }
 
@@ -462,7 +470,16 @@ bool Fh1NativeExecutor::Initialize(const Fh1NativeExecutorConfig& config) {
   }
 
   tile_owners_.assign(xenos::kEdramTileCount, kNoOwner);
-  if (const uint64_t dump_frame = Fh1FrameDump::RequestedFrame()) {
+  scale_ = native_textures_->draw_resolution_scale_x();
+  if (native_textures_->draw_resolution_scale_y() != scale_ || scale_ > 3 ||
+      (scale_ > 1 && !config_.presents)) {
+    REXGPU_ERROR("FH1 native executor: unsupported resolution scale {}x{}",
+                 native_textures_->draw_resolution_scale_x(),
+                 native_textures_->draw_resolution_scale_y());
+    return false;
+  }
+  // Frame dumps record and compare the 1x guest-memory mirror.
+  if (const uint64_t dump_frame = scale_ == 1 ? Fh1FrameDump::RequestedFrame() : 0) {
     frame_dump_ = std::make_unique<Fh1FrameDump>(command_processor_, register_file_, memory_,
                                                  *native_memory_, dump_frame,
                                                  Fh1FrameDump::RequestedPath());
@@ -598,14 +615,17 @@ uint32_t Fh1NativeExecutor::PitchTiles(uint32_t pitch_pixels, uint32_t msaa) {
          xenos::kEdramTileWidthSamples;
 }
 
-uint32_t Fh1NativeExecutor::SurfaceHeight(uint32_t pitch_tiles, uint32_t msaa) {
+uint32_t Fh1NativeExecutor::SurfaceHeight(uint32_t pitch_tiles, uint32_t msaa) const {
   // Down to the start of the same surface in the next EDRAM addressing period,
   // clamped to the guest texture size limit (RenderTargetCache at 1x scale).
   if (!pitch_tiles) return 0;
   uint32_t tile_rows = (xenos::kEdramTileCount + pitch_tiles - 1) / pitch_tiles;
   const uint32_t msaa_y_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k2X));
-  tile_rows = std::min(tile_rows, (xenos::kTexture2DCubeMaxWidthHeight << msaa_y_log2) /
-                                      xenos::kEdramTileHeightSamples);
+  // At scale, also what a host texture can hold.
+  const uint32_t max_height =
+      std::min(uint32_t(xenos::kTexture2DCubeMaxWidthHeight),
+               uint32_t(D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION) / scale_);
+  tile_rows = std::min(tile_rows, (max_height << msaa_y_log2) / xenos::kEdramTileHeightSamples);
   return tile_rows * (xenos::kEdramTileHeightSamples >> msaa_y_log2);
 }
 
@@ -705,8 +725,8 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
                         : 1u << key.msaa;
   D3D12_RESOURCE_DESC desc = {};
   desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  desc.Width = surface.width;
-  desc.Height = surface.height;
+  desc.Width = surface.width * scale_;
+  desc.Height = surface.height * scale_;
   desc.DepthOrArraySize = 1;
   desc.MipLevels = 1;
   desc.SampleDesc.Count = surface.samples;
@@ -915,7 +935,7 @@ void Fh1NativeExecutor::TransferTiles(Surface& dest, const TileRun& run) {
     D3D12_RECT rect = {LONG(column_first * tile_width), LONG(row_first * tile_height),
                        LONG(std::min(column_end * tile_width, dest.width)),
                        LONG(std::min(row_end * tile_height, dest.height))};
-    if (rect.left < rect.right && rect.top < rect.bottom) rects[rect_count++] = rect;
+    if (rect.left < rect.right && rect.top < rect.bottom) rects[rect_count++] = HostRect(rect);
   };
   const uint32_t first_row = first / pitch, last_row = (end - 1) / pitch;
   if (first_row == last_row) {
@@ -1006,7 +1026,8 @@ void Fh1NativeExecutor::ClaimTileRect(const SurfaceKey& key, uint32_t column_fir
       tiles_stencil = AnyTileStencil(key.base_tiles + row * key.pitch_tiles + column_first,
                                      column_end - column_first);
     }
-    TransferRects(*dest, previous_owner, &rect, 1,
+    const D3D12_RECT host_rect = HostRect(rect);
+    TransferRects(*dest, previous_owner, &host_rect, 1,
                   (column_end - column_first) * (row_end - row_first), tiles_stencil);
   }
 }
@@ -1062,9 +1083,7 @@ void Fh1NativeExecutor::FlushTransfers() {
                    [](const PendingTransfer& a, const PendingTransfer& b) {
                      return a.dest != b.dest ? a.dest < b.dest : a.source < b.source;
                    });
-  const uint32_t flags = (config_.depth_float24_round ? 1u : 0u) |
-                         (config_.gamma_as_unorm16 ? 2u : 0u) |
-                         (config_.fixed16_truncated ? 0u : 4u);
+  const uint32_t flags = TransferFlags();
   auto& list = command_processor_.GetDeferredCommandList();
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
   for (size_t group = 0; group < pending_transfers_.size();) {
@@ -1130,7 +1149,8 @@ void Fh1NativeExecutor::FlushTransfers() {
         const uint32_t words_constants[kResolveMemoryConstantCount] = {
             uint32_t(rect.left) | (uint32_t(rect.top) << 16),
             uint32_t(rect.right - rect.left) | (uint32_t(rect.bottom - rect.top) << 16),
-            LayoutConstant(*dest), LayoutConstant(*source), flags, dest->width, dest->samples, 0};
+            LayoutConstant(*dest), LayoutConstant(*source), flags, dest->width * scale_,
+            dest->samples, 0};
         list.D3DSetComputeRoot32BitConstants(0, kResolveMemoryConstantCount, words_constants, 0);
         list.D3DDispatch((uint32_t(rect.right - rect.left) + 7) / 8,
                          (uint32_t(rect.bottom - rect.top) + 7) / 8, 1);
@@ -1174,7 +1194,7 @@ void Fh1NativeExecutor::FlushTransfers() {
       }
       command_processor_.SetExternalPipeline(pipeline);
       const uint32_t pass_constants[3] = {LayoutConstant(*dest),
-                                          dest->width | (dest->samples << 16),
+                                          (dest->width * scale_) | (dest->samples << 16),
                                           flags | (pass ? (pass - 1) << 8 : 0)};
       list.D3DSetGraphicsRoot32BitConstants(0, 3, pass_constants, 0);
       command_processor_.SetStencilReference(pass ? 0xFF : 0);
@@ -1230,9 +1250,7 @@ void Fh1NativeExecutor::FlushColorTransfers(Surface& dest, size_t first, size_t 
   Transition(dest.resource.Get(), dest.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
   command_processor_.SubmitBarriers();
   auto& list = command_processor_.GetDeferredCommandList();
-  const uint32_t flags = (config_.depth_float24_round ? 1u : 0u) |
-                         (config_.gamma_as_unorm16 ? 2u : 0u) |
-                         (config_.fixed16_truncated ? 0u : 4u);
+  const uint32_t flags = TransferFlags();
   const uint32_t sample_mask =
       dest.key.msaa == uint32_t(xenos::MsaaSamples::k2X) && dest.samples == 4 ? 0b1001u
                                                                              : UINT_MAX;
@@ -1285,7 +1303,8 @@ void Fh1NativeExecutor::FlushColorTransfers(Surface& dest, size_t first, size_t 
 }
 
 bool Fh1NativeExecutor::EnsureTransferWords(const Surface& dest) {
-  const uint64_t size = uint64_t(dest.width) * dest.height * dest.samples * sizeof(uint32_t);
+  const uint64_t size = uint64_t(dest.width) * dest.height * scale_ * scale_ * dest.samples *
+                        sizeof(uint32_t);
   if (transfer_words_ && transfer_words_size_ >= size) return true;
   if (transfer_words_) {
     // The old buffer may still be in use by submitted commands; the buffer only
@@ -1833,9 +1852,10 @@ void Fh1NativeExecutor::ClaimOverwrittenDepthTiles(const SurfaceKey& key,
                packed_key, false);
   }
   if (!stencil_overwritten && dest->stencil_nonzero) {
-    const D3D12_RECT clear_rect = {LONG(column_first * tile_width), LONG(row_first * tile_height),
-                                   LONG(std::min(column_end * tile_width, dest->width)),
-                                   LONG(std::min(row_end * tile_height, dest->height))};
+    const D3D12_RECT clear_rect = HostRect(
+        {LONG(column_first * tile_width), LONG(row_first * tile_height),
+         LONG(std::min(column_end * tile_width, dest->width)),
+         LONG(std::min(row_end * tile_height, dest->height))});
     GpuTimer gpu_timer(*this, kGpuClears);
     Transition(dest->resource.Get(), dest->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     command_processor_.SubmitBarriers();
@@ -2214,8 +2234,9 @@ void Fh1NativeExecutor::ShadowDraw(D3D12RenderTargetCache& render_target_cache,
   }
 }
 
-void Fh1NativeExecutor::ClearSurfaceRect(Surface& surface, const D3D12_RECT& rect,
+void Fh1NativeExecutor::ClearSurfaceRect(Surface& surface, const D3D12_RECT& guest_rect,
                                          uint32_t clear_value, uint32_t clear_value_lo) {
+  const D3D12_RECT rect = HostRect(guest_rect);
   auto& list = command_processor_.GetDeferredCommandList();
   GpuTimer gpu_timer(*this, kGpuClears);
   if (surface.key.is_depth) {
@@ -2330,7 +2351,7 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   const SurfaceKey& owner = surface.key;
   const uint32_t host_sample_mode =
       owner.msaa == uint32_t(xenos::MsaaSamples::k2X) ? (surface.samples == 4 ? 2u : 1u) : 0u;
-  const D3D12_RECT& rect = source.rect;
+  const D3D12_RECT rect = HostRect(source.rect);
   uint32_t constants[kResolveMemoryConstantCount];
   constants[0] = uint32_t(rect.left) | (uint32_t(rect.top) << 16);
   constants[1] = uint32_t(rect.right - rect.left) | (uint32_t(rect.bottom - rect.top) << 16);
@@ -2340,7 +2361,7 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
                             owner.is_depth, owner.format) |
                  (host_sample_mode << 27);
   constants[4] = sample_select;
-  constants[5] = dest_info;
+  constants[5] = dest_info | ((scale_ - 1) << 20);
   constants[6] = dest_base;
   constants[7] = dest_pitch;
   auto& list = command_processor_.GetDeferredCommandList();
@@ -2564,7 +2585,8 @@ bool Fh1NativeExecutor::NativeResolve(uint32_t& written_address, uint32_t& writt
 
 void Fh1NativeExecutor::ReadBackResolve(uint32_t address, uint32_t length) {
   const ReadbackResolveMode mode = command_processor_.Fh1ReadbackResolveMode();
-  if (mode == ReadbackResolveMode::kDisabled) return;
+  // At scale resolves write the scaled resolve range, not guest memory.
+  if (mode == ReadbackResolveMode::kDisabled || scale_ > 1) return;
   uint8_t* destination = memory_.TranslatePhysical(address);
   if (!destination) return;
   ResolveReadback& readback = resolve_readbacks_[(uint64_t(address) << 32) | length];
@@ -2658,8 +2680,27 @@ bool Fh1NativeExecutor::Resolve(D3D12RenderTargetCache* render_target_cache,
     if (tracing_) Trace("resolve " + plan.kind + " of " + plan.resolve_key.Describe() + " rect " +
           std::to_string(x0) + "," + std::to_string(y0) + "-" + std::to_string(x1) + "," +
           std::to_string(y1) + " to " + std::to_string(plan.dest_base));
-    native_memory_->RequestRange(resolve_info.copy_dest_extent_start,
-                                 resolve_info.copy_dest_extent_length);
+    // At scale the destination is the texture cache's scaled resolve range,
+    // relative to the adjusted destination base.
+    D3D12_GPU_VIRTUAL_ADDRESS scaled_target = 0;
+    uint32_t dest_base = plan.dest_base;
+    if (scale_ > 1) {
+      if (!native_textures_->EnsureScaledResolveMemoryCommitted(
+              resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length) ||
+          !native_textures_->MakeScaledResolveRangeCurrent(
+              resolve_info.copy_dest_base, resolve_info.copy_dest_extent_start -
+                                               resolve_info.copy_dest_base +
+                                               resolve_info.copy_dest_extent_length)) {
+        Skip("resolve_scaled_memory");
+        return false;
+      }
+      native_textures_->TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      scaled_target = native_textures_->GetCurrentScaledResolveRangeGPUAddress();
+      dest_base = plan.dest_base - resolve_info.copy_dest_base;
+    } else {
+      native_memory_->RequestRange(resolve_info.copy_dest_extent_start,
+                                   resolve_info.copy_dest_extent_length);
+    }
     bool complete = true;
     for (const SourceRect& source : plan.sources) {
       if (source.rect.left >= source.rect.right || source.rect.top >= source.rect.bottom) {
@@ -2687,12 +2728,14 @@ bool Fh1NativeExecutor::Resolve(D3D12RenderTargetCache* render_target_cache,
         Count("resolve_through_alias");
       }
       if (!ResolveToMemory(source, plan.resolve_key, plan.sample_select, plan.dest_info,
-                           plan.dest_base, plan.dest_pitch)) {
+                           dest_base, plan.dest_pitch, nullptr, scaled_target)) {
         complete = false;
       }
     }
-    native_memory_->RangeWrittenByGpu(resolve_info.copy_dest_extent_start,
-                                      resolve_info.copy_dest_extent_length);
+    if (scale_ > 1) native_textures_->MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
+    // Invalidates textures over the range (and marks it scaled at scale).
+    native_textures_->MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
+                                          resolve_info.copy_dest_extent_length);
     if (written_address) *written_address = resolve_info.copy_dest_extent_start;
     if (written_length) *written_length = resolve_info.copy_dest_extent_length;
     if (complete) {
