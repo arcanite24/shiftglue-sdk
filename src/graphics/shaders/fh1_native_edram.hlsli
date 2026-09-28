@@ -279,7 +279,9 @@ uint LoadSourceWord(uint reader_layout, uint2 pixel, uint sample, uint source_la
     // The host keeps float24 depth halved.
     depth24 = Float32To20e4(depth * 2.0f, (flags & FH1_FLAG_FLOAT24_ROUND) != 0u);
   } else {
-    depth24 = uint(saturate(depth) * 16777215.0f + 0.5f);
+    // 1.0 * 16777215 + 0.5 rounds to 2^24 in float32; without the clamp the
+    // far plane would wrap to 0 when shifted into the EDRAM word.
+    depth24 = min(uint(saturate(depth) * 16777215.0f + 0.5f), 0xFFFFFFu);
   }
   return (depth24 << 8u) | (stencil & 0xFFu);
 #else
