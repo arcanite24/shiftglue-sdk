@@ -7,11 +7,14 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <string>
 #include <tuple>
 #include <unordered_map>
+
+#include <fmt/format.h>
 
 #include <rex/cvar.h>
 #include <rex/graphics/register_file.h>
@@ -128,12 +131,14 @@ struct Census {
   bool window_open = false;
   uint64_t draws = 0;
   std::map<SurfaceKey, uint32_t> surface_ids;
-  std::map<uint32_t, uint64_t> surface_draws;
+  std::array<uint64_t, kMaxSurfaces> surface_draws{};
   std::unordered_map<DrawStateKey, DrawStateCount, DrawStateKeyHash> draw_states;
   std::unordered_map<TextureKey, TextureCount, TextureKeyHash> textures;
   // Consecutive draws usually share a surface, and a fetch constant is usually
   // unchanged between draws; these caches skip the table lookups then.
   // Element pointers stay valid until the window is flushed.
+  DrawStateCount* last_draw_state = nullptr;
+  DrawStateKey last_draw_state_key{};
   bool last_surface_valid = false;
   SurfaceKey last_surface_key;
   uint32_t last_surface_id = UINT32_MAX;
@@ -190,6 +195,9 @@ bool EnsureInitialized(Census& census) {
   census.out.open(path, std::ios::app);
   census.window = std::max<int32_t>(1, REXCVAR_GET(fh1_frame_census_window));
   census.enabled = census.out.good();
+  // Race windows reach a few thousand states; avoid rehashing mid-frame.
+  census.draw_states.reserve(8192);
+  census.textures.reserve(2048);
   return census.enabled;
 }
 
@@ -206,134 +214,121 @@ bool InResolveRange(const Census& census, uint32_t address) {
   return address < it->second;
 }
 
-std::string Hex64(uint64_t value) {
-  char buffer[24];
-  std::snprintf(buffer, sizeof(buffer), "%016llX", static_cast<unsigned long long>(value));
-  return buffer;
-}
-
-std::string Hex32(uint32_t value) {
-  char buffer[16];
-  std::snprintf(buffer, sizeof(buffer), "%08X", value);
-  return buffer;
-}
-
 template <size_t N>
-std::string HexArray(const std::array<uint32_t, N>& values) {
-  std::string result = "[";
+void AppendHexArray(fmt::memory_buffer& out, const std::array<uint32_t, N>& values) {
+  out.push_back('[');
   for (size_t i = 0; i < N; ++i) {
-    if (i) result += ",";
-    result += "\"" + Hex32(values[i]) + "\"";
+    fmt::format_to(std::back_inserter(out), "{}\"{:08X}\"", i ? "," : "", values[i]);
   }
-  return result + "]";
+  out.push_back(']');
 }
 
 void Flush(Census& census, uint64_t last_frame) {
-  std::string line;
-  line.reserve(1 << 16);
-  line += "{\"schema\":\"pinyon-shift.fh1-frame-census.v1\",\"first_frame\":" +
-          std::to_string(census.first_frame) + ",\"last_frame\":" +
-          std::to_string(last_frame) + ",\"draws\":" + std::to_string(census.draws);
-  line += ",\"surfaces\":[";
+  fmt::memory_buffer line;
+  auto out = std::back_inserter(line);
+  fmt::format_to(out,
+                 "{{\"schema\":\"pinyon-shift.fh1-frame-census.v1\",\"first_frame\":{},"
+                 "\"last_frame\":{},\"draws\":{},\"surfaces\":[",
+                 census.first_frame, last_frame, census.draws);
   bool first = true;
   for (const auto& [key, id] : census.surface_ids) {
     const auto& [surface_info, depth_info, color_info, window_offset, bound_bits,
                  host_formats] = key;
-    line += std::string(first ? "" : ",") + "{\"id\":" + std::to_string(id) +
-            ",\"surface_info\":\"" + Hex32(surface_info) + "\",\"depth_info\":\"" +
-            Hex32(depth_info) + "\",\"color_info\":" + HexArray(color_info) +
-            ",\"window_offset\":\"" + Hex32(window_offset) + "\",\"bound\":" +
-            std::to_string(bound_bits) + ",\"host_formats\":" + HexArray(host_formats) +
-            ",\"draws\":" + std::to_string(census.surface_draws[id]) + "}";
+    fmt::format_to(out,
+                   "{}{{\"id\":{},\"surface_info\":\"{:08X}\",\"depth_info\":\"{:08X}\","
+                   "\"color_info\":",
+                   first ? "" : ",", id, surface_info, depth_info);
+    AppendHexArray(line, color_info);
+    fmt::format_to(out, ",\"window_offset\":\"{:08X}\",\"bound\":{},\"host_formats\":",
+                   window_offset, bound_bits);
+    AppendHexArray(line, host_formats);
+    fmt::format_to(out, ",\"draws\":{}}}", census.surface_draws[id]);
     first = false;
   }
-  line += "],\"draw_states\":[";
+  fmt::format_to(out, "],\"draw_states\":[");
   first = true;
   for (const auto& [key, count] : census.draw_states) {
-    line += std::string(first ? "" : ",") + "{\"vs\":\"" + Hex64(key.vertex_shader) +
-            "\",\"ps\":\"" + Hex64(key.pixel_shader) + "\",\"vs_mod\":\"" +
-            Hex64(key.vertex_modification) + "\",\"ps_mod\":\"" +
-            Hex64(key.pixel_modification) + "\",\"surface\":" + std::to_string(key.surface) +
-            ",\"guest_primitive\":" + std::to_string(key.guest_primitive) +
-            ",\"host_primitive\":" + std::to_string(key.host_primitive) +
-            ",\"indexed\":" + (key.indexed ? "true" : "false") +
-            ",\"index_format\":" + std::to_string(key.index_format) +
-            ",\"depth_control\":\"" + Hex32(key.depth_control) + "\",\"color_mask\":\"" +
-            Hex32(key.color_mask) + "\",\"stencil_ref_mask\":\"" +
-            Hex32(key.stencil_ref_mask) + "\",\"color_control\":\"" +
-            Hex32(key.color_control) + "\",\"mode_control\":\"" + Hex32(key.mode_control) +
-            "\",\"blend\":" + HexArray(key.blend) + ",\"textures\":\"" +
-            Hex32(key.used_texture_mask) + "\",\"memexport\":" +
-            (key.memexport ? "true" : "false") + ",\"occlusion_query\":" +
-            (key.occlusion_query ? "true" : "false") + ",\"pipeline\":\"" +
-            Hex64(count.pipeline_hash) + "\",\"draws\":" + std::to_string(count.draws) +
-            ",\"indices\":" + std::to_string(count.indices) + "}";
+    fmt::format_to(out,
+                   "{}{{\"vs\":\"{:016X}\",\"ps\":\"{:016X}\",\"vs_mod\":\"{:016X}\","
+                   "\"ps_mod\":\"{:016X}\",\"surface\":{},\"guest_primitive\":{},"
+                   "\"host_primitive\":{},\"indexed\":{},\"index_format\":{},"
+                   "\"depth_control\":\"{:08X}\",\"color_mask\":\"{:08X}\","
+                   "\"stencil_ref_mask\":\"{:08X}\",\"color_control\":\"{:08X}\","
+                   "\"mode_control\":\"{:08X}\",\"blend\":",
+                   first ? "" : ",", key.vertex_shader, key.pixel_shader,
+                   key.vertex_modification, key.pixel_modification, key.surface,
+                   key.guest_primitive, key.host_primitive, key.indexed, key.index_format,
+                   key.depth_control, key.color_mask, key.stencil_ref_mask, key.color_control,
+                   key.mode_control);
+    AppendHexArray(line, key.blend);
+    fmt::format_to(out,
+                   ",\"textures\":\"{:08X}\",\"memexport\":{},\"occlusion_query\":{},"
+                   "\"pipeline\":\"{:016X}\",\"draws\":{},\"indices\":{}}}",
+                   key.used_texture_mask, key.memexport, key.occlusion_query,
+                   count.pipeline_hash, count.draws, count.indices);
     first = false;
   }
-  line += "],\"textures\":[";
+  fmt::format_to(out, "],\"textures\":[");
   first = true;
   for (const auto& [key, count] : census.textures) {
     const auto& [format, dimension, width, height, depth, tiled, packed_mips, mip_min,
                  mip_max, signs, endian, swizzle] = key;
-    line += std::string(first ? "" : ",") + "{\"format\":" + std::to_string(format) +
-            ",\"dimension\":" + std::to_string(dimension) + ",\"width\":" +
-            std::to_string(width) + ",\"height\":" + std::to_string(height) +
-            ",\"depth\":" + std::to_string(depth) + ",\"tiled\":" + std::to_string(tiled) +
-            ",\"packed_mips\":" + std::to_string(packed_mips) + ",\"mip_min\":" +
-            std::to_string(mip_min) + ",\"mip_max\":" + std::to_string(mip_max) +
-            ",\"signs\":" + std::to_string(signs) + ",\"endian\":" + std::to_string(endian) +
-            ",\"swizzle\":\"" + Hex32(swizzle) + "\",\"fetches\":" +
-            std::to_string(count.fetches) + ",\"from_resolve\":" +
-            std::to_string(count.from_resolve) + "}";
+    fmt::format_to(out,
+                   "{}{{\"format\":{},\"dimension\":{},\"width\":{},\"height\":{},"
+                   "\"depth\":{},\"tiled\":{},\"packed_mips\":{},\"mip_min\":{},"
+                   "\"mip_max\":{},\"signs\":{},\"endian\":{},\"swizzle\":\"{:08X}\","
+                   "\"fetches\":{},\"from_resolve\":{}}}",
+                   first ? "" : ",", format, dimension, width, height, depth, tiled,
+                   packed_mips, mip_min, mip_max, signs, endian, swizzle, count.fetches,
+                   count.from_resolve);
     first = false;
   }
-  line += "],\"copies\":[";
+  fmt::format_to(out, "],\"copies\":[");
   first = true;
   for (const auto& [key, count] : census.copies) {
     const auto& [copy_control, dest_info, dest_pitch, surface_info, source_info,
                  depth_info, succeeded] = key;
-    line += std::string(first ? "" : ",") + "{\"copy_control\":\"" + Hex32(copy_control) +
-            "\",\"dest_info\":\"" + Hex32(dest_info) + "\",\"dest_pitch\":\"" +
-            Hex32(dest_pitch) + "\",\"surface_info\":\"" + Hex32(surface_info) +
-            "\",\"source_info\":\"" + Hex32(source_info) + "\",\"depth_info\":\"" +
-            Hex32(depth_info) + "\",\"succeeded\":" + (succeeded ? "true" : "false") +
-            ",\"copies\":" + std::to_string(count.copies) + ",\"bytes\":" +
-            std::to_string(count.bytes) + "}";
+    fmt::format_to(out,
+                   "{}{{\"copy_control\":\"{:08X}\",\"dest_info\":\"{:08X}\","
+                   "\"dest_pitch\":\"{:08X}\",\"surface_info\":\"{:08X}\","
+                   "\"source_info\":\"{:08X}\",\"depth_info\":\"{:08X}\",\"succeeded\":{},"
+                   "\"copies\":{},\"bytes\":{}}}",
+                   first ? "" : ",", copy_control, dest_info, dest_pitch, surface_info,
+                   source_info, depth_info, succeeded, count.copies, count.bytes);
     first = false;
   }
-  line += "],\"optimized_clears\":{";
+  fmt::format_to(out, "],\"optimized_clears\":{{");
   first = true;
   for (const auto& [mode, count] : census.clears) {
-    line += std::string(first ? "" : ",") + "\"" + std::to_string(mode) +
-            "\":" + std::to_string(count);
+    fmt::format_to(out, "{}\"{}\":{}", first ? "" : ",", mode, count);
     first = false;
   }
-  line += "},\"swaps\":[";
+  fmt::format_to(out, "}},\"swaps\":[");
   first = true;
   for (const auto& [key, count] : census.swaps) {
     const auto& [format, width, height] = key;
-    line += std::string(first ? "" : ",") + "{\"format\":" + std::to_string(format) +
-            ",\"width\":" + std::to_string(width) + ",\"height\":" + std::to_string(height) +
-            ",\"swaps\":" + std::to_string(count) + "}";
+    fmt::format_to(out, "{}{{\"format\":{},\"width\":{},\"height\":{},\"swaps\":{}}}",
+                   first ? "" : ",", format, width, height, count);
     first = false;
   }
-  line += "],\"zpd_events\":" + std::to_string(census.zpd_events) +
-          ",\"zpd_addresses\":" + std::to_string(census.zpd_addresses.size()) +
-          ",\"cost_ns\":" + std::to_string(census.cost_ns);
-  line += ",\"overflow\":{\"surfaces\":" + std::to_string(census.overflow_surfaces) +
-          ",\"draw_states\":" + std::to_string(census.overflow_draw_states) +
-          ",\"textures\":" + std::to_string(census.overflow_textures) +
-          ",\"copies\":" + std::to_string(census.overflow_copies) + "}}\n";
-  census.out << line;
+  fmt::format_to(out,
+                 "],\"zpd_events\":{},\"zpd_addresses\":{},\"cost_ns\":{},"
+                 "\"overflow\":{{\"surfaces\":{},\"draw_states\":{},\"textures\":{},"
+                 "\"copies\":{}}}}}\n",
+                 census.zpd_events, census.zpd_addresses.size(), census.cost_ns,
+                 census.overflow_surfaces, census.overflow_draw_states,
+                 census.overflow_textures, census.overflow_copies);
+  census.out.write(line.data(), std::streamsize(line.size()));
   census.out.flush();
 
   census.window_open = false;
   census.draws = 0;
   census.surface_ids.clear();
-  census.surface_draws.clear();
+  census.surface_draws.fill(0);
   census.draw_states.clear();
   census.textures.clear();
   census.last_surface_valid = false;
+  census.last_draw_state = nullptr;
   census.fetch_cache = {};
   census.copies.clear();
   census.clears.clear();
@@ -413,13 +408,23 @@ void Fh1FrameCensus::ObserveDraw(const RegisterFile& regs, const Fh1CensusDraw& 
                          draw.used_texture_mask,
                          draw.memexport,
                          draw.occlusion_query};
-  auto state = census.draw_states.find(key);
-  if (state == census.draw_states.end() && census.draw_states.size() < kMaxDrawStates) {
-    state = census.draw_states.emplace(key, DrawStateCount{draw.pipeline_hash}).first;
+  DrawStateCount* state = nullptr;
+  if (census.last_draw_state && census.last_draw_state_key == key) {
+    state = census.last_draw_state;
+  } else {
+    auto it = census.draw_states.find(key);
+    if (it == census.draw_states.end() && census.draw_states.size() < kMaxDrawStates) {
+      it = census.draw_states.emplace(key, DrawStateCount{draw.pipeline_hash}).first;
+    }
+    if (it != census.draw_states.end()) {
+      state = &it->second;
+      census.last_draw_state = state;
+      census.last_draw_state_key = key;
+    }
   }
-  if (state != census.draw_states.end()) {
-    ++state->second.draws;
-    state->second.indices += draw.index_count;
+  if (state) {
+    ++state->draws;
+    state->indices += draw.index_count;
   } else {
     ++census.overflow_draw_states;
   }
