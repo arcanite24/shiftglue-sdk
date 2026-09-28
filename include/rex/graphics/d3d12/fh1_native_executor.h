@@ -105,6 +105,14 @@ class Fh1NativeExecutor {
   // bookkeeping, native front-buffer PPM dumps and periodic stats.
   void OnSwap(uint64_t frame, uint32_t frontbuffer_address, uint32_t width, uint32_t height,
               const uint32_t* gamma_pwl);
+  // fh1_native_gpu_profile: GPU time of texture cache loads (untile and copy),
+  // split by whether a GPU write (a resolve) invalidated the reloaded data.
+  // Begin returns UINT32_MAX when the profile is off or the frame is not
+  // measured; End ignores it.
+  uint32_t BeginTextureLoadGpuTiming() { return GpuBegin(); }
+  void EndTextureLoadGpuTiming(uint32_t begin, bool resolve_sourced) {
+    GpuEnd(resolve_sourced ? kGpuTextureReloads : kGpuTextureLoads, begin);
+  }
 
  private:
   // Same fields as the Xenos RenderTargetKey so the two can be compared.
@@ -421,7 +429,14 @@ class Fh1NativeExecutor {
   std::array<uint64_t, kCpuPhases> cpu_ns_{};
   uint64_t cpu_frames_ = 0;
   // Optional GPU timestamps around executor work (fh1_native_gpu_profile).
-  enum GpuPhase { kGpuTransfers, kGpuResolves, kGpuClears, kGpuPhases };
+  enum GpuPhase {
+    kGpuTransfers,
+    kGpuResolves,
+    kGpuClears,
+    kGpuTextureReloads,
+    kGpuTextureLoads,
+    kGpuPhases
+  };
   static constexpr uint32_t kGpuProfileSlots = 4;
   static constexpr uint32_t kGpuProfileQueries = 8192;
   struct GpuProfileSlot {

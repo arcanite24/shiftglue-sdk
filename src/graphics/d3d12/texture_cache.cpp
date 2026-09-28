@@ -1893,6 +1893,9 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   if (copy_buffer == nullptr) {
     return false;
   }
+  Fh1NativeExecutor* const gpu_profile_executor = command_processor_.GetFh1NativeExecutor();
+  const uint32_t load_gpu_timing =
+      gpu_profile_executor ? gpu_profile_executor->BeginTextureLoadGpuTiming() : UINT32_MAX;
 
   // Begin loading.
   // May use different buffers for scaled base and mips, and also addressability
@@ -2145,6 +2148,9 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   }
 
   command_processor_.ReleaseScratchGPUBuffer(copy_buffer, copy_buffer_state);
+  if (gpu_profile_executor) {
+    gpu_profile_executor->EndTextureLoadGpuTiming(load_gpu_timing, loading_resolve_sourced());
+  }
 
   command_processor_.AdvanceFh1GpuWorkTiming(texture_timing, true);
   return true;

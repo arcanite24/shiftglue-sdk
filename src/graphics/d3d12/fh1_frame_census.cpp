@@ -53,6 +53,7 @@ struct DrawStateKey {
   uint32_t guest_primitive, host_primitive, index_format;
   bool indexed;
   uint32_t depth_control, color_mask, stencil_ref_mask, color_control, mode_control;
+  uint32_t stencil_ref_mask_bf;
   std::array<uint32_t, 4> blend;
   uint32_t used_texture_mask;
   bool memexport, occlusion_query;
@@ -60,7 +61,7 @@ struct DrawStateKey {
     return std::tie(vertex_shader, pixel_shader, vertex_modification, pixel_modification,
                     surface, guest_primitive, host_primitive, index_format, indexed,
                     depth_control, color_mask, stencil_ref_mask, color_control, mode_control,
-                    blend, used_texture_mask, memexport, occlusion_query);
+                    stencil_ref_mask_bf, blend, used_texture_mask, memexport, occlusion_query);
   }
   bool operator==(const DrawStateKey& other) const { return tie() == other.tie(); }
 };
@@ -86,6 +87,7 @@ struct DrawStateKeyHash {
     hash.Add(key.depth_control | (uint64_t(key.color_mask) << 32));
     hash.Add(key.stencil_ref_mask | (uint64_t(key.color_control) << 32));
     hash.Add(key.mode_control | (uint64_t(key.used_texture_mask) << 32));
+    hash.Add(key.stencil_ref_mask_bf);
     for (uint32_t blend : key.blend) hash.Add(blend);
     hash.Add(uint64_t(key.indexed) | (uint64_t(key.memexport) << 1) |
              (uint64_t(key.occlusion_query) << 2));
@@ -253,13 +255,13 @@ void Flush(Census& census, uint64_t last_frame) {
                    "\"ps_mod\":\"{:016X}\",\"surface\":{},\"guest_primitive\":{},"
                    "\"host_primitive\":{},\"indexed\":{},\"index_format\":{},"
                    "\"depth_control\":\"{:08X}\",\"color_mask\":\"{:08X}\","
-                   "\"stencil_ref_mask\":\"{:08X}\",\"color_control\":\"{:08X}\","
-                   "\"mode_control\":\"{:08X}\",\"blend\":",
+                   "\"stencil_ref_mask\":\"{:08X}\",\"stencil_ref_mask_bf\":\"{:08X}\","
+                   "\"color_control\":\"{:08X}\",\"mode_control\":\"{:08X}\",\"blend\":",
                    first ? "" : ",", key.vertex_shader, key.pixel_shader,
                    key.vertex_modification, key.pixel_modification, key.surface,
                    key.guest_primitive, key.host_primitive, key.indexed, key.index_format,
-                   key.depth_control, key.color_mask, key.stencil_ref_mask, key.color_control,
-                   key.mode_control);
+                   key.depth_control, key.color_mask, key.stencil_ref_mask,
+                   key.stencil_ref_mask_bf, key.color_control, key.mode_control);
     AppendHexArray(line, key.blend);
     fmt::format_to(out,
                    ",\"textures\":\"{:08X}\",\"memexport\":{},\"occlusion_query\":{},"
@@ -404,6 +406,7 @@ void Fh1FrameCensus::ObserveDraw(const RegisterFile& regs, const Fh1CensusDraw& 
                          regs.Get<reg::RB_STENCILREFMASK>().value,
                          regs.Get<reg::RB_COLORCONTROL>().value,
                          regs.Get<reg::PA_SU_SC_MODE_CNTL>().value,
+                         regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF).value,
                          blend,
                          draw.used_texture_mask,
                          draw.memexport,

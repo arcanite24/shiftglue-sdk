@@ -242,7 +242,12 @@ class TextureCache {
     void CompleteLoad(const std::unique_lock<std::recursive_mutex>& global_lock,
                       bool load_base, bool load_mips);
 
-    void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
+    void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip,
+                       bool invalidated_by_gpu);
+    // Outdated bits whose last invalidation was a GPU write (a resolve).
+    uint32_t gpu_outdated_mask(const std::unique_lock<std::recursive_mutex>& global_lock) const {
+      return gpu_outdated_mask_;
+    }
 
     // For LRU caching - updates the last usage frame and moves the texture to
     // the end of the usage queue. Must be called any time the texture is
@@ -286,6 +291,7 @@ class TextureCache {
     // Whether the recent mip data needs reloading from the memory.
     bool mips_outdated_ = false;
     std::atomic<uint32_t> outdated_mask_{0};
+    uint32_t gpu_outdated_mask_ = 0;
     // Watch handles for the memory ranges.
     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
@@ -550,6 +556,9 @@ class TextureCache {
   // into the texture object.
   virtual bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                      bool load_mips) = 0;
+  // Whether the load in LoadTextureDataFromResidentMemoryImpl reloads data a
+  // GPU write (a resolve) invalidated, for profiling.
+  bool loading_resolve_sourced() const { return loading_resolve_sourced_; }
 
   // Converts a texture fetch constant to a texture key, normalizing and
   // validating the values, or creating an invalid key, and also gets the
@@ -579,6 +588,7 @@ class TextureCache {
     Texture* texture = nullptr;
     bool load_base = false;
     bool load_mips = false;
+    bool resolve_sourced = false;
   };
   struct PendingSharedMemoryRange {
     uint32_t start = 0;
@@ -648,6 +658,7 @@ class TextureCache {
   // so need to recheck if textures aren't outdated, disregarding whether fetch
   // constants have been changed.
   std::atomic<bool> texture_became_outdated_{false};
+  bool loading_resolve_sourced_ = false;
 
   std::array<TextureBinding, xenos::kTextureFetchConstantCount> texture_bindings_;
   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch

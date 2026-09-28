@@ -125,6 +125,11 @@ enum class CounterId : uint16_t {
   kFh1TitleThreadCpuTimeNs,
   kFh1GpuThreadCpuTimeNs,
 
+  // Texture reloads caused by GPU writes (resolves) to the texture's guest
+  // range, and the guest bytes they untile; append to preserve existing IDs.
+  kTextureResolveReloads,
+  kTextureResolveReloadBytes,
+
   kCount  // sentinel -- must be last
 };
 

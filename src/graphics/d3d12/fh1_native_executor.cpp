@@ -2599,9 +2599,10 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
     const double scale = 1000.0 / double(gpu_timestamp_frequency_) / double(gpu_frames_);
     REXGPU_INFO(
         "FH1 native executor gpu ms/frame over {} frames: transfers {:.3f} resolves {:.3f} "
-        "clears {:.3f}",
+        "clears {:.3f} texture_reloads {:.3f} texture_loads {:.3f}",
         gpu_frames_, gpu_ticks_[kGpuTransfers] * scale, gpu_ticks_[kGpuResolves] * scale,
-        gpu_ticks_[kGpuClears] * scale);
+        gpu_ticks_[kGpuClears] * scale, gpu_ticks_[kGpuTextureReloads] * scale,
+        gpu_ticks_[kGpuTextureLoads] * scale);
     gpu_ticks_ = {};
     gpu_frames_ = 0;
     std::vector<std::pair<uint64_t, std::string>> volume;

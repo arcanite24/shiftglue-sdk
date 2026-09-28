@@ -390,6 +390,7 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
 
   bool base_outdated = false;
   bool mips_outdated = false;
+  bool resolve_sourced = false;
   {
     auto global_lock = global_critical_region_.Acquire();
     if (outdated_mask & Texture::kOutdatedBitBase) {
@@ -398,6 +399,9 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
     if (outdated_mask & Texture::kOutdatedBitMips) {
       mips_outdated = texture.mips_outdated(global_lock);
     }
+    const uint32_t gpu_outdated_mask = texture.gpu_outdated_mask(global_lock);
+    resolve_sourced = (base_outdated && (gpu_outdated_mask & Texture::kOutdatedBitBase)) ||
+                      (mips_outdated && (gpu_outdated_mask & Texture::kOutdatedBitMips));
     // Arm before RequestRanges: CPU uploads may themselves race guest writes.
     texture.WatchPendingLoad(global_lock, base_outdated, mips_outdated);
   }
@@ -428,6 +432,7 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
   pending_load_out.texture = &texture;
   pending_load_out.load_base = base_outdated;
   pending_load_out.load_mips = mips_outdated;
+  pending_load_out.resolve_sourced = resolve_sourced;
   pending_range_count_out = 0;
 
   TextureKey texture_key = texture.key();
@@ -475,9 +480,18 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
     }
   }
 
-  if (!LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
-                                             pending_load.load_mips)) {
+  loading_resolve_sourced_ = pending_load.resolve_sourced;
+  const bool loaded = LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
+                                                            pending_load.load_mips);
+  loading_resolve_sourced_ = false;
+  if (!loaded) {
     return retry();
+  }
+  if (pending_load.resolve_sourced) {
+    PERF_counter_inc(kTextureResolveReloads);
+    PERF_counter_add(kTextureResolveReloadBytes,
+                     int64_t(pending_load.load_base ? texture.GetGuestBaseSize() : 0) +
+                         int64_t(pending_load.load_mips ? texture.GetGuestMipsSize() : 0));
   }
 
   // Only clear loaded ranges whose watches survived the entire upload. A write
@@ -767,11 +781,13 @@ void TextureCache::Texture::CompleteLoad(
   bool loaded = false;
   if (load_base && base_watch_handle_) {
     base_outdated_ = false;
+    gpu_outdated_mask_ &= ~kOutdatedBitBase;
     outdated_mask_.fetch_and(~kOutdatedBitBase, std::memory_order_release);
     loaded = true;
   }
   if (load_mips && mips_watch_handle_) {
     mips_outdated_ = false;
+    gpu_outdated_mask_ &= ~kOutdatedBitMips;
     outdated_mask_.fetch_and(~kOutdatedBitMips, std::memory_order_release);
     loaded = true;
   }
@@ -816,18 +832,24 @@ void TextureCache::Texture::MarkAsUsed() {
 }
 
 void TextureCache::Texture::WatchCallback(
-    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip) {
+    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip,
+    bool invalidated_by_gpu) {
+  const uint32_t bit = is_mip ? kOutdatedBitMips : kOutdatedBitBase;
   if (is_mip) {
     assert_not_zero(GetGuestMipsSize());
     mips_outdated_ = true;
     mips_watch_handle_ = nullptr;
-    outdated_mask_.fetch_or(kOutdatedBitMips, std::memory_order_release);
   } else {
     assert_not_zero(GetGuestBaseSize());
     base_outdated_ = true;
     base_watch_handle_ = nullptr;
-    outdated_mask_.fetch_or(kOutdatedBitBase, std::memory_order_release);
   }
+  if (invalidated_by_gpu) {
+    gpu_outdated_mask_ |= bit;
+  } else {
+    gpu_outdated_mask_ &= ~bit;
+  }
+  outdated_mask_.fetch_or(bit, std::memory_order_release);
 }
 
 void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
@@ -845,7 +867,7 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
         key.GetHeight(), uint32_t(key.format), argument ? "mips" : "base",
         invalidated_by_gpu, texture.allocation_id(), texture.payload_generation());
   }
-  texture.WatchCallback(global_lock, argument != 0);
+  texture.WatchCallback(global_lock, argument != 0, invalidated_by_gpu);
   texture.texture_cache().texture_became_outdated_.store(true, std::memory_order_release);
 }
 

@@ -69,6 +69,8 @@ class D3D12CommandProcessor : public CommandProcessor {
     return graphics_system_->shader_translation_observer();
   }
 
+  // The FH1 native executor, or null before initialization.
+  Fh1NativeExecutor* GetFh1NativeExecutor() const { return fh1_native_executor_.get(); }
   // Returns the deferred drawing command list for the currently open
   // submission.
   DeferredCommandList& GetDeferredCommandList() {
