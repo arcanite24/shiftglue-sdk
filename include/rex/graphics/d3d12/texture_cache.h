@@ -98,20 +98,7 @@ class D3D12TextureCache final : public TextureCache {
   // (notifying the command processor about that), so this must be called before
   // binding the actual drawing pipeline.
   void RequestTextures(uint32_t used_texture_mask) override;
-  void RequestFh1Textures(uint32_t used_texture_mask);
   void RequestFh1VideoTextures(uint32_t used_texture_mask);
-  bool GenerateFh1ReflectionMips(uint32_t base_address, uint32_t face);
-
-  struct Fh1ReflectionImportStats {
-    uint64_t loads = 0;
-    uint64_t direct_loads = 0;
-    uint64_t subresource_copies = 0;
-    uint64_t guest_bytes = 0;
-    uint64_t upload_bytes = 0;
-  };
-  const Fh1ReflectionImportStats& GetFh1ReflectionImportStats() const {
-    return fh1_reflection_import_stats_;
-  }
 
   // Returns whether texture SRV keys stored externally are still valid for the
   // current bindings and host shader binding layout. Both keys and
@@ -129,16 +116,6 @@ class D3D12TextureCache final : public TextureCache {
   void WriteActiveTextureBindfulSRV(const D3D12Shader::TextureBinding& host_shader_binding,
                                     D3D12_CPU_DESCRIPTOR_HANDLE handle);
   uint32_t GetActiveTextureBindlessSRVIndex(const D3D12Shader::TextureBinding& host_shader_binding);
-  system::GraphicsFinalDrawTextureIdentity GetActiveNativeTextureIdentity(
-      uint32_t fetch_constant) const;
-  bool SnapshotActiveNativeTexture(
-      uint32_t fetch_constant, uint64_t max_bytes,
-      Microsoft::WRL::ComPtr<ID3D12Resource>& source,
-      Microsoft::WRL::ComPtr<ID3D12Resource>& snapshot,
-      D3D12_SHADER_RESOURCE_VIEW_DESC& view, uint64_t& bytes);
-  bool CopyFh1Snr04Bc3Mips(
-      uint32_t fetch_constant, ID3D12Resource* readback,
-      const std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 9>& footprints);
 
   SamplerParameters GetSamplerParameters(const D3D12Shader::SamplerBinding& binding) const;
   void WriteSampler(SamplerParameters parameters, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
@@ -320,7 +297,6 @@ class D3D12TextureCache final : public TextureCache {
   };
 
   bool TryLoadTextureDataFromCpu(Texture& texture, bool load_base, bool load_mips) override;
-  bool request_fh1_bc3_ = false;
   bool request_fh1_video_ = false;
 
   static constexpr uint32_t kSRVDescriptorCachePageSize = 65536;
@@ -506,11 +482,6 @@ class D3D12TextureCache final : public TextureCache {
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kLoadShaderCount> load_pipelines_scaled_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> load_pipeline_fh1_scaled_32_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fh1_reflection_cube_import_pipeline_;
-  Microsoft::WRL::ComPtr<ID3D12RootSignature> fh1_mip_root_signature_;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> fh1_mip_pipeline_;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> fh1_mip_pipeline_1x_;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> fh1_mip_pipeline_3x_;
-  Fh1ReflectionImportStats fh1_reflection_import_stats_;
 
   std::vector<SRVDescriptorCachePage> srv_descriptor_cache_;
   uint32_t srv_descriptor_cache_allocated_;

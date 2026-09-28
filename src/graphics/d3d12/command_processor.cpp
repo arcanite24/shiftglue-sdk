@@ -1125,7 +1125,7 @@ bool D3D12CommandProcessor::SetupContext() {
       bindless_resources_used_);
   // The native executor owns EDRAM; the render target cache only provides the
   // host configuration the pipelines are built against.
-  if (!render_target_cache_->Initialize(true)) {
+  if (!render_target_cache_->Initialize()) {
     REXGPU_ERROR("Failed to initialize the render target cache");
     return false;
   }

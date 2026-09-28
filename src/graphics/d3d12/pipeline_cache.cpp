@@ -83,13 +83,6 @@ bool FirstMissingCatalogShader(uint64_t hash) {
 }
 }  // namespace
 
-// The handwritten shader substitutions are approximations of exact guest
-// programs. Manual FH1 coverage found foliage alpha corruption and missing UI
-// layers that the narrow automated routes did not expose. Keep the exact
-// precompiled pack bytecode authoritative.
-constexpr bool kFh1UseNativeWorldVertexShaders = false;
-constexpr bool kFh1UseNativeDepthMeshVertexShaders = false;
-
 #pragma pack(push, 1)
 struct Fh1ShaderAnalysisCatalogHeader {
   uint32_t magic;
@@ -286,67 +279,6 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/discrete_triangle_3cp_hs.h"
 #include "../shaders/bytecode/d3d12_5_1/float24_round_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/float24_truncate_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_world_lit_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_packed_world_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_packed_world_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_shadow_mask_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_shadow_mask_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_position_color_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_position_only_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_passthrough_early_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_passthrough_early_centroid_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_shadow_mask_owned_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_shadow_mask_1x_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_shadow_26eb_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_shadow_26eb_1x_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_shadow_22da_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_shadow_22da_1x_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_shadow_8418_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_shadow_8418_1x_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_shadow_1182_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_shadow_1182_1x_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_shadow_26c4_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_shadow_26c4_1x_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_shadow_fcdf_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_shadow_fcdf_1x_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_packed_world_blend_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_world_material_b985_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_world_material_c0e2_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_world_material_d96c_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_world_material_b1f8_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_world_material_e163_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_world_material_ef18_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_packed_world_blend_y_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_packed_world_owned_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_blended_lit_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_blended_scene_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_lit_scene_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_skinned_scene_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_skinned_scene_owned_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_video_color_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_postprocess_center_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_rms_downsample_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_lit_scene_owned_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_blended_scene_owned_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_lit_scene_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_blended_lit_fixed_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_lit_scene_fixed_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_layered_scene_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_layered_lit_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_world_lit_uv2_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_depth_mesh_stride20_owned_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_depth_mesh_stride24_owned_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_depth_mesh_stride28_owned_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_depth_mesh_stride32_owned_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_depth_mesh_stride20_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_depth_mesh_stride24_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_depth_mesh_stride28_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_depth_mesh_stride32_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_terrain_depth_standard_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_terrain_depth_offset_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_terrain_depth_standard_owned_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_terrain_depth_offset_owned_vs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_constant_position_vs.h"
 #include "../shaders/bytecode/d3d12_5_1/tessellation_adaptive_vs.h"
 #include "../shaders/bytecode/d3d12_5_1/tessellation_indexed_vs.h"
 }  // namespace shaders
@@ -643,14 +575,10 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
         if (line.size() == 18 && line[1] == ' ') {
           char* end = nullptr;
           const uint64_t hash = std::strtoull(line.c_str() + 2, &end, 16);
-          if (end == line.c_str() + line.size()) {
-            if (line[0] == 'P') {
-              allowed_pipelines.insert(hash);
-            } else if (line[0] == 'D') {
-              fh1_execution_allowlist_.insert(hash);
-            } else if (line[0] == 'C') {
-              fh1_copy_allowlist_.insert(hash);
-            }
+          // Draw (D) and copy (C) execution keys admitted the removed Xenos
+          // renderer; only the pipeline (P) selection is still consumed.
+          if (end == line.c_str() + line.size() && line[0] == 'P') {
+            allowed_pipelines.insert(hash);
           }
         }
       }
@@ -671,26 +599,13 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
         REXGPU_ERROR("FH1 prewarm catalog is missing requested pipelines ({} selected, {} requested)",
                      fh1_pipeline_prewarm_descriptions.size(), requested_count);
       }
-      REXGPU_INFO(
-          "FH1 V4 prewarm selected {} of {} stored pipelines; admitted {} "
-          "draw and {} copy keys",
-          pipeline_prewarm_descriptions->size(), stored_count,
-          fh1_execution_allowlist_.size(), fh1_copy_allowlist_.size());
+      REXGPU_INFO("FH1 V4 prewarm selected {} of {} stored pipelines",
+                  pipeline_prewarm_descriptions->size(), stored_count);
     }
   }
 
-  // Retain a legacy variant if any selected non-native pipeline needs it.
+  // Translate every shader variant the selected pipelines need.
   for (const PipelineStoredDescription& stored : *pipeline_prewarm_descriptions) {
-#if !defined(REXGPU_FH1_SHADER_PRODUCER)
-    if ((stored.description.vertex_shader_hash == 0x6934E161812AB10Bull ||
-         stored.description.vertex_shader_hash == 0xA3B9ED5D5C87230Eull ||
-         stored.description.vertex_shader_hash == 0x1E6883FCCDE1F688ull) &&
-        IsFh1NativeScenePipeline(stored.description)) continue;
-#endif
-#if !defined(REXGPU_FH1_SHADER_PRODUCER)
-    if (!IsFh1NativeStandaloneVertex(stored.description.vertex_shader_hash,
-                               stored.description.vertex_shader_modification))
-#endif
     shader_translations_needed.emplace(stored.description.vertex_shader_hash,
                                        stored.description.vertex_shader_modification);
     if (stored.description.pixel_shader_hash) {
@@ -839,19 +754,6 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
     if (!analysis_catalog_valid || shader_it == shaders_.end()) {
       analysis_catalog_valid = false;
       break;
-    }
-    // Native velocity and scene stages supply their own bindings.
-    // Keep guest bytecode in the pack for lazy fallback and unqualified states.
-    // Layered PS 9584B309533EF6C9 remains shared by unqualified vertex families.
-    if (bindless_resources_used_ &&
-        (shader_hash == 0xECE830AC0333767Full || shader_hash == 0x8D8A197476841A9Aull ||
-         shader_hash == 0xBA6A2871A980A4E8ull || shader_hash == 0xAD2C355A6BE1EE87ull ||
-         shader_hash == 0x2F2137BF953DA7AFull || shader_hash == 0x3BC346726C1C2535ull ||
-         shader_hash == 0xC8C39E5AE1B08DE6ull || shader_hash == 0x9BF2991815B941B9ull ||
-         shader_hash == 0xB646F85EF69A57E0ull || shader_hash == 0xD0C40C04F166092Eull ||
-         shader_hash == 0x5A28C7FAFD86F112ull || shader_hash == 0xCA293E0A1CB4B416ull ||
-         shader_hash == 0x4E1DA281CC3D7EDBull || shader_hash == 0xB6C9863F710683ECull)) {
-      continue;
     }
     auto* translation = static_cast<D3D12Shader::D3D12Translation*>(
         shader_it->second->GetOrCreateTranslation(modification));
@@ -1387,9 +1289,6 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
         continue;
       }
 
-      const bool native_scene = IsFh1NativeScenePipeline(pipeline_description);
-      const bool native_vertex = native_scene || IsFh1NativeStandaloneVertex(
-          pipeline_description.vertex_shader_hash, pipeline_description.vertex_shader_modification);
       PipelineRuntimeDescription pipeline_runtime_description;
       auto vertex_shader_it = shaders_.find(pipeline_description.vertex_shader_hash);
       if (vertex_shader_it == shaders_.end()) {
@@ -1397,12 +1296,10 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       }
       D3D12Shader* vertex_shader = vertex_shader_it->second;
       pipeline_runtime_description.vertex_shader = static_cast<D3D12Shader::D3D12Translation*>(
-          (native_vertex
-               ? vertex_shader->GetOrCreateTranslation(pipeline_description.vertex_shader_modification)
-               : vertex_shader->GetTranslation(pipeline_description.vertex_shader_modification)));
+          vertex_shader->GetTranslation(pipeline_description.vertex_shader_modification));
       if (!pipeline_runtime_description.vertex_shader ||
-          (!native_vertex && (!pipeline_runtime_description.vertex_shader->is_translated() ||
-                             !pipeline_runtime_description.vertex_shader->is_valid()))) {
+          !pipeline_runtime_description.vertex_shader->is_translated() ||
+          !pipeline_runtime_description.vertex_shader->is_valid()) {
         continue;
       }
       D3D12Shader* pixel_shader;
@@ -1413,25 +1310,15 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
         }
         pixel_shader = pixel_shader_it->second;
         pipeline_runtime_description.pixel_shader = static_cast<D3D12Shader::D3D12Translation*>(
-            (native_scene
-                 ? pixel_shader->GetOrCreateTranslation(pipeline_description.pixel_shader_modification)
-                 : pixel_shader->GetTranslation(pipeline_description.pixel_shader_modification)));
+            pixel_shader->GetTranslation(pipeline_description.pixel_shader_modification));
         if (!pipeline_runtime_description.pixel_shader ||
-            (!native_scene && (!pipeline_runtime_description.pixel_shader->is_translated() ||
-                               !pipeline_runtime_description.pixel_shader->is_valid()))) {
+            !pipeline_runtime_description.pixel_shader->is_translated() ||
+            !pipeline_runtime_description.pixel_shader->is_valid()) {
           continue;
         }
       } else {
         pixel_shader = nullptr;
         pipeline_runtime_description.pixel_shader = nullptr;
-      }
-      // Prewarm qualified native PSOs without materializing either guest binary.
-      if (native_scene && !PrepareFh1SceneBindings(*vertex_shader, pixel_shader)) {
-        continue;
-      }
-      if (native_vertex && !native_scene) {
-        if (!vertex_shader->LoadPrecompiledBindings({}, {}, 0)) continue;
-        SetupShaderBindingLayouts(*vertex_shader);
       }
       GeometryShaderKey pipeline_geometry_shader_key;
       pipeline_runtime_description.geometry_shader =
@@ -1526,6 +1413,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
     }
 
     if (title_id == 0x4D5309C9 && fh1_prewarm_manifest_loaded_) {
+      std::unordered_set<uint64_t> prewarmed_pipelines;
       for (const PipelineStoredDescription& stored :
            *pipeline_prewarm_descriptions) {
         const auto found = pipelines_.equal_range(stored.description_hash);
@@ -1533,13 +1421,12 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
           if (!std::memcmp(&it->second->description.description,
                            &stored.description, sizeof(stored.description)) &&
               it->second->state.load(std::memory_order_acquire)) {
-            fh1_prewarmed_pipeline_allowlist_.insert(stored.description_hash);
+            prewarmed_pipelines.insert(stored.description_hash);
             break;
           }
         }
       }
-      REXGPU_INFO("FH1 V4 verified {} prewarmed pipelines",
-                  fh1_prewarmed_pipeline_allowlist_.size());
+      REXGPU_INFO("FH1 V4 verified {} prewarmed pipelines", prewarmed_pipelines.size());
     }
 
     REXGPU_INFO(
@@ -1636,9 +1523,6 @@ void PipelineCache::ShutdownShaderStorage() {
 
   shader_storage_cache_root_.clear();
   shader_storage_title_id_ = 0;
-  fh1_execution_allowlist_.clear();
-  fh1_copy_allowlist_.clear();
-  fh1_prewarmed_pipeline_allowlist_.clear();
   fh1_prewarm_manifest_loaded_ = false;
   fh1_runtime_shader_translations_.store(0, std::memory_order_relaxed);
   fh1_runtime_sync_pipeline_creations_.store(0, std::memory_order_relaxed);
@@ -1822,159 +1706,6 @@ DxbcShaderTranslator::Modification PipelineCache::GetCurrentPixelShaderModificat
   return modification;
 }
 
-bool PipelineCache::GetNativeDrawPipelineDescriptionHash(
-    D3D12Shader::D3D12Translation* vertex_shader,
-    D3D12Shader::D3D12Translation* pixel_shader,
-    const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
-    reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
-    uint32_t bound_render_target_bits, const uint32_t* bound_render_target_formats,
-    uint64_t& hash_out, bool native_shader_bindings) {
-  if (!vertex_shader->shader().is_ucode_analyzed() ||
-      (pixel_shader && !pixel_shader->shader().is_ucode_analyzed())) {
-    return false;
-  }
-  if (!native_shader_bindings &&
-      (!vertex_shader->is_translated() || !vertex_shader->is_valid() ||
-       (pixel_shader && (!pixel_shader->is_translated() || !pixel_shader->is_valid())))) {
-    return false;
-  }
-  PipelineRuntimeDescription runtime_description;
-  if (!GetCurrentStateDescription(
-          vertex_shader, pixel_shader, primitive_processing_result,
-          normalized_depth_control, normalized_color_mask, bound_render_target_bits,
-          bound_render_target_formats, runtime_description, native_shader_bindings)) {
-    return false;
-  }
-  hash_out = XXH3_64bits(&runtime_description.description,
-                       sizeof(runtime_description.description));
-  return true;
-}
-
-std::span<const uint32_t> PipelineCache::GetFh1PackedWorldTextureFetches(uint64_t hash) {
-  static constexpr uint32_t fetches_6B97D48A7336AB24[] = {5, 7, 13, 1, 0, 2};
-  static constexpr uint32_t fetches_A2C1F872E049AD8B[] = {6, 7, 13, 2, 5, 1, 0};
-  static constexpr uint32_t fetches_B1F8F94927415BED[] = {0, 13};
-  static constexpr uint32_t fetches_B98566FB7CE14699[] = {6, 13, 2, 5, 1, 0};
-  static constexpr uint32_t fetches_C0E286228970074D[] = {2, 0, 13};
-  static constexpr uint32_t fetches_D96CCDCC3F783790[] = {13, 0};
-  static constexpr uint32_t fetches_E163D0BE1C2F9775[] = {5, 13, 1, 0, 2};
-  switch (hash) {
-    case 0x6B97D48A7336AB24ull: return fetches_6B97D48A7336AB24;
-    case 0xA2C1F872E049AD8Bull: return fetches_A2C1F872E049AD8B;
-    case 0xB1F8F94927415BEDull: return fetches_B1F8F94927415BED;
-    case 0xB98566FB7CE14699ull: return fetches_B98566FB7CE14699;
-    case 0xC0E286228970074Dull: return fetches_C0E286228970074D;
-    case 0xD96CCDCC3F783790ull: return fetches_D96CCDCC3F783790;
-    case 0xE163D0BE1C2F9775ull: return fetches_E163D0BE1C2F9775;
-    case 0xEF18394497BDC2A6ull: return fetches_E163D0BE1C2F9775;
-    case 0xFF096DC71B188012ull: return fetches_6B97D48A7336AB24;
-    default: return {};
-  }
-}
-
-bool PipelineCache::IsFh1NativeShadowVertex(uint64_t hash, uint64_t modification) const {
-  return hash == 0xA3B9ED5D5C87230Eull && modification == 0x1ull &&
-      bindless_resources_used_ &&
-      render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
-      (render_target_cache_.draw_resolution_scale_x() == 1 ||
-       render_target_cache_.draw_resolution_scale_x() == 2) &&
-      render_target_cache_.draw_resolution_scale_y() == render_target_cache_.draw_resolution_scale_x();
-}
-
-bool PipelineCache::IsFh1NativeStandaloneVertex(uint64_t hash, uint64_t modification) const {
-  // The native executor draws the translated guest shaders, at runtime and
-  // when prewarming catalog pipelines.
-  (void)hash;
-  (void)modification;
-  return false;
-}
-
-bool PipelineCache::IsFh1NativeShadowPipeline(const PipelineDescription& description) const {
-  return IsFh1NativeShadowVertex(description.vertex_shader_hash, description.vertex_shader_modification) &&
-      (description.pixel_shader_hash == 0x93626E75D17576C5ull ||
-       description.pixel_shader_hash == 0x26EB620936001876ull ||
-       description.pixel_shader_hash == 0x22DA22B5639EBAE4ull ||
-       description.pixel_shader_hash == 0x8418C40F121D7EA7ull ||
-       description.pixel_shader_hash == 0x11824C2EC1B156C6ull ||
-       description.pixel_shader_hash == 0x26C4FD34AECBE4DEull ||
-       description.pixel_shader_hash == 0xFCDF9BE8C57F7D01ull) &&
-      description.pixel_shader_modification == 0x0000400300000001ull;
-}
-
-bool PipelineCache::IsFh1NativePositionPipeline(const PipelineDescription& description) const {
-  return description.vertex_shader_hash == 0x1E6883FCCDE1F688ull &&
-      description.vertex_shader_modification == 1ull &&
-      IsFh1NativeStandaloneVertex(description.vertex_shader_hash, description.vertex_shader_modification) &&
-      description.pixel_shader_hash == 0xA4A965C189287B99ull &&
-      (description.pixel_shader_modification == 0x0000400000000001ull ||
-       description.pixel_shader_modification == 0x0000400000010001ull);
-}
-
-bool PipelineCache::IsFh1NativeScenePipeline(const PipelineDescription& description) const {
-  // The native executor replays the pack's translated shaders.
-  (void)description;
-  return false;
-}
-
-bool PipelineCache::PrepareFh1SceneBindings(D3D12Shader& vertex, D3D12Shader* pixel) {
-  static constexpr D3D12Shader::TextureBinding textures[] = {
-      {2, 0, xenos::FetchOpDimension::k2D, false},
-      {3, 0, xenos::FetchOpDimension::k2D, true}};
-  static constexpr D3D12Shader::SamplerBinding samplers[] = {
-      {1, 0, xenos::TextureFilter::kUseFetchConst, xenos::TextureFilter::kUseFetchConst,
-       xenos::TextureFilter::kUseFetchConst, xenos::AnisoFilter::kUseFetchConst}};
-  if (!vertex.LoadPrecompiledBindings({}, {}, 0)) return false;
-  if (pixel && vertex.ucode_data_hash() == 0x1E6883FCCDE1F688ull) {
-    if (pixel->ucode_data_hash() != 0xA4A965C189287B99ull ||
-        !pixel->LoadPrecompiledBindings({}, {}, 0)) return false;
-    SetupShaderBindingLayouts(vertex);
-    SetupShaderBindingLayouts(*pixel);
-    return true;
-  }
-  if (pixel && vertex.ucode_data_hash() == 0xA3B9ED5D5C87230Eull) {
-    if (pixel->ucode_data_hash() != 0x93626E75D17576C5ull &&
-        pixel->ucode_data_hash() != 0x26EB620936001876ull &&
-        pixel->ucode_data_hash() != 0x22DA22B5639EBAE4ull &&
-        pixel->ucode_data_hash() != 0x8418C40F121D7EA7ull &&
-        pixel->ucode_data_hash() != 0x11824C2EC1B156C6ull &&
-        pixel->ucode_data_hash() != 0x26C4FD34AECBE4DEull &&
-        pixel->ucode_data_hash() != 0xFCDF9BE8C57F7D01ull) return false;
-    static constexpr D3D12Shader::TextureBinding shadow_textures[] = {
-        {2, 0, xenos::FetchOpDimension::k2D, false},
-        {3, 0, xenos::FetchOpDimension::k2D, true},
-        {5, 1, xenos::FetchOpDimension::k2D, false},
-        {6, 1, xenos::FetchOpDimension::k2D, true}};
-    static constexpr D3D12Shader::SamplerBinding shadow_samplers[] = {
-        {1, 0, xenos::TextureFilter::kPoint, xenos::TextureFilter::kPoint,
-         xenos::TextureFilter::kPoint, xenos::AnisoFilter::kDisabled},
-        {4, 1, xenos::TextureFilter::kUseFetchConst, xenos::TextureFilter::kUseFetchConst,
-         xenos::TextureFilter::kUseFetchConst, xenos::AnisoFilter::kDisabled}};
-    if (!pixel->LoadPrecompiledBindings(shadow_textures, shadow_samplers, 3)) return false;
-  } else if (pixel && vertex.ucode_data_hash() == 0x6934E161812AB10Bull) {
-    const auto fetches = GetFh1PackedWorldTextureFetches(pixel->ucode_data_hash());
-    if (fetches.empty()) return false;
-    std::array<D3D12Shader::TextureBinding, 14> packed_textures{};
-    std::array<D3D12Shader::SamplerBinding, 7> packed_samplers{};
-    uint32_t used_mask = 0;
-    for (uint32_t i = 0; i < fetches.size(); ++i) {
-      packed_textures[2 * i] = {2 + 3 * i, fetches[i], xenos::FetchOpDimension::k2D, false};
-      packed_textures[2 * i + 1] = {3 + 3 * i, fetches[i], xenos::FetchOpDimension::k2D, true};
-      packed_samplers[i] = {1 + 3 * i, fetches[i], xenos::TextureFilter::kUseFetchConst,
-          xenos::TextureFilter::kUseFetchConst, xenos::TextureFilter::kUseFetchConst,
-          xenos::AnisoFilter::kUseFetchConst};
-      used_mask |= 1u << fetches[i];
-    }
-    if (!pixel->LoadPrecompiledBindings(
-            {packed_textures.data(), 2 * fetches.size()},
-            {packed_samplers.data(), fetches.size()}, used_mask)) return false;
-  } else if (pixel && !pixel->LoadPrecompiledBindings(textures, samplers, 1)) {
-    return false;
-  }
-  SetupShaderBindingLayouts(vertex);
-  if (pixel) SetupShaderBindingLayouts(*pixel);
-  return true;
-}
-
 bool PipelineCache::ConfigurePipeline(
     D3D12Shader::D3D12Translation* vertex_shader, D3D12Shader::D3D12Translation* pixel_shader,
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
@@ -1992,37 +1723,7 @@ bool PipelineCache::ConfigurePipeline(
   bool use_async = REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() &&
                    pixel_shader != nullptr;
 
-  // Qualified native stages supply their own bindings before any guest bytecode load.
   PipelineRuntimeDescription runtime_description;
-  bool native_scene = false;
-  const bool native_standalone_vertex = IsFh1NativeStandaloneVertex(
-      vertex_shader->shader().ucode_data_hash(), vertex_shader->modification());
-  if ((pixel_shader &&
-      (vertex_shader->shader().ucode_data_hash() == 0x1E6883FCCDE1F688ull ||
-       vertex_shader->shader().ucode_data_hash() == 0xA3B9ED5D5C87230Eull ||
-       vertex_shader->shader().ucode_data_hash() == 0x6934E161812AB10Bull ||
-       vertex_shader->shader().ucode_data_hash() == 0x8D8A197476841A9Aull ||
-       vertex_shader->shader().ucode_data_hash() == 0xAD2C355A6BE1EE87ull ||
-       vertex_shader->shader().ucode_data_hash() == 0x3BC346726C1C2535ull)) ||
-      (!pixel_shader && (vertex_shader->shader().ucode_data_hash() == 0xC8C39E5AE1B08DE6ull ||
-                         vertex_shader->shader().ucode_data_hash() == 0x9BF2991815B941B9ull ||
-                         vertex_shader->shader().ucode_data_hash() == 0xB646F85EF69A57E0ull ||
-                         vertex_shader->shader().ucode_data_hash() == 0xD0C40C04F166092Eull ||
-                         vertex_shader->shader().ucode_data_hash() == 0x5A28C7FAFD86F112ull ||
-                         vertex_shader->shader().ucode_data_hash() == 0xCA293E0A1CB4B416ull ||
-                         vertex_shader->shader().ucode_data_hash() == 0x4E1DA281CC3D7EDBull ||
-                         vertex_shader->shader().ucode_data_hash() == 0xB6C9863F710683ECull))) {
-    native_scene = GetCurrentStateDescription(
-        vertex_shader, pixel_shader, primitive_processing_result, normalized_depth_control,
-        normalized_color_mask, bound_depth_and_color_render_target_bits,
-        bound_depth_and_color_render_target_formats, runtime_description, true) &&
-        IsFh1NativeScenePipeline(runtime_description.description);
-    if (native_scene && vertex_shader->shader().ucode_data_hash() != 0x6934E161812AB10Bull &&
-        vertex_shader->shader().ucode_data_hash() != 0xA3B9ED5D5C87230Eull &&
-        vertex_shader->shader().ucode_data_hash() != 0x1E6883FCCDE1F688ull) {
-      use_async = false;
-    }
-  }
 
   // Ensure shaders are translated - needed now for GetCurrentStateDescription.
   // Edge flags are not supported yet (because polygon primitives are not).
@@ -2045,7 +1746,7 @@ bool PipelineCache::ConfigurePipeline(
     return false;
 #endif
   }
-  if (!native_scene && !native_standalone_vertex && !vertex_shader->is_translated() && !use_async) {
+  if (!vertex_shader->is_translated() && !use_async) {
     std::lock_guard<std::mutex> lock(translation_request_lock_);
     if (!vertex_shader->is_translated()) {
       if (!TranslateAnalyzedShader(
@@ -2074,12 +1775,12 @@ bool PipelineCache::ConfigurePipeline(
 #endif
     }
   }
-  if (!native_scene && !native_standalone_vertex && !use_async && !vertex_shader->is_valid()) {
+  if (!use_async && !vertex_shader->is_valid()) {
     // Translation attempted previously, but not valid.
     return false;
   }
   if (pixel_shader != nullptr) {
-    if (!native_scene && !pixel_shader->is_translated() && !use_async) {
+    if (!pixel_shader->is_translated() && !use_async) {
       std::lock_guard<std::mutex> lock(translation_request_lock_);
       if (!pixel_shader->is_translated()) {
 #if defined(REXGPU_FH1_SHADER_PRODUCER)
@@ -2119,15 +1820,15 @@ bool PipelineCache::ConfigurePipeline(
 #endif
       }
     }
-    if (!native_scene && pixel_shader->is_translated() && !pixel_shader->is_valid()) {
+    if (pixel_shader->is_translated() && !pixel_shader->is_valid()) {
       return false;
     }
   }
 
-  if (!native_scene && !GetCurrentStateDescription(
+  if (!GetCurrentStateDescription(
           vertex_shader, pixel_shader, primitive_processing_result, normalized_depth_control,
           normalized_color_mask, bound_depth_and_color_render_target_bits,
-          bound_depth_and_color_render_target_formats, runtime_description, use_async || native_standalone_vertex)) {
+          bound_depth_and_color_render_target_formats, runtime_description, use_async)) {
     return false;
   }
   PipelineDescription& description = runtime_description.description;
@@ -2154,22 +1855,10 @@ bool PipelineCache::ConfigurePipeline(
   }
   PROFILE_PIPELINE_CACHE_MISS();
 
-  if (native_scene && !PrepareFh1SceneBindings(
-          static_cast<D3D12Shader&>(vertex_shader->shader()),
-          pixel_shader ? &static_cast<D3D12Shader&>(pixel_shader->shader()) : nullptr)) {
-    return false;
-  }
-
-  if (native_standalone_vertex && !native_scene) {
-    auto& vertex = static_cast<D3D12Shader&>(vertex_shader->shader());
-    if (!vertex.LoadPrecompiledBindings({}, {}, 0)) return false;
-    SetupShaderBindingLayouts(vertex);
-  }
-
   // A cached pipeline already owns these objects and its immutable binding layout.
   runtime_description.root_signature = command_processor_.GetRootSignature(
       static_cast<const DxbcShader*>(&vertex_shader->shader()),
-      (pixel_shader && (!use_async || native_scene))
+      (pixel_shader && !use_async)
           ? static_cast<const DxbcShader*>(&pixel_shader->shader())
           : nullptr,
       primitive_processing_result.IsTessellated());
@@ -2202,8 +1891,8 @@ bool PipelineCache::ConfigurePipeline(
                                             : normalized_depth_control.z_write_enable != 0;
     new_pipeline->priority = pipeline_util::CalculatePipelinePriority(
         bound_rts, shader_writes_color_targets, shader_writes_depth);
-    new_pipeline->pending_vertex_shader = (native_scene || native_standalone_vertex) ? nullptr : vertex_shader;
-    new_pipeline->pending_pixel_shader = native_scene ? nullptr : pixel_shader;
+    new_pipeline->pending_vertex_shader = vertex_shader;
+    new_pipeline->pending_pixel_shader = pixel_shader;
     // Submit the pipeline for creation to any available thread.
     {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
@@ -2244,36 +1933,6 @@ uint64_t PipelineCache::GetPipelineDescriptionHash(void* handle) const {
   const Pipeline& pipeline = *reinterpret_cast<const Pipeline*>(handle);
   return XXH3_64bits(&pipeline.description.description,
                      sizeof(pipeline.description.description));
-}
-
-bool PipelineCache::IsFh1ClearPipeline(void* handle) const {
-  if (!handle) return false;
-  const auto& d = reinterpret_cast<const Pipeline*>(handle)->description.description;
-  if (d.vertex_shader_hash != 0x1E6883FCCDE1F688ull ||
-      !IsFh1NativeStandaloneVertex(d.vertex_shader_hash, d.vertex_shader_modification) ||
-      (d.pixel_shader_hash ? !IsFh1NativePositionPipeline(d) : d.vertex_shader_modification != 0) ||
-      d.geometry_shader != PipelineGeometryShader::kRectangleList ||
-      d.cull_mode != PipelineCullMode::kNone || d.fill_mode_wireframe || d.depth_clip ||
-      d.depth_bias || d.depth_bias_slope_scaled != 0 ||
-      d.depth_func != xenos::CompareFunction::kAlways ||
-      (d.host_msaa_samples == xenos::MsaaSamples::k2X && !render_target_cache_.msaa_2x_supported())) return false;
-  if (d.stencil_enable && (d.stencil_write_mask != 255 ||
-      d.stencil_front_func != xenos::CompareFunction::kAlways ||
-      d.stencil_back_func != xenos::CompareFunction::kAlways ||
-      d.stencil_front_pass_op != xenos::StencilOp::kReplace ||
-      d.stencil_back_pass_op != xenos::StencilOp::kReplace)) return false;
-  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
-    const auto& t = d.render_targets[i];
-    if (!t.used || !t.write_mask) continue;
-    if (i || t.write_mask != 15 ||
-        (t.format != xenos::ColorRenderTargetFormat::k_8_8_8_8 &&
-         t.format != xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT &&
-         t.format != xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT) ||
-        t.src_blend != PipelineBlendFactor::kOne || t.dest_blend != PipelineBlendFactor::kZero ||
-        t.src_blend_alpha != PipelineBlendFactor::kOne || t.dest_blend_alpha != PipelineBlendFactor::kZero ||
-        t.blend_op != xenos::BlendOp::kAdd || t.blend_op_alpha != xenos::BlendOp::kAdd) return false;
-  }
-  return true;
 }
 
 // Named <stage>-<ucode hash>-<modification>.bin and holding the guest
@@ -4018,113 +3677,10 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
 
   D3D12_GRAPHICS_PIPELINE_STATE_DESC state_desc;
   std::memset(&state_desc, 0, sizeof(state_desc));
-  // Hand-written FH1 family replacements for guest shaders. Off: the FH1
-  // native executor replays the pack's translated shaders.
-  constexpr bool fh1_families = false;
-  // This straight-line program preserves the seven-interpolator guest variant.
-  const bool fh1_shadow_mask_pixel = fh1_families &&
-      IsFh1NativeShadowPipeline(description);
-  const bool fh1_shadow_vertex = fh1_families &&
-      IsFh1NativeShadowVertex(
-      description.vertex_shader_hash, description.vertex_shader_modification);
-  const bool fh1_standalone_vertex = fh1_families &&
-      IsFh1NativeStandaloneVertex(
-      description.vertex_shader_hash, description.vertex_shader_modification);
-  const bool fh1_position_vertex = fh1_standalone_vertex &&
-      description.vertex_shader_hash == 0x1E6883FCCDE1F688ull;
-  // Qualified title/video pixel variant; preserve the original vertex bindings.
-  const bool fh1_video_pixel = fh1_families &&
-      bindless_resources_used_ &&
-      description.vertex_shader_hash == 0x7156CE05C6365E51ull &&
-      description.vertex_shader_modification == 1ull &&
-      description.pixel_shader_hash == 0x31511D87CC0C94B9ull &&
-      description.pixel_shader_modification == 1ull &&
-      render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
-      (render_target_cache_.draw_resolution_scale_x() == 1 ||
-       render_target_cache_.draw_resolution_scale_x() == 2) &&
-      render_target_cache_.draw_resolution_scale_y() == render_target_cache_.draw_resolution_scale_x();
-  // Experimental blur reduction; disabled until live motion/performance checks.
-  const bool fh1_postprocess_center = false && bindless_resources_used_ &&
-      description.vertex_shader_hash == 0x20A41D46F34D238Eull &&
-      description.vertex_shader_modification == 7ull &&
-      description.pixel_shader_hash == 0x614588022744BF6Bull &&
-      description.pixel_shader_modification == 0x0000400000000007ull &&
-      render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
-      render_target_cache_.draw_resolution_scale_x() == 2 &&
-      render_target_cache_.draw_resolution_scale_y() == 2;
-  // Byte-exact RMS reference with live binding and 1x/2x non-regression checks.
-  const bool fh1_rms_downsample = fh1_families &&
-      bindless_resources_used_ &&
-      description.vertex_shader_hash == 0x2C53E1A563484076ull &&
-      description.vertex_shader_modification == 1ull &&
-      description.pixel_shader_hash == 0xE17BECBE8BE65806ull &&
-      description.pixel_shader_modification == 0x0000400000000001ull &&
-      render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
-      (render_target_cache_.draw_resolution_scale_x() == 1 ||
-       render_target_cache_.draw_resolution_scale_x() == 2) &&
-      render_target_cache_.draw_resolution_scale_y() ==
-          render_target_cache_.draw_resolution_scale_x();
-  const bool fh1_shadow_geometry = fh1_shadow_vertex &&
-      !runtime_description.vertex_shader->shader().memexport_eM_written() &&
-      (!runtime_description.pixel_shader ||
-       !runtime_description.pixel_shader->shader().memexport_eM_written());
-  const bool fh1_packed_world_vertex = fh1_families &&
-      description.vertex_shader_hash == 0x6934E161812AB10Bull &&
-      description.vertex_shader_modification == 0x7Full &&
-      render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets;
-  const bool fh1_packed_world_geometry = fh1_packed_world_vertex && bindless_resources_used_ &&
-      !runtime_description.vertex_shader->shader().memexport_eM_written() &&
-      (!runtime_description.pixel_shader ||
-       !runtime_description.pixel_shader->shader().memexport_eM_written());
-  const bool fh1_world_lit_vertex = fh1_families &&
-      kFh1UseNativeWorldVertexShaders && runtime_description.pixel_shader &&
-      runtime_description.vertex_shader->shader().ucode_data_hash() ==
-          0x79034645B1CB882Bull &&
-      runtime_description.pixel_shader->shader().ucode_data_hash() ==
-          0xCAE1DB68AFFA9D3Cull;
-  const bool fh1_world_lit_uv2_vertex = fh1_families &&
-      kFh1UseNativeWorldVertexShaders && runtime_description.pixel_shader &&
-      runtime_description.vertex_shader->shader().ucode_data_hash() ==
-          0x984DBF6AF14DBEBDull &&
-      runtime_description.pixel_shader->shader().ucode_data_hash() ==
-          0x6FDA0F1CDE67D12Full;
-  const uint64_t fh1_vertex_shader_hash =
-      runtime_description.vertex_shader->shader().ucode_data_hash();
-  const bool fh1_depth_mesh_vertex = fh1_families &&
-      kFh1UseNativeDepthMeshVertexShaders && !runtime_description.pixel_shader &&
-      (fh1_vertex_shader_hash == 0xC8C39E5AE1B08DE6ull ||
-       fh1_vertex_shader_hash == 0x9BF2991815B941B9ull ||
-       fh1_vertex_shader_hash == 0xD0C40C04F166092Eull ||
-       fh1_vertex_shader_hash == 0xB646F85EF69A57E0ull);
   bool edram_rov_used =
       render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
 
-  // Qualified scene stages. Keep the observed PSO states narrow;
-  // guest resource bindings and a creation-failure fallback remain.
-  const bool fh1_native_scene = fh1_families &&
-      IsFh1NativeScenePipeline(description);
-  const uint64_t fh1_scene_pipeline_hash = fh1_native_scene
-      ? XXH3_64bits(&description, sizeof(description)) : 0;
-
-  const bool fh1_native_depth = fh1_native_scene && !runtime_description.pixel_shader &&
-      (fh1_vertex_shader_hash == 0xC8C39E5AE1B08DE6ull ||
-       fh1_vertex_shader_hash == 0x9BF2991815B941B9ull ||
-       fh1_vertex_shader_hash == 0xD0C40C04F166092Eull ||
-       fh1_vertex_shader_hash == 0xB646F85EF69A57E0ull);
-  const bool fh1_native_terrain = fh1_native_scene && !runtime_description.pixel_shader &&
-      !edram_rov_used &&
-      (fh1_vertex_shader_hash == 0x5A28C7FAFD86F112ull ||
-       fh1_vertex_shader_hash == 0xCA293E0A1CB4B416ull ||
-       fh1_vertex_shader_hash == 0x4E1DA281CC3D7EDBull);
-  // Both native pixel programs use textures, not shared geometry. Reuse the
-  // layered root's vertex SRV, unsigned/signed texture views and sampler.
-  const bool fh1_native_scene_geometry = fh1_native_scene &&
-      (fh1_vertex_shader_hash == 0xAD2C355A6BE1EE87ull ||
-       fh1_vertex_shader_hash == 0x8D8A197476841A9Aull);
-  // Disabled: the 2026-09-07 ownership ABBA regressed frame and CPU time.
-  constexpr bool fh1_skinned_geometry = false;
-  // Root signature. The FH1 family root signatures were removed with the
-  // Xenos renderer; the families above are all off.
+  // Root signature.
   state_desc.pRootSignature = runtime_description.root_signature;
 
   // Index buffer strip cut value.
@@ -4141,7 +3697,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
   }
 
   // Primitive topology, vertex, hull, domain and geometry shaders.
-  if (!fh1_native_scene && !fh1_standalone_vertex && !runtime_description.vertex_shader->is_translated()) {
+  if (!runtime_description.vertex_shader->is_translated()) {
     REXGPU_ERROR("Vertex shader {:016X} not translated",
                  runtime_description.vertex_shader->shader().ucode_data_hash());
     assert_always();
@@ -4235,75 +3791,8 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
       // Fallback vertex shaders are not needed on Direct3D 12.
       return nullptr;
     }
-    if (fh1_position_vertex) {
-      state_desc.VS = description.vertex_shader_modification == 0
-          ? D3D12_SHADER_BYTECODE{shaders::fh1_position_only_vs, sizeof(shaders::fh1_position_only_vs)}
-          : D3D12_SHADER_BYTECODE{shaders::fh1_position_color_vs, sizeof(shaders::fh1_position_color_vs)};
-    } else if (fh1_standalone_vertex && fh1_vertex_shader_hash == 0xB8489164D5A86043ull) {
-      state_desc.VS = fh1_skinned_geometry
-          ? D3D12_SHADER_BYTECODE{shaders::fh1_skinned_scene_owned_vs, sizeof(shaders::fh1_skinned_scene_owned_vs)}
-          : D3D12_SHADER_BYTECODE{shaders::fh1_skinned_scene_vs, sizeof(shaders::fh1_skinned_scene_vs)};
-    } else if (fh1_shadow_vertex) {
-      state_desc.VS = fh1_shadow_geometry
-          ? D3D12_SHADER_BYTECODE{shaders::fh1_shadow_mask_owned_vs, sizeof(shaders::fh1_shadow_mask_owned_vs)}
-          : D3D12_SHADER_BYTECODE{shaders::fh1_shadow_mask_vs, sizeof(shaders::fh1_shadow_mask_vs)};
-    } else if (fh1_packed_world_vertex) {
-      state_desc.VS = fh1_packed_world_geometry
-          ? D3D12_SHADER_BYTECODE{shaders::fh1_packed_world_owned_vs, sizeof(shaders::fh1_packed_world_owned_vs)}
-          : D3D12_SHADER_BYTECODE{shaders::fh1_packed_world_vs, sizeof(shaders::fh1_packed_world_vs)};
-    } else if (fh1_world_lit_vertex) {
-      state_desc.VS = {shaders::fh1_world_lit_vs,
-                       sizeof(shaders::fh1_world_lit_vs)};
-    } else if (fh1_world_lit_uv2_vertex) {
-      state_desc.VS = {shaders::fh1_world_lit_uv2_vs,
-                       sizeof(shaders::fh1_world_lit_uv2_vs)};
-    } else if (fh1_native_scene && fh1_vertex_shader_hash == 0x5A28C7FAFD86F112ull) {
-      state_desc.VS = fh1_native_terrain
-          ? D3D12_SHADER_BYTECODE{shaders::fh1_terrain_depth_standard_owned_vs,
-                                  sizeof(shaders::fh1_terrain_depth_standard_owned_vs)}
-          : D3D12_SHADER_BYTECODE{shaders::fh1_terrain_depth_standard_vs,
-                                  sizeof(shaders::fh1_terrain_depth_standard_vs)};
-    } else if (fh1_native_scene && (fh1_vertex_shader_hash == 0xCA293E0A1CB4B416ull ||
-                                    fh1_vertex_shader_hash == 0x4E1DA281CC3D7EDBull)) {
-      state_desc.VS = fh1_native_terrain
-          ? D3D12_SHADER_BYTECODE{shaders::fh1_terrain_depth_offset_owned_vs,
-                                  sizeof(shaders::fh1_terrain_depth_offset_owned_vs)}
-          : D3D12_SHADER_BYTECODE{shaders::fh1_terrain_depth_offset_vs,
-                                  sizeof(shaders::fh1_terrain_depth_offset_vs)};
-    } else if (fh1_native_scene && fh1_vertex_shader_hash == 0xB6C9863F710683ECull) {
-      state_desc.VS = {shaders::fh1_constant_position_vs, sizeof(shaders::fh1_constant_position_vs)};
-    } else if (fh1_depth_mesh_vertex || (fh1_native_scene && !runtime_description.pixel_shader)) {
-      if (fh1_vertex_shader_hash == 0x9BF2991815B941B9ull) {
-        state_desc.VS = fh1_native_depth
-            ? D3D12_SHADER_BYTECODE{shaders::fh1_depth_mesh_stride20_owned_vs,
-                                    sizeof(shaders::fh1_depth_mesh_stride20_owned_vs)}
-            : D3D12_SHADER_BYTECODE{shaders::fh1_depth_mesh_stride20_vs,
-                                    sizeof(shaders::fh1_depth_mesh_stride20_vs)};
-      } else if (fh1_vertex_shader_hash == 0xC8C39E5AE1B08DE6ull) {
-        state_desc.VS = fh1_native_depth
-            ? D3D12_SHADER_BYTECODE{shaders::fh1_depth_mesh_stride24_owned_vs,
-                                    sizeof(shaders::fh1_depth_mesh_stride24_owned_vs)}
-            : D3D12_SHADER_BYTECODE{shaders::fh1_depth_mesh_stride24_vs,
-                                    sizeof(shaders::fh1_depth_mesh_stride24_vs)};
-      } else if (fh1_vertex_shader_hash == 0xB646F85EF69A57E0ull) {
-        state_desc.VS = fh1_native_depth
-            ? D3D12_SHADER_BYTECODE{shaders::fh1_depth_mesh_stride28_owned_vs,
-                                    sizeof(shaders::fh1_depth_mesh_stride28_owned_vs)}
-            : D3D12_SHADER_BYTECODE{shaders::fh1_depth_mesh_stride28_vs,
-                                    sizeof(shaders::fh1_depth_mesh_stride28_vs)};
-      } else {
-        state_desc.VS = fh1_native_depth
-            ? D3D12_SHADER_BYTECODE{shaders::fh1_depth_mesh_stride32_owned_vs,
-                                    sizeof(shaders::fh1_depth_mesh_stride32_owned_vs)}
-            : D3D12_SHADER_BYTECODE{shaders::fh1_depth_mesh_stride32_vs,
-                                    sizeof(shaders::fh1_depth_mesh_stride32_vs)};
-      }
-    } else {
-      state_desc.VS.pShaderBytecode =
-          runtime_description.vertex_shader->translated_binary().data();
-      state_desc.VS.BytecodeLength =
-          runtime_description.vertex_shader->translated_binary().size();
-    }
+    state_desc.VS.pShaderBytecode = runtime_description.vertex_shader->translated_binary().data();
+    state_desc.VS.BytecodeLength = runtime_description.vertex_shader->translated_binary().size();
     PipelinePrimitiveTopologyType primitive_topology_type =
         PipelinePrimitiveTopologyType(description.primitive_topology_type_or_tessellation_mode);
     switch (primitive_topology_type) {
@@ -4324,7 +3813,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
 
   // Pixel shader.
   if (runtime_description.pixel_shader != nullptr) {
-    if (!fh1_native_scene && !runtime_description.pixel_shader->is_translated()) {
+    if (!runtime_description.pixel_shader->is_translated()) {
       REXGPU_ERROR("Pixel shader {:016X} not translated",
                    runtime_description.pixel_shader->shader().ucode_data_hash());
       assert_always();
@@ -4334,103 +3823,6 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
         runtime_description.pixel_shader->translated_binary().data();
     state_desc.PS.BytecodeLength =
         runtime_description.pixel_shader->translated_binary().size();
-    if (fh1_video_pixel) {
-      state_desc.PS = {shaders::fh1_video_color_ps, sizeof(shaders::fh1_video_color_ps)};
-    }
-    if (fh1_postprocess_center) {
-      state_desc.PS = {shaders::fh1_postprocess_center_ps, sizeof(shaders::fh1_postprocess_center_ps)};
-    }
-    if (fh1_rms_downsample) {
-      state_desc.PS = {shaders::fh1_rms_downsample_ps, sizeof(shaders::fh1_rms_downsample_ps)};
-    }
-    if (IsFh1NativePositionPipeline(description)) {
-      state_desc.PS = description.pixel_shader_modification == 0x0000400000010001ull
-          ? D3D12_SHADER_BYTECODE{shaders::fh1_passthrough_early_centroid_ps, sizeof(shaders::fh1_passthrough_early_centroid_ps)}
-          : D3D12_SHADER_BYTECODE{shaders::fh1_passthrough_early_ps, sizeof(shaders::fh1_passthrough_early_ps)};
-    }
-    if (fh1_shadow_mask_pixel) {
-      switch (description.pixel_shader_hash) {
-        case 0x11824C2EC1B156C6ull:
-          state_desc.PS = render_target_cache_.draw_resolution_scale_x() == 1
-              ? D3D12_SHADER_BYTECODE{shaders::fh1_shadow_1182_1x_ps, sizeof(shaders::fh1_shadow_1182_1x_ps)}
-              : D3D12_SHADER_BYTECODE{shaders::fh1_shadow_1182_ps, sizeof(shaders::fh1_shadow_1182_ps)};
-          break;
-        case 0x26C4FD34AECBE4DEull:
-          state_desc.PS = render_target_cache_.draw_resolution_scale_x() == 1
-              ? D3D12_SHADER_BYTECODE{shaders::fh1_shadow_26c4_1x_ps, sizeof(shaders::fh1_shadow_26c4_1x_ps)}
-              : D3D12_SHADER_BYTECODE{shaders::fh1_shadow_26c4_ps, sizeof(shaders::fh1_shadow_26c4_ps)};
-          break;
-        case 0xFCDF9BE8C57F7D01ull:
-          state_desc.PS = render_target_cache_.draw_resolution_scale_x() == 1
-              ? D3D12_SHADER_BYTECODE{shaders::fh1_shadow_fcdf_1x_ps, sizeof(shaders::fh1_shadow_fcdf_1x_ps)}
-              : D3D12_SHADER_BYTECODE{shaders::fh1_shadow_fcdf_ps, sizeof(shaders::fh1_shadow_fcdf_ps)};
-          break;
-        case 0x93626E75D17576C5ull:
-          state_desc.PS = render_target_cache_.draw_resolution_scale_x() == 1
-              ? D3D12_SHADER_BYTECODE{shaders::fh1_shadow_mask_1x_ps, sizeof(shaders::fh1_shadow_mask_1x_ps)}
-              : D3D12_SHADER_BYTECODE{shaders::fh1_shadow_mask_ps, sizeof(shaders::fh1_shadow_mask_ps)};
-          break;
-        case 0x26EB620936001876ull:
-          state_desc.PS = render_target_cache_.draw_resolution_scale_x() == 1
-              ? D3D12_SHADER_BYTECODE{shaders::fh1_shadow_26eb_1x_ps, sizeof(shaders::fh1_shadow_26eb_1x_ps)}
-              : D3D12_SHADER_BYTECODE{shaders::fh1_shadow_26eb_ps, sizeof(shaders::fh1_shadow_26eb_ps)};
-          break;
-        case 0x22DA22B5639EBAE4ull:
-          state_desc.PS = render_target_cache_.draw_resolution_scale_x() == 1
-              ? D3D12_SHADER_BYTECODE{shaders::fh1_shadow_22da_1x_ps, sizeof(shaders::fh1_shadow_22da_1x_ps)}
-              : D3D12_SHADER_BYTECODE{shaders::fh1_shadow_22da_ps, sizeof(shaders::fh1_shadow_22da_ps)};
-          break;
-        case 0x8418C40F121D7EA7ull:
-          state_desc.PS = render_target_cache_.draw_resolution_scale_x() == 1
-              ? D3D12_SHADER_BYTECODE{shaders::fh1_shadow_8418_1x_ps, sizeof(shaders::fh1_shadow_8418_1x_ps)}
-              : D3D12_SHADER_BYTECODE{shaders::fh1_shadow_8418_ps, sizeof(shaders::fh1_shadow_8418_ps)};
-          break;
-      }
-    }
-    if (fh1_packed_world_vertex && bindless_resources_used_ &&
-        description.pixel_shader_modification == 0x00004000005B007Full) {
-      switch (description.pixel_shader_hash) {
-        case 0xA2C1F872E049AD8Bull:
-          state_desc.PS = {shaders::fh1_packed_world_ps, sizeof(shaders::fh1_packed_world_ps)};
-          break;
-        case 0xFF096DC71B188012ull:
-          state_desc.PS = {shaders::fh1_packed_world_blend_ps, sizeof(shaders::fh1_packed_world_blend_ps)};
-          break;
-        case 0xB98566FB7CE14699ull:
-          state_desc.PS = {shaders::fh1_world_material_b985_ps, sizeof(shaders::fh1_world_material_b985_ps)};
-          break;
-        case 0xC0E286228970074Dull:
-          state_desc.PS = {shaders::fh1_world_material_c0e2_ps, sizeof(shaders::fh1_world_material_c0e2_ps)};
-          break;
-        case 0xD96CCDCC3F783790ull:
-          state_desc.PS = {shaders::fh1_world_material_d96c_ps, sizeof(shaders::fh1_world_material_d96c_ps)};
-          break;
-        case 0xB1F8F94927415BEDull:
-          state_desc.PS = {shaders::fh1_world_material_b1f8_ps, sizeof(shaders::fh1_world_material_b1f8_ps)};
-          break;
-        case 0xE163D0BE1C2F9775ull:
-          state_desc.PS = {shaders::fh1_world_material_e163_ps, sizeof(shaders::fh1_world_material_e163_ps)};
-          break;
-        case 0xEF18394497BDC2A6ull:
-          state_desc.PS = {shaders::fh1_world_material_ef18_ps, sizeof(shaders::fh1_world_material_ef18_ps)};
-          break;
-        case 0x6B97D48A7336AB24ull:
-          state_desc.PS = {shaders::fh1_packed_world_blend_y_ps, sizeof(shaders::fh1_packed_world_blend_y_ps)};
-          break;
-      }
-    }
-    if (fh1_native_scene && !fh1_packed_world_vertex && !fh1_shadow_mask_pixel) {
-      if (fh1_vertex_shader_hash == 0x3BC346726C1C2535ull) {
-        state_desc.VS = {shaders::fh1_layered_scene_vs, sizeof(shaders::fh1_layered_scene_vs)};
-        state_desc.PS = {shaders::fh1_layered_lit_ps, sizeof(shaders::fh1_layered_lit_ps)};
-      } else if (fh1_vertex_shader_hash == 0xAD2C355A6BE1EE87ull) {
-        state_desc.VS = {shaders::fh1_lit_scene_owned_vs, sizeof(shaders::fh1_lit_scene_owned_vs)};
-        state_desc.PS = {shaders::fh1_lit_scene_fixed_ps, sizeof(shaders::fh1_lit_scene_fixed_ps)};
-      } else if (fh1_vertex_shader_hash == 0x8D8A197476841A9Aull) {
-        state_desc.VS = {shaders::fh1_blended_scene_owned_vs, sizeof(shaders::fh1_blended_scene_owned_vs)};
-        state_desc.PS = {shaders::fh1_blended_lit_fixed_ps, sizeof(shaders::fh1_blended_lit_fixed_ps)};
-      }
-    }
   } else {
     if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
         (description.depth_func != xenos::CompareFunction::kAlways || description.depth_write) &&
@@ -4623,72 +4015,6 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
   ID3D12PipelineState* state = nullptr;
   HRESULT create_result = device->CreateGraphicsPipelineState(&state_desc, IID_PPV_ARGS(&state));
-  if (FAILED(create_result) && (fh1_video_pixel || fh1_postprocess_center || fh1_rms_downsample || fh1_standalone_vertex || fh1_shadow_mask_pixel || fh1_packed_world_vertex || fh1_world_lit_vertex ||
-                                fh1_world_lit_uv2_vertex ||
-                                fh1_depth_mesh_vertex || fh1_native_scene)) {
-    if (fh1_world_lit_vertex) {
-      fh1_world_lit_native_pipeline_fallbacks_.fetch_add(
-          1, std::memory_order_relaxed);
-    } else if (fh1_world_lit_uv2_vertex) {
-      fh1_world_lit_uv2_native_pipeline_fallbacks_.fetch_add(
-          1, std::memory_order_relaxed);
-    } else if (fh1_depth_mesh_vertex) {
-      fh1_depth_mesh_native_pipeline_fallbacks_.fetch_add(
-          1, std::memory_order_relaxed);
-    }
-    if (fh1_native_scene || fh1_standalone_vertex) {
-      std::lock_guard<std::mutex> lock(translation_request_lock_);
-      for (auto* translation : {runtime_description.vertex_shader, runtime_description.pixel_shader}) {
-        if (!translation) continue;
-        if (!translation->is_translated() && !TranslateAnalyzedShader(
-#if defined(REXGPU_FH1_SHADER_PRODUCER)
-                shader_translator_.get(),
-#else
-                nullptr,
-#endif
-                *translation, dxbc_converter_, dxc_utils_, dxc_compiler_)) {
-          return nullptr;
-        }
-        if (!translation->is_valid()) {
-          return nullptr;
-        }
-      }
-    }
-    state_desc.VS.pShaderBytecode =
-        runtime_description.vertex_shader->translated_binary().data();
-    state_desc.pRootSignature = runtime_description.root_signature;
-    state_desc.VS.BytecodeLength =
-        runtime_description.vertex_shader->translated_binary().size();
-    if (runtime_description.pixel_shader != nullptr) {
-      state_desc.PS.pShaderBytecode =
-          runtime_description.pixel_shader->translated_binary().data();
-      state_desc.PS.BytecodeLength =
-          runtime_description.pixel_shader->translated_binary().size();
-    }
-    create_result =
-        device->CreateGraphicsPipelineState(&state_desc, IID_PPV_ARGS(&state));
-    if (fh1_native_scene && SUCCEEDED(create_result)) {
-      REXGPU_INFO("FH1 scene guest fallback pipeline {:016X} (VS translated {}, PS translated {})",
-                  fh1_scene_pipeline_hash, runtime_description.vertex_shader->is_translated(),
-                  runtime_description.pixel_shader && runtime_description.pixel_shader->is_translated());
-    }
-  } else if (SUCCEEDED(create_result)) {
-    if (fh1_native_scene) {
-      REXGPU_INFO("FH1 native scene vertex/pixel pipeline {:016X} (guest VS translated {}, PS translated {})",
-                  fh1_scene_pipeline_hash, runtime_description.vertex_shader->is_translated(),
-                  runtime_description.pixel_shader && runtime_description.pixel_shader->is_translated());
-    }
-    if (fh1_world_lit_vertex) {
-      fh1_world_lit_native_pipeline_creations_.fetch_add(
-          1, std::memory_order_relaxed);
-    } else if (fh1_world_lit_uv2_vertex) {
-      fh1_world_lit_uv2_native_pipeline_creations_.fetch_add(
-          1, std::memory_order_relaxed);
-    } else if (fh1_depth_mesh_vertex) {
-      fh1_depth_mesh_native_pipeline_creations_.fetch_add(
-          1, std::memory_order_relaxed);
-    }
-  }
   if (FAILED(create_result)) {
     if (runtime_description.pixel_shader != nullptr) {
       REXGPU_ERROR("Failed to create graphics pipeline with VS {:016X}, PS {:016X}",
@@ -4710,8 +4036,8 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
         fmt::format("VS {:016X}", runtime_description.vertex_shader->shader().ucode_data_hash()));
   }
   state->SetName(reinterpret_cast<LPCWSTR>(name.c_str()));
-  // Publish the root actually used, including a restored guest root on fallback,
-  // before the caller publishes the completed PSO to other threads.
+  // Publish the root before the caller publishes the completed PSO to other
+  // threads.
   pipeline->root_signature.store(state_desc.pRootSignature, std::memory_order_release);
   return state;
 }

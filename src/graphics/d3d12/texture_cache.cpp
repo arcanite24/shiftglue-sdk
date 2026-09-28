@@ -39,18 +39,11 @@ REXCVAR_DECLARE(bool, fh1_texture_reload_probe);
 
 namespace rex::graphics::d3d12 {
 
-// Diagnostic for the resolution-scaled reflection cube: reports why a mip chain
-// was not published natively. Off by default, read-only.
-REXCVAR_DEFINE_BOOL(fh1_glow_probe, false, "GPU/D3D12",
-                    "Log FH1 reflection mip publication admission decisions and range state");
 REXCVAR_DEFINE_BOOL(fh1_direct_reflection_cube_import, true, "GPU/D3D12",
                     "Import FH1 reflection cubes directly into their host texture");
 
 // Generated with `xb buildshaders`.
 namespace shaders {
-#include "../shaders/bytecode/d3d12_5_1/fh1_reflection_mip_1x_cs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_reflection_mip_2x_cs.h"
-#include "../shaders/bytecode/d3d12_5_1/fh1_reflection_mip_3x_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_reflection_cube_import_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_128bpb_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_128bpb_scaled_cs.h"
@@ -742,12 +735,6 @@ void D3D12TextureCache::EndFrame() {
   }
 }
 
-void D3D12TextureCache::RequestFh1Textures(uint32_t used_texture_mask) {
-  request_fh1_bc3_ = true;
-  RequestTextures(used_texture_mask);
-  request_fh1_bc3_ = false;
-}
-
 void D3D12TextureCache::RequestFh1VideoTextures(uint32_t used_texture_mask) {
   request_fh1_video_ = true;
   RequestTextures(used_texture_mask);
@@ -932,148 +919,6 @@ void D3D12TextureCache::WriteActiveTextureBindfulSRV(
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
     device->CopyDescriptorsSimple(1, handle, source_handle, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
   }
-}
-
-system::GraphicsFinalDrawTextureIdentity
-D3D12TextureCache::GetActiveNativeTextureIdentity(
-    uint32_t fetch_constant) const {
-  system::GraphicsFinalDrawTextureIdentity result;
-  result.fetch_constant = fetch_constant;
-  if (fetch_constant >= 32) return result;
-  const auto fetch = register_file().GetTextureFetch(fetch_constant);
-  static_assert(sizeof(fetch) == sizeof(result.fetch_words));
-  std::memcpy(result.fetch_words, &fetch, sizeof(fetch));
-  const TextureBinding* binding = GetValidTextureBinding(fetch_constant);
-  if (!binding || !binding->texture) return result;
-  const Texture* texture = binding->texture;
-  result.allocation_id = texture->allocation_id();
-  result.payload_generation = texture->payload_generation();
-  result.outdated_mask = texture->outdated_mask();
-  return result;
-}
-
-bool D3D12TextureCache::SnapshotActiveNativeTexture(
-    uint32_t fetch_constant, uint64_t max_bytes,
-    Microsoft::WRL::ComPtr<ID3D12Resource>& source,
-    Microsoft::WRL::ComPtr<ID3D12Resource>& snapshot,
-    D3D12_SHADER_RESOURCE_VIEW_DESC& view, uint64_t& bytes) {
-  if (fetch_constant >= 32) return false;
-  const TextureBinding* binding = GetValidTextureBinding(fetch_constant);
-  if (!binding || !binding->texture || !binding->key.base_page ||
-      binding->texture->outdated_mask() ||
-      (binding->key.dimension != xenos::DataDimension::k2DOrStacked &&
-       binding->key.dimension != xenos::DataDimension::k3D &&
-       binding->key.dimension != xenos::DataDimension::kCube))
-    return false;
-  auto* texture = static_cast<D3D12Texture*>(binding->texture);
-  ID3D12Resource* resource = texture->resource();
-  const DXGI_FORMAT view_format = GetDXGIUnormFormat(binding->key);
-  if (!resource || view_format == DXGI_FORMAT_UNKNOWN) return false;
-  const D3D12_RESOURCE_DESC desc = resource->GetDesc();
-  const bool volume = binding->key.dimension == xenos::DataDimension::k3D;
-  if (desc.Dimension != (volume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D
-                                 : D3D12_RESOURCE_DIMENSION_TEXTURE2D) ||
-      (!volume && desc.DepthOrArraySize !=
-          (binding->key.dimension == xenos::DataDimension::kCube ? 6 : 1)) ||
-      desc.SampleDesc.Count != 1)
-    return false;
-  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
-  const uint64_t size = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
-  if (size > max_bytes) return false;
-  if (FAILED(device->CreateCommittedResource(
-          &ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE,
-          &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-          IID_PPV_ARGS(&snapshot))))
-    return false;
-  source = resource;
-  const auto fetch = register_file().GetTextureFetch(fetch_constant);
-  view = {};
-  view.Format = view_format;
-  view.ViewDimension = volume ? D3D12_SRV_DIMENSION_TEXTURE3D
-      : binding->key.dimension == xenos::DataDimension::kCube
-          ? D3D12_SRV_DIMENSION_TEXTURECUBE
-          : D3D12_SRV_DIMENSION_TEXTURE2D;
-  view.Shader4ComponentMapping =
-      GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding->key)) |
-      D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
-  if (volume)
-    view.Texture3D.MipLevels = desc.MipLevels;
-  else if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE)
-    view.TextureCube.MipLevels = desc.MipLevels;
-  else
-    view.Texture2D.MipLevels = desc.MipLevels;
-
-  command_processor_.SubmitBarriers();
-  const D3D12_RESOURCE_STATES old_state =
-      texture->SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE);
-  if (!(old_state & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)) {
-    texture->SetResourceState(old_state);
-    return false;
-  }
-  command_processor_.PushTransitionBarrier(
-      resource, old_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-  command_processor_.SubmitBarriers();
-  command_processor_.GetDeferredCommandList().D3DCopyResource(snapshot.Get(), resource);
-  command_processor_.PushTransitionBarrier(
-      resource, texture->SetResourceState(old_state), old_state);
-  command_processor_.PushTransitionBarrier(
-      snapshot.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
-      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-  command_processor_.SubmitBarriers();
-  bytes = size;
-  return true;
-}
-
-bool D3D12TextureCache::CopyFh1Snr04Bc3Mips(
-    uint32_t fetch_constant, ID3D12Resource* readback,
-    const std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 9>& footprints) {
-  const TextureBinding* binding = GetValidTextureBinding(fetch_constant);
-  if (!binding || !binding->texture || binding->key.GetWidth() != 256 ||
-      binding->key.GetHeight() != 256 ||
-      binding->key.format != xenos::TextureFormat::k_DXT4_5) {
-    return false;
-  }
-  auto* texture = static_cast<D3D12Texture*>(binding->texture);
-  ID3D12Resource* source_resource = texture->resource();
-  const D3D12_RESOURCE_DESC description = source_resource->GetDesc();
-  if (description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-      description.Format != DXGI_FORMAT_BC3_UNORM ||
-      description.Width != 256 || description.Height != 256 ||
-      description.DepthOrArraySize != 1 || description.MipLevels != 9) {
-    return false;
-  }
-  REXGPU_INFO("FH1 SNR04 BC3 source {{\"fetch\":{},\"texture\":{},"
-              "\"resource\":{},\"base\":{},\"mips\":{},"
-              "\"base_bytes\":{},\"mips_bytes\":{},\"outdated\":{},"
-              "\"allocation_id\":{},\"payload_generation\":{}}}",
-              fetch_constant, reinterpret_cast<uintptr_t>(texture),
-              reinterpret_cast<uintptr_t>(source_resource),
-              uint32_t(binding->key.base_page << 12),
-              uint32_t(binding->key.mip_page << 12),
-              texture->GetGuestBaseSize(), texture->GetGuestMipsSize(),
-              texture->outdated_mask(), texture->allocation_id(),
-              texture->payload_generation());
-  texture->MarkAsUsed();
-  const D3D12_RESOURCE_STATES old_state =
-      texture->SetResourceState(D3D12_RESOURCE_STATE_COPY_SOURCE);
-  command_processor_.PushTransitionBarrier(source_resource, old_state,
-                                           D3D12_RESOURCE_STATE_COPY_SOURCE);
-  command_processor_.SubmitBarriers();
-  D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
-  source.pResource = source_resource;
-  source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  destination.pResource = readback;
-  destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  for (uint32_t mip = 0; mip < footprints.size(); ++mip) {
-    source.SubresourceIndex = mip;
-    destination.PlacedFootprint = footprints[mip];
-    command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(
-        &destination, 0, 0, 0, &source, nullptr);
-  }
-  command_processor_.PushTransitionBarrier(
-      source_resource, texture->SetResourceState(old_state), old_state);
-  command_processor_.SubmitBarriers();
-  return true;
 }
 
 uint32_t D3D12TextureCache::GetActiveTextureBindlessSRVIndex(
@@ -1564,115 +1409,6 @@ void D3D12TextureCache::CreateCurrentScaledResolveRangeUintPow2UAV(
           element_size_bytes_pow2);
 }
 
-bool D3D12TextureCache::GenerateFh1ReflectionMips(uint32_t base_address, uint32_t face) {
-  constexpr uint32_t base_bytes = 6 * 256 * 256 * 4;
-  constexpr uint32_t mip_bytes = 6 * (128 * 128 + 64 * 64 + 6 * 32 * 32) * 4;
-  constexpr uint32_t total_bytes = base_bytes + mip_bytes;
-  const uint32_t scale = draw_resolution_scale_x();
-  const bool unscaled = scale == 1;
-  const uint32_t area_scale = scale * scale;
-  // Diagnostic (default off): every rejection below is one of the reasons the
-  // resolution-scaled reflection cube falls back to the original mip draws.
-  const bool probe = REXCVAR_GET(fh1_glow_probe);
-  const auto reject = [&](const char* reason) {
-    if (probe) {
-      REXGPU_INFO(
-          "FH1 glow probe: base={:08X} face={} scale={}x{} extent={} mip_bytes={} -> {}",
-          base_address, face, scale, draw_resolution_scale_y(), base_bytes, mip_bytes, reason);
-    }
-    return false;
-  };
-  if (scale < 1 || scale > 3 || draw_resolution_scale_y() != scale || (base_address & 4095) ||
-      base_address > 0x20000000 - total_bytes || face >= 6)
-    return reject("unsupported geometry");
-  // Every source page must have authoritative scaled contents.
-  if (!unscaled && !IsRangeScaledResolved(base_address, base_bytes, true))
-    return reject("base range not fully scaled-resolved");
-  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
-  if (!fh1_mip_root_signature_) {
-    D3D12_ROOT_PARAMETER parameters[2] = {};
-    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    parameters[1].Constants.Num32BitValues = 6;
-    D3D12_ROOT_SIGNATURE_DESC desc = {2, parameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
-    Microsoft::WRL::ComPtr<ID3DBlob> serialized, errors;
-    if (FAILED(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized,
-                                           &errors)) ||
-        FAILED(device->CreateRootSignature(0, serialized->GetBufferPointer(),
-                                           serialized->GetBufferSize(),
-                                           IID_PPV_ARGS(&fh1_mip_root_signature_))))
-      return false;
-  }
-  Microsoft::WRL::ComPtr<ID3D12PipelineState>& pipeline =
-      unscaled ? fh1_mip_pipeline_1x_
-               : (scale == 3 ? fh1_mip_pipeline_3x_ : fh1_mip_pipeline_);
-  if (!pipeline) {
-    D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
-    desc.pRootSignature = fh1_mip_root_signature_.Get();
-    desc.CS = unscaled ? D3D12_SHADER_BYTECODE{shaders::fh1_native_mip_1x_cs,
-                                               sizeof(shaders::fh1_native_mip_1x_cs)}
-                       : (scale == 3
-                              ? D3D12_SHADER_BYTECODE{shaders::fh1_native_mip_3x_cs,
-                                                      sizeof(shaders::fh1_native_mip_3x_cs)}
-                              : D3D12_SHADER_BYTECODE{shaders::fh1_native_mip_cs,
-                                                      sizeof(shaders::fh1_native_mip_cs)});
-    if (FAILED(device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline))))
-      return false;
-    pipeline->SetName(L"FH1 native reflection mips");
-  }
-  // Preserve residency, aliasing, UAV ordering and invalidation through existing managers.
-  auto& shared = static_cast<D3D12SharedMemory&>(shared_memory());
-  ID3D12Resource* resource;
-  uint64_t relative;
-  if (unscaled) {
-    if (!shared.RequestRange(base_address, total_bytes))
-      return false;
-    shared.UseForWriting();
-    resource = shared.GetBuffer();
-    relative = base_address;
-  } else {
-    if (!EnsureScaledResolveMemoryCommitted(base_address, total_bytes, 4) ||
-        !MakeScaledResolveRangeCurrent(base_address, total_bytes, 4))
-      return false;
-    resource = GetCurrentScaledResolveBufferResource();
-    relative = uint64_t(base_address) * area_scale -
-               (uint64_t(GetCurrentScaledResolveBufferIndex()) << 30);
-    TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-  }
-  command_processor_.PushUAVBarrier(resource);
-  auto& commands = command_processor_.GetDeferredCommandList();
-  commands.BeginDebugMarker("FH1 native reflection mips");
-  command_processor_.SetExternalPipeline(pipeline.Get());
-  commands.D3DSetComputeRootSignature(fh1_mip_root_signature_.Get());
-  commands.D3DSetComputeRootUnorderedAccessView(0, resource->GetGPUVirtualAddress() + relative);
-  uint32_t source_offset = 0, destination_offset = base_bytes * area_scale;
-  for (uint32_t side = 256 * scale; side > scale; side >>= 1) {
-    uint32_t source_pitch = std::max(32u, side / scale),
-             destination_pitch = std::max(32u, side / (scale * 2));
-    uint32_t constants[6] = {source_offset,
-                             destination_offset,
-                             side,
-                             side >> 1,
-                             source_pitch * source_pitch * 4 * area_scale,
-                             destination_pitch * destination_pitch * 4 * area_scale};
-    constants[0] += face * constants[4];
-    constants[1] += face * constants[5];
-    commands.D3DSetComputeRoot32BitConstants(1, 6, constants, 0);
-    command_processor_.SubmitBarriers();
-    commands.D3DDispatch(((side >> 1) + 7) / 8, ((side >> 1) + 7) / 8, 1);
-    MarkRangeAsResolved(base_address + constants[1] / area_scale, constants[5] / area_scale);
-    command_processor_.PushUAVBarrier(resource);
-    source_offset = destination_offset;
-    destination_offset += 6 * destination_pitch * destination_pitch * 4 * area_scale;
-  }
-  commands.EndDebugMarker();
-  if (unscaled)
-    shared.MarkUAVWritesCommitNeeded();
-  else
-    MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
-  return true;
-}
-
 ID3D12Resource* D3D12TextureCache::RequestSwapTexture(D3D12_SHADER_RESOURCE_VIEW_DESC& srv_desc_out,
                                                       xenos::TextureFormat& format_out,
                                                       uint32_t* width_unscaled_out,
@@ -1920,86 +1656,7 @@ bool D3D12TextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_ba
     return true;
   }
   // END FH1 LINEAR VIDEO UPLOAD
-  if (!request_fh1_bc3_) return false;
-  const TextureKey key = texture.key();
-  if (key.scaled_resolve || texture.force_load_3d_tiling() ||
-      key.dimension != xenos::DataDimension::k2DOrStacked ||
-      key.GetDepthOrArraySize() != 1 || key.format != xenos::TextureFormat::k_DXT4_5 ||
-      !key.base_page || key.GetWidth() > 512 || key.GetHeight() > 512 ||
-      GetDXGIResourceFormat(key.format, key.GetWidth(), key.GetHeight()) != DXGI_FORMAT_BC3_UNORM) {
-    return false;
-  }
-  std::vector<uint8_t> base(texture.GetGuestBaseSize()), mips(texture.GetGuestMipsSize());
-  if (!shared_memory().CopyCpuRange(key.base_page << 12, base) ||
-      !shared_memory().CopyCpuRange(key.mip_page << 12, mips)) {
-    return false;
-  }
-  xenos::xe_gpu_texture_fetch_t fetch{};
-  fetch.type = xenos::FetchConstantType::kTexture;
-  fetch.dimension = key.dimension;
-  fetch.format = key.format;
-  fetch.size_2d.width = key.GetWidth() - 1;
-  fetch.size_2d.height = key.GetHeight() - 1;
-  fetch.pitch = key.pitch;
-  fetch.tiled = key.tiled;
-  fetch.packed_mips = key.packed_mips;
-  fetch.base_address = key.base_page;
-  fetch.mip_address = key.mip_page;
-  fetch.mip_max_level = key.mip_max_level;
-  fetch.endianness = key.endianness;
-  std::vector<uint8_t> linear;
-  try {
-    linear = texture_util::ImportBc3(fetch, base, mips);
-  } catch (const std::exception&) {
-    return false;
-  }
-  auto& d3d12_texture = static_cast<D3D12Texture&>(texture);
-  ID3D12Resource* resource = d3d12_texture.resource();
-  const auto desc = resource->GetDesc();
-  const uint32_t first = load_base ? 0 : 1;
-  const uint32_t last = load_mips ? key.mip_max_level : 0;
-  const uint32_t count = last - first + 1;
-  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[xenos::kTextureMaxMips];
-  UINT64 size;
-  command_processor_.GetD3D12Provider().GetDevice()->GetCopyableFootprints(
-      &desc, first, count, 0, footprints, nullptr, nullptr, &size);
-  ID3D12Resource* upload;
-  size_t offset;
-  uint8_t* mapping = command_processor_.GetConstantBufferPool().Request(
-      command_processor_.GetCurrentFrame(), size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT,
-      &upload, &offset, nullptr);
-  if (!mapping) return false;
-  size_t linear_offset = 0;
-  for (uint32_t mip = 0; mip <= last; ++mip) {
-    const uint32_t row_bytes = ((std::max(key.GetWidth() >> mip, 1u) + 3) / 4) * 16;
-    const uint32_t rows = (std::max(key.GetHeight() >> mip, 1u) + 3) / 4;
-    if (mip >= first) {
-      const auto& footprint = footprints[mip - first];
-      for (uint32_t row = 0; row < rows; ++row) {
-        std::memcpy(mapping + footprint.Offset + size_t(row) * footprint.Footprint.RowPitch,
-                    linear.data() + linear_offset + size_t(row) * row_bytes, row_bytes);
-      }
-    }
-    linear_offset += size_t(row_bytes) * rows;
-  }
-  d3d12_texture.MarkAsUsed();
-  command_processor_.PushTransitionBarrier(resource,
-      d3d12_texture.SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST), D3D12_RESOURCE_STATE_COPY_DEST);
-  command_processor_.SubmitBarriers();
-  D3D12_TEXTURE_COPY_LOCATION source{}, dest{};
-  source.pResource = upload;
-  source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  dest.pResource = resource;
-  dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  for (uint32_t mip = first; mip <= last; ++mip) {
-    source.PlacedFootprint = footprints[mip - first];
-    source.PlacedFootprint.Offset += offset;
-    dest.SubresourceIndex = mip;
-    command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(&dest, 0, 0, 0, &source, nullptr);
-  }
-  REXGPU_INFO("FH1 CPU BC3 import {}x{}, mips {}-{}, {} decoded bytes",
-              key.GetWidth(), key.GetHeight(), first, last, linear.size());
-  return true;
+  return false;
 }
 
 bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
@@ -2141,10 +1798,6 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
                                  (constants.size_blocks[1] + 7) / 8, 6);
       }
       d3d12_texture.MarkAsUsed();
-      ++fh1_reflection_import_stats_.loads;
-      ++fh1_reflection_import_stats_.direct_loads;
-      fh1_reflection_import_stats_.guest_bytes += d3d12_texture.GetGuestBaseSize() +
-                                                  d3d12_texture.GetGuestMipsSize();
       return true;
     }
   }
@@ -2492,17 +2145,6 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   }
 
   command_processor_.ReleaseScratchGPUBuffer(copy_buffer, copy_buffer_state);
-
-  if (fh1_reflection_cube) {
-    auto& stats = fh1_reflection_import_stats_;
-    ++stats.loads;
-    stats.subresource_copies +=
-        uint64_t(array_size) * (uint64_t(level_last) - level_first + 1);
-    stats.guest_bytes +=
-        (load_base ? d3d12_texture.GetGuestBaseSize() : 0) +
-        (load_mips ? d3d12_texture.GetGuestMipsSize() : 0);
-    stats.upload_bytes += copy_buffer_size;
-  }
 
   command_processor_.AdvanceFh1GpuWorkTiming(texture_timing, true);
   return true;
