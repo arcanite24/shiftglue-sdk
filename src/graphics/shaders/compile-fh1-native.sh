@@ -21,6 +21,8 @@ for source_kind in color depth uint; do
     [[ -n $source_msaa ]] && msaa_defines+=(FH1_SOURCE_MSAA=1)
     compile cs_5_1 fh1_native_resolve_memory.cs.hlsl \
       "fh1_native_resolve_memory_${source_kind}${source_msaa}_cs" "${msaa_defines[@]}"
+    compile cs_5_1 fh1_native_transfer_words.cs.hlsl \
+      "fh1_native_transfer_words_${source_kind}${source_msaa}_cs" "${msaa_defines[@]}"
     dest_index=0
     for dest_kind in color depth stencil uint; do
       for dest_msaa in "" _dms; do
@@ -33,5 +35,16 @@ for source_kind in color depth uint; do
       dest_index=$((dest_index + 1))
     done
   done
+done
+# Depth destinations: depth and stencil-bit passes from precomputed words.
+kind=1
+for dest_kind in depth stencil; do
+  for dest_msaa in "" _dms; do
+    defines=("FH1_DEST_KIND=$kind")
+    [[ -n $dest_msaa ]] && defines+=(FH1_DEST_MSAA=1)
+    compile ps_5_1 fh1_native_transfer_from_words.ps.hlsl \
+      "fh1_native_transfer_${dest_kind}${dest_msaa}_from_words_ps" "${defines[@]}"
+  done
+  kind=2
 done
 echo compiled

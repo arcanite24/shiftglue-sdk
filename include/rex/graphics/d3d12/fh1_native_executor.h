@@ -16,6 +16,7 @@
 #include <rex/graphics/util/draw_extent_estimator.h>
 #include <rex/graphics/xenos.h>
 #include <rex/ui/d3d12/d3d12_api.h>
+#include <rex/ui/d3d12/d3d12_util.h>
 
 namespace rex::memory {
 class Memory;
@@ -177,6 +178,9 @@ class Fh1NativeExecutor {
     DXGI_FORMAT srv_format = DXGI_FORMAT_UNKNOWN;
     DXGI_FORMAT stencil_srv_format = DXGI_FORMAT_UNKNOWN;
     SurfaceKey key;
+    // Depth surfaces: whether any stencil value may be nonzero. Transfers
+    // from a surface whose stencil is all zero skip the per-bit passes.
+    bool stencil_nonzero = false;
     uint32_t samples = 1;
     uint32_t width = 0;
     uint32_t height = 0;
@@ -250,14 +254,75 @@ class Fh1NativeExecutor {
   Surface* FindSurface(uint32_t packed_key);
   // Claims tiles [base, base + length) (with EDRAM address wrapping) for key
   // and transfers the previous owners' contents into the surface.
-  void ClaimTiles(uint32_t base, uint32_t length, uint32_t packed_key);
+  // Without transfer, the tiles change owner without their contents (the
+  // caller overwrites them, as a resolve clear does).
+  void ClaimTiles(uint32_t base, uint32_t length, uint32_t packed_key, bool transfer = true);
+  // Whether the current draw's stencil state can leave a nonzero value.
+  bool DrawMayWriteNonzeroStencil(reg::RB_DEPTHCONTROL depth_control) const;
+  // A depth-only rectangle with an ALWAYS depth test, in guest pixels
+  // [x0, y0, x1, y1): `inner` has the depth of every sample overwritten,
+  // `outer` bounds every pixel the draw can touch.
+  struct OverwriteRect {
+    std::array<int32_t, 4> inner;
+    std::array<int32_t, 4> outer;
+  };
+  // Finds the draw's rectangles by running the vertex shader on the CPU, into
+  // overwrite_rects_. Whether stencil is rewritten too is returned separately.
+  bool GetDepthOverwriteRects(const Fh1NativeDrawInfo& draw, bool& stencil_overwritten);
+  // Claims only the depth tiles the rectangles touch: covered tiles without a
+  // transfer when no stencil would be lost, edge tiles with one. False when
+  // the rectangles do not fit the surface's claimed range.
+  bool ClaimDepthOverwriteTiles(const SurfaceKey& key, uint32_t length, bool stencil_overwritten,
+                                bool stencil_written);
+  // Claims the depth tiles a depth-overwriting draw covers without transfers,
+  // when no stencil would be lost.
+  void ClaimOverwrittenDepthTiles(const SurfaceKey& key, const std::array<int32_t, 4>& rect,
+                                  bool stencil_overwritten);
+  std::vector<OverwriteRect> overwrite_rects_;
+  class PositionExportSink : public ShaderInterpreter::ExportSink {
+   public:
+    void Export(ucode::ExportRegister export_register, const float* value,
+                uint32_t value_mask) override;
+    std::array<float, 4> position{};
+    uint32_t position_mask = 0;
+    bool killed = false;
+  };
   void TransferTiles(Surface& dest, const TileRun& run);
+  // Depth destinations' transfers, batched until FlushTransfers so each
+  // destination takes its barriers and nine passes once for all of them.
+  struct PendingTransfer {
+    uint32_t dest;
+    uint32_t source;
+    D3D12_RECT rect;
+  };
+  std::vector<PendingTransfer> pending_transfers_;
+  void FlushTransfers();
+  void FlushColorTransfers(Surface& dest, size_t first, size_t end);
+  bool CreateTransferSourceViews(const Surface& source,
+                                 ui::d3d12::util::DescriptorCpuGpuHandlePair (&srvs)[2]);
+  // Transfers destination pixel rectangles from the previous owner.
+  void TransferRects(Surface& dest, uint32_t previous_owner, const D3D12_RECT* rects,
+                     uint32_t rect_count, uint32_t tile_count);
+  // Claims a rectangle of tiles with one transfer when it has a single
+  // previous owner; per-row claims otherwise.
+  void ClaimTileRect(const SurfaceKey& key, uint32_t column_first, uint32_t row_first,
+                     uint32_t column_end, uint32_t row_end);
   ID3D12PipelineState* GetTransferPipeline(const TransferPipelineKey& key);
   uint32_t LayoutConstant(const Surface& surface) const;
   // Splits the resolve's pixel rectangle into rectangles per owning surface.
   void GetResolveSources(const SurfaceKey& resolve_key, int32_t x0, int32_t y0, int32_t x1,
                          int32_t y1, std::vector<SourceRect>& sources_out);
   static constexpr uint32_t kTransferDestUint = 16;
+  // Transfer pipeline source kind for depth destinations fed from
+  // precomputed EDRAM words.
+  static constexpr uint32_t kTransferSourceWords = 3;
+  bool EnsureTransferWords(const Surface& dest);
+  ID3D12PipelineState* GetTransferWordsPipeline(uint32_t source_kind, bool msaa);
+  Microsoft::WRL::ComPtr<ID3D12Resource> transfer_words_;
+  uint32_t transfer_words_size_ = 0;
+  D3D12_RESOURCE_STATES transfer_words_state_ = D3D12_RESOURCE_STATE_COMMON;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> transfer_words_pipelines_[3][2];
+  std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> retired_transfer_words_;
   ID3D12PipelineState* GetResolveMemoryPipeline(uint32_t source_kind, bool msaa);
   // Writes into the native mirror, or (for verification) from another host
   // resource of the owner's layout into `target`.
@@ -329,6 +394,7 @@ class Fh1NativeExecutor {
   const RegisterFile& register_file_;
   memory::Memory& memory_;
   DrawExtentEstimator draw_extent_estimator_;
+  ShaderInterpreter overwrite_interpreter_;
   Fh1NativeExecutorConfig config_;
 
   // The mirror and texture cache the executor draws from: its own in shadow
@@ -361,6 +427,10 @@ class Fh1NativeExecutor {
   std::map<uint32_t, Surface> surfaces_;
   // EDRAM tile -> packed key of the surface that last wrote it.
   std::vector<uint32_t> tile_owners_;
+  // EDRAM tile -> whether the low byte of its words (stencil when read as
+  // depth) may be nonzero.
+  std::vector<uint8_t> tile_stencil_nonzero_;
+  void MarkTileStencil(uint32_t base, uint32_t length, bool nonzero);
   // Last claim per surface, so repeated draws to one pass do not rewalk tiles.
   std::map<uint32_t, std::pair<uint32_t, uint32_t>> last_claims_;
   std::deque<PendingDump> dumps_;
@@ -385,6 +455,40 @@ class Fh1NativeExecutor {
   enum CpuPhase { kCpuPrepareTargets, kCpuTransfers, kCpuBindTargets, kCpuResolves, kCpuPhases };
   std::array<uint64_t, kCpuPhases> cpu_ns_{};
   uint64_t cpu_frames_ = 0;
+  // Optional GPU timestamps around executor work (fh1_native_gpu_profile).
+  enum GpuPhase { kGpuTransfers, kGpuResolves, kGpuClears, kGpuPhases };
+  static constexpr uint32_t kGpuProfileSlots = 4;
+  static constexpr uint32_t kGpuProfileQueries = 8192;
+  struct GpuProfileSlot {
+    uint64_t submission = 0;
+    bool pending = false;
+    uint32_t used = 0;
+    std::vector<std::tuple<GpuPhase, uint32_t, uint32_t>> spans;  // phase, begin, end
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+  };
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> gpu_query_heap_;
+  std::array<GpuProfileSlot, kGpuProfileSlots> gpu_slots_;
+  uint32_t gpu_slot_ = 0;
+  uint64_t gpu_timestamp_frequency_ = 0;
+  std::array<uint64_t, kGpuPhases> gpu_ticks_{};
+  uint64_t gpu_frames_ = 0;
+  // Profiling: transferred tile-passes by source -> destination surface.
+  std::map<std::string, uint64_t> transfer_volume_;
+  uint32_t GpuBegin();
+  void GpuEnd(GpuPhase phase, uint32_t begin);
+  void GpuEndFrame();
+  void GpuDrain();
+  class GpuTimer {
+   public:
+    GpuTimer(Fh1NativeExecutor& executor, GpuPhase phase)
+        : executor_(executor), phase_(phase), begin_(executor.GpuBegin()) {}
+    ~GpuTimer() { executor_.GpuEnd(phase_, begin_); }
+
+   private:
+    Fh1NativeExecutor& executor_;
+    GpuPhase phase_;
+    uint32_t begin_;
+  };
   class CpuTimer {
    public:
     CpuTimer(Fh1NativeExecutor& executor, CpuPhase phase);

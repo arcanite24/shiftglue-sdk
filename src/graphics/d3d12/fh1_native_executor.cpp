@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cfloat>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -15,6 +16,7 @@
 #include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/graphics/d3d12/texture_cache.h>
+#include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
@@ -41,6 +43,10 @@ REXCVAR_DEFINE_STRING(fh1_native_shadow_dump_frames, "", "GPU/D3D12",
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(fh1_native_shadow_dump_dir, "", "GPU/D3D12",
                       "Directory for native front-buffer PPM dumps")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_native_gpu_profile, false, "GPU/D3D12",
+                    "Measure the FH1 native executor's GPU time per phase (transfers, resolves, "
+                    "clears) with timestamp queries and report it with the periodic stats")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_native_shadow_verify_draws, false, "GPU/D3D12",
                     "With fh1_native_shadow_verify, also compare every draw's targets before "
@@ -108,6 +114,16 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_uint_dms_from_depth_ms_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_uint_dms_from_uint_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_uint_dms_from_uint_ms_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_words_color_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_words_color_ms_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_words_depth_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_words_depth_ms_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_words_uint_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_words_uint_ms_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_depth_from_words_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_depth_dms_from_words_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_stencil_from_words_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/fh1_native_transfer_stencil_dms_from_words_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/fullscreen_cw_vs.h"
 }  // namespace shaders
 
@@ -308,7 +324,8 @@ Fh1NativeExecutor::Fh1NativeExecutor(D3D12CommandProcessor& command_processor,
     : command_processor_(command_processor),
       register_file_(register_file),
       memory_(memory),
-      draw_extent_estimator_(register_file, memory) {}
+      draw_extent_estimator_(register_file, memory),
+      overwrite_interpreter_(register_file, memory) {}
 
 Fh1NativeExecutor::~Fh1NativeExecutor() { Shutdown(); }
 
@@ -445,6 +462,7 @@ bool Fh1NativeExecutor::Initialize(const Fh1NativeExecutorConfig& config) {
   }
 
   tile_owners_.assign(xenos::kEdramTileCount, kNoOwner);
+  tile_stencil_nonzero_.assign(xenos::kEdramTileCount, 1);
 
   std::stringstream frames(REXCVAR_GET(fh1_native_shadow_dump_frames));
   std::string frame;
@@ -455,6 +473,30 @@ bool Fh1NativeExecutor::Initialize(const Fh1NativeExecutorConfig& config) {
   // Verification compares with Xenos, which does not render in native mode.
   verify_ = REXCVAR_GET(fh1_native_shadow_verify) && !config_.presents;
   verify_draws_ = verify_ && REXCVAR_GET(fh1_native_shadow_verify_draws);
+  if (REXCVAR_GET(fh1_native_gpu_profile)) {
+    D3D12_QUERY_HEAP_DESC query_desc = {};
+    query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    query_desc.Count = kGpuProfileSlots * kGpuProfileQueries;
+    D3D12_HEAP_PROPERTIES readback_heap = {};
+    readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC readback_desc = {};
+    readback_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    readback_desc.Width = kGpuProfileQueries * sizeof(uint64_t);
+    readback_desc.Height = 1;
+    readback_desc.DepthOrArraySize = 1;
+    readback_desc.MipLevels = 1;
+    readback_desc.SampleDesc.Count = 1;
+    readback_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bool ok = SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&gpu_query_heap_))) &&
+              SUCCEEDED(provider.GetDirectQueue()->GetTimestampFrequency(
+                  &gpu_timestamp_frequency_));
+    for (auto& slot : gpu_slots_) {
+      ok = ok && SUCCEEDED(device->CreateCommittedResource(
+                     &readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&slot.readback)));
+    }
+    if (!ok) gpu_query_heap_.Reset();
+  }
   initialized_ = true;
   REXGPU_INFO("FH1 native executor enabled: {} ({} dump frames, verify {})",
               config_.presents ? "native" : "native-shadow", dump_frames_.size(), verify_);
@@ -719,11 +761,22 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
       device->CreateRenderTargetView(surface.resource.Get(), &rtv, surface.uint_view);
     }
   }
+  // Render targets must be initialized before use; zero is also what the
+  // stencil tracking assumes for a new surface.
+  auto& list = command_processor_.GetDeferredCommandList();
+  if (key.is_depth) {
+    list.D3DClearDepthStencilView(surface.view, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+                                  0.0f, 0, 0, nullptr);
+  } else {
+    const float zero[4] = {};
+    list.D3DClearRenderTargetView(surface.view, zero, 0, nullptr);
+  }
   Count("surface_created");
   return &surfaces_.emplace(packed, std::move(surface)).first->second;
 }
 
-void Fh1NativeExecutor::ClaimTiles(uint32_t base, uint32_t length, uint32_t packed_key) {
+void Fh1NativeExecutor::ClaimTiles(uint32_t base, uint32_t length, uint32_t packed_key,
+                                   bool transfer) {
   length = std::min(length, xenos::kEdramTileCount);
   if (!length) return;
   // A surface that already owns the whole range needs no work; its cached
@@ -748,11 +801,23 @@ void Fh1NativeExecutor::ClaimTiles(uint32_t base, uint32_t length, uint32_t pack
     owner = packed_key;
   }
   for (const TileRun& run : runs) last_claims_.erase(run.previous_owner);
-  last_claims_[packed_key] = {base, length};
-  if (runs.empty()) return;
+  // A partial claim must not extend a cached larger one.
+  if (transfer) {
+    last_claims_[packed_key] = {base, length};
+  } else {
+    last_claims_.erase(packed_key);
+  }
+  if (runs.empty() || !transfer) return;
   Surface* dest = FindSurface(packed_key);
   if (!dest) return;
   for (const TileRun& run : runs) TransferTiles(*dest, run);
+}
+
+void Fh1NativeExecutor::MarkTileStencil(uint32_t base, uint32_t length, bool nonzero) {
+  length = std::min(length, xenos::kEdramTileCount);
+  for (uint32_t i = 0; i < length; ++i) {
+    tile_stencil_nonzero_[(base + i) & (xenos::kEdramTileCount - 1)] = nonzero;
+  }
 }
 
 uint32_t Fh1NativeExecutor::LayoutConstant(const Surface& surface) const {
@@ -772,7 +837,19 @@ ID3D12PipelineState* Fh1NativeExecutor::GetTransferPipeline(const TransferPipeli
   desc.pRootSignature = transfer_root_signature_.Get();
   desc.VS.pShaderBytecode = shaders::fullscreen_cw_vs;
   desc.VS.BytecodeLength = sizeof(shaders::fullscreen_cw_vs);
-  desc.PS = kTransferShaders[kind][key.dest_samples > 1][key.source_kind][key.source_msaa];
+  static const D3D12_SHADER_BYTECODE kFromWordsShaders[2][2] = {
+      {{shaders::fh1_native_transfer_depth_from_words_ps,
+        sizeof(shaders::fh1_native_transfer_depth_from_words_ps)},
+       {shaders::fh1_native_transfer_depth_dms_from_words_ps,
+        sizeof(shaders::fh1_native_transfer_depth_dms_from_words_ps)}},
+      {{shaders::fh1_native_transfer_stencil_from_words_ps,
+        sizeof(shaders::fh1_native_transfer_stencil_from_words_ps)},
+       {shaders::fh1_native_transfer_stencil_dms_from_words_ps,
+        sizeof(shaders::fh1_native_transfer_stencil_dms_from_words_ps)}},
+  };
+  desc.PS = key.source_kind == kTransferSourceWords
+                ? kFromWordsShaders[kind == 1 ? 0 : 1][key.dest_samples > 1]
+                : kTransferShaders[kind][key.dest_samples > 1][key.source_kind][key.source_msaa];
   desc.SampleMask = key.sample_mask;
   desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
   desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -814,28 +891,14 @@ ID3D12PipelineState* Fh1NativeExecutor::GetTransferPipeline(const TransferPipeli
 }
 
 void Fh1NativeExecutor::TransferTiles(Surface& dest, const TileRun& run) {
-  CpuTimer timer(*this, kCpuTransfers);
-  Surface* source = FindSurface(run.previous_owner);
-  if (!source) return Skip("transfer_source_missing");
-  if ((!dest.key.is_depth &&
-       !IsResolveColorFormatSupported(xenos::ColorRenderTargetFormat(dest.key.format))) ||
-      (!source->key.is_depth &&
-       !IsResolveColorFormatSupported(xenos::ColorRenderTargetFormat(source->key.format)))) {
-    return Skip("transfer_format");
-  }
-  Count("transfer");
-  if (tracing_) Trace("transfer " + source->key.Describe() + " -> " + dest.key.Describe() + " tiles " +
-        std::to_string(run.first) + "+" + std::to_string(run.count));
-  if (verify_ && ShouldLog()) LogOnce((uint64_t(source->key.Pack()) << 32) ^ dest.key.Pack() ^ 0x7F7F,
-          "transfer " + source->key.Describe() + " -> " + dest.key.Describe());
-
   // The run's tiles as at most three rectangles of the destination: the rest
   // of the first tile row, whole rows, and the start of the last row.
   const uint32_t msaa_x_log2 = uint32_t(dest.key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
   const uint32_t msaa_y_log2 = uint32_t(dest.key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
-  const uint32_t tile_width = xenos::kEdramTileWidthSamples >> msaa_x_log2;
+  const uint32_t dest_64bpp = dest.key.Is64bpp() ? 1 : 0;
+  const uint32_t tile_width = (xenos::kEdramTileWidthSamples >> msaa_x_log2) >> dest_64bpp;
   const uint32_t tile_height = xenos::kEdramTileHeightSamples >> msaa_y_log2;
-  const uint32_t pitch = dest.key.pitch_tiles;
+  const uint32_t pitch = dest.key.pitch_tiles << dest_64bpp;
   const uint32_t first = (run.first - dest.key.base_tiles) & (xenos::kEdramTileCount - 1);
   const uint32_t end = first + run.count;
   D3D12_RECT rects[3];
@@ -863,72 +926,329 @@ void Fh1NativeExecutor::TransferTiles(Surface& dest, const TileRun& run) {
     }
     if (full_first < full_end) add_rect(0, full_first, pitch, full_end);
   }
-  if (!rect_count) return;
+  if (rect_count) TransferRects(dest, run.previous_owner, rects, rect_count, run.count);
+}
 
-  ui::d3d12::util::DescriptorCpuGpuHandlePair srvs[2];
-  const bool source_depth = source->key.is_depth;
-  const uint32_t source_kind = SourceKind(source_depth, source->key.format);
+void Fh1NativeExecutor::ClaimTileRect(const SurfaceKey& key, uint32_t column_first,
+                                      uint32_t row_first, uint32_t column_end,
+                                      uint32_t row_end) {
+  if (column_first >= column_end || row_first >= row_end) return;
+  const uint32_t packed_key = key.Pack();
+  auto tile = [&](uint32_t row, uint32_t column) -> uint32_t& {
+    return tile_owners_[(key.base_tiles + row * key.pitch_tiles + column) &
+                        (xenos::kEdramTileCount - 1)];
+  };
+  // One previous owner (unowned tiles have no content to keep) and none of
+  // the destination's own tiles, which a transfer would overwrite.
+  uint32_t previous_owner = kNoOwner;
+  bool single = true, own = false;
+  for (uint32_t row = row_first; single && row < row_end; ++row) {
+    for (uint32_t column = column_first; column < column_end; ++column) {
+      const uint32_t owner = tile(row, column);
+      if (owner == kNoOwner) continue;
+      if (owner == packed_key) {
+        own = true;
+        continue;
+      }
+      if (previous_owner != kNoOwner && owner != previous_owner) {
+        single = false;
+        break;
+      }
+      previous_owner = owner;
+    }
+  }
+  if (!single || (own && previous_owner != kNoOwner)) {
+    for (uint32_t row = row_first; row < row_end; ++row) {
+      ClaimTiles(key.base_tiles + row * key.pitch_tiles + column_first,
+                 column_end - column_first, packed_key);
+    }
+    return;
+  }
+  for (uint32_t row = row_first; row < row_end; ++row) {
+    for (uint32_t column = column_first; column < column_end; ++column) {
+      tile(row, column) = packed_key;
+    }
+  }
+  last_claims_.erase(packed_key);
+  if (previous_owner == kNoOwner) return;
+  last_claims_.erase(previous_owner);
+  Surface* dest = FindSurface(packed_key);
+  if (!dest) return;
+  const uint32_t msaa_x_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
+  const uint32_t msaa_y_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
+  const uint32_t tile_width = xenos::kEdramTileWidthSamples >> msaa_x_log2;
+  const uint32_t tile_height = xenos::kEdramTileHeightSamples >> msaa_y_log2;
+  const D3D12_RECT rect = {LONG(column_first * tile_width), LONG(row_first * tile_height),
+                           LONG(std::min(column_end * tile_width, dest->width)),
+                           LONG(std::min(row_end * tile_height, dest->height))};
+  if (rect.left < rect.right && rect.top < rect.bottom) {
+    TransferRects(*dest, previous_owner, &rect, 1,
+                  (column_end - column_first) * (row_end - row_first));
+  }
+}
+
+void Fh1NativeExecutor::TransferRects(Surface& dest, uint32_t previous_owner,
+                                      const D3D12_RECT* rects, uint32_t rect_count,
+                                      uint32_t tile_count) {
+  CpuTimer timer(*this, kCpuTransfers);
+  GpuTimer gpu_timer(*this, kGpuTransfers);
+  Surface* source = FindSurface(previous_owner);
+  if (!source) return Skip("transfer_source_missing");
+  if ((!dest.key.is_depth &&
+       !IsResolveColorFormatSupported(xenos::ColorRenderTargetFormat(dest.key.format))) ||
+      (!source->key.is_depth &&
+       !IsResolveColorFormatSupported(xenos::ColorRenderTargetFormat(source->key.format)))) {
+    return Skip("transfer_format");
+  }
+  Count("transfer");
+  if (tracing_) Trace("transfer " + source->key.Describe() + " -> " + dest.key.Describe() +
+                      " tiles " + std::to_string(tile_count));
+  if (verify_ && ShouldLog()) LogOnce((uint64_t(source->key.Pack()) << 32) ^ dest.key.Pack() ^ 0x7F7F,
+          "transfer " + source->key.Describe() + " -> " + dest.key.Describe());
+  // The depth pass resets stencil to 0; per-bit passes are needed only when
+  // the source's stencil (or a color word's low byte) may be nonzero.
+  const bool source_stencil = source->key.is_depth ? source->stencil_nonzero : true;
+  uint32_t pass_count = 1;
+  if (dest.key.is_depth) {
+    // Depth destinations take up to nine passes from the EDRAM words, which
+    // are computed once per destination sample.
+    if (!EnsureTransferWords(dest)) return Skip("transfer_words_buffer");
+    dest.stencil_nonzero |= source_stencil;
+    pass_count = source_stencil ? 9 : 1;
+    if (!source_stencil) Count("transfer_stencil_skipped");
+  }
+  stats_["transfer_tile_passes"] += uint64_t(tile_count) * pass_count;
+  if (gpu_query_heap_) {
+    transfer_volume_[source->key.Describe() + "->" + dest.key.Describe()] +=
+        uint64_t(tile_count) * pass_count;
+  }
+  for (uint32_t i = 0; i < rect_count; ++i) {
+    pending_transfers_.push_back({dest.key.Pack(), previous_owner, rects[i]});
+  }
+}
+
+void Fh1NativeExecutor::FlushTransfers() {
+  if (pending_transfers_.empty()) return;
+  CpuTimer timer(*this, kCpuTransfers);
+  GpuTimer gpu_timer(*this, kGpuTransfers);
+  // Grouped by destination, then by source, keeping each group's order.
+  std::stable_sort(pending_transfers_.begin(), pending_transfers_.end(),
+                   [](const PendingTransfer& a, const PendingTransfer& b) {
+                     return a.dest != b.dest ? a.dest < b.dest : a.source < b.source;
+                   });
+  const uint32_t flags = (config_.depth_float24_round ? 1u : 0u) |
+                         (config_.gamma_as_unorm16 ? 2u : 0u) |
+                         (config_.fixed16_truncated ? 0u : 4u);
+  auto& list = command_processor_.GetDeferredCommandList();
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  for (size_t group = 0; group < pending_transfers_.size();) {
+    size_t group_end = group;
+    while (group_end < pending_transfers_.size() &&
+           pending_transfers_[group_end].dest == pending_transfers_[group].dest) {
+      ++group_end;
+    }
+    Surface* dest = FindSurface(pending_transfers_[group].dest);
+    if (dest && !dest->key.is_depth) {
+      FlushColorTransfers(*dest, group, group_end);
+      group = group_end;
+      continue;
+    }
+    if (!dest || !EnsureTransferWords(*dest)) {
+      Skip("transfer_words_buffer");
+      group = group_end;
+      continue;
+    }
+    // Words of every rectangle, one source at a time.
+    for (size_t i = group; i < group_end; ++i) {
+      Surface* source = FindSurface(pending_transfers_[i].source);
+      if (source) {
+        Transition(source->resource.Get(), source->state,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      }
+    }
+    Transition(transfer_words_.Get(), transfer_words_state_,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    command_processor_.SubmitBarriers();
+    list.D3DSetComputeRootSignature(resolve_memory_root_signature_.Get());
+    list.D3DSetComputeRootUnorderedAccessView(3, transfer_words_->GetGPUVirtualAddress());
+    bool any_stencil = false;
+    for (size_t i = group; i < group_end;) {
+      size_t source_end = i;
+      while (source_end < group_end &&
+             pending_transfers_[source_end].source == pending_transfers_[i].source) {
+        ++source_end;
+      }
+      Surface* source = FindSurface(pending_transfers_[i].source);
+      if (!source) {
+        i = source_end;
+        continue;
+      }
+      any_stencil |= source->key.is_depth ? source->stencil_nonzero : true;
+      const bool source_depth = source->key.is_depth;
+      ID3D12PipelineState* words_pipeline = GetTransferWordsPipeline(
+          SourceKind(source_depth, source->key.format), source->samples > 1);
+      ui::d3d12::util::DescriptorCpuGpuHandlePair srvs[2];
+      if (!words_pipeline || !CreateTransferSourceViews(*source, srvs)) {
+        Skip("transfer_words_pipeline");
+        i = source_end;
+        continue;
+      }
+      command_processor_.SetExternalPipeline(words_pipeline);
+      list.D3DSetComputeRootSignature(resolve_memory_root_signature_.Get());
+      list.D3DSetComputeRootDescriptorTable(1, srvs[0].second);
+      list.D3DSetComputeRootDescriptorTable(2, srvs[1].second);
+      list.D3DSetComputeRootUnorderedAccessView(3, transfer_words_->GetGPUVirtualAddress());
+      for (; i < source_end; ++i) {
+        const D3D12_RECT& rect = pending_transfers_[i].rect;
+        const uint32_t words_constants[kResolveMemoryConstantCount] = {
+            uint32_t(rect.left) | (uint32_t(rect.top) << 16),
+            uint32_t(rect.right - rect.left) | (uint32_t(rect.bottom - rect.top) << 16),
+            LayoutConstant(*dest), LayoutConstant(*source), flags, dest->width, dest->samples, 0};
+        list.D3DSetComputeRoot32BitConstants(0, kResolveMemoryConstantCount, words_constants, 0);
+        list.D3DDispatch((uint32_t(rect.right - rect.left) + 7) / 8,
+                         (uint32_t(rect.bottom - rect.top) + 7) / 8, 1);
+      }
+    }
+    command_processor_.PushUAVBarrier(transfer_words_.Get());
+    Transition(transfer_words_.Get(), transfer_words_state_,
+               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Transition(dest->resource.Get(), dest->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    command_processor_.SubmitBarriers();
+    ui::d3d12::util::DescriptorCpuGpuHandlePair words_srv;
+    if (!command_processor_.RequestOneUseSingleViewDescriptors(1, &words_srv)) {
+      Skip("transfer_descriptor");
+      group = group_end;
+      continue;
+    }
+    ui::d3d12::util::CreateBufferRawSRV(device, words_srv.first, transfer_words_.Get(),
+                                        transfer_words_size_);
+    command_processor_.SetExternalGraphicsRootSignature(transfer_root_signature_.Get());
+    list.D3DSetGraphicsRootDescriptorTable(1, words_srv.second);
+    list.D3DSetGraphicsRootDescriptorTable(2, words_srv.second);
+    command_processor_.SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list.D3DOMSetRenderTargets(0, nullptr, FALSE, &dest->view);
+    const uint32_t sample_mask =
+        dest->key.msaa == uint32_t(xenos::MsaaSamples::k2X) && dest->samples == 4 ? 0b1001u
+                                                                               : UINT_MAX;
+    // The depth pass (which resets stencil to 0), then one pass per stencil
+    // bit over the rectangles whose source may have nonzero stencil.
+    for (uint32_t pass = 0; pass < (any_stencil ? 9u : 1u); ++pass) {
+      TransferPipelineKey key;
+      key.dest_kind = pass ? 1 + pass : 1;
+      key.dest_format = dest->view_format;
+      key.dest_samples = dest->samples;
+      key.sample_mask = sample_mask;
+      key.source_kind = kTransferSourceWords;
+      key.source_msaa = false;
+      ID3D12PipelineState* pipeline = GetTransferPipeline(key);
+      if (!pipeline) {
+        Skip("transfer_pipeline");
+        break;
+      }
+      command_processor_.SetExternalPipeline(pipeline);
+      const uint32_t pass_constants[3] = {LayoutConstant(*dest),
+                                          dest->width | (dest->samples << 16),
+                                          flags | (pass ? (pass - 1) << 8 : 0)};
+      list.D3DSetGraphicsRoot32BitConstants(0, 3, pass_constants, 0);
+      command_processor_.SetStencilReference(pass ? 0xFF : 0);
+      for (size_t i = group; i < group_end; ++i) {
+        if (pass) {
+          const Surface* source = FindSurface(pending_transfers_[i].source);
+          if (source && source->key.is_depth && !source->stencil_nonzero) continue;
+        }
+        const D3D12_RECT& rect = pending_transfers_[i].rect;
+        D3D12_VIEWPORT viewport = {float(rect.left), float(rect.top),
+                                   float(rect.right - rect.left), float(rect.bottom - rect.top),
+                                   0.0f, 1.0f};
+        command_processor_.SetViewport(viewport);
+        command_processor_.SetScissorRect(rect);
+        list.D3DDrawInstanced(3, 1, 0, 0);
+      }
+    }
+    Count("transfer_batch");
+    group = group_end;
+  }
+  pending_transfers_.clear();
+}
+
+bool Fh1NativeExecutor::CreateTransferSourceViews(
+    const Surface& source, ui::d3d12::util::DescriptorCpuGpuHandlePair (&srvs)[2]) {
+  const bool source_depth = source.key.is_depth;
   if (!command_processor_.RequestOneUseSingleViewDescriptors(source_depth ? 2 : 1, srvs)) {
-    return Skip("transfer_descriptor");
+    return false;
   }
   if (!source_depth) srvs[1] = srvs[0];
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
-  const bool source_msaa = source->samples > 1;
-  for (uint32_t i = 0; i < (source_depth ? 2u : 1u); ++i) {
+  for (uint32_t plane = 0; plane < (source_depth ? 2u : 1u); ++plane) {
     D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-    srv_desc.Format = i ? source->stencil_srv_format : source->srv_format;
+    srv_desc.Format = plane ? source.stencil_srv_format : source.srv_format;
     srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    if (source_msaa) {
+    if (source.samples > 1) {
       srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
     } else {
       srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
       srv_desc.Texture2D.MipLevels = 1;
-      srv_desc.Texture2D.PlaneSlice = i;
+      srv_desc.Texture2D.PlaneSlice = plane;
     }
-    device->CreateShaderResourceView(source->resource.Get(), &srv_desc, srvs[i].first);
+    device->CreateShaderResourceView(source.resource.Get(), &srv_desc, srvs[plane].first);
   }
-  Transition(source->resource.Get(), source->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-  Transition(dest.resource.Get(), dest.state,
-             dest.key.is_depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE
-                               : D3D12_RESOURCE_STATE_RENDER_TARGET);
-  command_processor_.SubmitBarriers();
+  return true;
+}
 
-  const uint32_t constants[3] = {
-      LayoutConstant(dest), LayoutConstant(*source),
-      (config_.depth_float24_round ? 1u : 0u) | (config_.gamma_as_unorm16 ? 2u : 0u) |
-      (config_.fixed16_truncated ? 0u : 4u)};
+void Fh1NativeExecutor::FlushColorTransfers(Surface& dest, size_t first, size_t end) {
+  // All sources read as pixel shader resources, one barrier batch.
+  for (size_t i = first; i < end; ++i) {
+    if (Surface* source = FindSurface(pending_transfers_[i].source)) {
+      Transition(source->resource.Get(), source->state,
+                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+  }
+  Transition(dest.resource.Get(), dest.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+  command_processor_.SubmitBarriers();
+  auto& list = command_processor_.GetDeferredCommandList();
+  const uint32_t flags = (config_.depth_float24_round ? 1u : 0u) |
+                         (config_.gamma_as_unorm16 ? 2u : 0u) |
+                         (config_.fixed16_truncated ? 0u : 4u);
   const uint32_t sample_mask =
       dest.key.msaa == uint32_t(xenos::MsaaSamples::k2X) && dest.samples == 4 ? 0b1001u
                                                                              : UINT_MAX;
-  auto& list = command_processor_.GetDeferredCommandList();
   command_processor_.SetExternalGraphicsRootSignature(transfer_root_signature_.Get());
-  list.D3DSetGraphicsRootDescriptorTable(1, srvs[0].second);
-  list.D3DSetGraphicsRootDescriptorTable(2, srvs[1].second);
   command_processor_.SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   const bool dest_uint = dest.uint_view.ptr != 0;
-  if (dest.key.is_depth) {
-    list.D3DOMSetRenderTargets(0, nullptr, FALSE, &dest.view);
-  } else {
-    list.D3DOMSetRenderTargets(1, dest_uint ? &dest.uint_view : &dest.view, FALSE, nullptr);
-  }
-  const uint32_t pass_count = dest.key.is_depth ? 9 : 1;
-  for (uint32_t pass = 0; pass < pass_count; ++pass) {
+  list.D3DOMSetRenderTargets(1, dest_uint ? &dest.uint_view : &dest.view, FALSE, nullptr);
+  for (size_t i = first; i < end;) {
+    size_t source_end = i;
+    while (source_end < end &&
+           pending_transfers_[source_end].source == pending_transfers_[i].source) {
+      ++source_end;
+    }
+    Surface* source = FindSurface(pending_transfers_[i].source);
+    ui::d3d12::util::DescriptorCpuGpuHandlePair srvs[2];
+    if (!source || !CreateTransferSourceViews(*source, srvs)) {
+      Skip("transfer_descriptor");
+      i = source_end;
+      continue;
+    }
     TransferPipelineKey key;
-    key.dest_kind = dest.key.is_depth ? (pass ? 1 + pass : 1) : (dest_uint ? kTransferDestUint : 0);
+    key.dest_kind = dest_uint ? kTransferDestUint : 0;
     key.dest_format = dest_uint ? dest.srv_format : dest.view_format;
     key.dest_samples = dest.samples;
     key.sample_mask = sample_mask;
-    key.source_kind = source_kind;
-    key.source_msaa = source_msaa;
+    key.source_kind = SourceKind(source->key.is_depth, source->key.format);
+    key.source_msaa = source->samples > 1;
     ID3D12PipelineState* pipeline = GetTransferPipeline(key);
-    if (!pipeline) return Skip("transfer_pipeline");
+    if (!pipeline) {
+      Skip("transfer_pipeline");
+      i = source_end;
+      continue;
+    }
     command_processor_.SetExternalPipeline(pipeline);
-    const uint32_t pass_constants[3] = {constants[0], constants[1],
-                                        constants[2] | (pass ? (pass - 1) << 8 : 0)};
-    list.D3DSetGraphicsRoot32BitConstants(0, 3, pass_constants, 0);
-    if (dest.key.is_depth) command_processor_.SetStencilReference(pass ? 0xFF : 0);
-    for (uint32_t i = 0; i < rect_count; ++i) {
-      const D3D12_RECT& rect = rects[i];
+    list.D3DSetGraphicsRootDescriptorTable(1, srvs[0].second);
+    list.D3DSetGraphicsRootDescriptorTable(2, srvs[1].second);
+    const uint32_t constants[3] = {LayoutConstant(dest), LayoutConstant(*source), flags};
+    list.D3DSetGraphicsRoot32BitConstants(0, 3, constants, 0);
+    for (; i < source_end; ++i) {
+      const D3D12_RECT& rect = pending_transfers_[i].rect;
       D3D12_VIEWPORT viewport = {float(rect.left), float(rect.top),
                                  float(rect.right - rect.left), float(rect.bottom - rect.top),
                                  0.0f, 1.0f};
@@ -937,6 +1257,66 @@ void Fh1NativeExecutor::TransferTiles(Surface& dest, const TileRun& run) {
       list.D3DDrawInstanced(3, 1, 0, 0);
     }
   }
+  Count("transfer_batch");
+}
+
+bool Fh1NativeExecutor::EnsureTransferWords(const Surface& dest) {
+  const uint64_t size = uint64_t(dest.width) * dest.height * dest.samples * sizeof(uint32_t);
+  if (transfer_words_ && transfer_words_size_ >= size) return true;
+  if (transfer_words_) {
+    // The old buffer may still be in use by submitted commands; the buffer only
+    // grows a few times, so keep outgrown ones until shutdown.
+    retired_transfer_words_.push_back(std::move(transfer_words_));
+  }
+  D3D12_HEAP_PROPERTIES heap = {};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC buffer = {};
+  buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  buffer.Width = size;
+  buffer.Height = 1;
+  buffer.DepthOrArraySize = 1;
+  buffer.MipLevels = 1;
+  buffer.SampleDesc.Count = 1;
+  buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  transfer_words_state_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
+                                             transfer_words_state_, nullptr,
+                                             IID_PPV_ARGS(&transfer_words_)))) {
+    transfer_words_size_ = 0;
+    return false;
+  }
+  transfer_words_size_ = uint32_t(size);
+  return true;
+}
+
+ID3D12PipelineState* Fh1NativeExecutor::GetTransferWordsPipeline(uint32_t source_kind,
+                                                                 bool msaa) {
+  auto& pipeline = transfer_words_pipelines_[source_kind][msaa];
+  if (pipeline) return pipeline.Get();
+  static const D3D12_SHADER_BYTECODE kWordsShaders[3][2] = {
+      {{shaders::fh1_native_transfer_words_color_cs,
+        sizeof(shaders::fh1_native_transfer_words_color_cs)},
+       {shaders::fh1_native_transfer_words_color_ms_cs,
+        sizeof(shaders::fh1_native_transfer_words_color_ms_cs)}},
+      {{shaders::fh1_native_transfer_words_depth_cs,
+        sizeof(shaders::fh1_native_transfer_words_depth_cs)},
+       {shaders::fh1_native_transfer_words_depth_ms_cs,
+        sizeof(shaders::fh1_native_transfer_words_depth_ms_cs)}},
+      {{shaders::fh1_native_transfer_words_uint_cs,
+        sizeof(shaders::fh1_native_transfer_words_uint_cs)},
+       {shaders::fh1_native_transfer_words_uint_ms_cs,
+        sizeof(shaders::fh1_native_transfer_words_uint_ms_cs)}},
+  };
+  D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
+  desc.pRootSignature = resolve_memory_root_signature_.Get();
+  desc.CS = kWordsShaders[source_kind][msaa];
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  if (FAILED(device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline)))) {
+    return nullptr;
+  }
+  return pipeline.Get();
 }
 
 void Fh1NativeExecutor::GetResolveSources(const SurfaceKey& resolve_key, int32_t x0, int32_t y0,
@@ -1092,6 +1472,307 @@ void Fh1NativeExecutor::PrepareDraw(uint32_t used_texture_mask, const Shader& ve
   }
 }
 
+bool Fh1NativeExecutor::DrawMayWriteNonzeroStencil(reg::RB_DEPTHCONTROL depth_control) const {
+  if (!depth_control.stencil_enable) return false;
+  const RegisterFile& regs = register_file_;
+  auto may_write = [](xenos::StencilOp op, uint32_t reference) {
+    switch (op) {
+      case xenos::StencilOp::kKeep:
+      case xenos::StencilOp::kZero:
+        return false;
+      case xenos::StencilOp::kReplace:
+        return reference != 0;
+      default:
+        return true;
+    }
+  };
+  auto face = [&](const reg::RB_STENCILREFMASK& mask, xenos::StencilOp fail,
+                  xenos::StencilOp zfail, xenos::StencilOp zpass) {
+    const uint32_t reference = mask.stencilref & mask.stencilwritemask;
+    return mask.stencilwritemask != 0 &&
+           (may_write(fail, reference) || may_write(zfail, reference) ||
+            may_write(zpass, reference));
+  };
+  const auto front = regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK);
+  if (face(front, depth_control.stencilfail, depth_control.stencilzfail,
+           depth_control.stencilzpass)) {
+    return true;
+  }
+  return depth_control.backface_enable &&
+         face(regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF),
+              depth_control.stencilfail_bf, depth_control.stencilzfail_bf,
+              depth_control.stencilzpass_bf);
+}
+
+void Fh1NativeExecutor::PositionExportSink::Export(ucode::ExportRegister export_register,
+                                                   const float* value, uint32_t value_mask) {
+  if (export_register == ucode::ExportRegister::kVSPosition) {
+    for (uint32_t i = 0; i < 4; ++i) {
+      if (value_mask & (1u << i)) position[i] = value[i];
+    }
+    position_mask |= value_mask;
+  } else if (export_register == ucode::ExportRegister::kVSPointSizeEdgeFlagKillVertex &&
+             (value_mask & 0b0100) &&
+             (rex::memory::Reinterpret<uint32_t>(value[2]) & ~(UINT32_C(1) << 31))) {
+    killed = true;
+  }
+}
+
+bool Fh1NativeExecutor::GetDepthOverwriteRects(const Fh1NativeDrawInfo& draw,
+                                               bool& stencil_overwritten) {
+  const RegisterFile& regs = register_file_;
+  const reg::RB_DEPTHCONTROL depth_control = draw.normalized_depth_control;
+  if (!draw.vertex_shader || !depth_control.z_enable || !depth_control.z_write_enable ||
+      depth_control.zfunc != xenos::CompareFunction::kAlways) {
+    return false;
+  }
+  // Stencil must not fail anywhere; it is either rewritten or kept.
+  const auto stencil_front = regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK);
+  stencil_overwritten = false;
+  if (depth_control.stencil_enable) {
+    if (depth_control.stencilfunc != xenos::CompareFunction::kAlways ||
+        (depth_control.backface_enable &&
+         depth_control.stencilfunc_bf != xenos::CompareFunction::kAlways)) {
+      return false;
+    }
+    stencil_overwritten =
+        depth_control.stencilzpass == xenos::StencilOp::kReplace &&
+        stencil_front.stencilwritemask == 0xFF &&
+        (!depth_control.backface_enable ||
+         (depth_control.stencilzpass_bf == xenos::StencilOp::kReplace &&
+          regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF).stencilwritemask ==
+              0xFF &&
+          regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF).stencilref ==
+              stencil_front.stencilref));
+  }
+  if (draw.pixel_shader &&
+      (draw.pixel_shader->kills_pixels() || draw.pixel_shader->writes_depth())) {
+    return false;
+  }
+  const auto color_control = regs.Get<reg::RB_COLORCONTROL>();
+  if ((draw.pixel_shader && color_control.alpha_test_enable &&
+       color_control.alpha_func != xenos::CompareFunction::kAlways) ||
+      color_control.alpha_to_mask_enable || (regs[XE_GPU_REG_PA_SC_AA_MASK] & 0xFFFF) != 0xFFFF) {
+    return false;
+  }
+  const auto mode_control = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  if (mode_control.cull_front || mode_control.cull_back ||
+      mode_control.poly_mode != xenos::PolygonModeEnable::kDisabled) {
+    return false;
+  }
+  const auto initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+  if (initiator.prim_type != xenos::PrimitiveType::kRectangleList ||
+      initiator.source_select != xenos::SourceSelect::kAutoIndex || !initiator.num_indices ||
+      initiator.num_indices > 12 || initiator.num_indices % 3 ||
+      (xenos::IsMajorModeExplicit(initiator.major_mode, initiator.prim_type) &&
+       regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select ==
+           xenos::VGTOutputPath::kTessellationEnable) ||
+      !ShaderInterpreter::CanInterpretShader(*draw.vertex_shader)) {
+    return false;
+  }
+
+  const uint32_t index_offset = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
+  const uint32_t min_index = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
+  const uint32_t max_index = regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
+  const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
+  const bool clip = !regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable;
+  const float scale[3] = {
+      vte.vport_x_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE) : 1.0f,
+      vte.vport_y_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE) : 1.0f,
+      vte.vport_z_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE) : 1.0f};
+  float offset[3] = {
+      vte.vport_x_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET) : 0.0f,
+      vte.vport_y_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET) : 0.0f,
+      vte.vport_z_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET) : 0.0f};
+  if (mode_control.vtx_window_offset_enable) {
+    const auto window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+    offset[0] += float(window_offset.window_x_offset);
+    offset[1] += float(window_offset.window_y_offset);
+  }
+  draw_util::Scissor scissor;
+  draw_util::GetScissor(regs, scissor);
+  const float pixel_offset = REXCVAR_GET(half_pixel_offset) &&
+                                     regs.Get<reg::PA_SU_VTX_CNTL>().pix_center ==
+                                         xenos::PixelCenter::kD3DZero
+                                 ? 0.5f
+                                 : 0.0f;
+  overwrite_rects_.clear();
+  overwrite_interpreter_.SetShader(*draw.vertex_shader);
+  PositionExportSink sink;
+  overwrite_interpreter_.SetExportSink(&sink);
+  bool ok = true;
+  for (uint32_t first = 0; ok && first < initiator.num_indices; first += 3) {
+    float corners[3][2];
+    for (uint32_t i = 0; ok && i < 3; ++i) {
+      sink = PositionExportSink();
+      overwrite_interpreter_.temp_registers()[0] = float(std::min(
+          max_index, std::max(min_index, (first + i + index_offset) & 0xFFFFFF)));
+      overwrite_interpreter_.Execute();
+      if (sink.killed || (sink.position_mask & 0b1111) != 0b1111) {
+        ok = false;
+        break;
+      }
+      float position[3] = {sink.position[0], sink.position[1], sink.position[2]};
+      const float w = sink.position[3];
+      if (!vte.vtx_xy_fmt || !vte.vtx_z_fmt) {
+        if (!(w > 0.0f)) {
+          ok = false;
+          break;
+        }
+      }
+      if (!vte.vtx_xy_fmt) {
+        position[0] /= w;
+        position[1] /= w;
+      }
+      if (!vte.vtx_z_fmt) position[2] /= w;
+      // Clipped depth could drop the rectangle.
+      if (clip && !(position[2] >= 0.0f && position[2] <= 1.0f)) {
+        ok = false;
+        break;
+      }
+      for (uint32_t j = 0; j < 2; ++j) {
+        corners[i][j] = position[j] * scale[j] + offset[j];
+        if (!std::isfinite(corners[i][j])) ok = false;
+      }
+    }
+    if (!ok) break;
+    // The rectangle list completes three corners of an axis-aligned rectangle
+    // into four: two distinct values per axis.
+    float bounds[4];
+    for (uint32_t j = 0; j < 2; ++j) {
+      const float a = corners[0][j], b = corners[1][j], c = corners[2][j];
+      const bool two_values = (a == b || b == c || a == c) && !(a == b && b == c);
+      if (!two_values) ok = false;
+      bounds[j] = std::min({a, b, c});
+      bounds[2 + j] = std::max({a, b, c});
+    }
+    if (!ok) break;
+    // Inner: pixels whose whole area is inside as the host rasterizes the
+    // rectangle (samples are never on pixel edges). Outer: pixels any part of
+    // which is inside.
+    auto bound = [&](bool outer) {
+      std::array<int32_t, 4> rect;
+      for (uint32_t j = 0; j < 2; ++j) {
+        const float low = bounds[j] + pixel_offset, high = bounds[2 + j] + pixel_offset;
+        rect[j] = int32_t(outer ? std::floor(low) : std::ceil(low));
+        rect[2 + j] = int32_t(outer ? std::ceil(high) : std::floor(high));
+        if (clip) {
+          const float viewport_low = offset[j] + pixel_offset - std::abs(scale[j]);
+          const float viewport_high = offset[j] + pixel_offset + std::abs(scale[j]);
+          rect[j] = std::max(rect[j], int32_t(outer ? std::floor(viewport_low)
+                                                    : std::ceil(viewport_low)));
+          rect[2 + j] = std::min(rect[2 + j], int32_t(outer ? std::ceil(viewport_high)
+                                                            : std::floor(viewport_high)));
+        }
+        rect[j] = std::max({rect[j], int32_t(scissor.offset[j]), int32_t(0)});
+        rect[2 + j] = std::min(rect[2 + j], int32_t(scissor.offset[j] + scissor.extent[j]));
+        if (rect[2 + j] < rect[j]) rect[2 + j] = rect[j];
+      }
+      return rect;
+    };
+    const OverwriteRect rect = {bound(false), bound(true)};
+    if (rect.outer[0] < rect.outer[2] && rect.outer[1] < rect.outer[3]) {
+      overwrite_rects_.push_back(rect);
+    }
+  }
+  overwrite_interpreter_.SetExportSink(nullptr);
+  return ok;
+}
+
+bool Fh1NativeExecutor::ClaimDepthOverwriteTiles(const SurfaceKey& key, uint32_t length,
+                                                 bool stencil_overwritten, bool stencil_written) {
+  const uint32_t msaa_x_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
+  const uint32_t msaa_y_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
+  const uint32_t tile_width = xenos::kEdramTileWidthSamples >> msaa_x_log2;
+  const uint32_t tile_height = xenos::kEdramTileHeightSamples >> msaa_y_log2;
+  for (const OverwriteRect& rect : overwrite_rects_) {
+    const uint32_t column_end = (uint32_t(rect.outer[2]) + tile_width - 1) / tile_width;
+    const uint32_t row_end = (uint32_t(rect.outer[3]) + tile_height - 1) / tile_height;
+    // Wider than the pitch wraps into the next row of tiles.
+    if (column_end > key.pitch_tiles || (row_end - 1) * key.pitch_tiles + column_end > length) {
+      return false;
+    }
+  }
+  for (const OverwriteRect& rect : overwrite_rects_) {
+    ClaimOverwrittenDepthTiles(key, rect.inner, stencil_overwritten);
+    // The tiles the draw touches beyond the covered ones, as up to four
+    // strips around them, each taken with one transfer where possible.
+    const uint32_t column_first = uint32_t(rect.outer[0]) / tile_width;
+    const uint32_t column_end = (uint32_t(rect.outer[2]) + tile_width - 1) / tile_width;
+    const uint32_t row_first = uint32_t(rect.outer[1]) / tile_height;
+    const uint32_t row_end = (uint32_t(rect.outer[3]) + tile_height - 1) / tile_height;
+    uint32_t inner_column_first = (uint32_t(rect.inner[0]) + tile_width - 1) / tile_width;
+    uint32_t inner_column_end = uint32_t(rect.inner[2]) / tile_width;
+    uint32_t inner_row_first = (uint32_t(rect.inner[1]) + tile_height - 1) / tile_height;
+    uint32_t inner_row_end = uint32_t(rect.inner[3]) / tile_height;
+    if (inner_column_first >= inner_column_end || inner_row_first >= inner_row_end) {
+      inner_column_first = inner_column_end = column_first;
+      inner_row_first = inner_row_end = row_first;
+    }
+    ClaimTileRect(key, column_first, row_first, column_end, inner_row_first);
+    ClaimTileRect(key, column_first, inner_row_end, column_end, row_end);
+    ClaimTileRect(key, column_first, inner_row_first, inner_column_first, inner_row_end);
+    ClaimTileRect(key, inner_column_end, inner_row_first, column_end, inner_row_end);
+    // Covered tiles the stencil check left unclaimed.
+    ClaimTileRect(key, inner_column_first, inner_row_first, inner_column_end, inner_row_end);
+    if (stencil_written) {
+      for (uint32_t row = row_first; row < row_end; ++row) {
+        MarkTileStencil(key.base_tiles + row * key.pitch_tiles + column_first,
+                        column_end - column_first, true);
+      }
+    }
+  }
+  Count("depth_overwrite_draw");
+  return true;
+}
+
+void Fh1NativeExecutor::ClaimOverwrittenDepthTiles(const SurfaceKey& key,
+                                                   const std::array<int32_t, 4>& rect,
+                                                   bool stencil_overwritten) {
+  const uint32_t msaa_x_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
+  const uint32_t msaa_y_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
+  const uint32_t tile_width = xenos::kEdramTileWidthSamples >> msaa_x_log2;
+  const uint32_t tile_height = xenos::kEdramTileHeightSamples >> msaa_y_log2;
+  const uint32_t column_first = (uint32_t(rect[0]) + tile_width - 1) / tile_width;
+  const uint32_t column_end = std::min(uint32_t(rect[2]) / tile_width, key.pitch_tiles);
+  const uint32_t row_first = (uint32_t(rect[1]) + tile_height - 1) / tile_height;
+  const uint32_t row_end = uint32_t(rect[3]) / tile_height;
+  if (column_first >= column_end || row_first >= row_end) return;
+  auto tile_index = [&](uint32_t row, uint32_t column) {
+    return row * key.pitch_tiles + column;
+  };
+  const uint32_t packed_key = key.Pack();
+  Surface* dest = FindSurface(packed_key);
+  if (!dest) return;
+  // A draw that keeps stencil needs zero stencil in the covered tiles' words;
+  // the new owner's stencil is then reset there instead of transferred.
+  if (!stencil_overwritten) {
+    for (uint32_t row = row_first; row < row_end; ++row) {
+      for (uint32_t column = column_first; column < column_end; ++column) {
+        if (tile_stencil_nonzero_[(key.base_tiles + tile_index(row, column)) &
+                                  (xenos::kEdramTileCount - 1)]) {
+          return;
+        }
+      }
+    }
+  }
+  for (uint32_t row = row_first; row < row_end; ++row) {
+    ClaimTiles(key.base_tiles + tile_index(row, column_first), column_end - column_first,
+               packed_key, false);
+  }
+  if (!stencil_overwritten && dest->stencil_nonzero) {
+    const D3D12_RECT clear_rect = {LONG(column_first * tile_width), LONG(row_first * tile_height),
+                                   LONG(std::min(column_end * tile_width, dest->width)),
+                                   LONG(std::min(row_end * tile_height, dest->height))};
+    GpuTimer gpu_timer(*this, kGpuClears);
+    Transition(dest->resource.Get(), dest->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    command_processor_.SubmitBarriers();
+    command_processor_.GetDeferredCommandList().D3DClearDepthStencilView(
+        dest->view, D3D12_CLEAR_FLAG_STENCIL, 0.0f, 0, 1, &clear_rect);
+  }
+  Count("depth_overwrite_claim");
+}
+
 void Fh1NativeExecutor::PrepareTargets(const Fh1NativeDrawInfo& draw) {
   if (!initialized_) return;
   CpuTimer timer(*this, kCpuPrepareTargets);
@@ -1159,6 +1840,9 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1NativeDrawInfo& draw) {
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
     if ((used_bits & (1u << i)) && !GetOrCreateSurface(keys[i])) used_bits &= ~(1u << i);
   }
+  const bool depth_stencil_written =
+      (used_bits & 1) && DrawMayWriteNonzeroStencil(draw.normalized_depth_control);
+  if (depth_stencil_written) FindSurface(keys[0].Pack())->stencil_nonzero = true;
 
   // Tiles each target covers, as far down as the draw can reach.
   const uint32_t msaa_y_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k2X));
@@ -1174,6 +1858,9 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1NativeDrawInfo& draw) {
     if (used_bits & (1u << i)) bases.emplace_back(keys[i].base_tiles, i);
   }
   std::sort(bases.begin(), bases.end());
+  bool stencil_overwritten = false;
+  const bool depth_overwritten =
+      used_bits == 1 && GetDepthOverwriteRects(draw, stencil_overwritten);
   for (size_t i = 0; i < bases.size(); ++i) {
     const SurfaceKey& key = keys[bases[i].second];
     const uint32_t next_base = i + 1 < bases.size()
@@ -1181,8 +1868,16 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1NativeDrawInfo& draw) {
                                    : xenos::kEdramTileCount + bases[0].first;
     const uint32_t length =
         std::min(length_tiles_32bpp << uint32_t(key.Is64bpp()), next_base - key.base_tiles);
+    if (depth_overwritten &&
+        ClaimDepthOverwriteTiles(key, length, stencil_overwritten, depth_stencil_written)) {
+      continue;
+    }
     ClaimTiles(key.base_tiles, length, key.Pack());
+    // Color words and depth draws that may write stencil leave the low byte
+    // unknown.
+    if (!key.is_depth || depth_stencil_written) MarkTileStencil(key.base_tiles, length, true);
   }
+  FlushTransfers();
 }
 
 void Fh1NativeExecutor::VerifyTargetsBeforeDraw(D3D12RenderTargetCache& render_target_cache,
@@ -1404,7 +2099,7 @@ void Fh1NativeExecutor::ShadowDraw(D3D12RenderTargetCache& render_target_cache,
   }
   render_target_cache.Fh1InvalidateCommandListRenderTargets();
   ++shadow_draws_;
-  if (verify_ && dump_frames_.count(frame_ + 1) && trace_lines_ < 400) {
+  if (tracing_ && trace_lines_ < 4000) {
     for (uint32_t mask = pending_texture_mask_; mask; mask &= mask - 1) {
       const uint32_t fetch = uint32_t(std::countr_zero(mask));
       if (tracing_) Trace("texture " + std::to_string(fetch) + " native " +
@@ -1427,6 +2122,7 @@ void Fh1NativeExecutor::ShadowDraw(D3D12RenderTargetCache& render_target_cache,
 void Fh1NativeExecutor::ClearSurfaceRect(Surface& surface, const D3D12_RECT& rect,
                                          uint32_t clear_value, uint32_t clear_value_lo) {
   auto& list = command_processor_.GetDeferredCommandList();
+  GpuTimer gpu_timer(*this, kGpuClears);
   if (surface.key.is_depth) {
     // The host keeps float24 depth halved in [0, 1) (RenderTargetCache).
     const uint32_t depth_bits = (clear_value >> 8) & 0xFFFFFF;
@@ -1434,6 +2130,7 @@ void Fh1NativeExecutor::ClearSurfaceRect(Surface& surface, const D3D12_RECT& rec
                                 xenos::DepthRenderTargetFormat::kD24FS8
                             ? xenos::Float20e4To32(depth_bits) * 0.5f
                             : xenos::UNorm24To32(depth_bits);
+    surface.stencil_nonzero |= (clear_value & 0xFF) != 0;
     Transition(surface.resource.Get(), surface.state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     command_processor_.SubmitBarriers();
     list.D3DClearDepthStencilView(surface.view,
@@ -1498,6 +2195,7 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
                                         ID3D12Resource* source_override,
                                         D3D12_GPU_VIRTUAL_ADDRESS target) {
   Surface& surface = *source.surface;
+  GpuTimer gpu_timer(*this, kGpuResolves);
   const bool depth = surface.key.is_depth;
   const bool msaa = surface.samples > 1;
   ID3D12PipelineState* pipeline =
@@ -1884,11 +2582,39 @@ bool Fh1NativeExecutor::Resolve(D3D12RenderTargetCache* render_target_cache,
     const uint32_t pitch = key.pitch_tiles << is_64bpp;
     const uint32_t column_first = uint32_t(x0) / tile_width;
     const uint32_t column_end = (uint32_t(x1) + tile_width - 1) / tile_width;
+    // Tiles the clear covers completely change owner without a transfer, as
+    // on the guest their old words are overwritten; edge tiles keep the rest.
+    const uint32_t inner_first = (uint32_t(x0) + tile_width - 1) / tile_width;
+    const uint32_t inner_end = std::max(inner_first, uint32_t(x1) / tile_width);
     for (uint32_t row = uint32_t(y0) / tile_height;
          row < (uint32_t(y1) + tile_height - 1) / tile_height; ++row) {
-      ClaimTiles(key.base_tiles + row * pitch + column_first, column_end - column_first,
-                 key.Pack());
+      const uint32_t row_base = key.base_tiles + row * pitch;
+      const bool row_covered =
+          row * tile_height >= uint32_t(y0) && (row + 1) * tile_height <= uint32_t(y1);
+      if (!row_covered || inner_first >= inner_end) {
+        ClaimTiles(row_base + column_first, column_end - column_first, key.Pack());
+        continue;
+      }
+      if (column_first < inner_first) {
+        ClaimTiles(row_base + column_first, inner_first - column_first, key.Pack());
+      }
+      ClaimTiles(row_base + inner_first, inner_end - inner_first, key.Pack(), false);
+      if (inner_end < column_end) {
+        ClaimTiles(row_base + inner_end, column_end - inner_end, key.Pack());
+      }
     }
+    for (uint32_t row = uint32_t(y0) / tile_height;
+         row < (uint32_t(y1) + tile_height - 1) / tile_height; ++row) {
+      const uint32_t row_base = key.base_tiles + row * pitch;
+      const bool row_covered =
+          row * tile_height >= uint32_t(y0) && (row + 1) * tile_height <= uint32_t(y1);
+      if (!key.is_depth || (value & 0xFF)) {
+        MarkTileStencil(row_base + column_first, column_end - column_first, true);
+      } else if (row_covered && inner_first < inner_end) {
+        MarkTileStencil(row_base + inner_first, inner_end - inner_first, false);
+      }
+    }
+    FlushTransfers();
     ClearSurfaceRect(*surface, rect, value, value_lo);
     Count(key.is_depth ? "clear_depth" : "clear_color");
     if (tracing_) Trace("clear " + key.Describe() + " rect " + std::to_string(x0) + "," + std::to_string(y0) +
@@ -2046,6 +2772,8 @@ void Fh1NativeExecutor::ShadowSwap(uint64_t frame, uint32_t frontbuffer_address,
                                    uint32_t width, uint32_t height, const uint32_t* gamma_pwl) {
   if (!initialized_) return;
   if (tracing_) Trace("swap");
+  GpuEndFrame();
+  GpuDrain();
   frame_ = frame;
   tracing_ = verify_ && dump_frames_.count(frame_ + 1) != 0;
   {
@@ -2182,6 +2910,63 @@ void Fh1NativeExecutor::DrainDumps() {
   }
 }
 
+uint32_t Fh1NativeExecutor::GpuBegin() {
+  GpuProfileSlot& slot = gpu_slots_[gpu_slot_];
+  if (!gpu_query_heap_ || slot.pending || slot.used + 2 > kGpuProfileQueries) return UINT32_MAX;
+  const uint32_t index = gpu_slot_ * kGpuProfileQueries + slot.used++;
+  command_processor_.GetDeferredCommandList().D3DEndQuery(gpu_query_heap_.Get(),
+                                                         D3D12_QUERY_TYPE_TIMESTAMP, index);
+  return index;
+}
+
+void Fh1NativeExecutor::GpuEnd(GpuPhase phase, uint32_t begin) {
+  if (begin == UINT32_MAX) return;
+  GpuProfileSlot& slot = gpu_slots_[gpu_slot_];
+  const uint32_t index = gpu_slot_ * kGpuProfileQueries + slot.used++;
+  command_processor_.GetDeferredCommandList().D3DEndQuery(gpu_query_heap_.Get(),
+                                                         D3D12_QUERY_TYPE_TIMESTAMP, index);
+  slot.spans.emplace_back(phase, begin - gpu_slot_ * kGpuProfileQueries,
+                          index - gpu_slot_ * kGpuProfileQueries);
+}
+
+void Fh1NativeExecutor::GpuEndFrame() {
+  if (!gpu_query_heap_) return;
+  GpuProfileSlot& slot = gpu_slots_[gpu_slot_];
+  if (slot.pending) return;  // Previous results not read yet: this frame was not measured.
+  if (slot.used) {
+    command_processor_.GetDeferredCommandList().D3DResolveQueryData(
+        gpu_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, gpu_slot_ * kGpuProfileQueries,
+        slot.used, slot.readback.Get(), 0);
+  }
+  slot.submission = command_processor_.GetCurrentSubmission();
+  slot.pending = true;
+  gpu_slot_ = (gpu_slot_ + 1) % kGpuProfileSlots;
+}
+
+void Fh1NativeExecutor::GpuDrain() {
+  if (!gpu_query_heap_) return;
+  const uint64_t completed = command_processor_.GetCompletedSubmission();
+  for (GpuProfileSlot& slot : gpu_slots_) {
+    if (!slot.pending || slot.submission > completed) continue;
+    if (slot.used) {
+      void* mapped = nullptr;
+      D3D12_RANGE range = {0, slot.used * sizeof(uint64_t)};
+      if (SUCCEEDED(slot.readback->Map(0, &range, &mapped))) {
+        const auto* ticks = static_cast<const uint64_t*>(mapped);
+        for (const auto& [phase, begin, end] : slot.spans) {
+          if (ticks[end] > ticks[begin]) gpu_ticks_[phase] += ticks[end] - ticks[begin];
+        }
+        D3D12_RANGE written = {0, 0};
+        slot.readback->Unmap(0, &written);
+      }
+    }
+    ++gpu_frames_;
+    slot.used = 0;
+    slot.spans.clear();
+    slot.pending = false;
+  }
+}
+
 void Fh1NativeExecutor::LogStats(uint64_t frame) {
   std::string skips;
   for (const auto& [reason, count] : skips_) {
@@ -2205,6 +2990,25 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
         cpu_ns_[kCpuResolves] / frames / 1e6);
     cpu_ns_ = {};
     cpu_frames_ = 0;
+  }
+  if (gpu_frames_ && gpu_timestamp_frequency_) {
+    const double scale = 1000.0 / double(gpu_timestamp_frequency_) / double(gpu_frames_);
+    REXGPU_INFO(
+        "FH1 native executor gpu ms/frame over {} frames: transfers {:.3f} resolves {:.3f} "
+        "clears {:.3f}",
+        gpu_frames_, gpu_ticks_[kGpuTransfers] * scale, gpu_ticks_[kGpuResolves] * scale,
+        gpu_ticks_[kGpuClears] * scale);
+    gpu_ticks_ = {};
+    gpu_frames_ = 0;
+    std::vector<std::pair<uint64_t, std::string>> volume;
+    for (const auto& [pair, tiles] : transfer_volume_) volume.emplace_back(tiles, pair);
+    std::sort(volume.rbegin(), volume.rend());
+    std::string top;
+    for (size_t i = 0; i < std::min<size_t>(volume.size(), 8); ++i) {
+      top += volume[i].second + "=" + std::to_string(volume[i].first) + " ";
+    }
+    REXGPU_INFO("FH1 native executor transfer tile-passes: {}", top);
+    transfer_volume_.clear();
   }
   if (!verify_counts_.empty()) {
     std::string verified;

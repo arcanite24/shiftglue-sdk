@@ -3928,6 +3928,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     native_targets.normalized_depth_control = normalized_depth_control;
     native_targets.normalized_color_mask = normalized_color_mask;
     native_targets.vertex_shader = vertex_shader;
+    native_targets.pixel_shader = pixel_shader;
     fh1_native_executor_->PrepareTargets(native_targets);
     if (!fh1_native_presents) render_target_cache_->Fh1InvalidateCommandListRenderTargets();
   }

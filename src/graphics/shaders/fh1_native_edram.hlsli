@@ -21,6 +21,7 @@
 #ifndef FH1_NATIVE_EDRAM_HLSLI_
 #define FH1_NATIVE_EDRAM_HLSLI_
 
+#ifndef FH1_NO_SOURCE
 #ifdef FH1_SOURCE_DEPTH
 #ifdef FH1_SOURCE_MSAA
 Texture2DMS<float> fh1_source_depth : register(t0);
@@ -42,6 +43,7 @@ Texture2DMS<float4> fh1_source_color : register(t0);
 Texture2D<float4> fh1_source_color : register(t0);
 #endif
 #endif
+#endif  // FH1_NO_SOURCE
 
 // Guest ColorRenderTargetFormat values.
 #define FORMAT_8_8_8_8 0u
@@ -279,6 +281,7 @@ uint GuestSample(uint host_sample, uint msaa, uint host_mode) {
   return guest_sample;
 }
 
+#ifndef FH1_NO_SOURCE
 // The source surface's guest EDRAM word at `pixel`, guest sample `sample` of
 // a reader with `reader_layout`; for a 64bpp reader, `half` selects the low
 // (0) or high (1) word of the sample.
@@ -370,5 +373,7 @@ uint LoadSourceWord(uint reader_layout, uint2 pixel, uint sample, uint half,
   return EncodeColor(color, source_format);
 #endif
 }
+
+#endif  // FH1_NO_SOURCE
 
 #endif  // FH1_NATIVE_EDRAM_HLSLI_
