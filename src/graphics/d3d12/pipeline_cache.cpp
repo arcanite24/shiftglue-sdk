@@ -20,6 +20,7 @@
 #include <deque>
 #include <fstream>
 #include <mutex>
+#include <unordered_set>
 #if defined(REXGPU_FH1_SHADER_PRODUCER)
 #include <cstdlib>
 #include <optional>
@@ -72,6 +73,16 @@ REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
                     "Render tessellation as wireframe");
 
 namespace rex::graphics::d3d12 {
+
+namespace {
+// Missing catalog shaders fail every draw that uses them; report each once.
+bool FirstMissingCatalogShader(uint64_t hash) {
+  static std::mutex mutex;
+  static std::unordered_set<uint64_t> reported;
+  std::lock_guard lock(mutex);
+  return reported.insert(hash).second;
+}
+}  // namespace
 
 // The handwritten shader substitutions are approximations of exact guest
 // programs. Manual FH1 coverage found foliage alpha corruption and missing UI
@@ -2020,8 +2031,10 @@ bool PipelineCache::ConfigurePipeline(
 #if defined(REXGPU_FH1_SHADER_PRODUCER)
     vertex_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
 #else
-    REXGPU_ERROR("FH1 vertex shader {:016X} is absent from the offline analysis catalog",
-                 vertex_shader->shader().ucode_data_hash());
+    if (FirstMissingCatalogShader(vertex_shader->shader().ucode_data_hash())) {
+      REXGPU_ERROR("FH1 vertex shader {:016X} is absent from the offline analysis catalog",
+                   vertex_shader->shader().ucode_data_hash());
+    }
     return false;
 #endif
   }
@@ -2066,8 +2079,10 @@ bool PipelineCache::ConfigurePipeline(
         pixel_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
 #else
         if (!pixel_shader->shader().is_ucode_analyzed()) {
-          REXGPU_ERROR("FH1 pixel shader {:016X} is absent from the offline analysis catalog",
-                       pixel_shader->shader().ucode_data_hash());
+          if (FirstMissingCatalogShader(pixel_shader->shader().ucode_data_hash())) {
+            REXGPU_ERROR("FH1 pixel shader {:016X} is absent from the offline analysis catalog",
+                         pixel_shader->shader().ucode_data_hash());
+          }
           return false;
         }
 #endif

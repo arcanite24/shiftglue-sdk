@@ -1586,12 +1586,15 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
               vgt_hos_cntl.value, uint32_t(vgt_hos_cntl.tess_mode), rb_modecontrol.value,
               uint32_t(rb_modecontrol.edram_mode));
         }
-        REXGPU_ERROR(
-            "{}({}, {}, {}): Failed in backend "
+        // Bounded: a draw that fails once usually fails every frame.
+        static std::atomic<uint64_t> failed_draws{0};
+        const uint64_t failed = failed_draws.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (failed <= 16 || !(failed & (failed - 1))) REXGPU_ERROR(
+            "{}({}, {}, {}): Failed in backend ({} so far) "
             "(major_mode={}, explicit_major={}, path_select={}, tess_mode={}, edram_mode={})",
             opcode_name, static_cast<uint32_t>(vgt_draw_initiator.num_indices),
             uint32_t(vgt_draw_initiator.prim_type), uint32_t(vgt_draw_initiator.source_select),
-            uint32_t(vgt_draw_initiator.major_mode), uint32_t(major_mode_explicit),
+            failed, uint32_t(vgt_draw_initiator.major_mode), uint32_t(major_mode_explicit),
             uint32_t(vgt_output_path_cntl.path_select), uint32_t(vgt_hos_cntl.tess_mode),
             uint32_t(rb_modecontrol.edram_mode));
       }
