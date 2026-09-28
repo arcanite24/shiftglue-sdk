@@ -1260,6 +1260,13 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
           {0xE67462AC487FB369, 0x0000000000000001},
           {0xD606035F41900757, 0x000000000000003F},
           {0xEC8B8A5D5D0171BE, 0x00000000000000FF},
+          // Autoshow and race vertex shaders paired with pixel shaders that
+          // read fewer interpolators than the vertex program declares.
+          {0x2B2187189DFBFB10, 0x0000000000000007},
+          {0x958D2F74344C7B36, 0x000000000000003F},
+          {0xAE8FEE9795590D78, 0x000000000000007F},
+          {0xC8DB78EC7C219094, 0x000000000000007F},
+          {0xFCB6BAC481AA29F2, 0x000000000000007F},
       };
       for (const auto& [hash, modification] : kFh1RuntimeVariants) {
         auto shader_it = shaders_.find(hash);
