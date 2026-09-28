@@ -53,6 +53,18 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, false, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(d3d12_async_submission, true, "GPU/D3D12",
+                    "Replay recorded command lists into Direct3D 12 and submit them on a worker "
+                    "thread instead of the GPU command thread")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(d3d12_submission_split_draws, 1024, "GPU/D3D12",
+                     "With asynchronous submission, end a submission after this many draws so its "
+                     "replay overlaps the recording of the rest of the frame (0 = one submission "
+                     "per frame)")
+    .range(0, 1 << 20)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::graphics::d3d12 {
 
 static bool Fh1GpuCorpusEnabled() {
@@ -1647,6 +1659,8 @@ bool D3D12CommandProcessor::SetupContext() {
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
 
+  StartSubmissionWorker();
+
   return true;
 }
 
@@ -1722,6 +1736,7 @@ void D3D12CommandProcessor::ShutdownContext() {
 
   shared_memory_.reset();
 
+  StopSubmissionWorker();
   deferred_command_list_.Reset();
   ui::d3d12::util::ReleaseAndNull(command_list_1_);
   ui::d3d12::util::ReleaseAndNull(command_list_);
@@ -2842,6 +2857,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
+  // Let the submission worker replay what is recorded so far while the rest
+  // of the frame records; the next draw opens a new submission.
+  if (submission_split_draws_ && ++submission_draws_ >= submission_split_draws_ &&
+      CanSplitSubmission()) {
+    EndSubmission(false);
+  }
+
   return true;
 }
 
@@ -2942,6 +2964,7 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission,
     }
     // Include operations such as UpdateTileMappings made outside a submission.
     if (queue_operations_done_since_submission_signal_) {
+      AwaitSubmissionWorker();
       const UINT64 fence_value = ++queue_operations_since_submission_fence_last_;
       const HRESULT signal_result = GetD3D12Provider().GetDirectQueue()->Signal(
           queue_operations_since_submission_fence_, fence_value);
@@ -3135,6 +3158,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
   if (!submission_open_) {
     submission_open_ = true;
+    submission_draws_ = 0;
 
     // Start a new deferred command list - will submit it to the real one in the
     // end of the submission (when async pipeline creation requests are
@@ -3263,8 +3287,6 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       EndNativeGuestOutputGpuTimingFrame();
     }
 
-    ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
-
     // Submit the deferred command list.
     // Only one deferred command list must be executed in the same
     // ExecuteCommandLists - the boundaries of ExecuteCommandLists are a full
@@ -3272,17 +3294,8 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // happens between Xenia submissions.
     ID3D12CommandAllocator* command_allocator =
         command_allocator_writable_first_->command_allocator;
-    command_allocator->Reset();
-    command_list_->Reset(command_allocator, nullptr);
-    const uint64_t traced_submission = submission_current_;
-    perf::TraceCriticalPath("submission_begin",
-                            perf::GetTotalCounter(perf::CounterId::kSourceFrameCount),
-                            int64_t(traced_submission), is_closing_frame ? 1 : 0);
-    deferred_command_list_.Execute(command_list_, command_list_1_);
-    command_list_->Close();
-    ID3D12CommandList* execute_command_lists[] = {command_list_};
-    direct_queue->ExecuteCommandLists(1, execute_command_lists);
-    command_allocator_writable_first_->last_usage_submission = submission_current_;
+    const uint64_t submission = submission_current_;
+    command_allocator_writable_first_->last_usage_submission = submission;
     if (command_allocator_submitted_last_) {
       command_allocator_submitted_last_->next = command_allocator_writable_first_;
     } else {
@@ -3295,10 +3308,36 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       command_allocator_writable_last_ = nullptr;
     }
 
-    direct_queue->Signal(submission_fence_, submission_current_++);
-    perf::TraceCriticalPath("submission_end",
-                            perf::GetTotalCounter(perf::CounterId::kSourceFrameCount),
-                            int64_t(traced_submission), is_closing_frame ? 1 : 0);
+    ++submission_current_;
+    if (async_submission_) {
+      // Hand the tape to the worker and keep recording into a recycled one.
+      std::unique_ptr<DeferredCommandList> tape;
+      {
+        std::lock_guard<std::mutex> lock(submission_worker_mutex_);
+        if (!submission_free_tapes_.empty()) {
+          tape = std::move(submission_free_tapes_.back());
+          submission_free_tapes_.pop_back();
+        }
+      }
+      if (!tape) {
+        tape = std::make_unique<DeferredCommandList>(*this);
+      }
+      tape->Swap(deferred_command_list_);
+      {
+        std::lock_guard<std::mutex> lock(submission_worker_mutex_);
+        submission_jobs_.push_back(
+            SubmissionJob{std::move(tape), command_allocator, submission, is_closing_frame});
+      }
+      submission_worker_wake_.notify_one();
+      // The presenter queues work reading the guest output right after the
+      // swap, so the frame must be on the queue first.
+      if (is_swap) {
+        AwaitSubmissionWorker();
+      }
+    } else {
+      ExecuteSubmission(deferred_command_list_, command_allocator, submission,
+                        is_closing_frame);
+    }
 
     submission_open_ = false;
 
@@ -3348,6 +3387,96 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   }
 
   return true;
+}
+
+void D3D12CommandProcessor::ExecuteSubmission(DeferredCommandList& tape,
+                                              ID3D12CommandAllocator* command_allocator,
+                                              uint64_t submission, bool closing_frame) {
+  ID3D12CommandQueue* direct_queue = GetD3D12Provider().GetDirectQueue();
+  command_allocator->Reset();
+  command_list_->Reset(command_allocator, nullptr);
+  perf::TraceCriticalPath("submission_begin",
+                          perf::GetTotalCounter(perf::CounterId::kSourceFrameCount),
+                          int64_t(submission), closing_frame ? 1 : 0);
+  tape.Execute(command_list_, command_list_1_);
+  command_list_->Close();
+  ID3D12CommandList* execute_command_lists[] = {command_list_};
+  direct_queue->ExecuteCommandLists(1, execute_command_lists);
+  direct_queue->Signal(submission_fence_, submission);
+  perf::TraceCriticalPath("submission_end",
+                          perf::GetTotalCounter(perf::CounterId::kSourceFrameCount),
+                          int64_t(submission), closing_frame ? 1 : 0);
+}
+
+bool D3D12CommandProcessor::CanSplitSubmission() const {
+  // A submission boundary ends host occlusion queries, and ending with
+  // pipelines still being created would wait for them.
+  return submission_open_ && frame_open_ && !scratch_buffer_used_ &&
+         !active_occlusion_query_.valid &&
+         modern_occlusion_query_active_index_ == UINT32_MAX &&
+         !pipeline_cache_->IsCreatingPipelines();
+}
+
+void D3D12CommandProcessor::StartSubmissionWorker() {
+  async_submission_ = REXCVAR_GET(d3d12_async_submission);
+  submission_split_draws_ =
+      async_submission_ ? uint32_t(std::max(0, REXCVAR_GET(d3d12_submission_split_draws))) : 0;
+  if (!async_submission_) {
+    return;
+  }
+  submission_worker_stop_ = false;
+  submission_worker_ = std::thread([this]() { SubmissionWorkerMain(); });
+  REXGPU_INFO("Asynchronous Direct3D 12 submission enabled (split after {} draws)",
+              submission_split_draws_);
+}
+
+void D3D12CommandProcessor::StopSubmissionWorker() {
+  if (!submission_worker_.joinable()) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(submission_worker_mutex_);
+    submission_worker_stop_ = true;
+  }
+  submission_worker_wake_.notify_all();
+  submission_worker_.join();
+  submission_free_tapes_.clear();
+  async_submission_ = false;
+  submission_split_draws_ = 0;
+}
+
+void D3D12CommandProcessor::SubmissionWorkerMain() {
+  SetThreadDescription(GetCurrentThread(), L"GPU Submission");
+  std::unique_lock<std::mutex> lock(submission_worker_mutex_);
+  while (true) {
+    submission_worker_wake_.wait(
+        lock, [this]() { return submission_worker_stop_ || !submission_jobs_.empty(); });
+    if (submission_jobs_.empty()) {
+      // Stopping, and every queued submission has been made.
+      break;
+    }
+    SubmissionJob job = std::move(submission_jobs_.front());
+    submission_jobs_.pop_front();
+    submission_worker_busy_ = true;
+    lock.unlock();
+    ExecuteSubmission(*job.tape, job.command_allocator, job.submission, job.closing_frame);
+    job.tape->Reset();
+    lock.lock();
+    submission_free_tapes_.push_back(std::move(job.tape));
+    submission_worker_busy_ = false;
+    if (submission_jobs_.empty()) {
+      submission_worker_idle_.notify_all();
+    }
+  }
+}
+
+void D3D12CommandProcessor::AwaitSubmissionWorker() {
+  if (!async_submission_) {
+    return;
+  }
+  std::unique_lock<std::mutex> lock(submission_worker_mutex_);
+  submission_worker_idle_.wait(
+      lock, [this]() { return submission_jobs_.empty() && !submission_worker_busy_; });
 }
 
 bool D3D12CommandProcessor::CanEndSubmissionImmediately() const {

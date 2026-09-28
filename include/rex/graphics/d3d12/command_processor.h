@@ -14,11 +14,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -71,6 +74,10 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   // The FH1 native executor, or null before initialization.
   Fh1NativeExecutor* GetFh1NativeExecutor() const { return fh1_native_executor_.get(); }
+  // Returns once the submission worker has submitted every queued command
+  // list. Anything that uses the direct queue from this thread must call it
+  // first so queue order matches submission order.
+  void AwaitSubmissionWorker();
   // Returns the deferred drawing command list for the currently open
   // submission.
   DeferredCommandList& GetDeferredCommandList() {
@@ -465,6 +472,34 @@ class D3D12CommandProcessor : public CommandProcessor {
   ID3D12GraphicsCommandList* command_list_ = nullptr;
   ID3D12GraphicsCommandList1* command_list_1_ = nullptr;
   DeferredCommandList deferred_command_list_;
+
+  // Replays a recorded tape into command_list_, executes it and signals the
+  // submission fence. Runs on the submission worker, or inline without one.
+  void ExecuteSubmission(DeferredCommandList& tape, ID3D12CommandAllocator* command_allocator,
+                         uint64_t submission, bool closing_frame);
+  // Whether the open submission can end after the current draw to let its
+  // replay overlap the recording of later draws.
+  bool CanSplitSubmission() const;
+  void StartSubmissionWorker();
+  void StopSubmissionWorker();
+  void SubmissionWorkerMain();
+  struct SubmissionJob {
+    std::unique_ptr<DeferredCommandList> tape;
+    ID3D12CommandAllocator* command_allocator = nullptr;
+    uint64_t submission = 0;
+    bool closing_frame = false;
+  };
+  bool async_submission_ = false;
+  uint32_t submission_split_draws_ = 0;
+  uint32_t submission_draws_ = 0;
+  std::thread submission_worker_;
+  std::mutex submission_worker_mutex_;
+  std::condition_variable submission_worker_wake_;
+  std::condition_variable submission_worker_idle_;
+  std::deque<SubmissionJob> submission_jobs_;
+  std::vector<std::unique_ptr<DeferredCommandList>> submission_free_tapes_;
+  bool submission_worker_busy_ = false;
+  bool submission_worker_stop_ = false;
 
   bool debug_markers_enabled_ = false;
 

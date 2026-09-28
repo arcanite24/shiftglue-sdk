@@ -1225,6 +1225,8 @@ bool D3D12TextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unscal
     if (scaled_resolve_heaps_[i]) {
       continue;
     }
+    // UpdateTileMappings goes on the direct queue after every queued submission.
+    command_processor_.AwaitSubmissionWorker();
     auto direct_queue = provider.GetDirectQueue();
     D3D12_HEAP_DESC heap_desc = {};
     heap_desc.SizeInBytes = kScaledResolveHeapSize;

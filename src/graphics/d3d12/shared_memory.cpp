@@ -271,6 +271,8 @@ bool D3D12SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocat
 
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
+  // UpdateTileMappings goes on the direct queue after every queued submission.
+  command_processor_.AwaitSubmissionWorker();
   ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
 
   D3D12_HEAP_DESC heap_desc = {};

@@ -34,6 +34,13 @@ class DeferredCommandList {
 
   void Reset();
   void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1);
+  // Exchanges the recorded commands with another list of the same command
+  // processor, so a recorded tape can be replayed elsewhere while recording
+  // continues into this object.
+  void Swap(DeferredCommandList& other) {
+    command_stream_.swap(other.command_stream_);
+    std::swap(command_count_, other.command_count_);
+  }
 
   void ReserveAdditionalBytes(size_t bytes) {
     command_stream_.reserve(command_stream_.size() +
