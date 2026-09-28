@@ -55,6 +55,10 @@ REXCVAR_DEFINE_BOOL(fh1_native_ui_boundary_probe, false, "GPU/D3D12",
                     "Assemble the native race scene before guest UI draws")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_STRING(fh1_resolve_dump_dir, "", "GPU/D3D12",
+                      "Diagnostics: write every resolve's output bytes (scaled when resolution "
+                      "scaling is on) to this directory, waiting for the GPU after each")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_native_reflection_mips, true, "GPU/D3D12",
                     "Use experimental native reflection mips at symmetric 1x/2x; "
                     "fall back when the current command/input contract does not match")
@@ -5957,6 +5961,9 @@ bool D3D12CommandProcessor::IssueCopy() {
   }
   if (fh1_mip_replacement_active_ && copy_succeeded)
     ++fh1_mip_skipped_copies_;
+  if (copy_succeeded && written_length && !REXCVAR_GET(fh1_resolve_dump_dir).empty()) {
+    DumpResolveOutput(written_address, written_length);
+  }
 
   auto copy_observer = graphics_system_->copy_observer();
   if (!Fh1ObserveCorpusFrame(observation_frame_sequence_) || fh1_native_presents) {
@@ -8944,6 +8951,57 @@ void D3D12CommandProcessor::RunRequestedFrameReplay() {
   // A replay is a tool run with the title suspended: end the process here.
   rex::FlushLogging();
   std::_Exit(exit_code);
+}
+
+void D3D12CommandProcessor::DumpResolveOutput(uint32_t address, uint32_t length) {
+  static uint32_t sequence = 0;
+  const bool scaled = texture_cache_->IsDrawResolutionScaled();
+  const uint64_t area =
+      uint64_t(texture_cache_->draw_resolution_scale_x()) * texture_cache_->draw_resolution_scale_y();
+  const uint64_t size = scaled ? uint64_t(length) * area : length;
+  ID3D12Resource* source = nullptr;
+  uint64_t source_offset = 0;
+  if (scaled) {
+    if (!texture_cache_->MakeScaledResolveRangeCurrent(address, length)) return;
+    texture_cache_->TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE_COPY_SOURCE);
+    source = texture_cache_->GetCurrentScaledResolveBufferResource();
+    source_offset = texture_cache_->GetCurrentScaledResolveRangeStartScaled() -
+                    (uint64_t(texture_cache_->GetCurrentScaledResolveBufferIndexPublic()) << 30);
+  } else {
+    if (!shared_memory_->RequestRange(address, length)) return;
+    shared_memory_->UseAsCopySource();
+    source = shared_memory_->GetBuffer();
+    source_offset = address;
+  }
+  D3D12_HEAP_PROPERTIES heap = {};
+  heap.Type = D3D12_HEAP_TYPE_READBACK;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  desc.Width = size;
+  desc.Height = 1;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+  if (FAILED(GetD3D12Provider().GetDevice()->CreateCommittedResource(
+          &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+          IID_PPV_ARGS(&readback)))) {
+    return;
+  }
+  SubmitBarriers();
+  deferred_command_list_.D3DCopyBufferRegion(readback.Get(), 0, source, source_offset, size);
+  AwaitAllQueueOperationsCompletion();
+  void* mapped = nullptr;
+  D3D12_RANGE range = {0, size_t(size)};
+  if (FAILED(readback->Map(0, &range, &mapped))) return;
+  char name[64];
+  std::snprintf(name, sizeof(name), "%05u_%08X_%u.bin", sequence++, address, length);
+  std::ofstream(std::filesystem::path(REXCVAR_GET(fh1_resolve_dump_dir)) / name, std::ios::binary)
+      .write(static_cast<const char*>(mapped), std::streamsize(size));
+  D3D12_RANGE written = {0, 0};
+  readback->Unmap(0, &written);
+  BeginSubmission(true);
 }
 
 ReadbackResolveMode D3D12CommandProcessor::Fh1ReadbackResolveMode() const {

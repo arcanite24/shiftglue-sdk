@@ -242,6 +242,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Opens a submission for work recorded outside guest packets.
   bool Fh1BeginSubmission() { return BeginSubmission(false); }
   void RunRequestedFrameReplay() override;
+  // fh1_resolve_dump_dir: one resolve's output (scaled when scaling).
+  void DumpResolveOutput(uint32_t address, uint32_t length);
   D3D12TextureCache& Fh1XenosTextureCache() const { return *texture_cache_; }
 
   // FH1 native executor: after a Xenos draw, rebinds the resources that draw
