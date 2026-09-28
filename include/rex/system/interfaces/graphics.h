@@ -52,7 +52,7 @@ enum class NativeGuestOutputPhase : uint32_t {
 
 // Which renderer produced the guest output of a kPresented notification.
 enum class NativeGuestOutputPresenter : uint32_t {
-  // The Xenos-emulating backend (fh1_renderer xenos or native-shadow).
+  // The Xenos-emulating backend (fh1_renderer xenos).
   kXenos = 0,
   // The frozen six-family pilot, through this renderer callback.
   kPilot = 1,

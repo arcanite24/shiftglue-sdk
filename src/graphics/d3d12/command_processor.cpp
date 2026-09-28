@@ -306,9 +306,6 @@ void D3D12CommandProcessor::InvalidateGpuMemory() {
   if (shared_memory_) {
     shared_memory_->InvalidateAllPages();
   }
-  if (fh1_native_executor_ && fh1_native_executor_->shared_memory()) {
-    fh1_native_executor_->shared_memory()->InvalidateAllPages();
-  }
 }
 
 void D3D12CommandProcessor::InvalidateAllVertexBufferResidency() {
@@ -971,26 +968,21 @@ ui::d3d12::util::DescriptorCpuGpuHandlePair D3D12CommandProcessor::GetSystemBind
 
 ui::d3d12::util::DescriptorCpuGpuHandlePair
 D3D12CommandProcessor::GetSharedMemoryUintPow2BindlessSRVHandlePair(
-    uint32_t element_size_bytes_pow2, const D3D12SharedMemory* memory) const {
-  const bool native = memory && memory != shared_memory_.get();
+    uint32_t element_size_bytes_pow2) const {
   SystemBindlessView view;
   switch (element_size_bytes_pow2) {
     case 2:
-      view = native ? SystemBindlessView::kFh1NativeSharedMemoryR32UintSRV
-                    : SystemBindlessView::kSharedMemoryR32UintSRV;
+      view = SystemBindlessView::kSharedMemoryR32UintSRV;
       break;
     case 3:
-      view = native ? SystemBindlessView::kFh1NativeSharedMemoryR32G32UintSRV
-                    : SystemBindlessView::kSharedMemoryR32G32UintSRV;
+      view = SystemBindlessView::kSharedMemoryR32G32UintSRV;
       break;
     case 4:
-      view = native ? SystemBindlessView::kFh1NativeSharedMemoryR32G32B32A32UintSRV
-                    : SystemBindlessView::kSharedMemoryR32G32B32A32UintSRV;
+      view = SystemBindlessView::kSharedMemoryR32G32B32A32UintSRV;
       break;
     default:
       assert_unhandled_case(element_size_bytes_pow2);
-      view = native ? SystemBindlessView::kFh1NativeSharedMemoryR32UintSRV
-                    : SystemBindlessView::kSharedMemoryR32UintSRV;
+      view = SystemBindlessView::kSharedMemoryR32UintSRV;
   }
   return GetSystemBindlessViewHandlePair(view);
 }
@@ -1612,7 +1604,7 @@ bool D3D12CommandProcessor::SetupContext() {
       bindless_resources_used_);
   // In FH1 native mode the native executor owns EDRAM; the render target cache
   // only provides the host configuration the pipelines are built against.
-  if (!render_target_cache_->Initialize(Fh1NativeExecutor::Presents())) {
+  if (!render_target_cache_->Initialize(Fh1NativeExecutor::Enabled())) {
     REXGPU_ERROR("Failed to initialize the render target cache");
     return false;
   }
@@ -1932,21 +1924,15 @@ bool D3D12CommandProcessor::SetupContext() {
     Fh1NativeExecutorConfig native_config;
     native_config.msaa_2x_supported = render_target_cache_->msaa_2x_supported();
     native_config.gamma_as_unorm16 = render_target_cache_->gamma_render_target_as_unorm16();
-    native_config.bindless = bindless_resources_used_;
     native_config.depth_float24_round = render_target_cache_->depth_float24_round();
     native_config.fixed16_truncated = render_target_cache_->IsFixed16TruncatedToMinus1To1();
-    native_config.presents = Fh1NativeExecutor::Presents();
-    if (native_config.presents) {
-      native_config.memory = shared_memory_.get();
-      native_config.textures = texture_cache_.get();
-    }
+    native_config.memory = shared_memory_.get();
+    native_config.textures = texture_cache_.get();
     if (!fh1_native_executor_->Initialize(native_config)) {
       REXGPU_ERROR("Failed to initialize the FH1 native executor");
       fh1_native_executor_.reset();
       // Native mode has no EDRAM without the executor.
-      if (native_config.presents) return false;
-    } else if (fh1_native_executor_->verifying()) {
-      render_target_cache_->Fh1SetRecordResolveOwners(true);
+      return false;
     }
   }
 
@@ -2229,33 +2215,6 @@ bool D3D12CommandProcessor::SetupContext() {
         nullptr, &null_srv_desc,
         provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
                                       uint32_t(SystemBindlessView::kNullTextureCube)));
-    // FH1 native executor mirror views, or null views without the executor.
-    {
-      D3D12SharedMemory* native_memory =
-          fh1_native_executor_ ? fh1_native_executor_->shared_memory() : nullptr;
-      auto view_handle = [&](SystemBindlessView view) {
-        return provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_, uint32_t(view));
-      };
-      ui::d3d12::util::CreateBufferRawUAV(
-          device, view_handle(SystemBindlessView::kFh1NativeNullRawUAV), nullptr, 0);
-      if (native_memory) {
-        native_memory->WriteRawSRVDescriptor(
-            view_handle(SystemBindlessView::kFh1NativeSharedMemoryRawSRV));
-        native_memory->WriteUintPow2SRVDescriptor(
-            view_handle(SystemBindlessView::kFh1NativeSharedMemoryR32UintSRV), 2);
-        native_memory->WriteUintPow2SRVDescriptor(
-            view_handle(SystemBindlessView::kFh1NativeSharedMemoryR32G32UintSRV), 3);
-        native_memory->WriteUintPow2SRVDescriptor(
-            view_handle(SystemBindlessView::kFh1NativeSharedMemoryR32G32B32A32UintSRV), 4);
-      } else {
-        for (SystemBindlessView view : {SystemBindlessView::kFh1NativeSharedMemoryRawSRV,
-                                        SystemBindlessView::kFh1NativeSharedMemoryR32UintSRV,
-                                        SystemBindlessView::kFh1NativeSharedMemoryR32G32UintSRV,
-                                        SystemBindlessView::kFh1NativeSharedMemoryR32G32B32A32UintSRV}) {
-          ui::d3d12::util::CreateBufferRawSRV(device, view_handle(view), nullptr, 0);
-        }
-      }
-    }
     // kSharedMemoryRawSRV.
     shared_memory_->WriteRawSRVDescriptor(provider.OffsetViewDescriptor(
         view_bindless_heap_cpu_start_, uint32_t(SystemBindlessView::kSharedMemoryRawSRV)));
@@ -2524,11 +2483,6 @@ void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       texture_cache_->TextureFetchConstantWritten((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) /
                                                   6);
     }
-    if (fh1_native_executor_) {
-      fh1_native_executor_->TextureFetchConstantsWritten(
-          (index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6,
-          (index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6);
-    }
     InvalidateVertexBufferResidency((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 2);
   }
 }
@@ -2613,10 +2567,6 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
     uint32_t last_fetch_dword = end_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
     if (texture_cache_) {
       texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
-    }
-    if (fh1_native_executor_) {
-      fh1_native_executor_->TextureFetchConstantsWritten(first_fetch_dword / 6,
-                                                         last_fetch_dword / 6);
     }
     InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
     return;
@@ -2989,8 +2939,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                                 uint32_t(register_file_->GetTextureFetch(0).format));
   }
   if (fh1_native_executor_ && observation_frame_sequence_ % 600 == 0) {
-    // Native mode: the EDRAM emulation must do no work at all. Shadow mode:
-    // Xenos's own work, for comparison with the executor's.
+    // Native mode: the EDRAM emulation must do no work at all.
     const auto work = render_target_cache_->fh1_work_counters();
     REXGPU_INFO(
         "FH1 xenos edram work: updates={} resolves={} render_targets={} "
@@ -3004,8 +2953,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                 front_format == xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16
             ? reinterpret_cast<const uint32_t*>(gamma_ramp_pwl_rgb())
             : nullptr;
-    fh1_native_executor_->ShadowSwap(observation_frame_sequence_, frontbuffer_ptr,
-                                     frontbuffer_width, frontbuffer_height, gamma_pwl);
+    fh1_native_executor_->OnSwap(observation_frame_sequence_, frontbuffer_ptr,
+                                 frontbuffer_width, frontbuffer_height, gamma_pwl);
   }
   static thread_local int64_t previous_cpu_ns = 0;
   if (Fh1NativeRaceCaptureStartFrame()) {
@@ -3512,7 +3461,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         if (renderer) {
           native_context.phase = system::NativeGuestOutputPhase::kPresented;
           native_context.presenter =
-              fh1_native_executor_ && fh1_native_executor_->presents()
+              fh1_native_executor_
                   ? system::NativeGuestOutputPresenter::kNativeExecutor
                   : system::NativeGuestOutputPresenter::kXenos;
           native_context.clear_color = nullptr;
@@ -3926,10 +3875,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     };
     if (try_owned_clear()) return finish_draw(true);
   }
-  const bool fh1_native_presents = fh1_native_executor_ && fh1_native_executor_->presents();
+  const bool fh1_native_presents = fh1_native_executor_ != nullptr;
   if (fh1_native_executor_) {
-    // Native targets and EDRAM ownership transfers before Xenos binds its own
-    // render targets for this draw (or, in native mode, instead of them).
+    // Native targets and EDRAM ownership transfers, in place of the Xenos
+    // render targets for this draw.
     Fh1NativeDrawInfo native_targets;
     native_targets.memexport = memexport_used;
     native_targets.rasterization_done = is_rasterization_done;
@@ -3938,7 +3887,6 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     native_targets.vertex_shader = vertex_shader;
     native_targets.pixel_shader = pixel_shader;
     fh1_native_executor_->PrepareTargets(native_targets);
-    if (!fh1_native_presents) render_target_cache_->Fh1InvalidateCommandListRenderTargets();
   }
   uint32_t bound_depth_and_color_render_target_bits = 0;
   uint32_t bound_depth_and_color_render_target_formats[1 + xenos::kMaxColorRenderTargets] = {};
@@ -3950,11 +3898,6 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   } else if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                            normalized_color_mask, *vertex_shader)) {
     return finish_draw(false);
-  } else if (fh1_native_executor_ && fh1_native_executor_->verifying()) {
-    Fh1NativeDrawInfo verify_draw;
-    verify_draw.vertex_shader = vertex_shader;
-    verify_draw.pixel_shader = pixel_shader;
-    fh1_native_executor_->VerifyTargetsBeforeDraw(*render_target_cache_, verify_draw);
   }
 
   // Obtain shader metadata and the actual render-target formats. Native passes
@@ -4930,8 +4873,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     texture_cache_->RequestTextures(used_texture_mask);
   }
   if (fh1_native_executor_) {
-    // The native mirror and textures are prepared before the Xenos pipeline is
-    // bound, since loading textures may dispatch compute work.
+    // Frame dumps: the guest ranges the draw reads.
     const bool guest_dma_indices = primitive_processing_result.index_buffer_type ==
                                    PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA;
     const uint32_t index_base = guest_dma_indices ? primitive_processing_result.guest_index_base : 0;
@@ -4942,13 +4884,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                        ? uint32_t(sizeof(uint16_t))
                        : uint32_t(sizeof(uint32_t)))
             : 0;
-    if (fh1_native_presents) {
-      fh1_native_executor_->RecordDrawInputs(used_texture_mask, *vertex_shader, index_base,
-                                             index_size);
-    } else {
-      fh1_native_executor_->PrepareDraw(used_texture_mask, *vertex_shader, index_base,
-                                        index_size);
-    }
+    fh1_native_executor_->RecordDrawInputs(used_texture_mask, *vertex_shader, index_base,
+                                           index_size);
   }
   if (time_texture_request) {
     PERF_counter_add(kTextureRequestCpuTimeNs,
@@ -5697,8 +5634,6 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
     if (fh1_native_executor_) {
       Fh1NativeDrawInfo native_draw;
-      native_draw.indexed = false;
-      native_draw.vertex_count = primitive_processing_result.host_draw_vertex_count;
       native_draw.memexport = memexport_used;
       native_draw.occlusion_query_active = active_occlusion_query_.valid ||
                                            zpd_lifecycle_.active_report() ||
@@ -5708,11 +5643,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       native_draw.normalized_color_mask = normalized_color_mask;
       native_draw.vertex_shader = vertex_shader;
       native_draw.pixel_shader = pixel_shader;
-      if (fh1_native_presents) {
-        fh1_native_executor_->NativeDrawIssued(native_draw);
-      } else {
-        fh1_native_executor_->ShadowDraw(*render_target_cache_, native_draw);
-      }
+      fh1_native_executor_->NativeDrawIssued(native_draw);
     }
     if (snr04_mark_foliage) deferred_command_list_.EndDebugMarker();
   } else {
@@ -5787,8 +5718,6 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
     if (fh1_native_executor_) {
       Fh1NativeDrawInfo native_draw;
-      native_draw.indexed = true;
-      native_draw.vertex_count = primitive_processing_result.host_draw_vertex_count;
       native_draw.memexport = memexport_used;
       native_draw.occlusion_query_active = active_occlusion_query_.valid ||
                                            zpd_lifecycle_.active_report() ||
@@ -5798,17 +5727,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       native_draw.normalized_color_mask = normalized_color_mask;
       native_draw.vertex_shader = vertex_shader;
       native_draw.pixel_shader = pixel_shader;
-      if (primitive_processing_result.index_buffer_type ==
-          PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA) {
-        native_draw.guest_dma_index_offset = primitive_processing_result.guest_index_base;
-        native_draw.guest_dma_index_size = index_buffer_view.SizeInBytes;
-        native_draw.guest_dma_index_format = index_buffer_view.Format;
-      }
-      if (fh1_native_presents) {
-        fh1_native_executor_->NativeDrawIssued(native_draw);
-      } else {
-        fh1_native_executor_->ShadowDraw(*render_target_cache_, native_draw);
-      }
+      fh1_native_executor_->NativeDrawIssued(native_draw);
     }
     if (snr04_mark_foliage) deferred_command_list_.EndDebugMarker();
     if (scratch_index_buffer != nullptr) {
@@ -5932,14 +5851,11 @@ bool D3D12CommandProcessor::IssueCopy() {
   uint32_t written_length = 0;
   BeginFh1GpuPassTimingCopy();
   if (fh1_native_executor_) fh1_native_executor_->RecordCopyInputs();
-  const bool fh1_native_presents = fh1_native_executor_ && fh1_native_executor_->presents();
+  const bool fh1_native_presents = fh1_native_executor_ != nullptr;
   bool copy_succeeded;
   if (fh1_native_presents) {
     copy_succeeded = fh1_native_executor_->NativeResolve(written_address, written_length);
   } else {
-    if (fh1_native_executor_) {
-      fh1_native_executor_->VerifySurfacesBeforeResolve(*render_target_cache_);
-    }
     copy_succeeded =
         render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
                                       written_address, written_length,
@@ -5948,9 +5864,6 @@ bool D3D12CommandProcessor::IssueCopy() {
   if (Fh1FrameCensus::Enabled()) {
     Fh1FrameCensus::ObserveCopy(*register_file_, observation_frame_sequence_,
                                 written_address, written_length, copy_succeeded);
-  }
-  if (fh1_native_executor_ && !fh1_native_presents) {
-    fh1_native_executor_->ShadowResolve(*render_target_cache_, copy_succeeded);
   }
   if (copy_succeeded && REXCVAR_GET(fh1_post_chain_probe)) {
     REXGPU_INFO(
@@ -6238,7 +6151,6 @@ bool D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission,
   }
 
   shared_memory_->CompletedSubmissionUpdated();
-  if (fh1_native_executor_) fh1_native_executor_->CompletedSubmissionUpdated(submission_completed_);
 
   if (!render_target_cache_->fh1_config_only()) render_target_cache_->CompletedSubmissionUpdated();
 
@@ -6387,7 +6299,6 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     primitive_processor_->BeginSubmission();
 
     texture_cache_->BeginSubmission(submission_current_);
-    if (fh1_native_executor_) fh1_native_executor_->BeginSubmission(submission_current_);
   }
 
   if (is_opening_frame) {
@@ -6423,7 +6334,6 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     primitive_processor_->BeginFrame();
 
     texture_cache_->BeginFrame();
-    if (fh1_native_executor_) fh1_native_executor_->BeginFrame();
   }
 
   if ((GetZPDMode() == ZPDMode::kFast || GetZPDMode() == ZPDMode::kStrict) &&
@@ -6527,7 +6437,6 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     EndFh1GpuPassTimingFrame();
 
     texture_cache_->EndFrame();
-    if (fh1_native_executor_) fh1_native_executor_->EndFrame();
 
     primitive_processor_->EndFrame();
   }
@@ -6602,9 +6511,6 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   if (is_closing_frame) {
     if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
       shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
-      if (fh1_native_executor_ && fh1_native_executor_->shared_memory()) {
-        fh1_native_executor_->shared_memory()->SetSystemPageBlocksValidWithGpuDataWritten();
-      }
     }
     frame_open_ = false;
     // Submission already closed now, so minus 1.
@@ -6633,7 +6539,6 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       constant_buffer_pool_->ClearCache();
 
       texture_cache_->ClearCache();
-      if (fh1_native_executor_) fh1_native_executor_->ClearCache();
 
       // Not clearing the root signatures as they're referenced by pipelines,
       // which are not destroyed.
@@ -7162,86 +7067,6 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   }
 
   cbuffer_binding_system_.up_to_date &= !dirty;
-}
-
-bool D3D12CommandProcessor::Fh1BindNativeDrawResources(
-    const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
-    D3D12TextureCache& native_textures, D3D12SharedMemory& native_memory,
-    uint32_t index_offset, uint32_t index_size, DXGI_FORMAT index_format,
-    uint32_t* null_textures_out) {
-  if (null_textures_out) *null_textures_out = 0;
-  if (!bindless_resources_used_ || !current_graphics_root_signature_ ||
-      current_graphics_root_signature_ == root_signature_fh1_layered_ ||
-      current_graphics_root_signature_ == root_signature_fh1_depth_ ||
-      current_graphics_root_signature_ == root_signature_fh1_skinned_ ||
-      current_graphics_root_signature_ == root_signature_fh1_terrain_) {
-    return false;
-  }
-  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
-  auto bind_indices = [&](const D3D12Shader* shader, const std::vector<uint32_t>& samplers,
-                          uint32_t root_parameter) {
-    if (!shader) return true;
-    const auto& textures = shader->GetTextureBindingsAfterTranslation();
-    const auto& sampler_bindings = shader->GetSamplerBindingsAfterTranslation();
-    const size_t count = textures.size() + sampler_bindings.size();
-    if (!count) return true;
-    D3D12_GPU_VIRTUAL_ADDRESS address;
-    auto* indices = reinterpret_cast<uint32_t*>(constant_buffer_pool_->Request(
-        frame_current_, uint32_t(count * sizeof(uint32_t)),
-        D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr, nullptr, &address));
-    if (!indices) return false;
-    for (const D3D12Shader::TextureBinding& texture : textures) {
-      const uint32_t index = native_textures.GetActiveTextureBindlessSRVIndex(texture);
-      // A shader samples each fetch through an unsigned and a signed binding
-      // and selects by the fetch's signs, so only a null binding of the used
-      // signedness is missing data.
-      if (null_textures_out && index >= uint32_t(SystemBindlessView::kNullTexture2DArray) &&
-          index <= uint32_t(SystemBindlessView::kNullTextureCube) &&
-          native_textures.IsActiveTextureSignednessUsed(texture.fetch_constant,
-                                                         texture.is_signed)) {
-        if (!*null_textures_out) {
-          static uint32_t logged = 0;
-          if (logged++ < 16) {
-            REXGPU_INFO("FH1 native null texture fetch {} signed {} dimension {}: {}",
-                        texture.fetch_constant, texture.is_signed, uint32_t(texture.dimension),
-                        native_textures.Fh1DescribeBinding(texture.fetch_constant));
-          }
-        }
-        ++*null_textures_out;
-      }
-      indices[texture.bindless_descriptor_index] =
-          index - uint32_t(SystemBindlessView::kUnboundedSRVsStart);
-    }
-    // Sampler descriptors are derived from the fetch constants alone, so the
-    // heap entries of the current draw are the native samplers as well.
-    for (size_t i = 0; i < sampler_bindings.size(); ++i) {
-      indices[sampler_bindings[i].bindless_descriptor_index] = samplers[i];
-    }
-    deferred_command_list_.D3DSetGraphicsRootConstantBufferView(root_parameter, address);
-    current_graphics_root_up_to_date_ &= ~(1u << root_parameter);
-    return true;
-  };
-  if (!bind_indices(vertex_shader, current_sampler_bindless_indices_vertex_,
-                    kRootParameter_Bindless_DescriptorIndicesVertex) ||
-      !bind_indices(pixel_shader, current_sampler_bindless_indices_pixel_,
-                    kRootParameter_Bindless_DescriptorIndicesPixel)) {
-    return false;
-  }
-  native_memory.UseForReading();
-  deferred_command_list_.D3DSetGraphicsRootDescriptorTable(
-      kRootParameter_Bindless_SharedMemory,
-      provider.OffsetViewDescriptor(
-          view_bindless_heap_gpu_start_,
-          uint32_t(SystemBindlessView::kFh1NativeSharedMemoryRawSRVAndNullRawUAVStart)));
-  current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_SharedMemory);
-  if (index_format != DXGI_FORMAT_UNKNOWN) {
-    D3D12_INDEX_BUFFER_VIEW index_buffer_view;
-    index_buffer_view.BufferLocation = native_memory.GetGPUAddress() + index_offset;
-    index_buffer_view.SizeInBytes = index_size;
-    index_buffer_view.Format = index_format;
-    deferred_command_list_.D3DIASetIndexBuffer(&index_buffer_view);
-  }
-  return true;
 }
 
 bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,

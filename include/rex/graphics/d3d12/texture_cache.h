@@ -128,13 +128,6 @@ class D3D12TextureCache final : public TextureCache {
                                  size_t host_shader_binding_count) const;
   void WriteActiveTextureBindfulSRV(const D3D12Shader::TextureBinding& host_shader_binding,
                                     D3D12_CPU_DESCRIPTOR_HANDLE handle);
-  // Diagnostics for the FH1 native executor: the state behind a binding.
-  std::string Fh1DescribeBinding(uint32_t fetch_constant_index) const;
-  bool IsActiveTextureSignednessUsed(uint32_t fetch_constant_index, bool is_signed) const {
-    const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
-    return binding && (is_signed ? texture_util::IsAnySignSigned(binding->swizzled_signs)
-                                 : texture_util::IsAnySignNotSigned(binding->swizzled_signs));
-  }
   uint32_t GetActiveTextureBindlessSRVIndex(const D3D12Shader::TextureBinding& host_shader_binding);
   system::GraphicsFinalDrawTextureIdentity GetActiveNativeTextureIdentity(
       uint32_t fetch_constant) const;

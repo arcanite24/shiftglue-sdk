@@ -1137,47 +1137,6 @@ bool D3D12RenderTargetCache::ClearFh1OwnedDepthTiles(
   return true;
 }
 
-bool D3D12RenderTargetCache::Fh1GetBoundTarget(uint32_t slot,
-                                               Fh1BoundTarget& target_out) const {
-  if (slot > xenos::kMaxColorRenderTargets) return false;
-  // The array is filled with memcpy from the bound RenderTarget* values.
-  const RenderTarget* render_target =
-      reinterpret_cast<const RenderTarget*>(current_command_list_render_targets_[slot]);
-  if (!render_target) return false;
-  const RenderTargetKey key = render_target->key();
-  target_out.key = key.key;
-  target_out.base_tiles = key.base_tiles;
-  target_out.resource_format = key.resource_format;
-  target_out.msaa_samples = uint32_t(key.msaa_samples);
-  target_out.is_depth = key.is_depth != 0;
-  target_out.view_format = key.is_depth ? GetDepthDSVDXGIFormat(key.GetDepthFormat())
-                                        : GetColorDrawDXGIFormat(key.GetColorFormat());
-  target_out.resource = static_cast<const D3D12RenderTarget*>(render_target)->resource();
-  return true;
-}
-
-ID3D12Resource* D3D12RenderTargetCache::Fh1PrepareTargetForRead(uint32_t key_value,
-                                                               D3D12_RESOURCE_STATES state) {
-  RenderTargetKey key;
-  key.key = key_value;
-  auto* target = static_cast<D3D12RenderTarget*>(FindRenderTarget(key));
-  if (!target) return nullptr;
-  command_processor_.PushTransitionBarrier(target->resource(), target->SetResourceState(state),
-                                           state);
-  return target->resource();
-}
-
-void D3D12RenderTargetCache::Fh1DecodeTargetKey(uint32_t key_value, uint32_t& base_tiles,
-                                                bool& is_depth, uint32_t& resource_format,
-                                                uint32_t& msaa_samples) {
-  RenderTargetKey key;
-  key.key = key_value;
-  base_tiles = key.base_tiles;
-  is_depth = key.is_depth != 0;
-  resource_format = key.resource_format;
-  msaa_samples = uint32_t(key.msaa_samples);
-}
-
 ID3D12Resource* D3D12RenderTargetCache::GetFh1UiOutputTarget() const {
   if (GetPath() != Path::kHostRenderTargets) return nullptr;
   auto* target = static_cast<D3D12RenderTarget*>(
@@ -1365,7 +1324,6 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
   written_address_out = 0;
   written_length_out = 0;
   copy_observation_resolve_info_valid_ = false;
-  fh1_last_resolve_owners_.clear();
 
   bool draw_resolution_scaled = IsDrawResolutionScaled();
 
@@ -1408,18 +1366,6 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
         uint32_t dump_rows;
         uint32_t dump_pitch;
         resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
-        if (fh1_record_resolve_owners_) {
-          std::vector<ResolveCopyDumpRectangle> owners;
-          GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
-                                         owners);
-          for (const ResolveCopyDumpRectangle& owner : owners) {
-            const uint32_t owner_key = owner.render_target->key().key;
-            if (std::find(fh1_last_resolve_owners_.begin(), fh1_last_resolve_owners_.end(),
-                          owner_key) == fh1_last_resolve_owners_.end()) {
-              fh1_last_resolve_owners_.push_back(owner_key);
-            }
-          }
-        }
         if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows,
                                dump_pitch)) {
           REXGPU_ERROR("D3D12RenderTargetCache: Failed to dump host render targets for resolve");

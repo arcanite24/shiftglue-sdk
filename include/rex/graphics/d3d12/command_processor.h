@@ -179,15 +179,6 @@ class D3D12CommandProcessor : public CommandProcessor {
     kEdramR32G32UintUAV,
     kEdramR32G32B32A32UintUAV,
 
-    // The FH1 native executor's guest-memory mirror (null views when the
-    // executor is off). The first two may be bound as one root parameter.
-    kFh1NativeSharedMemoryRawSRVAndNullRawUAVStart,
-    kFh1NativeSharedMemoryRawSRV = kFh1NativeSharedMemoryRawSRVAndNullRawUAVStart,
-    kFh1NativeNullRawUAV,
-    kFh1NativeSharedMemoryR32UintSRV,
-    kFh1NativeSharedMemoryR32G32UintSRV,
-    kFh1NativeSharedMemoryR32G32B32A32UintSRV,
-
     kGammaRampTableSRV,
     kGammaRampPWLSRV,
 
@@ -203,10 +194,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   };
   ui::d3d12::util::DescriptorCpuGpuHandlePair GetSystemBindlessViewHandlePair(
       SystemBindlessView view) const;
-  // memory selects the guest-memory mirror: the Xenos one (nullptr or
-  // shared_memory_) or the FH1 native executor's.
   ui::d3d12::util::DescriptorCpuGpuHandlePair GetSharedMemoryUintPow2BindlessSRVHandlePair(
-      uint32_t element_size_bytes_pow2, const D3D12SharedMemory* memory = nullptr) const;
+      uint32_t element_size_bytes_pow2) const;
   ui::d3d12::util::DescriptorCpuGpuHandlePair GetSharedMemoryUintPow2BindlessUAVHandlePair(
       uint32_t element_size_bytes_pow2) const;
   ui::d3d12::util::DescriptorCpuGpuHandlePair GetEdramUintPow2BindlessSRVHandlePair(
@@ -233,9 +222,6 @@ class D3D12CommandProcessor : public CommandProcessor {
   void SetExternalPipeline(ID3D12PipelineState* pipeline);
   void SetExternalGraphicsRootSignature(ID3D12RootSignature* root_signature);
 
-  // The Xenos guest-memory mirror, for the FH1 native executor's shadow-mode
-  // comparison of resolve output only.
-  D3D12SharedMemory& Fh1XenosSharedMemory() const { return *shared_memory_; }
   // For the FH1 native executor's resolve readback.
   ReadbackResolveMode Fh1ReadbackResolveMode() const;
   bool Fh1AwaitAllQueueOperations() { return AwaitAllQueueOperationsCompletion(); }
@@ -244,22 +230,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   void RunRequestedFrameReplay() override;
   // fh1_resolve_dump_dir: one resolve's output (scaled when scaling).
   void DumpResolveOutput(uint32_t address, uint32_t length);
-  D3D12TextureCache& Fh1XenosTextureCache() const { return *texture_cache_; }
 
-  // FH1 native executor: after a Xenos draw, rebinds the resources that draw
-  // reads from the Xenos guest-memory mirror and texture cache to the native
-  // ones - texture descriptor indices from native_textures, the mirror
-  // descriptor table and a guest-DMA index buffer at index_offset (when
-  // index_format is not DXGI_FORMAT_UNKNOWN) - keeping every other root
-  // binding. The replaced root parameters are marked for the next Xenos draw
-  // to rebind. Returns false when the current root signature is not the
-  // standard bindless one.
-  bool Fh1BindNativeDrawResources(const D3D12Shader* vertex_shader,
-                                  const D3D12Shader* pixel_shader,
-                                  D3D12TextureCache& native_textures,
-                                  D3D12SharedMemory& native_memory, uint32_t index_offset,
-                                  uint32_t index_size, DXGI_FORMAT index_format,
-                                  uint32_t* null_textures_out = nullptr);
   void SetViewport(const D3D12_VIEWPORT& viewport);
   void SetScissorRect(const D3D12_RECT& scissor_rect);
   void SetStencilReference(uint32_t stencil_ref);
