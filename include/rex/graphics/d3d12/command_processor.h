@@ -236,6 +236,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   // The Xenos guest-memory mirror, for the FH1 native executor's shadow-mode
   // comparison of resolve output only.
   D3D12SharedMemory& Fh1XenosSharedMemory() const { return *shared_memory_; }
+  // For the FH1 native executor's resolve readback.
+  ReadbackResolveMode Fh1ReadbackResolveMode() const;
+  bool Fh1AwaitAllQueueOperations() { return AwaitAllQueueOperationsCompletion(); }
   D3D12TextureCache& Fh1XenosTextureCache() const { return *texture_cache_; }
 
   // FH1 native executor: after a Xenos draw, rebinds the resources that draw

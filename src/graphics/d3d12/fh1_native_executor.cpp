@@ -2462,7 +2462,75 @@ bool Fh1NativeExecutor::NativeResolve(uint32_t& written_address, uint32_t& writt
   written_address = 0;
   written_length = 0;
   if (!initialized_) return false;
-  return Resolve(nullptr, &written_address, &written_length);
+  if (!Resolve(nullptr, &written_address, &written_length)) return false;
+  if (written_length) ReadBackResolve(written_address, written_length);
+  return true;
+}
+
+void Fh1NativeExecutor::ReadBackResolve(uint32_t address, uint32_t length) {
+  const ReadbackResolveMode mode = command_processor_.Fh1ReadbackResolveMode();
+  if (mode == ReadbackResolveMode::kDisabled) return;
+  uint8_t* destination = memory_.TranslatePhysical(address);
+  if (!destination) return;
+  ResolveReadback& readback = resolve_readbacks_[(uint64_t(address) << 32) | length];
+  readback.last_used_frame = frame_;
+  const uint32_t write_index = readback.current;
+  const uint32_t size = (length + 0xFFFF) & ~uint32_t(0xFFFF);
+  if (!readback.buffers[write_index] || readback.sizes[write_index] < size) {
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = size;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    if (FAILED(command_processor_.GetD3D12Provider().GetDevice()->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&buffer)))) {
+      return Skip("resolve_readback_buffer");
+    }
+    // The old buffer may still be the target of a submitted copy.
+    if (readback.buffers[write_index]) command_processor_.Fh1AwaitAllQueueOperations();
+    readback.buffers[write_index] = std::move(buffer);
+    readback.sizes[write_index] = size;
+  }
+  native_memory_->UseAsCopySource();
+  command_processor_.SubmitBarriers();
+  command_processor_.GetDeferredCommandList().D3DCopyBufferRegion(
+      readback.buffers[write_index].Get(), 0, native_memory_->GetBuffer(), address, length);
+  readback.submissions[write_index] = command_processor_.GetCurrentSubmission();
+  Count("resolve_readback");
+
+  // Full: wait for this resolve. Fast and some: take the previous frame's copy
+  // of the same range, waiting only when there is none (some copies only then).
+  uint32_t read_index = write_index;
+  bool miss = false;
+  if (mode == ReadbackResolveMode::kFull) {
+    command_processor_.Fh1AwaitAllQueueOperations();
+  } else {
+    read_index = 1 - write_index;
+    if (!readback.buffers[read_index] || readback.sizes[read_index] < length) {
+      miss = true;
+      read_index = write_index;
+      command_processor_.Fh1AwaitAllQueueOperations();
+    } else if (readback.submissions[read_index] > command_processor_.GetCompletedSubmission()) {
+      command_processor_.Fh1AwaitAllQueueOperations();
+    }
+  }
+  if (mode != ReadbackResolveMode::kSome || miss || mode == ReadbackResolveMode::kFull) {
+    void* mapped = nullptr;
+    D3D12_RANGE range = {0, length};
+    if (SUCCEEDED(readback.buffers[read_index]->Map(0, &range, &mapped))) {
+      std::memcpy(destination, mapped, length);
+      D3D12_RANGE written = {0, 0};
+      readback.buffers[read_index]->Unmap(0, &written);
+    }
+  }
+  readback.current = 1 - readback.current;
 }
 
 bool Fh1NativeExecutor::Resolve(D3D12RenderTargetCache* render_target_cache,

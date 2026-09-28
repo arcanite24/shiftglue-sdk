@@ -279,6 +279,19 @@ class Fh1NativeExecutor {
   void ClaimOverwrittenDepthTiles(const SurfaceKey& key, const std::array<int32_t, 4>& rect,
                                   bool stencil_overwritten);
   std::vector<OverwriteRect> overwrite_rects_;
+  // readback_resolve: copies of resolved ranges into guest RAM, as the
+  // Vulkan backend does (the guest GPU writes resolves to RAM, which the CPU
+  // may read, e.g. to compress car thumbnails). Double-buffered per range for
+  // the delayed modes.
+  struct ResolveReadback {
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffers[2];
+    uint32_t sizes[2] = {};
+    uint64_t submissions[2] = {};
+    uint32_t current = 0;
+    uint64_t last_used_frame = 0;
+  };
+  std::map<uint64_t, ResolveReadback> resolve_readbacks_;
+  void ReadBackResolve(uint32_t address, uint32_t length);
   class PositionExportSink : public ShaderInterpreter::ExportSink {
    public:
     void Export(ucode::ExportRegister export_register, const float* value,

@@ -8926,6 +8926,10 @@ bool D3D12CommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_addre
   return true;
 }
 
+ReadbackResolveMode D3D12CommandProcessor::Fh1ReadbackResolveMode() const {
+  return GetReadbackResolveMode(false);
+}
+
 bool D3D12CommandProcessor::EndGuestOcclusionQuery(
     uint32_t sample_count_address, xenos::xe_gpu_depth_sample_counts* sample_counts) {
   if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_ ||
