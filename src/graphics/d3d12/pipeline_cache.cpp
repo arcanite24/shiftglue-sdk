@@ -499,6 +499,7 @@ void PipelineCache::Shutdown() {
 void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                             uint32_t title_id, bool blocking) {
   ShutdownShaderStorage();
+  fh1_shader_miss_root_ = title_id == 0x4D5309C9 ? cache_root : std::filesystem::path();
 
 #if defined(REXGPU_FH1_SHADER_PRODUCER)
   const auto fh1_disc_shader_corpus_root = Fh1DiscShaderCorpusRoot();
@@ -1287,6 +1288,56 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
           }
         }
       }
+      // Pack misses recorded by shipping runs (RecordFh1ShaderPackMiss): title
+      // generated shaders and pairings no disc scan predicts.
+      size_t recorded_misses = 0;
+      for (std::filesystem::directory_iterator
+               it(cache_root / "fh1-shader-misses", corpus_error),
+           end;
+           !corpus_error && it != end; it.increment(corpus_error)) {
+        const std::string name = it->path().filename().string();
+        uint64_t hash = 0, modification = 0;
+        char stage_name[8] = {};
+        if (!it->is_regular_file() ||
+            std::sscanf(name.c_str(), "%6[a-z]-%16" SCNx64 "-%16" SCNx64 ".bin", stage_name,
+                        &hash, &modification) != 3) {
+          continue;
+        }
+        const std::string stage_string = stage_name;
+        if (stage_string != "vertex" && stage_string != "pixel") continue;
+        const xenos::ShaderType stage = stage_string == "vertex" ? xenos::ShaderType::kVertex
+                                                                 : xenos::ShaderType::kPixel;
+        std::ifstream input(it->path(), std::ios::binary | std::ios::ate);
+        const std::streamoff size = input ? std::streamoff(input.tellg()) : -1;
+        if (size <= 0 || size > 0xFFFF * 4 || size % 12) {
+          ++failed;
+          continue;
+        }
+        std::vector<uint32_t> ucode(size_t(size) / sizeof(uint32_t));
+        input.seekg(0);
+        if (!input.read(reinterpret_cast<char*>(ucode.data()), size) ||
+            XXH3_64bits(ucode.data(), size_t(size)) != hash) {
+          ++failed;
+          continue;
+        }
+        D3D12Shader* shader = LoadShader(stage, ucode.data(), ucode.size(), hash);
+        if (!shader->is_ucode_analyzed()) {
+          shader->AnalyzeUcode(ucode_disasm_buffer);
+        }
+        auto* translation = static_cast<D3D12Shader::D3D12Translation*>(
+            shader->GetOrCreateTranslation(modification));
+        if (!translation->is_translated()) {
+          if (TranslateAnalyzedShader(shader_translator_.get(), *translation)) {
+            ++translated[size_t(stage)];
+            ++recorded_misses;
+          } else {
+            ++failed;
+          }
+        }
+      }
+      corpus_error.clear();
+      REXGPU_INFO("FH1 shader production translated {} recorded pack misses",
+                  recorded_misses);
       const std::filesystem::path analysis_catalog_path =
           cache_root / "fh1-native-shaders-v2.bin";
       if (!WriteFh1ShaderAnalysisCatalog(analysis_catalog_path, shaders_)) {
@@ -2276,6 +2327,35 @@ bool PipelineCache::IsFh1ClearPipeline(void* handle) const {
   return true;
 }
 
+// Named <stage>-<ucode hash>-<modification>.bin and holding the guest
+// (big-endian) microcode, as the disc corpus files do.
+static std::string Fh1ShaderMissFileName(xenos::ShaderType stage, uint64_t hash,
+                                         uint64_t modification) {
+  return fmt::format("{}-{:016X}-{:016X}.bin",
+                     stage == xenos::ShaderType::kVertex ? "vertex" : "pixel", hash,
+                     modification);
+}
+
+void PipelineCache::RecordFh1ShaderPackMiss(const Shader& shader, uint64_t modification) {
+  if (fh1_shader_miss_root_.empty() || shader.ucode_data().empty()) return;
+  std::lock_guard<std::mutex> lock(fh1_shader_miss_mutex_);
+  if (!fh1_recorded_shader_misses_.emplace(shader.ucode_data_hash(), modification).second) {
+    return;
+  }
+  const std::filesystem::path directory = fh1_shader_miss_root_ / "fh1-shader-misses";
+  std::error_code error;
+  std::filesystem::create_directories(directory, error);
+  std::vector<uint32_t> guest(shader.ucode_data().size());
+  for (size_t i = 0; i < guest.size(); ++i) {
+    guest[i] = rex::byte_swap(shader.ucode_data()[i]);
+  }
+  std::ofstream(directory / Fh1ShaderMissFileName(shader.type(), shader.ucode_data_hash(),
+                                                  modification),
+                std::ios::binary | std::ios::trunc)
+      .write(reinterpret_cast<const char*>(guest.data()),
+             std::streamsize(guest.size() * sizeof(uint32_t)));
+}
+
 void PipelineCache::RecordFh1RuntimeShaderTranslation() {
   if (!fh1_prewarm_manifest_loaded_) {
     return;
@@ -2313,6 +2393,9 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator* translator,
     translation.RejectPrecompiledMiss();
     REXGPU_ERROR("FH1 precompiled shader pack miss for {:016X}/{:016X}",
                  shader.ucode_data_hash(), translation.modification());
+#if !defined(REXGPU_FH1_SHADER_PRODUCER)
+    RecordFh1ShaderPackMiss(shader, translation.modification());
+#endif
     return false;
 #if defined(REXGPU_FH1_SHADER_PRODUCER)
     }

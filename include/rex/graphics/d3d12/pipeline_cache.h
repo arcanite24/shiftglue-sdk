@@ -327,6 +327,12 @@ class PipelineCache {
                                IDxcUtils* dxc_utils = nullptr,
                                IDxcCompiler* dxc_compiler = nullptr);
   void RecordFh1RuntimeShaderTranslation();
+  // Shipping builds: keeps the microcode of each pack miss under the cache
+  // root (fh1-shader-misses) so the next pack production translates it.
+  void RecordFh1ShaderPackMiss(const Shader& shader, uint64_t modification);
+  std::mutex fh1_shader_miss_mutex_;
+  std::filesystem::path fh1_shader_miss_root_;
+  std::set<std::pair<uint64_t, uint64_t>> fh1_recorded_shader_misses_;
   void SetupShaderBindingLayouts(D3D12Shader& shader);
   static std::span<const uint32_t> GetFh1PackedWorldTextureFetches(uint64_t hash);
   bool IsFh1NativeStandaloneVertex(uint64_t hash, uint64_t modification) const;
