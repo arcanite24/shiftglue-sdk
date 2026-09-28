@@ -247,8 +247,10 @@ class CommandProcessor {
 
   // Shared readback resolve mode with backend legacy-flag alias support.
   ReadbackResolveMode GetReadbackResolveMode(bool legacy_readback_resolve_enabled) const;
+#if REX_HAS_VULKAN
   // Shared memexport readback enable state with backend legacy-flag override support.
   bool IsReadbackMemexportEnabled(bool legacy_backend_flag) const;
+#endif  // REX_HAS_VULKAN
 
   ZPDPolicySettings GetZPDPolicySettings() const;
   ZPDClassificationResult ClassifyZPD(uint32_t report_address,
@@ -302,9 +304,11 @@ class CommandProcessor {
   SwapPostEffect swap_post_effect_desired_ = SwapPostEffect::kNone;
   SwapPostEffect swap_post_effect_actual_ = SwapPostEffect::kNone;
 
+#if REX_HAS_VULKAN
   // Set by backend command processors to their legacy memexport readback cvar
   // name (for explicit-override compatibility).
   const char* legacy_readback_memexport_cvar_name_ = nullptr;
+#endif  // REX_HAS_VULKAN
 
   bool zpd_fake_logical_active_ = false;
   uint32_t zpd_fake_slot_base_ = 0;

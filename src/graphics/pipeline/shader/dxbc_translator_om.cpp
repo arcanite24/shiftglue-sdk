@@ -19,6 +19,10 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/math.h>
 
+REXCVAR_DEFINE_BOOL(use_fuzzy_alpha_epsilon, false, "GPU",
+                    "Use approximate compare for alpha test values to prevent "
+                    "flickering on NVIDIA graphics cards");
+
 namespace rex::graphics {
 using namespace ucode;
 

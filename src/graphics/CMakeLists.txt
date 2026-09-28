@@ -13,7 +13,6 @@ set(REXGPU_XENOS_SOURCES
     registers.cpp
     pipeline/shader/shader.cpp
     format/ucode.cpp
-    sampler_info.cpp
 
     # GPU system
     graphics_system.cpp
@@ -66,13 +65,14 @@ if(REXGLUE_USE_D3D12)
     )
 
     # The runtime needs the DXBC container, but guest translation is confined
-    # to the explicit offline producer.
+    # to the explicit offline producer. The runtime uses only the translator
+    # header's register layout, modification bits and system constants.
     set(REXGPU_XENOS_DXBC_SOURCES
         pipeline/shader/dxbc.cpp
-        pipeline/shader/dxbc_translator.cpp
-        pipeline/shader/dxbc_translator_om.cpp
     )
     set(REXGPU_FH1_SHADER_PRODUCER_SOURCES
+        pipeline/shader/dxbc_translator.cpp
+        pipeline/shader/dxbc_translator_om.cpp
         pipeline/shader/dxbc_translator_alu.cpp
         pipeline/shader/dxbc_translator_fetch.cpp
         pipeline/shader/dxbc_translator_memexport.cpp
