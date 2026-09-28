@@ -107,6 +107,10 @@ class SharedMemory {
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
 
+  // Diagnostics: pages in the range currently valid, and valid because the GPU
+  // wrote them.
+  std::pair<uint32_t, uint32_t> CountValidPages(uint32_t start, uint32_t length);
+
  protected:
   SharedMemory(memory::Memory& memory);
   // Call in implementation-specific initialization.

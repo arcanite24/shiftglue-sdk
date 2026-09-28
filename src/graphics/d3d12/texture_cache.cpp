@@ -1076,6 +1076,26 @@ bool D3D12TextureCache::CopyFh1Snr04Bc3Mips(
   return true;
 }
 
+std::string D3D12TextureCache::Fh1DescribeBinding(uint32_t fetch_constant_index) const {
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  if (!binding) return "invalid binding";
+  const D3D12TextureBinding& d3d12_binding = d3d12_texture_bindings_[fetch_constant_index];
+  return "format " + std::to_string(uint32_t(binding->key.format)) + " dimension " +
+         std::to_string(uint32_t(binding->key.dimension)) + " " +
+         std::to_string(binding->key.GetWidth()) + "x" + std::to_string(binding->key.GetHeight()) +
+         " base " + std::to_string(binding->key.base_page << 12) + " tiled " +
+         std::to_string(binding->key.tiled) + " texture " +
+         std::to_string(binding->texture != nullptr) + " signs " +
+         std::to_string(binding->swizzled_signs) + " descriptor " +
+         std::to_string(int64_t(d3d12_binding.descriptor_index == UINT32_MAX
+                                    ? -1
+                                    : d3d12_binding.descriptor_index)) +
+         " signed " +
+         std::to_string(int64_t(d3d12_binding.descriptor_index_signed == UINT32_MAX
+                                    ? -1
+                                    : d3d12_binding.descriptor_index_signed));
+}
+
 uint32_t D3D12TextureCache::GetActiveTextureBindlessSRVIndex(
     const D3D12Shader::TextureBinding& host_shader_binding) {
   assert_true(bindless_resources_used_);
@@ -2091,7 +2111,8 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
             static_cast<D3D12SharedMemory&>(shared_memory());
         d3d12_shared_memory.UseForReading();
         if (bindless_resources_used_) {
-          source_descriptor = command_processor_.GetSharedMemoryUintPow2BindlessSRVHandlePair(4);
+          source_descriptor =
+              command_processor_.GetSharedMemoryUintPow2BindlessSRVHandlePair(4, &d3d12_shared_memory);
         } else {
           source_descriptor = descriptors[descriptor_index++];
           d3d12_shared_memory.WriteUintPow2SRVDescriptor(source_descriptor.first, 4);
@@ -2283,7 +2304,7 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
     ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_unscaled_source;
     if (bindless_resources_used_) {
       descriptor_unscaled_source = command_processor_.GetSharedMemoryUintPow2BindlessSRVHandlePair(
-          load_shader_info.source_bpe_log2);
+          load_shader_info.source_bpe_log2, &d3d12_shared_memory);
     } else {
       assert_true(descriptor_write_index < descriptor_count);
       descriptor_unscaled_source = descriptors_allocated[descriptor_write_index++];

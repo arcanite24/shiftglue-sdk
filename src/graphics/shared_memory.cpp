@@ -340,6 +340,21 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   MakeRangeValid(start, length, true);
 }
 
+std::pair<uint32_t, uint32_t> SharedMemory::CountValidPages(uint32_t start, uint32_t length) {
+  if (!length || start >= kBufferSize) return {0, 0};
+  length = std::min(length, kBufferSize - start);
+  const uint32_t page_first = start >> page_size_log2_;
+  const uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  auto global_lock = global_critical_region_.Acquire();
+  uint32_t valid = 0, gpu_written = 0;
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    const uint64_t bit = uint64_t(1) << (page & 63);
+    valid += (system_page_flags_valid_[page >> 6] & bit) != 0;
+    gpu_written += (system_page_flags_valid_and_gpu_written_[page >> 6] & bit) != 0;
+  }
+  return {valid, gpu_written};
+}
+
 bool SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
                                                     uint32_t length_allocations) {
   assert_always(

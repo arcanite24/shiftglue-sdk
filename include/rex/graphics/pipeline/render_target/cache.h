@@ -551,6 +551,10 @@ class RenderTargetCache {
   void PixelShaderInterlockFullEdramBarrierPlaced();
 
   RenderTarget* GetFullyOwnedRenderTarget(RenderTargetKey key) const;
+  RenderTarget* FindRenderTarget(RenderTargetKey key) const {
+    auto it = render_targets_.find(key);
+    return it != render_targets_.end() ? it->second : nullptr;
+  }
 
   // Caller must overwrite both depth and stencil in every claimed tile.
   RenderTarget* PrepareFh1FullTileDepthClear(

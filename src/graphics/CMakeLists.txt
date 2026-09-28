@@ -88,6 +88,7 @@ if(REXGLUE_USE_D3D12)
         d3d12/texture_cache.cpp
         d3d12/deferred_command_list.cpp
         d3d12/fh1_frame_census.cpp
+        d3d12/fh1_native_executor.cpp
         d3d12/fh1_shader_pack.cpp
         d3d12/pipeline_cache.cpp
     )

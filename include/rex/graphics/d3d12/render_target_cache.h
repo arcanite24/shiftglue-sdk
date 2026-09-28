@@ -70,6 +70,36 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
                          bool color, bool depth, bool stencil, uint8_t reference);
   bool ClearFh1UiOutput(const float color[4]);
   ID3D12Resource* GetFh1UiOutputTarget() const;
+
+  // FH1 native executor: the host targets bound by the last Update (slot 0
+  // is depth, 1-4 are colors), described without exposing cache internals,
+  // and a way to force the next Update to rebind them after the executor
+  // bound its own targets.
+  struct Fh1BoundTarget {
+    uint32_t key = 0;
+    uint32_t base_tiles = 0;
+    uint32_t resource_format = 0;
+    uint32_t msaa_samples = 0;
+    bool is_depth = false;
+    DXGI_FORMAT view_format = DXGI_FORMAT_UNKNOWN;
+    ID3D12Resource* resource = nullptr;
+  };
+  bool Fh1CurrentRenderTargetsValid() const {
+    return are_current_command_list_render_targets_valid_;
+  }
+  bool Fh1GetBoundTarget(uint32_t slot, Fh1BoundTarget& target_out) const;
+  static void Fh1DecodeTargetKey(uint32_t key, uint32_t& base_tiles, bool& is_depth,
+                                 uint32_t& resource_format, uint32_t& msaa_samples);
+  void Fh1InvalidateCommandListRenderTargets() {
+    are_current_command_list_render_targets_valid_ = false;
+  }
+  // FH1 native executor verification: keys of the targets owning the EDRAM
+  // tiles the last resolve copied, recorded only when enabled.
+  void Fh1SetRecordResolveOwners(bool record) { fh1_record_resolve_owners_ = record; }
+  const std::vector<uint32_t>& Fh1LastResolveOwners() const { return fh1_last_resolve_owners_; }
+  // FH1 native executor verification: the host resource of the render target
+  // with this key, transitioned to `state`, or nullptr.
+  ID3D12Resource* Fh1PrepareTargetForRead(uint32_t key, D3D12_RESOURCE_STATES state);
   Microsoft::WRL::ComPtr<ID3D12Resource> SnapshotFh1InitialColorDepth();
   void RestoreFh1UiOutputTargets();
 
@@ -711,6 +741,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       dump_pipelines_;
   draw_util::ResolveInfo copy_observation_resolve_info_{};
   bool copy_observation_resolve_info_valid_ = false;
+  bool fh1_record_resolve_owners_ = false;
+  std::vector<uint32_t> fh1_last_resolve_owners_;
 
   // Parameter 0 - 2 root constants (red, green).
   ID3D12RootSignature* uint32_rtv_clear_root_signature_ = nullptr;

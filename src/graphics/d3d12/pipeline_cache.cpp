@@ -37,6 +37,7 @@
 #include <rex/perf/counter.h>
 #include <rex/filesystem.h>
 #include <rex/graphics/d3d12/command_processor.h>
+#include <rex/graphics/d3d12/fh1_native_executor.h>
 #include <rex/graphics/d3d12/pipeline_cache.h>
 #include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/flags.h>
@@ -3959,16 +3960,23 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
 
   D3D12_GRAPHICS_PIPELINE_STATE_DESC state_desc;
   std::memset(&state_desc, 0, sizeof(state_desc));
+  // Hand-written FH1 family replacements for guest shaders. Off with the FH1
+  // native executor, which replays the pack's translated shaders.
+  const bool fh1_families = !Fh1NativeExecutor::Enabled();
   // This straight-line program preserves the seven-interpolator guest variant.
-  const bool fh1_shadow_mask_pixel = IsFh1NativeShadowPipeline(description);
-  const bool fh1_shadow_vertex = IsFh1NativeShadowVertex(
+  const bool fh1_shadow_mask_pixel = fh1_families &&
+      IsFh1NativeShadowPipeline(description);
+  const bool fh1_shadow_vertex = fh1_families &&
+      IsFh1NativeShadowVertex(
       description.vertex_shader_hash, description.vertex_shader_modification);
-  const bool fh1_standalone_vertex = IsFh1NativeStandaloneVertex(
+  const bool fh1_standalone_vertex = fh1_families &&
+      IsFh1NativeStandaloneVertex(
       description.vertex_shader_hash, description.vertex_shader_modification);
   const bool fh1_position_vertex = fh1_standalone_vertex &&
       description.vertex_shader_hash == 0x1E6883FCCDE1F688ull;
   // Qualified title/video pixel variant; preserve the original vertex bindings.
-  const bool fh1_video_pixel = bindless_resources_used_ &&
+  const bool fh1_video_pixel = fh1_families &&
+      bindless_resources_used_ &&
       description.vertex_shader_hash == 0x7156CE05C6365E51ull &&
       description.vertex_shader_modification == 1ull &&
       description.pixel_shader_hash == 0x31511D87CC0C94B9ull &&
@@ -3987,7 +3995,8 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
       render_target_cache_.draw_resolution_scale_x() == 2 &&
       render_target_cache_.draw_resolution_scale_y() == 2;
   // Byte-exact RMS reference with live binding and 1x/2x non-regression checks.
-  const bool fh1_rms_downsample = bindless_resources_used_ &&
+  const bool fh1_rms_downsample = fh1_families &&
+      bindless_resources_used_ &&
       description.vertex_shader_hash == 0x2C53E1A563484076ull &&
       description.vertex_shader_modification == 1ull &&
       description.pixel_shader_hash == 0xE17BECBE8BE65806ull &&
@@ -4001,7 +4010,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
       !runtime_description.vertex_shader->shader().memexport_eM_written() &&
       (!runtime_description.pixel_shader ||
        !runtime_description.pixel_shader->shader().memexport_eM_written());
-  const bool fh1_packed_world_vertex =
+  const bool fh1_packed_world_vertex = fh1_families &&
       description.vertex_shader_hash == 0x6934E161812AB10Bull &&
       description.vertex_shader_modification == 0x7Full &&
       render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets;
@@ -4009,13 +4018,13 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
       !runtime_description.vertex_shader->shader().memexport_eM_written() &&
       (!runtime_description.pixel_shader ||
        !runtime_description.pixel_shader->shader().memexport_eM_written());
-  const bool fh1_world_lit_vertex =
+  const bool fh1_world_lit_vertex = fh1_families &&
       kFh1UseNativeWorldVertexShaders && runtime_description.pixel_shader &&
       runtime_description.vertex_shader->shader().ucode_data_hash() ==
           0x79034645B1CB882Bull &&
       runtime_description.pixel_shader->shader().ucode_data_hash() ==
           0xCAE1DB68AFFA9D3Cull;
-  const bool fh1_world_lit_uv2_vertex =
+  const bool fh1_world_lit_uv2_vertex = fh1_families &&
       kFh1UseNativeWorldVertexShaders && runtime_description.pixel_shader &&
       runtime_description.vertex_shader->shader().ucode_data_hash() ==
           0x984DBF6AF14DBEBDull &&
@@ -4023,7 +4032,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
           0x6FDA0F1CDE67D12Full;
   const uint64_t fh1_vertex_shader_hash =
       runtime_description.vertex_shader->shader().ucode_data_hash();
-  const bool fh1_depth_mesh_vertex =
+  const bool fh1_depth_mesh_vertex = fh1_families &&
       kFh1UseNativeDepthMeshVertexShaders && !runtime_description.pixel_shader &&
       (fh1_vertex_shader_hash == 0xC8C39E5AE1B08DE6ull ||
        fh1_vertex_shader_hash == 0x9BF2991815B941B9ull ||
@@ -4034,7 +4043,8 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
 
   // Qualified scene stages. Keep the observed PSO states narrow;
   // guest resource bindings and a creation-failure fallback remain.
-  const bool fh1_native_scene = IsFh1NativeScenePipeline(description);
+  const bool fh1_native_scene = fh1_families &&
+      IsFh1NativeScenePipeline(description);
   const uint64_t fh1_scene_pipeline_hash = fh1_native_scene
       ? XXH3_64bits(&description, sizeof(description)) : 0;
 
