@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -204,6 +205,17 @@ Fh1NativeExecutor::Fh1NativeExecutor(D3D12CommandProcessor& command_processor,
 
 Fh1NativeExecutor::~Fh1NativeExecutor() { Shutdown(); }
 
+Fh1NativeExecutor::CpuTimer::CpuTimer(Fh1NativeExecutor& executor, CpuPhase phase)
+    : executor_(executor),
+      phase_(phase),
+      start_(std::chrono::steady_clock::now().time_since_epoch().count()) {}
+
+Fh1NativeExecutor::CpuTimer::~CpuTimer() {
+  executor_.cpu_ns_[phase_] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::duration(
+          std::chrono::steady_clock::now().time_since_epoch().count() - start_)).count());
+}
+
 bool Fh1NativeExecutor::Enabled() {
   static const bool enabled = REXCVAR_GET(fh1_native_shadow) || Presents() ||
                               REXCVAR_GET(fh1_renderer) == "native-shadow";
@@ -375,10 +387,10 @@ void Fh1NativeExecutor::ClearCache() {
 
 void Fh1NativeExecutor::SkipDraw(const char* reason, const Fh1NativeDrawInfo& draw) {
   Skip(reason);
-  Trace(std::string("draw skipped ") + reason);
+  if (tracing_) Trace(std::string("draw skipped ") + reason);
   const uint64_t vs = draw.vertex_shader ? draw.vertex_shader->ucode_data_hash() : 0;
   const uint64_t ps = draw.pixel_shader ? draw.pixel_shader->ucode_data_hash() : 0;
-  LogOnce(vs ^ (ps << 1) ^ std::hash<std::string>{}(reason),
+  if (ShouldLog()) LogOnce(vs ^ (ps << 1) ^ std::hash<std::string>{}(reason),
           std::string("draw skipped (") + reason + ") vs " + std::to_string(vs) + " ps " +
               std::to_string(ps));
 }
@@ -579,8 +591,13 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
 void Fh1NativeExecutor::ClaimTiles(uint32_t base, uint32_t length, uint32_t packed_key) {
   length = std::min(length, xenos::kEdramTileCount);
   if (!length) return;
+  // A surface that already owns the whole range needs no work; its cached
+  // claim is dropped whenever another surface takes any of its tiles.
   auto last = last_claims_.find(packed_key);
-  if (last != last_claims_.end() && last->second == std::make_pair(base, length)) return;
+  if (last != last_claims_.end() && last->second.first == base &&
+      last->second.second >= length) {
+    return;
+  }
   std::vector<TileRun> runs;
   for (uint32_t i = 0; i < length; ++i) {
     uint32_t& owner = tile_owners_[(base + i) & (xenos::kEdramTileCount - 1)];
@@ -595,7 +612,7 @@ void Fh1NativeExecutor::ClaimTiles(uint32_t base, uint32_t length, uint32_t pack
     }
     owner = packed_key;
   }
-  last_claims_.clear();
+  for (const TileRun& run : runs) last_claims_.erase(run.previous_owner);
   last_claims_[packed_key] = {base, length};
   if (runs.empty()) return;
   Surface* dest = FindSurface(packed_key);
@@ -662,6 +679,7 @@ ID3D12PipelineState* Fh1NativeExecutor::GetTransferPipeline(const TransferPipeli
 }
 
 void Fh1NativeExecutor::TransferTiles(Surface& dest, const TileRun& run) {
+  CpuTimer timer(*this, kCpuTransfers);
   Surface* source = FindSurface(run.previous_owner);
   if (!source) return Skip("transfer_source_missing");
   if (dest.key.Is64bpp() || source->key.Is64bpp()) return Skip("transfer_64bpp");
@@ -672,9 +690,9 @@ void Fh1NativeExecutor::TransferTiles(Surface& dest, const TileRun& run) {
     return Skip("transfer_format");
   }
   Count("transfer");
-  Trace("transfer " + source->key.Describe() + " -> " + dest.key.Describe() + " tiles " +
+  if (tracing_) Trace("transfer " + source->key.Describe() + " -> " + dest.key.Describe() + " tiles " +
         std::to_string(run.first) + "+" + std::to_string(run.count));
-  LogOnce((uint64_t(source->key.Pack()) << 32) ^ dest.key.Pack() ^ 0x7F7F,
+  if (verify_ && ShouldLog()) LogOnce((uint64_t(source->key.Pack()) << 32) ^ dest.key.Pack() ^ 0x7F7F,
           "transfer " + source->key.Describe() + " -> " + dest.key.Describe());
 
   // The run's tiles as at most three rectangles of the destination: the rest
@@ -934,6 +952,7 @@ void Fh1NativeExecutor::PrepareDraw(uint32_t used_texture_mask, const Shader& ve
 
 void Fh1NativeExecutor::PrepareTargets(const Fh1NativeDrawInfo& draw) {
   if (!initialized_) return;
+  CpuTimer timer(*this, kCpuPrepareTargets);
   pending_targets_valid_ = true;
   pending_used_bits_ = 0;
   if (draw.memexport) return;
@@ -971,12 +990,12 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1NativeDrawInfo& draw) {
     }
   }
   pending_used_bits_ = used_bits;
-  {
+  if (tracing_) {
     std::string targets;
     for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
       if (used_bits & (1u << i)) targets += keys[i].Describe() + " ";
     }
-    Trace("draw vs " +
+    if (tracing_) Trace("draw vs " +
           std::to_string(draw.vertex_shader ? draw.vertex_shader->ucode_data_hash() : 0) +
           " targets " + targets);
   }
@@ -988,7 +1007,7 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1NativeDrawInfo& draw) {
       targets += keys[i].Describe() + " ";
       signature = signature * 31 + keys[i].Pack();
     }
-    LogOnce(signature ^ 0x7A7A7A,
+    if (ShouldLog()) LogOnce(signature ^ 0x7A7A7A,
             "vs " + std::to_string(draw.vertex_shader ? draw.vertex_shader->ucode_data_hash() : 0) +
                 " targets " + targets);
   }
@@ -1067,14 +1086,14 @@ void Fh1NativeExecutor::VerifyDrawTarget(D3D12RenderTargetCache& render_target_c
   const uint32_t pitch = (width + 31) & ~31u;
   const uint32_t length = pitch * ((height + 31) & ~31u) * 4;
   if (length > kVerifyScratchSize / 2 || verifies_.size() >= 256 || !EnsureVerifyScratch()) {
-    Trace("draw verify skipped: size " + std::to_string(length) + " pending " +
+    if (tracing_) Trace("draw verify skipped: size " + std::to_string(length) + " pending " +
           std::to_string(verifies_.size()));
     return;
   }
   ID3D12Resource* xenos_target = render_target_cache.Fh1PrepareTargetForRead(
       surface.key.Pack(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   if (!xenos_target) {
-    Trace("draw verify skipped: no xenos target " + surface.key.Describe());
+    if (tracing_) Trace("draw verify skipped: no xenos target " + surface.key.Describe());
     return;
   }
   Transition(surface.resource.Get(), surface.state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -1115,6 +1134,7 @@ void Fh1NativeExecutor::VerifyDrawTarget(D3D12RenderTargetCache& render_target_c
 bool Fh1NativeExecutor::BindTargets(uint32_t& bound_bits, uint32_t* formats) {
   bound_bits = 0;
   if (!initialized_) return false;
+  CpuTimer timer(*this, kCpuBindTargets);
   if (!pending_targets_valid_) {
     Skip("draw_targets_not_prepared");
     return false;
@@ -1158,7 +1178,7 @@ void Fh1NativeExecutor::NativeDrawIssued(const Fh1NativeDrawInfo& draw) {
   pending_targets_valid_ = false;
   if (draw.occlusion_query_active) Count("draw_in_occlusion_query");
   ++shadow_draws_;
-  Trace("draw executed");
+  if (tracing_) Trace("draw executed");
 }
 
 void Fh1NativeExecutor::ShadowDraw(D3D12RenderTargetCache& render_target_cache,
@@ -1196,7 +1216,7 @@ void Fh1NativeExecutor::ShadowDraw(D3D12RenderTargetCache& render_target_cache,
     SurfaceKey key = used ? keys[i] : SurfaceKey::Unpack(xenos_target.key);
     if (used && key.Pack() != xenos_target.key) {
       Count("draw_target_key_differs");
-      LogOnce((uint64_t(key.Pack()) << 32) ^ xenos_target.key ^ 0x5A5A,
+      if (ShouldLog()) LogOnce((uint64_t(key.Pack()) << 32) ^ xenos_target.key ^ 0x5A5A,
               "draw target key differs: native " + key.Describe() + " xenos " +
                   SurfaceKey::Unpack(xenos_target.key).Describe());
       // The pipeline expects the Xenos target's format.
@@ -1228,7 +1248,7 @@ void Fh1NativeExecutor::ShadowDraw(D3D12RenderTargetCache& render_target_cache,
     Count("draw_null_texture");
     const uint64_t vs = draw.vertex_shader ? draw.vertex_shader->ucode_data_hash() : 0;
     const uint64_t ps = draw.pixel_shader ? draw.pixel_shader->ucode_data_hash() : 0;
-    LogOnce(vs ^ (ps << 1) ^ 0x4E554C4C,
+    if (verify_ && ShouldLog()) LogOnce(vs ^ (ps << 1) ^ 0x4E554C4C,
             "draw binds " + std::to_string(null_textures) + " null textures: vs " +
                 std::to_string(vs) + " ps " + std::to_string(ps));
   }
@@ -1243,11 +1263,11 @@ void Fh1NativeExecutor::ShadowDraw(D3D12RenderTargetCache& render_target_cache,
   }
   render_target_cache.Fh1InvalidateCommandListRenderTargets();
   ++shadow_draws_;
-  Trace("draw executed");
+  if (tracing_) Trace("draw executed");
   if (verify_ && dump_frames_.count(frame_ + 1) && trace_lines_ < 400) {
     for (uint32_t mask = pending_texture_mask_; mask; mask &= mask - 1) {
       const uint32_t fetch = uint32_t(std::countr_zero(mask));
-      Trace("texture " + std::to_string(fetch) + " native " +
+      if (tracing_) Trace("texture " + std::to_string(fetch) + " native " +
             native_textures_->Fh1DescribeBinding(fetch) + " xenos " +
             command_processor_.Fh1XenosTextureCache().Fh1DescribeBinding(fetch));
     }
@@ -1586,6 +1606,7 @@ bool Fh1NativeExecutor::NativeResolve(uint32_t& written_address, uint32_t& writt
 
 bool Fh1NativeExecutor::Resolve(D3D12RenderTargetCache* render_target_cache,
                                 uint32_t* written_address, uint32_t* written_length) {
+  CpuTimer timer(*this, kCpuResolves);
   const RegisterFile& regs = register_file_;
   CopyPlan plan;
   if (!PlanCopy(plan)) {
@@ -1610,7 +1631,7 @@ bool Fh1NativeExecutor::Resolve(D3D12RenderTargetCache* render_target_cache,
     Skip(plan.skip);
     succeeded = false;
   } else if (plan.copy) {
-    Trace("resolve " + plan.kind + " of " + plan.resolve_key.Describe() + " rect " +
+    if (tracing_) Trace("resolve " + plan.kind + " of " + plan.resolve_key.Describe() + " rect " +
           std::to_string(x0) + "," + std::to_string(y0) + "-" + std::to_string(x1) + "," +
           std::to_string(y1) + " to " + std::to_string(plan.dest_base));
     native_memory_->RequestRange(resolve_info.copy_dest_extent_start,
@@ -1685,7 +1706,7 @@ bool Fh1NativeExecutor::Resolve(D3D12RenderTargetCache* render_target_cache,
         }
         text += "] xenos [";
         for (uint32_t owner : xenos_owners) text += SurfaceKey::Unpack(owner).Describe() + " ";
-        LogOnce(std::hash<std::string>{}(text), text + "]");
+        if (ShouldLog()) LogOnce(std::hash<std::string>{}(text), text + "]");
       }
       QueueVerify(resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
                   plan.kind);
@@ -1712,7 +1733,7 @@ bool Fh1NativeExecutor::Resolve(D3D12RenderTargetCache* render_target_cache,
     }
     ClearSurfaceRect(*surface, rect, value, value_lo);
     Count(key.is_depth ? "clear_depth" : "clear_color");
-    Trace("clear " + key.Describe() + " rect " + std::to_string(x0) + "," + std::to_string(y0) +
+    if (tracing_) Trace("clear " + key.Describe() + " rect " + std::to_string(x0) + "," + std::to_string(y0) +
           "-" + std::to_string(x1) + "," + std::to_string(y1));
   };
   if (resolve_info.IsClearingColor()) {
@@ -1864,8 +1885,10 @@ void Fh1NativeExecutor::DrainVerifies() {
 void Fh1NativeExecutor::ShadowSwap(uint64_t frame, uint32_t frontbuffer_address,
                                    uint32_t width, uint32_t height, const uint32_t* gamma_pwl) {
   if (!initialized_) return;
-  Trace("swap");
+  if (tracing_) Trace("swap");
   frame_ = frame;
+  tracing_ = verify_ && dump_frames_.count(frame_ + 1) != 0;
+  ++cpu_frames_;
   trace_lines_ = 0;
   DrainDumps();
   DrainVerifies();
@@ -2005,6 +2028,18 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
   REXGPU_INFO(
       "FH1 native executor frame={} draws={} resolves={} surfaces={} skips={{{}}} stats={{{}}}",
       frame, shadow_draws_, shadow_resolves_, surfaces_.size(), skips, stats);
+  if (cpu_frames_) {
+    // Transfers run inside target preparation and resolve clears.
+    const double frames = double(cpu_frames_);
+    REXGPU_INFO(
+        "FH1 native executor cpu ms/frame over {} frames: prepare_targets {:.3f} (transfers "
+        "{:.3f}) bind_targets {:.3f} resolves {:.3f}",
+        cpu_frames_, cpu_ns_[kCpuPrepareTargets] / frames / 1e6,
+        cpu_ns_[kCpuTransfers] / frames / 1e6, cpu_ns_[kCpuBindTargets] / frames / 1e6,
+        cpu_ns_[kCpuResolves] / frames / 1e6);
+    cpu_ns_ = {};
+    cpu_frames_ = 0;
+  }
   if (!verify_counts_.empty()) {
     std::string verified;
     for (const auto& [kind, counts] : verify_counts_) {

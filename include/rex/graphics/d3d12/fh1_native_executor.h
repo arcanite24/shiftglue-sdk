@@ -301,6 +301,10 @@ class Fh1NativeExecutor {
   void SkipDraw(const char* reason, const Fh1NativeDrawInfo& draw);
   void Count(const char* stat) { ++stats_[stat]; }
   void LogOnce(uint64_t signature, const std::string& message);
+  // Whether LogOnce can still log (checked before building a message).
+  bool ShouldLog() const { return logged_.size() < 256; }
+  // Tracing the current frame (verification dump frames only).
+  bool tracing_ = false;
   // Verification: ordered events of dump frames.
   void Trace(const std::string& event);
   uint32_t trace_lines_ = 0;
@@ -367,6 +371,20 @@ class Fh1NativeExecutor {
   std::map<std::string, std::array<uint64_t, 3>> verify_cpu_counts_;
   std::set<uint64_t> logged_;
   uint64_t shadow_draws_ = 0;
+  // CPU time on the GPU command thread, per phase, since the last stats line.
+  enum CpuPhase { kCpuPrepareTargets, kCpuTransfers, kCpuBindTargets, kCpuResolves, kCpuPhases };
+  std::array<uint64_t, kCpuPhases> cpu_ns_{};
+  uint64_t cpu_frames_ = 0;
+  class CpuTimer {
+   public:
+    CpuTimer(Fh1NativeExecutor& executor, CpuPhase phase);
+    ~CpuTimer();
+
+   private:
+    Fh1NativeExecutor& executor_;
+    CpuPhase phase_;
+    int64_t start_;
+  };
   uint64_t shadow_resolves_ = 0;
   bool initialized_ = false;
 };
