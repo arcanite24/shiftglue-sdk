@@ -30,6 +30,7 @@
 #include <rex/perf/counter.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/graphics_system.h>
+#include <rex/graphics/d3d12/fh1_frame_census.h>
 #include <rex/graphics/d3d12/fh1_geometry.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
@@ -344,6 +345,10 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
   ZPDMode mode = GetZPDMode();
   if (mode == ZPDMode::kFast || mode == ZPDMode::kStrict) {
     return ExecuteModernZPD(reader, packet, count);
+  if (Fh1FrameCensus::Enabled()) {
+    Fh1FrameCensus::ObserveZpd(observation_frame_sequence_,
+                               register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR]);
+  }
   }
   if (mode == ZPDMode::kFake) {
     return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
@@ -2942,6 +2947,12 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     // Dump texture fetch constant 0 for debugging
     const auto& regs = *register_file_;
     auto fetch = regs.GetTextureFetch(0);
+  if (Fh1FrameCensus::Enabled()) {
+    // VdSwap stores the front buffer description in texture fetch constant 0.
+    Fh1FrameCensus::ObserveSwap(observation_frame_sequence_, frontbuffer_ptr, frontbuffer_width,
+                                frontbuffer_height,
+                                uint32_t(register_file_->GetTextureFetch(0).format));
+  }
     REXGPU_ERROR(
         "IssueSwap: RequestSwapTexture failed - fetch0: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
         fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
@@ -3582,6 +3593,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         }
       }
     }
+    if (Fh1FrameCensus::Enabled())
+      Fh1FrameCensus::ObserveOptimizedClear(observation_frame_sequence_, mode);
   } else {
     // Disabling pixel shader for this case is also required by the pipeline
     // cache.
@@ -3989,6 +4002,31 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     prepared_observation.surface_info = regs.Get<reg::RB_SURFACE_INFO>().value;
     for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
       prepared_observation.color_info[i] =
+  if (Fh1FrameCensus::Enabled()) {
+    Fh1CensusDraw census{};
+    census.frame = observation_frame_sequence_;
+    census.vertex_shader = vertex_shader->ucode_data_hash();
+    census.pixel_shader = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
+    census.vertex_modification = vertex_shader_modification.value;
+    census.pixel_modification = pixel_shader_modification.value;
+    census.pipeline_hash = pipeline_description_hash;
+    census.guest_primitive = uint32_t(primitive_processing_result.guest_primitive_type);
+    census.host_primitive = uint32_t(primitive_processing_result.host_primitive_type);
+    census.indexed = index_buffer_info != nullptr;
+    census.index_format = uint32_t(primitive_processing_result.host_index_format);
+    census.index_count = primitive_processing_result.guest_draw_vertex_count;
+    census.normalized_depth_control = normalized_depth_control.value;
+    census.normalized_color_mask = normalized_color_mask;
+    census.bound_render_target_bits = bound_depth_and_color_render_target_bits;
+    std::copy(std::begin(bound_depth_and_color_render_target_formats),
+              std::end(bound_depth_and_color_render_target_formats),
+              census.host_render_target_formats);
+    census.used_texture_mask = used_texture_mask;
+    census.memexport = memexport_used;
+    census.occlusion_query =
+        active_occlusion_query_.valid || zpd_lifecycle_.active().logical_active;
+    Fh1FrameCensus::ObserveDraw(regs, census);
+  }
           regs[reg::RB_COLOR_INFO::rt_register_indices[i]];
     }
     prepared_observation.depth_info = regs.Get<reg::RB_DEPTH_INFO>().value;
@@ -5813,6 +5851,13 @@ bool D3D12CommandProcessor::IssueCopy() {
 
 void D3D12CommandProcessor::LogFh1TextureReloadConsumer(
     const D3D12TextureCache::TextureKey& key) const {
+  if (Fh1FrameCensus::Enabled()) {
+    Fh1FrameCensus::ObserveCopy(*register_file_, observation_frame_sequence_,
+                                written_address, written_length, copy_succeeded);
+  }
+  if (fh1_native_executor_) {
+    fh1_native_executor_->ShadowResolve(*render_target_cache_, copy_succeeded);
+  }
   if (!REXCVAR_GET(fh1_post_chain_probe)) {
     return;
   }
