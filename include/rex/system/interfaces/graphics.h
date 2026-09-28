@@ -50,6 +50,16 @@ enum class NativeGuestOutputPhase : uint32_t {
   kBeforeUi = 2,
 };
 
+// Which renderer produced the guest output of a kPresented notification.
+enum class NativeGuestOutputPresenter : uint32_t {
+  // The Xenos-emulating backend (fh1_renderer xenos or native-shadow).
+  kXenos = 0,
+  // The frozen six-family pilot, through this renderer callback.
+  kPilot = 1,
+  // The FH1 native executor (fh1_renderer native).
+  kNativeExecutor = 2,
+};
+
 using NativeGuestOutputClearColor = bool (*)(
     const NativeGuestOutputRenderContext& context, const float color[4]);
 using NativeGuestOutputShader = bool (*)(
@@ -92,6 +102,8 @@ struct NativeGuestOutputRenderContext {
   // Valid during kNativeAttempt or kBeforeUi; stage 0 is vertex, 1 is pixel.
   NativeGuestOutputShader shader = nullptr;
   NativeGuestOutputTexture texture = nullptr;
+  // Valid during kPresented.
+  NativeGuestOutputPresenter presenter = NativeGuestOutputPresenter::kXenos;
 };
 
 // Returning false yields without modifying guest output. Commands targeting

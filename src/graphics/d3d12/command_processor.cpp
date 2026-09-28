@@ -3202,6 +3202,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             context.SetIs8bpc(false);
             SubmitBarriers();
             native_context.phase = system::NativeGuestOutputPhase::kPresented;
+            native_context.presenter = system::NativeGuestOutputPresenter::kPilot;
             native_context.clear_color = nullptr;
             native_context.shader = nullptr;
             native_context.texture = nullptr;
@@ -3466,6 +3467,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         SubmitBarriers();
         if (renderer) {
           native_context.phase = system::NativeGuestOutputPhase::kPresented;
+          native_context.presenter =
+              fh1_native_executor_ && fh1_native_executor_->presents()
+                  ? system::NativeGuestOutputPresenter::kNativeExecutor
+                  : system::NativeGuestOutputPresenter::kXenos;
           native_context.clear_color = nullptr;
           native_context.shader = nullptr;
           native_context.deferred_command_list = nullptr;
