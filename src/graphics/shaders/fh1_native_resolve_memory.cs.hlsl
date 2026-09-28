@@ -26,7 +26,9 @@ cbuffer Fh1NativeResolveMemoryConstants : register(b0) {
   // exp bias 8:15 (signed), bytes per texel log2 16:17, gamma targets hold
   // linear values 18, 16_16[_16_16] hosts keep the full range as snorm / 32 19,
   // resolution scale - 1 20:21 (the rectangle is then in host pixels and the
-  // destination is the texture cache's scaled resolve range).
+  // destination is the texture cache's scaled resolve range), unscaled
+  // destination 22 (at scale: the rectangle in guest pixels, each written to
+  // the guest layout from its first host pixel).
   uint fh1_dest_info;
   uint fh1_dest_base;       // bytes (scaled: from the scaled range's base, unscaled)
   uint fh1_dest_pitch;      // texels
@@ -97,13 +99,18 @@ void main(uint3 thread : SV_DispatchThreadID) {
   uint2 pixel = uint2(fh1_rect_origin & 0xFFFFu, fh1_rect_origin >> 16u) + thread.xy;
   fh1_fixed16_scale = ((fh1_dest_info >> 19u) & 1u) != 0u ? 32.0f : 1.0f;
   uint scale = ((fh1_dest_info >> 20u) & 3u) + 1u;
-  SetScaledPixel(pixel, scale);
+  bool unscaled_dest = ((fh1_dest_info >> 22u) & 1u) != 0u;
+  if (unscaled_dest) {
+    fh1_scale = scale;
+  } else {
+    SetScaledPixel(pixel, scale);
+  }
 
   uint pack = fh1_dest_info & 7u;
   uint endian = (fh1_dest_info >> 3u) & 7u;
   uint bpb_log2 = (fh1_dest_info >> 16u) & 3u;
   uint address;
-  [branch] if (scale > 1u) {
+  [branch] if (scale > 1u && !unscaled_dest) {
     address = fh1_dest_base * scale * scale +
               ScaledOffset(pixel, fh1_subpixel, fh1_dest_pitch, bpb_log2, scale);
   } else {

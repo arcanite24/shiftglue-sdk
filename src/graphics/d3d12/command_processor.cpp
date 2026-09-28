@@ -3558,6 +3558,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   }
 }
 
+void D3D12CommandProcessor::FlushCpuVisibleResults() {
+  if (fh1_native_executor_) fh1_native_executor_->FlushResolveReadbacks();
+}
+
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
   if (REXCVAR_GET(d3d12_submit_on_primary_buffer_end) && submission_open_ &&
       CanEndSubmissionImmediately()) {

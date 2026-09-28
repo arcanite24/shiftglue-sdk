@@ -139,6 +139,9 @@ class Fh1NativeExecutor {
   // Native mode, in place of the render target cache's resolve. Returns
   // whether the copy (or clear) ran, and the guest range it wrote.
   bool NativeResolve(uint32_t& written_address, uint32_t& written_length);
+  // Before the guest CPU can observe GPU progress: copies the one-off resolve
+  // read-backs recorded since into guest memory, waiting for the GPU once.
+  void FlushResolveReadbacks();
   // Verification, before the Xenos resolve: the copy from the native owners
   // and from the Xenos render targets of the same keys, compared.
   void VerifySurfacesBeforeResolve(D3D12RenderTargetCache& render_target_cache);
@@ -297,11 +300,26 @@ class Fh1NativeExecutor {
     uint64_t submissions[2] = {};
     uint32_t current = 0;
     uint64_t last_used_frame = 0;
+    // First frame of the current run of frames resolving this range, and of
+    // the range being new (first resolved, or again after an idle time).
+    uint64_t run_start_frame = 0;
+    uint64_t new_since_frame = 0;
   };
   std::map<uint64_t, ResolveReadback> resolve_readbacks_;
+  struct PendingReadback {
+    uint32_t address;
+    uint32_t length;
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+  };
+  std::vector<PendingReadback> pending_readbacks_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> CreateReadbackBuffer(uint32_t size);
   // fh1_frame_dump_frame: records one frame for offline replay.
   std::unique_ptr<Fh1FrameDump> frame_dump_;
   void ReadBackResolve(uint32_t address, uint32_t length);
+  // With readback_resolve = none: whether a resolve to the range is a one-off
+  // capture to read back (fh1_native_readback_new_resolves), and queueing it.
+  bool IsOneOffResolve(uint32_t address, uint32_t length);
+  void QueueResolveReadback(uint32_t address, uint32_t length);
   class PositionExportSink : public ShaderInterpreter::ExportSink {
    public:
     void Export(ucode::ExportRegister export_register, const float* value,
@@ -356,7 +374,7 @@ class Fh1NativeExecutor {
   bool ResolveToMemory(const SourceRect& source, const SurfaceKey& resolve_key,
                        uint32_t sample_select, uint32_t dest_info, uint32_t dest_base,
                        uint32_t dest_pitch, ID3D12Resource* source_override = nullptr,
-                       D3D12_GPU_VIRTUAL_ADDRESS target = 0);
+                       D3D12_GPU_VIRTUAL_ADDRESS target = 0, bool unscaled_dest = false);
   // A guest copy: its rectangle, destination and the native sources.
   struct CopyPlan {
     bool empty = false;        // Nothing to copy or clear.

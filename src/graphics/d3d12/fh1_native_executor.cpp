@@ -44,6 +44,12 @@ REXCVAR_DEFINE_STRING(fh1_native_shadow_dump_frames, "", "GPU/D3D12",
 REXCVAR_DEFINE_STRING(fh1_native_shadow_dump_dir, "", "GPU/D3D12",
                       "Directory for native front-buffer PPM dumps")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_native_readback_new_resolves, true, "GPU/D3D12",
+                    "With readback_resolve = none, still read back to guest memory, waiting for "
+                    "the GPU, resolves to ranges no resolve wrote in the last few frames: one-off "
+                    "captures the game reads on the CPU, such as the car thumbnails it saves. "
+                    "Ranges resolved every frame are not read back")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_native_gpu_profile, false, "GPU/D3D12",
                     "Measure the FH1 native executor's GPU time per phase (transfers, resolves, "
                     "clears) with timestamp queries and report it with the periodic stats")
@@ -2309,7 +2315,7 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
                                         uint32_t sample_select, uint32_t dest_info,
                                         uint32_t dest_base, uint32_t dest_pitch,
                                         ID3D12Resource* source_override,
-                                        D3D12_GPU_VIRTUAL_ADDRESS target) {
+                                        D3D12_GPU_VIRTUAL_ADDRESS target, bool unscaled_dest) {
   Surface& surface = *source.surface;
   GpuTimer gpu_timer(*this, kGpuResolves);
   const bool depth = surface.key.is_depth;
@@ -2351,7 +2357,7 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   const SurfaceKey& owner = surface.key;
   const uint32_t host_sample_mode =
       owner.msaa == uint32_t(xenos::MsaaSamples::k2X) ? (surface.samples == 4 ? 2u : 1u) : 0u;
-  const D3D12_RECT rect = HostRect(source.rect);
+  const D3D12_RECT rect = unscaled_dest ? source.rect : HostRect(source.rect);
   uint32_t constants[kResolveMemoryConstantCount];
   constants[0] = uint32_t(rect.left) | (uint32_t(rect.top) << 16);
   constants[1] = uint32_t(rect.right - rect.left) | (uint32_t(rect.bottom - rect.top) << 16);
@@ -2361,7 +2367,7 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
                             owner.is_depth, owner.format) |
                  (host_sample_mode << 27);
   constants[4] = sample_select;
-  constants[5] = dest_info | ((scale_ - 1) << 20);
+  constants[5] = dest_info | ((scale_ - 1) << 20) | (unscaled_dest ? 1u << 22 : 0u);
   constants[6] = dest_base;
   constants[7] = dest_pitch;
   auto& list = command_processor_.GetDeferredCommandList();
@@ -2583,33 +2589,60 @@ bool Fh1NativeExecutor::NativeResolve(uint32_t& written_address, uint32_t& writt
   return true;
 }
 
+bool Fh1NativeExecutor::IsOneOffResolve(uint32_t address, uint32_t length) {
+  // Resolves to a range come in runs of frames (a new run after a gap of a few
+  // frames). A range is new when first resolved or after seconds without a
+  // run. One-off captures such as a car thumbnail are a few runs over a new,
+  // large range; per-frame targets and periodic updates (reflection faces
+  // every few frames) keep a range busy. While a range is new, the first
+  // frames of each run are read back.
+  constexpr uint64_t kRunGapFrames = 4, kRunReadbackFrames = 2, kIdleFrames = 300,
+                     kNewFrames = 120;
+  constexpr uint32_t kMinLength = 256 * 1024;
+  ResolveReadback& readback = resolve_readbacks_[(uint64_t(address) << 32) | length];
+  if (!readback.last_used_frame || frame_ > readback.last_used_frame + kRunGapFrames) {
+    if (!readback.last_used_frame || frame_ > readback.last_used_frame + kIdleFrames) {
+      readback.new_since_frame = frame_;
+    }
+    readback.run_start_frame = frame_;
+  }
+  readback.last_used_frame = frame_;
+  return REXCVAR_GET(fh1_native_readback_new_resolves) && length >= kMinLength &&
+         frame_ < readback.run_start_frame + kRunReadbackFrames &&
+         frame_ < readback.new_since_frame + kNewFrames;
+}
+
+void Fh1NativeExecutor::QueueResolveReadback(uint32_t address, uint32_t length) {
+  // The CPU can only read the result after the GPU reports progress, so the
+  // copy waits for the next CPU-visible command (FlushResolveReadbacks).
+  Microsoft::WRL::ComPtr<ID3D12Resource> buffer = CreateReadbackBuffer(length);
+  if (!buffer) return Skip("resolve_readback_buffer");
+  native_memory_->UseAsCopySource();
+  command_processor_.SubmitBarriers();
+  command_processor_.GetDeferredCommandList().D3DCopyBufferRegion(
+      buffer.Get(), 0, native_memory_->GetBuffer(), address, length);
+  pending_readbacks_.push_back({address, length, std::move(buffer)});
+  Count("resolve_readback_one_off");
+}
+
 void Fh1NativeExecutor::ReadBackResolve(uint32_t address, uint32_t length) {
+  // At scale resolves write the scaled resolve range, not guest memory (the
+  // resolve reads one-off captures back itself).
+  if (scale_ > 1) return;
   const ReadbackResolveMode mode = command_processor_.Fh1ReadbackResolveMode();
-  // At scale resolves write the scaled resolve range, not guest memory.
-  if (mode == ReadbackResolveMode::kDisabled || scale_ > 1) return;
-  uint8_t* destination = memory_.TranslatePhysical(address);
-  if (!destination) return;
+  if (mode == ReadbackResolveMode::kDisabled) {
+    if (IsOneOffResolve(address, length)) QueueResolveReadback(address, length);
+    return;
+  }
   ResolveReadback& readback = resolve_readbacks_[(uint64_t(address) << 32) | length];
   readback.last_used_frame = frame_;
+  uint8_t* destination = memory_.TranslatePhysical(address);
+  if (!destination) return;
   const uint32_t write_index = readback.current;
   const uint32_t size = (length + 0xFFFF) & ~uint32_t(0xFFFF);
   if (!readback.buffers[write_index] || readback.sizes[write_index] < size) {
-    D3D12_HEAP_PROPERTIES heap = {};
-    heap.Type = D3D12_HEAP_TYPE_READBACK;
-    D3D12_RESOURCE_DESC desc = {};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = size;
-    desc.Height = 1;
-    desc.DepthOrArraySize = 1;
-    desc.MipLevels = 1;
-    desc.SampleDesc.Count = 1;
-    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
-    if (FAILED(command_processor_.GetD3D12Provider().GetDevice()->CreateCommittedResource(
-            &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-            IID_PPV_ARGS(&buffer)))) {
-      return Skip("resolve_readback_buffer");
-    }
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer = CreateReadbackBuffer(size);
+    if (!buffer) return Skip("resolve_readback_buffer");
     // The old buffer may still be the target of a submitted copy.
     if (readback.buffers[write_index]) command_processor_.Fh1AwaitAllQueueOperations();
     readback.buffers[write_index] = std::move(buffer);
@@ -2648,6 +2681,44 @@ void Fh1NativeExecutor::ReadBackResolve(uint32_t address, uint32_t length) {
     }
   }
   readback.current = 1 - readback.current;
+}
+
+Microsoft::WRL::ComPtr<ID3D12Resource> Fh1NativeExecutor::CreateReadbackBuffer(uint32_t size) {
+  D3D12_HEAP_PROPERTIES heap = {};
+  heap.Type = D3D12_HEAP_TYPE_READBACK;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  desc.Width = size;
+  desc.Height = 1;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+  if (FAILED(command_processor_.GetD3D12Provider().GetDevice()->CreateCommittedResource(
+          &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+          IID_PPV_ARGS(&buffer)))) {
+    return nullptr;
+  }
+  return buffer;
+}
+
+void Fh1NativeExecutor::FlushResolveReadbacks() {
+  if (pending_readbacks_.empty()) return;
+  command_processor_.Fh1AwaitAllQueueOperations();
+  // In order: a later resolve over the same bytes wins, as on the GPU.
+  for (PendingReadback& pending : pending_readbacks_) {
+    uint8_t* destination = memory_.TranslatePhysical(pending.address);
+    void* mapped = nullptr;
+    D3D12_RANGE range = {0, pending.length};
+    if (destination && SUCCEEDED(pending.buffer->Map(0, &range, &mapped))) {
+      std::memcpy(destination, mapped, pending.length);
+      D3D12_RANGE written = {0, 0};
+      pending.buffer->Unmap(0, &written);
+    }
+  }
+  pending_readbacks_.clear();
+  Count("resolve_readback_flush");
 }
 
 bool Fh1NativeExecutor::Resolve(D3D12RenderTargetCache* render_target_cache,
@@ -2732,7 +2803,36 @@ bool Fh1NativeExecutor::Resolve(D3D12RenderTargetCache* render_target_cache,
         complete = false;
       }
     }
-    if (scale_ > 1) native_textures_->MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
+    if (scale_ > 1) {
+      native_textures_->MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
+      // One-off captures the CPU reads also need the guest layout: resolved
+      // again unscaled into the guest memory mirror, from each guest pixel's
+      // first host pixel, and read back.
+      if (written_address &&
+          command_processor_.Fh1ReadbackResolveMode() == ReadbackResolveMode::kDisabled &&
+          IsOneOffResolve(resolve_info.copy_dest_extent_start,
+                          resolve_info.copy_dest_extent_length)) {
+        native_memory_->RequestRange(resolve_info.copy_dest_extent_start,
+                                     resolve_info.copy_dest_extent_length);
+        bool unscaled_complete = true;
+        for (const SourceRect& source : plan.sources) {
+          if (!source.surface || source.rect.left >= source.rect.right ||
+              source.rect.top >= source.rect.bottom ||
+              (!source.surface->key.is_depth &&
+               !IsResolveColorFormatSupported(
+                   xenos::ColorRenderTargetFormat(source.surface->key.format)))) {
+            continue;
+          }
+          unscaled_complete &=
+              ResolveToMemory(source, plan.resolve_key, plan.sample_select, plan.dest_info,
+                              plan.dest_base, plan.dest_pitch, nullptr, 0, true);
+        }
+        if (unscaled_complete) {
+          QueueResolveReadback(resolve_info.copy_dest_extent_start,
+                               resolve_info.copy_dest_extent_length);
+        }
+      }
+    }
     // Invalidates textures over the range (and marks it scaled at scale).
     native_textures_->MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                           resolve_info.copy_dest_extent_length);

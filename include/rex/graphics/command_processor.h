@@ -187,6 +187,10 @@ class CommandProcessor {
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}
+  // Before the command processor does something the guest CPU can observe
+  // (writes guest memory, raises an interrupt, swaps, advances the ring read
+  // pointer): results the CPU may read from then on must be in guest memory.
+  virtual void FlushCpuVisibleResults() {}
   virtual void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
   bool ExecutePacket(memory::RingBuffer* reader);
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);

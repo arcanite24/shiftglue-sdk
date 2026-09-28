@@ -680,6 +680,7 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
     }
   } while (reader.read_count());
 
+  FlushCpuVisibleResults();
   OnPrimaryBufferEnd();
 
   return write_index;
@@ -868,6 +869,21 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       reader->AdvanceRead(count * sizeof(uint32_t));
       return true;
     }
+  }
+
+  switch (opcode) {
+    case PM4_INTERRUPT:
+    case PM4_XE_SWAP:
+    case PM4_REG_TO_MEM:
+    case PM4_MEM_WRITE:
+    case PM4_COND_WRITE:
+    case PM4_EVENT_WRITE_SHD:
+    case PM4_EVENT_WRITE_EXT:
+    case PM4_EVENT_WRITE_ZPD:
+      FlushCpuVisibleResults();
+      break;
+    default:
+      break;
   }
 
   bool result = false;

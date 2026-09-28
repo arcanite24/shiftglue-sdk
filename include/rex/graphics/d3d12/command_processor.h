@@ -284,6 +284,7 @@ class D3D12CommandProcessor : public CommandProcessor {
                  uint32_t frontbuffer_height) override;
 
   void OnPrimaryBufferEnd() override;
+  void FlushCpuVisibleResults() override;
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) override;
   // Scoped to one fully validated list; state packets and scratch clears still execute.
   bool fh1_mip_replacement_active_ = false;
