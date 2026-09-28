@@ -229,7 +229,15 @@ std::optional<size_t> RegisterFlag(FlagEntry entry) {
   auto& storage = GetRegistryStorage();
   auto it = index.find(entry.name);
   if (it != index.end()) {
-    REXLOG_ERROR("cvar: duplicate registration of '{}'; second registration ignored", entry.name);
+    // A second module defining the same flag (the FH1 shader producer loads
+    // beside the regular GPU plugin) keeps its own storage: give it the
+    // registered flag's current value so both see the configured setting.
+    const FlagEntry& registered = storage[it->second];
+    if (entry.setter && registered.getter) {
+      entry.setter(registered.getter());
+    }
+    REXLOG_WARN("cvar: duplicate registration of '{}'; it mirrors the first registration's value",
+                entry.name);
     return std::nullopt;
   }
   size_t pos = storage.size();
