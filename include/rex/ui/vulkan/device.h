@@ -71,6 +71,7 @@ class VulkanDevice {
     uint32_t maxFragmentInputComponents = 64;
     uint32_t maxFragmentCombinedOutputResources = 4;
     float maxSamplerAnisotropy = 1.0f;
+    float maxSamplerLodBias = 2.0f;
     uint32_t maxViewportDimensions[2] = {4096, 4096};
     VkDeviceSize minUniformBufferOffsetAlignment = 256;
     VkDeviceSize minStorageBufferOffsetAlignment = 256;

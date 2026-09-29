@@ -607,6 +607,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_LIMIT(maxFragmentInputComponents)
   XE_UI_VULKAN_LIMIT(maxFragmentCombinedOutputResources)
   XE_UI_VULKAN_LIMIT(maxSamplerAnisotropy)
+  XE_UI_VULKAN_LIMIT(maxSamplerLodBias)
   XE_UI_VULKAN_LIMIT(maxViewportDimensions[0])
   XE_UI_VULKAN_LIMIT(maxViewportDimensions[1])
   XE_UI_VULKAN_LIMIT(minUniformBufferOffsetAlignment)

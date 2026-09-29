@@ -864,7 +864,14 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
   sampler_create_info.addressModeU = kAddressModeMap[uint32_t(parameters.clamp_x)];
   sampler_create_info.addressModeV = kAddressModeMap[uint32_t(parameters.clamp_y)];
   sampler_create_info.addressModeW = kAddressModeMap[uint32_t(parameters.clamp_z)];
-  // LOD biasing is performed in shaders.
+  // The title's LOD bias is applied in shaders; this is the player's global
+  // offset on top of it (samplers are cached, so it applies after a restart),
+  // within the device's limit.
+  {
+    const float max_bias = command_processor_.GetVulkanDevice()->properties().maxSamplerLodBias;
+    sampler_create_info.mipLodBias =
+        std::clamp(float(REXCVAR_GET(texture_mip_lod_bias)), -max_bias, max_bias);
+  }
   if (parameters.aniso_filter != xenos::AnisoFilter::kDisabled) {
     sampler_create_info.anisotropyEnable = VK_TRUE;
     sampler_create_info.maxAnisotropy =
