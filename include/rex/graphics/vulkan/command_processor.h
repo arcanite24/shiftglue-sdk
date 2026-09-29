@@ -13,9 +13,12 @@
 #include <array>
 #include <climits>
 #include <cstdint>
+#include <condition_variable>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -275,6 +278,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
 
+  bool IssueDrawImpl(xenos::PrimitiveType prim_type, uint32_t index_count,
+                     IndexBufferInfo* index_buffer_info, bool major_mode_explicit);
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
@@ -284,6 +289,42 @@ class VulkanCommandProcessor : public CommandProcessor {
     VkCommandPool pool;
     VkCommandBuffer buffer;
   };
+
+  // Submission worker (as on D3D12): an ended submission's command stream is
+  // replayed into its command buffer and submitted on another thread, so the
+  // driver's recording overlaps the next submission's command processing. A
+  // frame splits into submissions every vulkan_async_submission_split_draws
+  // draws; the swap waits for the worker, so the presenter's work follows the
+  // frame on the queue.
+  struct SubmissionJob {
+    std::unique_ptr<DeferredCommandBuffer> tape;
+    CommandBuffer command_buffer;
+    std::vector<VkSemaphore> wait_semaphores;
+    std::vector<VkPipelineStageFlags> wait_stage_masks;
+    VkFence fence = VK_NULL_HANDLE;
+  };
+  // Replays `tape` into `command_buffer` and submits it signaling `fence`;
+  // on failure still signals the fence (an empty submission) unless the
+  // device is lost, so waits for it end.
+  bool ExecuteSubmission(DeferredCommandBuffer& tape, const CommandBuffer& command_buffer,
+                         const std::vector<VkSemaphore>& wait_semaphores,
+                         const std::vector<VkPipelineStageFlags>& wait_stage_masks,
+                         VkFence fence);
+  void StartSubmissionWorker();
+  void StopSubmissionWorker();
+  void SubmissionWorkerMain();
+  void AwaitSubmissionWorker();
+  bool async_submission_ = false;
+  uint32_t submission_split_draws_ = 0;
+  uint32_t submission_draws_ = 0;
+  std::thread submission_worker_;
+  std::mutex submission_worker_mutex_;
+  std::condition_variable submission_worker_wake_;
+  std::condition_variable submission_worker_idle_;
+  std::deque<SubmissionJob> submission_jobs_;
+  std::vector<std::unique_ptr<DeferredCommandBuffer>> submission_free_tapes_;
+  bool submission_worker_busy_ = false;
+  bool submission_worker_stop_ = false;
 
   struct SparseBufferBind {
     VkBuffer buffer;
