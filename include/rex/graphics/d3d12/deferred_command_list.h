@@ -40,7 +40,17 @@ class DeferredCommandList {
   void Swap(DeferredCommandList& other) {
     command_stream_.swap(other.command_stream_);
     std::swap(command_count_, other.command_count_);
+    // Each tape replays into its own command list, so bindings recorded in
+    // one say nothing about the other.
+    render_targets_valid_ = false;
+    other.render_targets_valid_ = false;
   }
+
+  // Render-target binds requested, and those elided because they repeated
+  // the tape's current one.
+  uint64_t render_target_binds() const { return render_target_binds_; }
+  void set_elide_repeated_render_target_binds(bool elide) { elide_render_target_binds_ = elide; }
+  uint64_t elided_render_target_binds() const { return elided_render_target_binds_; }
 
   void ReserveAdditionalBytes(size_t bytes) {
     command_stream_.reserve(command_stream_.size() +
@@ -290,11 +300,12 @@ class DeferredCommandList {
                              const D3D12_CPU_DESCRIPTOR_HANDLE* render_target_descriptors,
                              BOOL rts_single_handle_to_descriptor_range,
                              const D3D12_CPU_DESCRIPTOR_HANDLE* depth_stencil_descriptor) {
-    auto& args = *reinterpret_cast<D3DOMSetRenderTargetsArguments*>(
-        WriteCommand(Command::kD3DOMSetRenderTargets, sizeof(D3DOMSetRenderTargetsArguments)));
+    ++render_target_binds_;
+    D3DOMSetRenderTargetsArguments args;
+    std::memset(&args, 0, sizeof(args));
     num_render_target_descriptors =
         std::min(num_render_target_descriptors, UINT(D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT));
-    args.num_render_target_descriptors = num_render_target_descriptors;
+    args.num_render_target_descriptors = uint8_t(num_render_target_descriptors);
     args.rts_single_handle_to_descriptor_range = rts_single_handle_to_descriptor_range ? 1 : 0;
     if (num_render_target_descriptors != 0) {
       std::memcpy(args.render_target_descriptors, render_target_descriptors,
@@ -305,6 +316,19 @@ class DeferredCommandList {
     if (depth_stencil_descriptor != nullptr) {
       args.depth_stencil_descriptor.ptr = depth_stencil_descriptor->ptr;
     }
+    // Render targets stay bound until changed, and the command list this tape
+    // replays into starts with the tape: a bind equal to the tape's current
+    // one records nothing. The arguments start zeroed, padding included, so
+    // comparing the bytes compares only what was set.
+    if (elide_render_target_binds_ && render_targets_valid_ &&
+        !std::memcmp(&args, &render_targets_, sizeof(args))) {
+      ++elided_render_target_binds_;
+      return;
+    }
+    std::memcpy(&render_targets_, &args, sizeof(args));
+    render_targets_valid_ = true;
+    std::memcpy(WriteCommand(Command::kD3DOMSetRenderTargets, sizeof(D3DOMSetRenderTargetsArguments)),
+                &args, sizeof(args));
   }
 
   void D3DOMSetStencilRef(UINT stencil_ref) {
@@ -702,6 +726,12 @@ class DeferredCommandList {
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
   std::vector<uintmax_t> command_stream_;
   uint64_t command_count_ = 0;
+
+  D3DOMSetRenderTargetsArguments render_targets_ = {};
+  bool render_targets_valid_ = false;
+  bool elide_render_target_binds_ = true;
+  uint64_t render_target_binds_ = 0;
+  uint64_t elided_render_target_binds_ = 0;
 };
 
 }  // namespace rex::graphics::d3d12

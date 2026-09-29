@@ -46,6 +46,10 @@ REXCVAR_DEFINE_STRING(fh1_resolve_dump_dir, "", "GPU/D3D12",
                       "scaling is on) to this directory, waiting for the GPU after each")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(d3d12_elide_repeated_render_target_binds, true, "GPU/D3D12",
+                    "Record a render-target bind only when it differs from the command "
+                    "list's current one");
+
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
@@ -2977,6 +2981,9 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     // end of the submission (when async pipeline creation requests are
     // fulfilled).
     deferred_command_list_.Reset();
+    deferred_command_list_.set_elide_repeated_render_target_binds(
+        REXCVAR_GET(d3d12_elide_repeated_render_target_binds));
+
     if (is_opening_frame) {
       BeginNativeGuestOutputGpuTimingFrame();
     }

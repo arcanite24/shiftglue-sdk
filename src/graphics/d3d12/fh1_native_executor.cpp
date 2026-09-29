@@ -2588,10 +2588,13 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
     const double frames = double(cpu_frames_);
     REXGPU_INFO(
         "FH1 native executor cpu ms/frame over {} frames: prepare_targets {:.3f} (transfers "
-        "{:.3f}) bind_targets {:.3f} resolves {:.3f}",
+        "{:.3f}) bind_targets {:.3f} resolves {:.3f}; render-target binds {} requested, {} "
+        "elided as repeats",
         cpu_frames_, cpu_ns_[kCpuPrepareTargets] / frames / 1e6,
         cpu_ns_[kCpuTransfers] / frames / 1e6, cpu_ns_[kCpuBindTargets] / frames / 1e6,
-        cpu_ns_[kCpuResolves] / frames / 1e6);
+        cpu_ns_[kCpuResolves] / frames / 1e6,
+        command_processor_.GetDeferredCommandList().render_target_binds(),
+        command_processor_.GetDeferredCommandList().elided_render_target_binds());
     cpu_ns_ = {};
     cpu_frames_ = 0;
   }

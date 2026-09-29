@@ -30,6 +30,7 @@ DeferredCommandList::DeferredCommandList(const D3D12CommandProcessor& command_pr
 void DeferredCommandList::Reset() {
   command_stream_.clear();
   command_count_ = 0;
+  render_targets_valid_ = false;
 }
 
 void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
