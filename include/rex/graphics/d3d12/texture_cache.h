@@ -43,6 +43,9 @@ class D3D12TextureCache final : public TextureCache {
     TextureKey key;
     uint32_t host_swizzle;
     uint8_t swizzled_signs;
+    // texture_resource_generation_ when written: a texture that switched
+    // between its guest and replacement resources needs new descriptors.
+    uint32_t resource_generation;
   };
 
   // Sampler parameters that can be directly converted to a host sampler or used
@@ -283,10 +286,39 @@ class D3D12TextureCache final : public TextureCache {
       srv_descriptors_.emplace(descriptor_key, descriptor_index);
     }
 
+    // Higher-resolution texture replacements (NP-10.3): the texture draws from
+    // a larger resource, with its own views, while its data is replaced; the
+    // guest-size resource stays for when the guest data changes to data
+    // without a replacement. Views of both live until the texture is
+    // destroyed, so switching never frees a descriptor the GPU may still read.
+    bool uses_replacement_resource() const { return uses_replacement_; }
+    ID3D12Resource* guest_resource() const {
+      return uses_replacement_ ? other_resource_.Get() : resource_.Get();
+    }
+    // Mip levels the active resource has beyond the guest's.
+    uint32_t extra_mip_levels() const { return uses_replacement_ ? replacement_extra_levels_ : 0; }
+    // The replacement resource matching the description, created on demand
+    // (null on failure); makes it the active resource.
+    ID3D12Resource* UseReplacementResource(const D3D12_RESOURCE_DESC& desc, uint32_t extra_levels);
+    void UseGuestResource();
+
    private:
+    void SwapActiveResource();
+
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
     D3D12_RESOURCE_STATES resource_state_;
     std::unique_ptr<D3D12Texture> texture_3d_as_2d_;
+    // The inactive one of the guest and replacement resources.
+    Microsoft::WRL::ComPtr<ID3D12Resource> other_resource_;
+    D3D12_RESOURCE_STATES other_resource_state_ = D3D12_RESOURCE_STATE_COMMON;
+    std::unordered_map<SRVDescriptorKey, uint32_t, SRVDescriptorKey::Hasher> other_srv_descriptors_;
+    bool uses_replacement_ = false;
+    uint32_t replacement_extra_levels_ = 0;
+    uint64_t guest_memory_usage_ = 0;
+    // Replacement resources of another size, and their views, kept until
+    // destruction.
+    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> retired_resources_;
+    std::vector<uint32_t> retired_descriptors_;
 
     // For bindful - indices in the non-shader-visible descriptor cache for
     // copying to the shader-visible heap (much faster than recreating, which,
@@ -299,6 +331,10 @@ class D3D12TextureCache final : public TextureCache {
   // Dumps and replaces DXT1/3/5 textures by the hash of their guest base level
   // (texture_dump_dir, texture_replacement_dirs); true when replaced.
   bool TryLoadTextureReplacement(Texture& texture);
+  // After a texture switched resources: rebinds it and invalidates cached
+  // descriptor tables.
+  void OnTextureResourceSwitched(Texture& texture);
+  uint32_t texture_resource_generation_ = 0;
 
   static constexpr uint32_t kSRVDescriptorCachePageSize = 65536;
 

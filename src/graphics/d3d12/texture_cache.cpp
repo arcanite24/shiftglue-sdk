@@ -833,7 +833,8 @@ bool D3D12TextureCache::AreActiveTextureSRVKeysUpToDate(
       continue;
     }
     if (key.key != binding->key || key.host_swizzle != binding->host_swizzle ||
-        key.swizzled_signs != binding->swizzled_signs) {
+        key.swizzled_signs != binding->swizzled_signs ||
+        key.resource_generation != texture_resource_generation_) {
       return false;
     }
   }
@@ -850,11 +851,13 @@ void D3D12TextureCache::WriteActiveTextureSRVKeys(
       key.key.MakeInvalid();
       key.host_swizzle = xenos::XE_GPU_TEXTURE_SWIZZLE_0000;
       key.swizzled_signs = kSwizzledSignsUnsigned;
+      key.resource_generation = texture_resource_generation_;
       continue;
     }
     key.key = binding->key;
     key.host_swizzle = binding->host_swizzle;
     key.swizzled_signs = binding->swizzled_signs;
+    key.resource_generation = texture_resource_generation_;
   }
 }
 
@@ -1490,13 +1493,71 @@ D3D12TextureCache::D3D12Texture::D3D12Texture(D3D12TextureCache& texture_cache,
       resource_state_(resource_state) {
   ID3D12Device* device = texture_cache.command_processor_.GetD3D12Provider().GetDevice();
   D3D12_RESOURCE_DESC resource_desc = resource_->GetDesc();
-  SetHostMemoryUsage(device->GetResourceAllocationInfo(0, 1, &resource_desc).SizeInBytes);
+  guest_memory_usage_ = device->GetResourceAllocationInfo(0, 1, &resource_desc).SizeInBytes;
+  SetHostMemoryUsage(guest_memory_usage_);
 }
 
 D3D12TextureCache::D3D12Texture::~D3D12Texture() {
   auto& d3d12_texture_cache = static_cast<D3D12TextureCache&>(texture_cache());
   for (const auto& descriptor_pair : srv_descriptors_) {
     d3d12_texture_cache.ReleaseTextureDescriptor(descriptor_pair.second);
+  }
+  for (const auto& descriptor_pair : other_srv_descriptors_) {
+    d3d12_texture_cache.ReleaseTextureDescriptor(descriptor_pair.second);
+  }
+  for (uint32_t descriptor_index : retired_descriptors_) {
+    d3d12_texture_cache.ReleaseTextureDescriptor(descriptor_index);
+  }
+}
+
+void D3D12TextureCache::D3D12Texture::SwapActiveResource() {
+  std::swap(resource_, other_resource_);
+  std::swap(resource_state_, other_resource_state_);
+  std::swap(srv_descriptors_, other_srv_descriptors_);
+  uses_replacement_ = !uses_replacement_;
+}
+
+ID3D12Resource* D3D12TextureCache::D3D12Texture::UseReplacementResource(
+    const D3D12_RESOURCE_DESC& desc, uint32_t extra_levels) {
+  // Retire a replacement of another size (a different replacement for new
+  // guest data); its views may still be in flight.
+  if (uses_replacement_) {
+    SwapActiveResource();
+  }
+  if (other_resource_) {
+    const D3D12_RESOURCE_DESC other_desc = other_resource_->GetDesc();
+    if (other_desc.Width != desc.Width || other_desc.Height != desc.Height ||
+        other_desc.MipLevels != desc.MipLevels || other_desc.Format != desc.Format) {
+      retired_resources_.push_back(std::move(other_resource_));
+      for (const auto& descriptor_pair : other_srv_descriptors_) {
+        retired_descriptors_.push_back(descriptor_pair.second);
+      }
+      other_srv_descriptors_.clear();
+    }
+  }
+  auto& d3d12_texture_cache = static_cast<D3D12TextureCache&>(texture_cache());
+  const ui::d3d12::D3D12Provider& provider =
+      d3d12_texture_cache.command_processor_.GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  if (!other_resource_) {
+    other_resource_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
+    if (FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesDefault, provider.GetHeapFlagCreateNotZeroed(), &desc,
+            other_resource_state_, nullptr, IID_PPV_ARGS(&other_resource_)))) {
+      return nullptr;
+    }
+    const D3D12_RESOURCE_DESC created_desc = other_resource_->GetDesc();
+    SetHostMemoryUsage(guest_memory_usage_ +
+                       device->GetResourceAllocationInfo(0, 1, &created_desc).SizeInBytes);
+  }
+  replacement_extra_levels_ = extra_levels;
+  SwapActiveResource();
+  return resource_.Get();
+}
+
+void D3D12TextureCache::D3D12Texture::UseGuestResource() {
+  if (uses_replacement_) {
+    SwapActiveResource();
   }
 }
 
@@ -1846,6 +1907,15 @@ bool D3D12TextureCache::TryLoadTextureReplacement(Texture& texture) {
     return false;
   }
   const uint64_t hash = XXH3_64bits(base.data(), base.size());
+  auto& target = static_cast<D3D12Texture&>(texture);
+  // New guest data: back to the guest-size resource unless it is replaced
+  // again at a higher resolution below.
+  auto use_guest_resource = [&]() {
+    if (target.uses_replacement_resource()) {
+      target.UseGuestResource();
+      OnTextureResourceSwitched(texture);
+    }
+  };
 
   if (!dump_dir.empty()) {
     bool dump = false;
@@ -1872,7 +1942,10 @@ bool D3D12TextureCache::TryLoadTextureReplacement(Texture& texture) {
   {
     std::lock_guard lock(state.mutex);
     const auto file = state.files.find(hash);
-    if (file == state.files.end()) return false;
+    if (file == state.files.end()) {
+      use_guest_resource();
+      return false;
+    }
     auto& slot = state.loaded[hash];
     if (!slot) {
       auto read = ReadDds(file->second);
@@ -1881,28 +1954,56 @@ bool D3D12TextureCache::TryLoadTextureReplacement(Texture& texture) {
                     file->second.string());
         state.files.erase(file);
         state.loaded.erase(hash);
+        use_guest_resource();
         return false;
       }
       slot = std::make_shared<const BcImage>(std::move(*read));
     }
     image = slot;
   }
-  auto& target = static_cast<D3D12Texture&>(texture);
-  auto* resource = target.resource();
-  const auto desc = resource->GetDesc();
-  const uint32_t levels = desc.MipLevels;
-  if (image->format != format || image->width != key.GetWidth() ||
-      image->height != key.GetHeight() || image->levels < levels ||
-      desc.DepthOrArraySize != 1 ||
-      (desc.Format != format->unorm && desc.Format != format->srgb &&
-       desc.Format != format->typeless)) {
+  // The replacement may be larger by a power of two (the same in both
+  // directions, up to 8x); it then keeps the guest's level count plus the
+  // levels it has below that, drawing from a resource of its own.
+  const uint32_t guest_levels = key.mip_max_level + 1u;
+  const uint32_t width = key.GetWidth(), height = key.GetHeight();
+  uint32_t scale_log2 = 0;
+  while (scale_log2 < 3 && image->width > (width << scale_log2)) ++scale_log2;
+  const D3D12_RESOURCE_DESC guest_desc = target.guest_resource()->GetDesc();
+  const bool size_valid = image->width == (width << scale_log2) &&
+                          image->height == (height << scale_log2);
+  if (image->format != format || !size_valid || image->levels < guest_levels ||
+      guest_desc.DepthOrArraySize != 1 ||
+      (guest_desc.Format != format->unorm && guest_desc.Format != format->srgb &&
+       guest_desc.Format != format->typeless)) {
     std::lock_guard lock(state.mutex);
     if (state.logged.insert(hash).second) {
-      REXGPU_WARN("Texture replacement {:016X}: needs {}x{} with the dumped format and {} levels",
-                  hash, key.GetWidth(), key.GetHeight(), levels);
+      REXGPU_WARN(
+          "Texture replacement {:016X}: needs {}x{} (or 2x, 4x or 8x that) with the dumped "
+          "format and at least {} levels",
+          hash, width, height, guest_levels);
     }
+    use_guest_resource();
     return false;
   }
+  ID3D12Resource* resource = nullptr;
+  if (scale_log2) {
+    D3D12_RESOURCE_DESC replacement_desc = guest_desc;
+    const uint32_t levels = std::min(image->levels, guest_levels + scale_log2);
+    replacement_desc.Width = image->width;
+    replacement_desc.Height = image->height;
+    replacement_desc.MipLevels = UINT16(levels);
+    resource = target.UseReplacementResource(replacement_desc, levels - guest_levels);
+    OnTextureResourceSwitched(texture);
+    if (!resource) {
+      target.UseGuestResource();
+      return false;
+    }
+  } else {
+    use_guest_resource();
+    resource = target.resource();
+  }
+  const auto desc = resource->GetDesc();
+  const uint32_t levels = desc.MipLevels;
   std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(levels);
   std::vector<UINT> row_counts(levels);
   std::vector<UINT64> row_bytes(levels);
@@ -1949,6 +2050,21 @@ bool D3D12TextureCache::TryLoadTextureReplacement(Texture& texture) {
                 image->height, levels);
   }
   return true;
+}
+
+void D3D12TextureCache::OnTextureResourceSwitched(Texture& texture) {
+  // Cached descriptor tables compare this generation.
+  ++texture_resource_generation_;
+  uint32_t bindings = 0;
+  for (uint32_t index = 0; index < 32; ++index) {
+    const TextureBinding* binding = GetValidTextureBinding(index);
+    if (binding && (binding->texture == &texture || binding->texture_signed == &texture)) {
+      bindings |= uint32_t(1) << index;
+    }
+  }
+  if (bindings) {
+    UpdateTextureBindingsImpl(bindings);
+  }
 }
 
 bool D3D12TextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_base, bool load_mips) {
@@ -2636,7 +2752,7 @@ uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(D3D12Texture& texture,
     return UINT32_MAX;
   }
 
-  uint32_t mip_levels = texture_key.mip_max_level + 1;
+  uint32_t mip_levels = texture_key.mip_max_level + 1 + texture.extra_mip_levels();
   ID3D12Resource* resource_for_view = texture.resource();
   switch (dimension) {
     case xenos::DataDimension::k3D:
