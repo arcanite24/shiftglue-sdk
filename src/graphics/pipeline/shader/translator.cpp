@@ -573,7 +573,7 @@ void Shader::GatherAluResultInformation(const InstructionResult& result, uint32_
   }
 }
 
-#if defined(REXGPU_FH1_SHADER_PRODUCER)
+#if defined(REXGPU_FH1_SHADER_PRODUCER) || defined(REXGPU_SHADER_TRANSLATOR)
 ShaderTranslator::ShaderTranslator() = default;
 
 ShaderTranslator::~ShaderTranslator() = default;
@@ -854,7 +854,7 @@ void ParseControlFlowAlloc(const ControlFlowAllocInstruction& cf, uint32_t cf_in
   instr.is_vertex_shader = is_vertex_shader;
 }
 
-#if defined(REXGPU_FH1_SHADER_PRODUCER)
+#if defined(REXGPU_FH1_SHADER_PRODUCER) || defined(REXGPU_SHADER_TRANSLATOR)
 void ShaderTranslator::TranslateExecInstructions(const ParsedExecInstruction& instr) {
   ProcessExecInstructionBegin(instr);
 

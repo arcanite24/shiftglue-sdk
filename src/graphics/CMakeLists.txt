@@ -99,7 +99,11 @@ if(REXGLUE_USE_D3D12)
 endif()
 
 if(REXGLUE_USE_VULKAN)
-    list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_SPIRV_SOURCES} ${REXGPU_XENOS_VULKAN_SOURCES})
+    # The Vulkan backend translates shaders at runtime (no prebuilt pack), so
+    # it carries the translator and ucode analysis the D3D12 path only needs
+    # in the pack producer.
+    list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_SPIRV_SOURCES} ${REXGPU_XENOS_VULKAN_SOURCES}
+        ${REXGPU_FH1_SHADER_ANALYSIS_SOURCES})
 endif()
 
 if(REXGLUE_USE_D3D12)
@@ -112,10 +116,10 @@ endif()
 add_library(rexgpu-fh1 SHARED ${REXGPU_XENOS_SOURCES})
 add_library(rex::gpu-fh1 ALIAS rexgpu-fh1)
 if(REXGLUE_USE_D3D12)
-    add_library(rexgpu-fh1-producer SHARED EXCLUDE_FROM_ALL
-        ${REXGPU_XENOS_SOURCES}
-        ${REXGPU_FH1_SHADER_ANALYSIS_SOURCES}
-        ${REXGPU_FH1_SHADER_PRODUCER_SOURCES})
+    set(REXGPU_FH1_PRODUCER_SOURCES ${REXGPU_XENOS_SOURCES}
+        ${REXGPU_FH1_SHADER_ANALYSIS_SOURCES} ${REXGPU_FH1_SHADER_PRODUCER_SOURCES})
+    list(REMOVE_DUPLICATES REXGPU_FH1_PRODUCER_SOURCES)
+    add_library(rexgpu-fh1-producer SHARED EXCLUDE_FROM_ALL ${REXGPU_FH1_PRODUCER_SOURCES})
     target_compile_definitions(rexgpu-fh1-producer PRIVATE
         REXGPU_FH1_SHADER_PRODUCER=1)
 endif()
@@ -163,6 +167,9 @@ endif()
 # libraries (rexcore/rexui) here; rexruntime already contains those objects
 # and relinking them would duplicate global state.
 if(REXGLUE_USE_VULKAN)
+    # Runtime shader translation (translator.cpp keeps it out of D3D12-only
+    # runtimes, which load prebuilt packs).
+    target_compile_definitions(rexgpu-fh1 PRIVATE REXGPU_SHADER_TRANSLATOR=1)
     target_link_libraries(rexgpu-fh1 PRIVATE
         Vulkan::Headers
         glslang::SPIRV
