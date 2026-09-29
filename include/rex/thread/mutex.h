@@ -57,18 +57,26 @@ class global_critical_region {
  public:
   static std::recursive_mutex& mutex();
 
+  // Locks the global mutex, counting the acquisitions that had to wait
+  // (the kCriticalRegionContentions performance counter).
+  static void LockCounted() {
+    if (!mutex().try_lock()) {
+      NoteContention();
+      mutex().lock();
+    }
+  }
+
   // Acquires a lock on the global critical section.
   // Use this when keeping an instance is not possible. Otherwise, prefer
   // to keep an instance of global_critical_region near the members requiring
   // it to keep things readable.
   static std::unique_lock<std::recursive_mutex> AcquireDirect() {
-    return std::unique_lock<std::recursive_mutex>(mutex());
+    LockCounted();
+    return std::unique_lock<std::recursive_mutex>(mutex(), std::adopt_lock);
   }
 
   // Acquires a lock on the global critical section.
-  inline std::unique_lock<std::recursive_mutex> Acquire() {
-    return std::unique_lock<std::recursive_mutex>(mutex());
-  }
+  inline std::unique_lock<std::recursive_mutex> Acquire() { return AcquireDirect(); }
 
   // Acquires a deferred lock on the global critical section.
   inline std::unique_lock<std::recursive_mutex> AcquireDeferred() {
@@ -80,6 +88,9 @@ class global_critical_region {
   inline std::unique_lock<std::recursive_mutex> TryAcquire() {
     return std::unique_lock<std::recursive_mutex>(mutex(), std::try_to_lock);
   }
+
+ private:
+  static void NoteContention();
 };
 
 }  // namespace rex::thread

@@ -210,6 +210,10 @@ void SleepUntil(std::chrono::steady_clock::time_point deadline, std::chrono::mic
   }
 }
 
+void WaitUntil(std::chrono::steady_clock::time_point deadline) {
+  std::this_thread::sleep_until(deadline);
+}
+
 void Sleep(std::chrono::microseconds duration) {
   timespec rqtp = DurationToTimeSpec(duration);
   timespec rmtp = {};

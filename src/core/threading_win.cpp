@@ -153,6 +153,22 @@ void SleepUntil(std::chrono::steady_clock::time_point deadline, std::chrono::mic
   }
 }
 
+void WaitUntil(std::chrono::steady_clock::time_point deadline) {
+  thread_local ThreadWaitTimer timer;
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= deadline) {
+    return;
+  }
+  LARGE_INTEGER due_time;
+  due_time.QuadPart = -std::max<int64_t>(
+      1, std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now).count() / 100);
+  if (timer.handle && SetWaitableTimer(timer.handle, &due_time, 0, nullptr, nullptr, FALSE)) {
+    WaitForSingleObject(timer.handle, INFINITE);
+  } else {
+    std::this_thread::sleep_until(deadline);
+  }
+}
+
 SleepResult AlertableSleep(std::chrono::microseconds duration) {
   if (SleepEx(static_cast<DWORD>(duration.count() / 1000), TRUE) == WAIT_IO_COMPLETION) {
     return SleepResult::kAlerted;

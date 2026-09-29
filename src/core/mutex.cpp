@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/perf/counter.h>
 #include <rex/thread/mutex.h>
 
 namespace rex::thread {
@@ -16,6 +17,10 @@ namespace rex::thread {
 std::recursive_mutex& global_critical_region::mutex() {
   static std::recursive_mutex global_mutex;
   return global_mutex;
+}
+
+void global_critical_region::NoteContention() {
+  PROFILE_CRITICAL_REGION_CONTENTION();
 }
 
 }  // namespace rex::thread

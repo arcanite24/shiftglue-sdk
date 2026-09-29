@@ -13,6 +13,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <algorithm>
+#include <atomic>
 #include <string>
 
 #include <rex/chrono/chrono_steady_cast.h>
@@ -378,7 +379,11 @@ u32 RtlInitializeCriticalSectionAndSpinCount_entry(ppc_ptr_t<X_RTL_CRITICAL_SECT
 
 void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
   uint32_t cur_thread = XThread::GetCurrentThread()->guest_object();
-  uint32_t spin_count = cs->header.absolute * 256;
+  // The title's spin counts (up to 255 * 256) were tuned for the Xenon; cap
+  // them, and read before each compare-exchange with a pause so waiters do
+  // not keep stealing the cache line the owner needs to release the lock.
+  constexpr uint32_t kMaxSpinCount = 1024;
+  uint32_t spin_count = std::min<uint32_t>(cs->header.absolute * 256, kMaxSpinCount);
 
   if (cs->owning_thread == cur_thread) {
     // We already own the lock.
@@ -389,6 +394,10 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
 
   // Spin loop
   while (spin_count--) {
+    if (std::atomic_ref<int32_t>(cs->lock_count).load(std::memory_order_relaxed) != -1) {
+      rex::thread::SpinPause();
+      continue;
+    }
     if (rex::thread::atomic_cas(-1, 0, &cs->lock_count)) {
       // Acquired.
       cs->owning_thread = cur_thread;

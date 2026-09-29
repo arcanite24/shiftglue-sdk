@@ -15,7 +15,7 @@
 #include <disruptorplus/multi_threaded_claim_strategy.hpp>
 #include <disruptorplus/ring_buffer.hpp>
 #include <disruptorplus/sequence_barrier.hpp>
-#include <disruptorplus/spin_wait_strategy.hpp>
+#include <disruptorplus/blocking_wait_strategy.hpp>
 
 #include <rex/assert.h>
 #include <rex/thread.h>
@@ -66,10 +66,24 @@ class TimerQueue {
 
     while (!stop_token.stop_requested()) {
       {
+        // With no timer queued, block until one is published. Otherwise
+        // sleep on the high-resolution wait until the earliest is due: a
+        // condition-variable timeout is only as precise as the system timer
+        // tick (15.6 ms by default on Windows), too coarse for the kernel's
+        // 1 ms KeTimeStampBundle timer. Items published meanwhile are picked
+        // up when it wakes, at most one due period late.
+        if (!wait_queue_.empty()) {
+          const auto due = wait_queue_.front()->due_;
+          if (due > clock::now()) {
+            WaitUntil(due);
+          }
+        }
         // Consume new wait items and add them to sorted wait queue
         dp::sequence_t available = claim_strategy_.wait_until_published(
             next_sequence, next_sequence - 1,
-            wait_queue_.empty() ? clock::time_point::max() : wait_queue_.front()->due_);
+            // A finite idle timeout: condition-variable waits until
+            // time_point::max() overflow on some standard libraries.
+            wait_queue_.empty() ? clock::now() + std::chrono::hours(1) : clock::now());
 
         // Check for timeout
         if (available != next_sequence - 1) {
@@ -142,9 +156,11 @@ class TimerQueue {
   // This ring buffer will be used to introduce timers queued by the public API
   static constexpr size_t kWaitCount = 512;
   dp::ring_buffer<std::shared_ptr<WaitItem>> buffer_;
-  dp::spin_wait_strategy wait_strategy_;
-  dp::multi_threaded_claim_strategy<dp::spin_wait_strategy> claim_strategy_;
-  dp::sequence_barrier<dp::spin_wait_strategy> consumed_;
+  // Blocking, not spinning: an idle queue sleeps until an item is published
+  // or the next item is due, instead of yielding a thousand times a second.
+  dp::blocking_wait_strategy wait_strategy_;
+  dp::multi_threaded_claim_strategy<dp::blocking_wait_strategy> claim_strategy_;
+  dp::sequence_barrier<dp::blocking_wait_strategy> consumed_;
 
   // This is a _sorted_ (ascending due_) list of active timers managed by a
   // dedicated thread
@@ -152,7 +168,12 @@ class TimerQueue {
   std::jthread dispatch_thread_;
 };
 
-rex::thread::TimerQueue timer_queue_;
+// Created on first use: only the POSIX timers queue work here, so Windows
+// never starts the dispatch thread.
+rex::thread::TimerQueue& timer_queue() {
+  static rex::thread::TimerQueue queue;
+  return queue;
+}
 
 void TimerQueueWaitItem::Disarm() {
   State state;
@@ -189,15 +210,15 @@ void TimerQueueWaitItem::Disarm() {
 
 std::weak_ptr<WaitItem> QueueTimerOnce(std::function<void(void*)> callback, void* userdata,
                                        WaitItem::clock::time_point due) {
-  return timer_queue_.QueueTimer(std::make_shared<WaitItem>(
-      std::move(callback), userdata, &timer_queue_, due, WaitItem::clock::duration::zero()));
+  return timer_queue().QueueTimer(std::make_shared<WaitItem>(
+      std::move(callback), userdata, &timer_queue(), due, WaitItem::clock::duration::zero()));
 }
 
 std::weak_ptr<WaitItem> QueueTimerRecurring(std::function<void(void*)> callback, void* userdata,
                                             WaitItem::clock::time_point due,
                                             WaitItem::clock::duration interval) {
-  return timer_queue_.QueueTimer(
-      std::make_shared<WaitItem>(std::move(callback), userdata, &timer_queue_, due, interval));
+  return timer_queue().QueueTimer(
+      std::make_shared<WaitItem>(std::move(callback), userdata, &timer_queue(), due, interval));
 }
 
 }  // namespace rex::thread

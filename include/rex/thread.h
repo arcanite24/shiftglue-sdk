@@ -11,6 +11,9 @@
 
 #pragma once
 
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h>
+#endif
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -115,6 +118,16 @@ void set_current_thread_name(const std::string_view name);
 // Yields the current thread to the scheduler. Maybe.
 void MaybeYield();
 
+// One iteration of a busy-wait: lets the sibling hardware thread run and
+// saves power while the loop re-reads a shared value.
+inline void SpinPause() {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+  _mm_pause();
+#elif defined(__aarch64__) || defined(_M_ARM64)
+  __asm__ __volatile__("yield");
+#endif
+}
+
 // Memory barrier (request - may be ignored).
 void SyncMemory();
 
@@ -129,6 +142,10 @@ void Sleep(std::chrono::duration<Rep, Period> duration) {
 // Windows a high-resolution waitable timer set `spin` plus the thread's
 // learned timer overshoot early, then a processor-yield spin for the rest.
 void SleepUntil(std::chrono::steady_clock::time_point deadline, std::chrono::microseconds spin);
+
+// Waits until `deadline` on the same high-resolution timer without spinning,
+// for periodic work that tolerates waking a few hundred microseconds late.
+void WaitUntil(std::chrono::steady_clock::time_point deadline);
 
 enum class SleepResult {
   kSuccess,

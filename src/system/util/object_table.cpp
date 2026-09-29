@@ -275,7 +275,7 @@ XObject* ObjectTable::LookupObject(X_HANDLE handle, bool already_locked) {
 
   XObject* object = nullptr;
   if (!already_locked) {
-    global_critical_region_.mutex().lock();
+    global_critical_region_.LockCounted();
   }
 
   // Lower 2 bits are ignored.
