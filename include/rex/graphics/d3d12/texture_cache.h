@@ -335,6 +335,9 @@ class D3D12TextureCache final : public TextureCache {
   // descriptor tables.
   void OnTextureResourceSwitched(Texture& texture);
   uint32_t texture_resource_generation_ = 0;
+  // texture_replacement_reload as last seen.
+  bool texture_replacement_reload_seen_ = false;
+  int32_t texture_replacement_reload_ = 0;
 
   static constexpr uint32_t kSRVDescriptorCachePageSize = 65536;
 

@@ -55,6 +55,15 @@ REXCVAR_DEFINE_STRING(texture_dump_dir, "", "GPU/D3D12",
 REXCVAR_DEFINE_STRING(texture_replacement_dirs, "", "GPU/D3D12",
                       "Folders of <hash>.dds texture replacements, separated by ';', "
                       "earlier folders first; read when the first texture loads");
+REXCVAR_DEFINE_INT32(texture_replacement_reload, 0, "GPU/D3D12",
+                     "Change to rescan texture_replacement_dirs and reload every texture at "
+                     "the next frame (clears the GPU caches once)");
+
+namespace {
+// Forgets the scanned replacement folders and loaded files (defined with the
+// replacement loader below).
+void ResetTextureReplacements();
+}  // namespace
 REXCVAR_DEFINE_BOOL(fh1_direct_reflection_cube_import, true, "GPU/D3D12",
                     "Import FH1 reflection cubes directly into their host texture");
 
@@ -727,6 +736,20 @@ void D3D12TextureCache::BeginSubmission(uint64_t new_submission_index) {
 
 void D3D12TextureCache::BeginFrame() {
   TextureCache::BeginFrame();
+
+  // A reload of texture replacements: rescan the folders and clear the
+  // caches, so every texture loads again (through replacements) at the next
+  // use. The first frame only records the setting.
+  const int32_t reload = REXCVAR_GET(texture_replacement_reload);
+  if (!texture_replacement_reload_seen_) {
+    texture_replacement_reload_seen_ = true;
+    texture_replacement_reload_ = reload;
+  } else if (reload != texture_replacement_reload_) {
+    texture_replacement_reload_ = reload;
+    ResetTextureReplacements();
+    command_processor_.ClearCaches();
+    REXGPU_INFO("Texture replacements: reloading");
+  }
 
   std::memset(unsupported_format_features_used_, 0, sizeof(unsupported_format_features_used_));
 }
@@ -1857,6 +1880,15 @@ struct TextureReplacements {
 TextureReplacements& Replacements() {
   static TextureReplacements replacements;
   return replacements;
+}
+
+void ResetTextureReplacements() {
+  auto& state = Replacements();
+  std::lock_guard lock(state.mutex);
+  state.scanned = false;
+  state.files.clear();
+  state.loaded.clear();
+  state.logged.clear();
 }
 
 }  // namespace
