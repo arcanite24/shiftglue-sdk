@@ -21,6 +21,14 @@
 #ifndef FH1_NATIVE_EDRAM_HLSLI_
 #define FH1_NATIVE_EDRAM_HLSLI_
 
+// Stencil views return stencil in G on D3D12 (X24_TYPELESS_G8_UINT and
+// X32_TYPELESS_G8X24_UINT) and in R on Vulkan (a stencil aspect view).
+#ifdef FH1_SPIRV
+#define FH1_STENCIL_COMPONENT r
+#else
+#define FH1_STENCIL_COMPONENT g
+#endif
+
 #ifndef FH1_NO_SOURCE
 #ifdef FH1_SOURCE_DEPTH
 #ifdef FH1_SOURCE_MSAA
@@ -343,10 +351,10 @@ uint LoadSourceWord(uint reader_layout, uint2 pixel, uint sample, uint half,
 #ifdef FH1_SOURCE_DEPTH
 #ifdef FH1_SOURCE_MSAA
   float depth = fh1_source_depth.Load(source_pixel, host_sample);
-  uint stencil = fh1_source_stencil.Load(source_pixel, host_sample).g;
+  uint stencil = fh1_source_stencil.Load(source_pixel, host_sample).FH1_STENCIL_COMPONENT;
 #else
   float depth = fh1_source_depth.Load(int3(source_pixel, 0));
-  uint stencil = fh1_source_stencil.Load(int3(source_pixel, 0)).g;
+  uint stencil = fh1_source_stencil.Load(int3(source_pixel, 0)).FH1_STENCIL_COMPONENT;
 #endif
   uint depth24;
   if (LayoutFormat(source_layout) == DEPTH_D24FS8) {

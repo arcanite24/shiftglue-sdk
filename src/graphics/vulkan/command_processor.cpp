@@ -64,6 +64,11 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
                     "Submit command buffer when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(vulkan_fh1_native_executor, true, "GPU/Vulkan",
+                    "Render FH1 with the native executor (EDRAM ownership, transfers "
+                    "and resolves over native surfaces) instead of the generic render "
+                    "target cache; needs dynamic rendering and 1x resolution scale")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                     "device (falls back to render passes otherwise)")
@@ -1022,6 +1027,23 @@ bool VulkanCommandProcessor::SetupContext() {
   if (!texture_cache_) {
     REXGPU_ERROR("Failed to initialize the texture cache");
     return false;
+  }
+
+  if (REXCVAR_GET(vulkan_fh1_native_executor) && REXCVAR_GET(vulkan_dynamic_rendering) &&
+      render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
+    fh1_native_executor_ = std::make_unique<Fh1NativeExecutor>(*this, *register_file_, *memory_);
+    Fh1VulkanExecutorConfig native_config;
+    native_config.msaa_2x_supported = render_target_cache_->msaa_2x_attachments_supported();
+    native_config.gamma_as_unorm16 = render_target_cache_->gamma_render_target_as_unorm16();
+    native_config.depth_float24_round = render_target_cache_->depth_float24_round();
+    native_config.fixed16_truncated = render_target_cache_->IsFixedRG16TruncatedToMinus1To1();
+    native_config.memory = shared_memory_.get();
+    native_config.textures = texture_cache_.get();
+    native_config.render_targets = render_target_cache_.get();
+    if (!fh1_native_executor_->Initialize(native_config)) {
+      REXGPU_WARN("FH1 native executor unavailable; using the render target cache");
+      fh1_native_executor_.reset();
+    }
   }
 
   // Shared memory and EDRAM common bindings.
@@ -2018,6 +2040,8 @@ void VulkanCommandProcessor::ShutdownContext() {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
                                          shared_memory_and_edram_descriptor_pool_);
 
+  fh1_native_executor_.reset();
+
   texture_cache_.reset();
 
   pipeline_cache_.reset();
@@ -2274,6 +2298,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   SCOPE_profile_cpu_f("gpu");
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
+  if (fh1_native_executor_) {
+    fh1_native_executor_->OnSwap(frame_current_);
+  }
 
   if (!graphics_system_)
     return;
@@ -3277,8 +3304,40 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   in_render_pass_ = true;
 }
 
+void VulkanCommandProcessor::SubmitBarriersAndBeginFh1Rendering(
+    const VkRenderingInfo& rendering_info, uint64_t id) {
+  SubmitBarriers(false);
+  if (in_render_pass_ && current_fh1_rendering_id_ == id) {
+    return;
+  }
+  EndRenderPass();
+  deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
+  current_render_pass_ = VK_NULL_HANDLE;
+  current_framebuffer_ = nullptr;
+  current_fh1_rendering_id_ = id;
+  in_render_pass_ = true;
+}
+
+void VulkanCommandProcessor::Fh1AwaitAllQueueOperations() {
+  const bool was_open = submission_open_;
+  if (was_open) {
+    EndSubmission(false);
+  }
+  AwaitAllQueueOperationsCompletion();
+  if (was_open) {
+    BeginSubmission(true);
+  }
+}
+
+void VulkanCommandProcessor::FlushCpuVisibleResults() {
+  if (fh1_native_executor_) {
+    fh1_native_executor_->FlushResolveReadbacks();
+  }
+}
+
 void VulkanCommandProcessor::EndRenderPass() {
   assert_true(submission_open_);
+  current_fh1_rendering_id_ = 0;
   if (!in_render_pass_) {
     return;
   }
@@ -3863,8 +3922,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
   // Set up the render targets - this may perform dispatches and draws.
-  if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
-                                    normalized_color_mask, *vertex_shader)) {
+  Fh1DrawInfo fh1_draw;
+  VulkanRenderTargetCache::RenderPassKey fh1_render_pass_key;
+  if (fh1_native_executor_) {
+    fh1_draw.memexport = memexport_writes_possible;
+    fh1_draw.rasterization_done = is_rasterization_done;
+    fh1_draw.normalized_depth_control = normalized_depth_control;
+    fh1_draw.normalized_color_mask = normalized_color_mask;
+    fh1_draw.vertex_shader = vertex_shader;
+    fh1_draw.pixel_shader = pixel_shader;
+    fh1_native_executor_->PrepareTargets(fh1_draw);
+    if (!fh1_native_executor_->BindTargets(fh1_render_pass_key)) {
+      return draw_fail("fh1_bind_targets");
+    }
+  } else if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+                                           normalized_color_mask, *vertex_shader)) {
     return draw_fail("render_target_update");
   }
 
@@ -3876,7 +3948,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
                                           primitive_processing_result, normalized_depth_control,
                                           normalized_color_mask,
-                                          render_target_cache_->last_update_render_pass_key(),
+                                          fh1_native_executor_
+                                              ? fh1_render_pass_key
+                                              : render_target_cache_->last_update_render_pass_key(),
                                           pipeline, pipeline_layout_provider, &pipeline_handle)) {
     return draw_fail("configure_pipeline");
   }
@@ -4135,9 +4209,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // After all commands that may dispatch, copy or insert barriers, submit
   // the barriers (may end the render pass), and (re)enter the render pass
   // before drawing.
-  SubmitBarriersAndEnterRenderTargetCacheRenderPass(
-      render_target_cache_->last_update_render_pass(),
-      render_target_cache_->last_update_framebuffer());
+  if (fh1_native_executor_) {
+    fh1_native_executor_->BeginDrawRendering();
+  } else {
+    SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+        render_target_cache_->last_update_render_pass(),
+        render_target_cache_->last_update_framebuffer());
+  }
 
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
@@ -4176,6 +4254,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
             : VK_INDEX_TYPE_UINT32);
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
+  }
+  if (fh1_native_executor_) {
+    fh1_native_executor_->NativeDrawIssued(fh1_draw);
   }
 
   // Invalidate textures in memexported memory and watch for changes.
@@ -4412,6 +4493,11 @@ bool VulkanCommandProcessor::IssueCopy() {
 
   if (!BeginSubmission(true)) {
     return false;
+  }
+
+  if (fh1_native_executor_) {
+    uint32_t written_address, written_length;
+    return fh1_native_executor_->NativeResolve(written_address, written_length);
   }
 
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));

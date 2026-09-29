@@ -50,6 +50,7 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     pipeline/render_target/cache.cpp
     vulkan/graphics_system.cpp
     vulkan/deferred_command_buffer.cpp
+    vulkan/fh1_native_executor.cpp
     vulkan/command_processor.cpp
     vulkan/pipeline_cache.cpp
     vulkan/primitive_processor.cpp

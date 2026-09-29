@@ -46,6 +46,10 @@ REXCVAR_DEFINE_STRING(fh1_resolve_dump_dir, "", "GPU/D3D12",
                       "Diagnostics: write every resolve's output bytes (scaled when resolution "
                       "scaling is on) to this directory, waiting for the GPU after each")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(fh1_resolve_dump_frame, 0, "GPU/D3D12",
+                     "Diagnostics: with fh1_resolve_dump_dir, dump only the resolves of this "
+                     "frame (swap count; 0 dumps every frame)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(d3d12_elide_repeated_render_target_binds, true, "GPU/D3D12",
                     "Record a render-target bind only when it differs from the command "
@@ -2715,7 +2719,9 @@ bool D3D12CommandProcessor::IssueCopy() {
         register_file_->Get<reg::RB_COPY_DEST_PITCH>().value,
         register_file_->Get<reg::RB_SURFACE_INFO>().value);
   }
-  if (copy_succeeded && written_length && !REXCVAR_GET(fh1_resolve_dump_dir).empty()) {
+  if (copy_succeeded && written_length && !REXCVAR_GET(fh1_resolve_dump_dir).empty() &&
+      (!REXCVAR_GET(fh1_resolve_dump_frame) ||
+       observation_frame_sequence_ == uint64_t(REXCVAR_GET(fh1_resolve_dump_frame)))) {
     DumpResolveOutput(written_address, written_length);
   }
   return copy_succeeded;

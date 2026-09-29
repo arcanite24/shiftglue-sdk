@@ -31,6 +31,7 @@
 #include <rex/graphics/vulkan/graphics_system.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/primitive_processor.h>
+#include <rex/graphics/vulkan/fh1_native_executor.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/vulkan/shared_memory.h>
@@ -199,6 +200,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   void SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       VkRenderPass render_pass, const VulkanRenderTargetCache::Framebuffer* framebuffer,
       VkImageView transfer_dest_view, bool transfer_dest_is_depth);
+  // Dynamic rendering for the FH1 native executor: begins the scope unless
+  // the one identified by `id` is already open. Submission must be open.
+  void SubmitBarriersAndBeginFh1Rendering(const VkRenderingInfo& rendering_info, uint64_t id);
+  // Submits the open submission, waits for every queue operation and reopens
+  // the submission if one was open (FH1 resolve read-backs).
+  void Fh1AwaitAllQueueOperations();
   // Must be called before doing anything outside the render pass scope,
   // including adding pipeline barriers that are not a part of the render pass
   // scope. Submission must be open.
@@ -252,6 +259,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
                                           uint32_t count) override;
+  void FlushCpuVisibleResults() override;
 
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
@@ -612,6 +620,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::unique_ptr<VulkanPrimitiveProcessor> primitive_processor_;
 
   std::unique_ptr<VulkanRenderTargetCache> render_target_cache_;
+  // The FH1 native renderer (NP-12.4); guest draws, copies and clears go
+  // through it instead of the render target cache when it initialized.
+  std::unique_ptr<Fh1NativeExecutor> fh1_native_executor_;
+  // Identifies the open dynamic rendering scope of the executor (0: none).
+  uint64_t current_fh1_rendering_id_ = 0;
 
   std::unique_ptr<VulkanPipelineCache> pipeline_cache_;
 
