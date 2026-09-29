@@ -118,6 +118,11 @@ void Sleep(std::chrono::duration<Rep, Period> duration) {
   Sleep(std::chrono::duration_cast<std::chrono::microseconds>(duration));
 }
 
+// Sleeps the current thread until the steady clock reaches `deadline`: on
+// Windows a high-resolution waitable timer set `spin` plus the thread's
+// learned timer overshoot early, then a processor-yield spin for the rest.
+void SleepUntil(std::chrono::steady_clock::time_point deadline, std::chrono::microseconds spin);
+
 enum class SleepResult {
   kSuccess,
   kAlerted,

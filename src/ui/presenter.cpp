@@ -20,7 +20,9 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
+#include <rex/chrono/clock.h>
 #include <rex/platform.h>
+#include <rex/thread.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
 
@@ -1547,7 +1549,9 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   if (pacing.wait_ns > 0) {
     auto deadline = PresentationClock::time_point(
         std::chrono::nanoseconds(pacing.deadline_ns));
-    if (REXCVAR_GET(host_present_sleep_spin) && pacing.wait_ns > 500000) {
+    if (REXCVAR_GET(high_resolution_timer_waits)) {
+      rex::thread::SleepUntil(deadline, std::chrono::microseconds(50));
+    } else if (REXCVAR_GET(host_present_sleep_spin) && pacing.wait_ns > 500000) {
       std::this_thread::sleep_until(deadline - std::chrono::microseconds(500));
       while (PresentationClock::now() < deadline) {
         std::this_thread::yield();

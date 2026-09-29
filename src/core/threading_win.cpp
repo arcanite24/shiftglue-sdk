@@ -13,6 +13,9 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
 
 #include "platform_win.h"
 
+#include <algorithm>
+#include <thread>
+
 #include <spdlog/spdlog.h>
 
 #include <rex/assert.h>
@@ -98,6 +101,54 @@ void Sleep(std::chrono::microseconds duration) {
     MaybeYield();
   } else {
     ::Sleep(static_cast<DWORD>(duration.count() / 1000));
+  }
+}
+
+namespace {
+// One high-resolution waitable timer per thread that waits with SleepUntil.
+struct ThreadWaitTimer {
+  HANDLE handle = nullptr;
+  // Running estimate of how late the timer wakes, in nanoseconds; waits are
+  // set that much early so the spin, not the overshoot, meets the deadline.
+  int64_t overshoot_ns = 0;
+  ThreadWaitTimer() {
+    handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                    TIMER_ALL_ACCESS);
+    if (!handle) {
+      // Before Windows 10 1803: an ordinary timer, as coarse as Sleep.
+      handle = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+    }
+  }
+  ~ThreadWaitTimer() {
+    if (handle) CloseHandle(handle);
+  }
+};
+}  // namespace
+
+void SleepUntil(std::chrono::steady_clock::time_point deadline, std::chrono::microseconds spin) {
+  using Clock = std::chrono::steady_clock;
+  thread_local ThreadWaitTimer timer;
+  const auto wake = deadline - spin - std::chrono::nanoseconds(timer.overshoot_ns);
+  const auto now = Clock::now();
+  if (now < wake) {
+    // Relative due time in 100 ns units.
+    LARGE_INTEGER due_time;
+    due_time.QuadPart = -std::max<int64_t>(
+        1, std::chrono::duration_cast<std::chrono::nanoseconds>(wake - now).count() / 100);
+    if (timer.handle && SetWaitableTimer(timer.handle, &due_time, 0, nullptr, nullptr, FALSE)) {
+      WaitForSingleObject(timer.handle, INFINITE);
+      // Moves an eighth of the way to this wait's overshoot, capped at 2 ms
+      // so a preempted wake cannot turn later waits into long spins.
+      const int64_t overshoot = std::clamp<int64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - wake).count(), 0,
+          2000000);
+      timer.overshoot_ns += (overshoot - timer.overshoot_ns) / 8;
+    } else {
+      std::this_thread::sleep_until(wake);
+    }
+  }
+  while (Clock::now() < deadline) {
+    YieldProcessor();
   }
 }
 

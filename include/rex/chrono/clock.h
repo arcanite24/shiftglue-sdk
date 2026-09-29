@@ -19,6 +19,7 @@
 
 REXCVAR_DECLARE(bool, clock_no_scaling);
 REXCVAR_DECLARE(bool, clock_source_raw);
+REXCVAR_DECLARE(bool, high_resolution_timer_waits);
 
 #if REX_ARCH_AMD64
 // Raw clock source requires platform-specific implementation

@@ -192,6 +192,18 @@ void SyncMemory() {
   __sync_synchronize();
 }
 
+void SleepUntil(std::chrono::steady_clock::time_point deadline, std::chrono::microseconds spin) {
+  using Clock = std::chrono::steady_clock;
+  if (Clock::now() < deadline - spin) std::this_thread::sleep_until(deadline - spin);
+  while (Clock::now() < deadline) {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#else
+    sched_yield();
+#endif
+  }
+}
+
 void Sleep(std::chrono::microseconds duration) {
   timespec rqtp = DurationToTimeSpec(duration);
   timespec rmtp = {};

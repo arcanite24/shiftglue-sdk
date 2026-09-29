@@ -22,6 +22,12 @@ REXCVAR_DEFINE_BOOL(clock_no_scaling, false, "Clock",
 
 REXCVAR_DEFINE_BOOL(clock_source_raw, false, "Clock", "Use raw clock source without scaling");
 
+REXCVAR_DEFINE_BOOL(high_resolution_timer_waits, true, "Clock",
+                    "Pace the guest vblank and host presentation with a high-resolution "
+                    "waitable timer that learns its own overshoot and a short spin, instead of "
+                    "a sleep and a 500 us yield spin")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::chrono {
 
 // Time scalar applied to all time operations.

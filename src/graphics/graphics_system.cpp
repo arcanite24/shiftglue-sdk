@@ -220,13 +220,17 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
           }
 
           constexpr auto kVblankSpinTime = std::chrono::microseconds(500);
+          constexpr auto kVblankTimerSpinTime = std::chrono::microseconds(50);
           const uint64_t deadline_ticks = last_frame_time + interval_ticks;
           const uint64_t remaining_ticks = deadline_ticks - current_time;
           const double guest_time_scalar = std::max(0.001, chrono::Clock::guest_time_scalar());
           const auto remaining_time = std::chrono::nanoseconds(std::max<int64_t>(
               1, int64_t(double(remaining_ticks) * 1000000000.0 /
                          (double(guest_tick_frequency) * guest_time_scalar))));
-          if (remaining_time > kVblankSpinTime) {
+          if (REXCVAR_GET(high_resolution_timer_waits)) {
+            rex::thread::SleepUntil(std::chrono::steady_clock::now() + remaining_time,
+                                    kVblankTimerSpinTime);
+          } else if (remaining_time > kVblankSpinTime) {
             std::this_thread::sleep_for(remaining_time - kVblankSpinTime);
           }
           while (vsync_worker_running_ &&
