@@ -548,6 +548,14 @@ class D3D12TextureCache final : public TextureCache {
   std::vector<Microsoft::WRL::ComPtr<ID3D12Heap>> scaled_resolve_heaps_;
   // Number of currently resident portions of the tiled buffer, for profiling.
   uint32_t scaled_resolve_heap_count_ = 0;
+
+ public:
+  // Committed scaled-resolve memory (resident heaps of the tiled buffers).
+  uint64_t scaled_resolve_committed_bytes() const {
+    return uint64_t(scaled_resolve_heap_count_) << kScaledResolveHeapSizeLog2;
+  }
+
+ private:
   // Current scaled resolve state.
   // For aliasing barrier placement, last owning buffer index for each of 1 GB.
   size_t scaled_resolve_1gb_buffer_indices_[(uint64_t(SharedMemory::kBufferSize) *

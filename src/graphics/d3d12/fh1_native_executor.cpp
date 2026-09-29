@@ -407,7 +407,7 @@ bool Fh1NativeExecutor::Initialize(const Fh1NativeExecutorConfig& config) {
 
   tile_owners_.assign(xenos::kEdramTileCount, kNoOwner);
   scale_ = native_textures_->draw_resolution_scale_x();
-  if (native_textures_->draw_resolution_scale_y() != scale_ || scale_ > 3) {
+  if (native_textures_->draw_resolution_scale_y() != scale_ || scale_ > 4) {
     REXGPU_ERROR("FH1 native executor: unsupported resolution scale {}x{}",
                  native_textures_->draw_resolution_scale_x(),
                  native_textures_->draw_resolution_scale_y());
@@ -2582,9 +2582,11 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
     surface_bytes += device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
   }
   REXGPU_INFO(
-      "FH1 native executor memory MB: surfaces {} transfer_words {} textures {}",
+      "FH1 native executor memory MB: surfaces {} transfer_words {} textures {} "
+      "scaled_resolve {}",
       surface_bytes >> 20, transfer_words_size_ >> 20,
-      native_textures_ ? native_textures_->total_host_memory_usage() >> 20 : 0);
+      native_textures_ ? native_textures_->total_host_memory_usage() >> 20 : 0,
+      native_textures_ ? native_textures_->scaled_resolve_committed_bytes() >> 20 : 0);
   if (cpu_frames_) {
     // Transfers run inside target preparation and resolve clears.
     const double frames = double(cpu_frames_);

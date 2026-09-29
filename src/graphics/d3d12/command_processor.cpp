@@ -887,12 +887,13 @@ bool D3D12CommandProcessor::SetupContext() {
         "the emulator, reducing to {}x{}",
         draw_resolution_scale_x, draw_resolution_scale_y);
   }
-  // The FH1 native executor is the only renderer; it supports symmetric 1x,
-  // 2x and 3x draw resolution scales.
+  // The FH1 native executor is the only renderer; it supports symmetric 1x to
+  // 4x draw resolution scales (the resolve constants hold scale - 1 in two
+  // bits).
   if (draw_resolution_scale_x != draw_resolution_scale_y || draw_resolution_scale_x < 1 ||
-      draw_resolution_scale_x > 3) {
+      draw_resolution_scale_x > 4) {
     REXGPU_ERROR(
-        "FH1 native renderer supports 1x, 2x and 3x resolution scale, but {}x{} was requested",
+        "FH1 native renderer supports 1x to 4x resolution scale, but {}x{} was requested",
         draw_resolution_scale_x, draw_resolution_scale_y);
     return false;
   }
