@@ -36,8 +36,7 @@
 #include <rex/ui/windowed_app_context.h>
 
 REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
-    .allowed({"none", "fxaa", "fxaa_extreme"})
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .allowed({"none", "fxaa", "fxaa_extreme"});
 
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
@@ -45,8 +44,7 @@ REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
 REXCVAR_DEFINE_UINT32(
     pinyon_shift_fh1_render_fps_limit, 0, "Pinyon Shift",
     "FH1 source-render FPS limit (0 follows the host display)")
-    .range(0, 240)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .range(0, 240);
 REXCVAR_DEFINE_BOOL(pinyon_shift_fh1_vblank_deadline_wait, true, "Pinyon Shift",
                     "Deliver FH1 guest vblanks from deadlines instead of 1 ms polling")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -157,6 +155,12 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
     return X_STATUS_UNSUCCESSFUL;
   }
   command_processor_->SetDesiredSwapPostEffect(ParseSwapPostEffect(REXCVAR_GET(swap_post_effect)));
+  // The post effect is applied per swap, so a change takes effect at once.
+  cvar::RegisterChangeCallback("swap_post_effect", [this](std::string_view, std::string_view value) {
+    if (command_processor_) {
+      command_processor_->SetDesiredSwapPostEffect(ParseSwapPostEffect(std::string(value)));
+    }
+  });
 
   // Register GPU MMIO handlers
   // GPU registers are at 0x7FC80000-0x7FCFFFFF
@@ -173,20 +177,25 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
       new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
         system::X_VIDEO_MODE video_mode;
         kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
-        const uint32_t render_fps_limit =
-            REXCVAR_GET(pinyon_shift_fh1_render_fps_limit);
+        uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
         // FH1 waits for two guest vblanks per rendered frame. Follow the
         // detected host refresh by default so completed source frames arrive
-        // at the cadence the display can actually consume.
-        const double refresh_rate_hz =
-            Fh1GuestVblankHzForRenderLimit(
-                render_fps_limit, REXCVAR_GET(video_mode_refresh_rate));
-        uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
-        uint64_t vsync_interval_ticks =
-            std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+        // at the cadence the display can actually consume. The limit is read
+        // every tick so the in-game settings change it live.
+        uint32_t render_fps_limit = UINT32_MAX;
+        uint64_t vsync_interval_ticks = 1;
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
         while (vsync_worker_running_) {
+          const uint32_t current_render_fps_limit =
+              REXCVAR_GET(pinyon_shift_fh1_render_fps_limit);
+          if (current_render_fps_limit != render_fps_limit) {
+            render_fps_limit = current_render_fps_limit;
+            const double refresh_rate_hz = Fh1GuestVblankHzForRenderLimit(
+                render_fps_limit, REXCVAR_GET(video_mode_refresh_rate));
+            vsync_interval_ticks =
+                std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+          }
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           const bool vsync_enabled = REXCVAR_GET(vsync);
           uint64_t interval_ticks = vsync_enabled ? vsync_interval_ticks : no_vsync_interval_ticks;
@@ -236,6 +245,7 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
 }
 
 void GraphicsSystem::Shutdown() {
+  cvar::UnregisterChangeCallbacks("swap_post_effect");
   if (command_processor_) {
     command_processor_->Shutdown();
     command_processor_.reset();

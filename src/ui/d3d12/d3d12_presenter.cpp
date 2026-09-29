@@ -347,6 +347,14 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
   // ConnectOrReconnectPaintingToSurfaceFromUIThread may be called only for the
   // surface of the current swap chain or when the old swap chain has already
   // been destroyed, if the surface is the same, try resizing.
+  // ResizeBuffers cannot toggle tearing, so a changed preference recreates
+  // the swap chain (a surface resize is how callers request that).
+  const bool allow_tearing =
+      REXCVAR_GET(d3d12_allow_variable_refresh_rate_and_tearing) && dxgi_supports_tearing_;
+  if (paint_context_.swap_chain && paint_context_.swap_chain_allows_tearing != allow_tearing) {
+    paint_context_.AwaitSwapChainUsageCompletion();
+    paint_context_.DestroySwapChain();
+  }
   if (paint_context_.swap_chain) {
     if (was_paintable && paint_context_.swap_chain_width == new_swap_chain_width &&
         paint_context_.swap_chain_height == new_swap_chain_height) {
@@ -408,7 +416,7 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
     swap_chain_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     swap_chain_desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
     swap_chain_desc.Flags = 0;
-    if (REXCVAR_GET(d3d12_allow_variable_refresh_rate_and_tearing) && dxgi_supports_tearing_) {
+    if (allow_tearing) {
       // Allow tearing in borderless fullscreen to support variable refresh
       // rate.
       swap_chain_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
