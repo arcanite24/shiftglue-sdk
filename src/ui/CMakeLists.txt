@@ -116,12 +116,17 @@ target_link_libraries(rexui PUBLIC
 )
 target_link_libraries(rexui PRIVATE utf8cpp)
 
+# The spatial effects (CAS, FSR 1 EASU and RCAS) ship as prebuilt shaders and
+# need nothing from the FidelityFX SDK, so REX_HAS_FIDELITYFX_SDK (a historical
+# name) is always set, for every target including presenter.h so they all see
+# the same class layout. Only the temporal FSR 2/3 path needs the SDK runtime
+# (REX_HAS_FIDELITYFX_RUNTIME below).
+target_compile_definitions(rexui PUBLIC REX_HAS_FIDELITYFX_SDK=1)
 if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sdk/include")
     target_include_directories(rexui PRIVATE
         "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sdk/include"
         "${REXGLUE_FIDELITYFX_SOURCE_DIR}/ffx-api/include"
     )
-    target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_SDK=1)
 endif()
 
 set(REXUI_HAS_FIDELITYFX_RUNTIME OFF)

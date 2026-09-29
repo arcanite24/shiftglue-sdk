@@ -56,10 +56,18 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
     .range(0, 100);
 
 #if defined(REX_HAS_FIDELITYFX_SDK)
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
                       "Guest output effect: bilinear, cas, fsr, fsr2, fsr3")
     .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#else
+REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
+                      "Guest output effect: bilinear, cas (sharpen, and resample when "
+                      "downscaling), fsr (FSR 1 upscale with RCAS sharpening)")
+    .allowed({"bilinear", "cas", "fsr"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#endif
 
 REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
                       rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessDefault,
