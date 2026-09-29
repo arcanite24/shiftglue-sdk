@@ -303,12 +303,6 @@ uint32_t PackLayout(uint32_t base, uint32_t pitch, uint32_t msaa, bool is_64bpp,
 
 }  // namespace
 
-std::string Fh1NativeExecutor::SurfaceKey::Describe() const {
-  static const char* kMsaa[] = {"1x", "2x", "4x", "?"};
-  return std::to_string(base_tiles) + "/" + std::to_string(pitch_tiles) + "/" + kMsaa[msaa] +
-         (is_depth ? "/d" : "/c") + std::to_string(format);
-}
-
 Fh1NativeExecutor::Fh1NativeExecutor(D3D12CommandProcessor& command_processor,
                                      const RegisterFile& register_file, memory::Memory& memory)
     : command_processor_(command_processor),
@@ -485,51 +479,22 @@ void Fh1NativeExecutor::Transition(ID3D12Resource* resource, D3D12_RESOURCE_STAT
 }
 
 uint32_t Fh1NativeExecutor::PitchTiles(uint32_t pitch_pixels, uint32_t msaa) {
-  const uint32_t msaa_x_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k4X));
-  return ((pitch_pixels << msaa_x_log2) + (xenos::kEdramTileWidthSamples - 1)) /
-         xenos::kEdramTileWidthSamples;
+  return Fh1PitchTiles(pitch_pixels, msaa);
 }
 
 uint32_t Fh1NativeExecutor::SurfaceHeight(uint32_t pitch_tiles, uint32_t msaa) const {
-  // Down to the start of the same surface in the next EDRAM addressing period,
-  // clamped to the guest texture size limit (as the Xenos render target cache
-  // did at 1x scale).
-  if (!pitch_tiles) return 0;
-  uint32_t tile_rows = (xenos::kEdramTileCount + pitch_tiles - 1) / pitch_tiles;
-  const uint32_t msaa_y_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k2X));
-  // At scale, also what a host texture can hold.
-  const uint32_t max_height =
-      std::min(uint32_t(xenos::kTexture2DCubeMaxWidthHeight),
-               uint32_t(D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION) / scale_);
-  tile_rows = std::min(tile_rows, (max_height << msaa_y_log2) / xenos::kEdramTileHeightSamples);
-  return tile_rows * (xenos::kEdramTileHeightSamples >> msaa_y_log2);
+  return Fh1SurfaceHeight(pitch_tiles, msaa, D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION, scale_);
 }
 
 Fh1NativeExecutor::SurfaceKey Fh1NativeExecutor::MakeColorKey(
     uint32_t base, uint32_t pitch_tiles, uint32_t msaa,
     xenos::ColorRenderTargetFormat format) const {
-  SurfaceKey key;
-  key.base_tiles = base & (xenos::kEdramTileCount - 1);
-  key.pitch_tiles = pitch_tiles;
-  key.msaa = msaa;
-  key.is_depth = false;
-  format = xenos::GetStorageColorFormat(format);
-  if (format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA && !config_.gamma_as_unorm16) {
-    format = xenos::ColorRenderTargetFormat::k_8_8_8_8;
-  }
-  key.format = uint32_t(format);
-  return key;
+  return SurfaceKey::Color(base, pitch_tiles, msaa, format, config_.gamma_as_unorm16);
 }
 
 Fh1NativeExecutor::SurfaceKey Fh1NativeExecutor::MakeDepthKey(
     uint32_t base, uint32_t pitch_tiles, uint32_t msaa, xenos::DepthRenderTargetFormat format) {
-  SurfaceKey key;
-  key.base_tiles = base & (xenos::kEdramTileCount - 1);
-  key.pitch_tiles = pitch_tiles;
-  key.msaa = msaa;
-  key.is_depth = true;
-  key.format = uint32_t(format);
-  return key;
+  return SurfaceKey::Depth(base, pitch_tiles, msaa, format);
 }
 
 DXGI_FORMAT Fh1NativeExecutor::ColorResourceFormat(xenos::ColorRenderTargetFormat format) const {

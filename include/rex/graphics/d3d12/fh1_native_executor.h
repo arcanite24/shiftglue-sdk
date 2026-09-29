@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <rex/graphics/d3d12/fh1_frame_dump.h>
+#include <rex/graphics/fh1_edram_surfaces.h>
 #include <rex/graphics/fh1_edram_tiles.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
@@ -116,23 +117,7 @@ class Fh1NativeExecutor {
   }
 
  private:
-  // Same fields as the Xenos RenderTargetKey so the two can be compared.
-  struct SurfaceKey {
-    uint32_t base_tiles = 0;
-    uint32_t pitch_tiles = 0;  // At 32bpp.
-    uint32_t msaa = 0;         // xenos::MsaaSamples.
-    bool is_depth = false;
-    uint32_t format = 0;  // DepthRenderTargetFormat or color resource format.
-    uint32_t Pack() const {
-      return base_tiles | (pitch_tiles << 11) | (msaa << 19) | (uint32_t(is_depth) << 21) |
-             (format << 22);
-    }
-    bool Is64bpp() const {
-      return !is_depth &&
-             xenos::IsColorRenderTargetFormat64bpp(xenos::ColorRenderTargetFormat(format));
-    }
-    std::string Describe() const;
-  };
+  using SurfaceKey = Fh1SurfaceKey;
   struct Surface {
     Microsoft::WRL::ComPtr<ID3D12Resource> resource;
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
