@@ -39,6 +39,16 @@
 #include <rex/system/user_module.h>
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+// FH1's race polls through WAIT_REG_MEM about 1.5 ms per frame on the GPU
+// commands thread, its bottleneck; yielding first ends those waits sooner
+// (NP-9.3: race frames 16.76-16.92 against 17.05-17.23 ms mean over three
+// interleaved pairs).
+REXCVAR_DEFINE_INT32(wait_reg_mem_yield_us, 2000, "GPU",
+                     "With vsync, how long a WAIT_REG_MEM poll yields before it sleeps (the "
+                     "sleep is at least a millisecond, which can outlast the wait); 0 sleeps at "
+                     "once")
+    .range(0, 16000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
@@ -1111,6 +1121,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         PrepareForWait();
         if (!REXCVAR_GET(vsync)) {
           // User wants it fast and dangerous.
+          rex::thread::MaybeYield();
+        } else if (std::chrono::steady_clock::now() - wait_start <
+                   std::chrono::microseconds(REXCVAR_GET(wait_reg_mem_yield_us))) {
           rex::thread::MaybeYield();
         } else {
           rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
