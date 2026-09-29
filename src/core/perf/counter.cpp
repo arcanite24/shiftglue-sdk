@@ -174,6 +174,7 @@ constexpr const char* kCounterNames[] = {
     "write_watch_triggers",
     "write_watch_protect_calls",
     "write_watch_protect_pages",
+    "texture_resolve_reload_cpu_time_ns",
 };
 static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
 
@@ -248,6 +249,7 @@ constexpr bool kIsGauge[] = {
     false,  // kWriteWatchTriggers
     false,  // kWriteWatchProtectCalls
     false,  // kWriteWatchProtectPages
+    false,  // kTextureResolveReloadCpuTimeNs
 };
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 

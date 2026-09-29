@@ -120,6 +120,10 @@ enum class CounterId : uint16_t {
   kWriteWatchProtectCalls,
   kWriteWatchProtectPages,
 
+  // CPU time of the resolve-sourced texture reloads on the GPU commands
+  // thread (NP-9.1); append to preserve existing IDs.
+  kTextureResolveReloadCpuTimeNs,
+
   kCount  // sentinel -- must be last
 };
 

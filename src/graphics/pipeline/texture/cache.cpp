@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <utility>
 
@@ -492,8 +493,15 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   }
 
   loading_resolve_sourced_ = pending_load.resolve_sourced;
+  const auto load_start = std::chrono::steady_clock::now();
   const bool loaded = LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
                                                             pending_load.load_mips);
+  if (pending_load.resolve_sourced) {
+    PERF_counter_add(kTextureResolveReloadCpuTimeNs,
+                     std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now() - load_start)
+                         .count());
+  }
   loading_resolve_sourced_ = false;
   if (!loaded) {
     return retry();
