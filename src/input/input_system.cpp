@@ -19,6 +19,7 @@
 #include <rex/input/input_system.h>
 #include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/input/nop/nop_input_driver.h>
+#include <rex/input/pad_remap.h>
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/input/state_merge.h>
 #include <rex/input/xinput/xinput_input_driver.h>
@@ -28,6 +29,11 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
     .allowed({"sdl", "xinput"});
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
+REXCVAR_DEFINE_INT32(pad_rumble_strength, 100, "Input",
+                     "Controller rumble strength in percent of what the title asks for (0 turns "
+                     "it off)")
+    .range(0, 100)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 namespace rex::input {
 
 namespace {
@@ -248,6 +254,11 @@ X_RESULT InputSystem::GetMergedState(uint32_t user_index, bool host_pads_only,
       continue;
     }
     active_devices_.Observe(user_index, id, state.gamepad);
+    // The title reads remapped controllers; host menus keep the physical
+    // layout so a remap can never lock the player out of the remap screen.
+    if (!host_pads_only && !driver->is_keyboard_and_mouse()) {
+      ApplyPadRemap(state.gamepad);
+    }
     if (!any) {
       merged = state;
       any = true;
@@ -283,6 +294,16 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
   bool any_synthetic = false;
   bool pad_rumbled = false;
   X_RESULT pad_error = X_ERROR_DEVICE_NOT_CONNECTED;
+  X_INPUT_VIBRATION scaled;
+  if (vibration) {
+    const int32_t strength = std::clamp(REXCVAR_GET(pad_rumble_strength), 0, 100);
+    scaled = *vibration;
+    scaled.left_motor_speed = uint16_t(uint32_t(uint16_t(vibration->left_motor_speed)) *
+                                       uint32_t(strength) / 100);
+    scaled.right_motor_speed = uint16_t(uint32_t(uint16_t(vibration->right_motor_speed)) *
+                                        uint32_t(strength) / 100);
+    vibration = &scaled;
+  }
   for (DeviceId id : ids) {
     auto* driver = DriverForDevice(id);
     const DeviceInfo* info = DeviceInfoFor(id);
