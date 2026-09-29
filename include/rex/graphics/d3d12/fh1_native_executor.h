@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <rex/graphics/d3d12/fh1_frame_dump.h>
+#include <rex/graphics/fh1_depth_overwrite.h>
 #include <rex/graphics/fh1_edram_resolve.h>
 #include <rex/graphics/fh1_edram_surfaces.h>
 #include <rex/graphics/fh1_edram_tiles.h>
@@ -39,15 +40,7 @@ class D3D12TextureCache;
 
 // State of a consumed guest draw that the executor needs, captured by
 // D3D12CommandProcessor::IssueDraw.
-struct Fh1NativeDrawInfo {
-  bool memexport = false;
-  bool occlusion_query_active = false;
-  bool rasterization_done = false;
-  reg::RB_DEPTHCONTROL normalized_depth_control;
-  uint32_t normalized_color_mask = 0;
-  const Shader* vertex_shader = nullptr;
-  const Shader* pixel_shader = nullptr;
-};
+using Fh1NativeDrawInfo = rex::graphics::Fh1DrawInfo;
 
 // Host configuration the executor must share with the pipelines it reuses.
 struct Fh1NativeExecutorConfig {
@@ -191,15 +184,9 @@ class Fh1NativeExecutor {
   void ClaimTiles(uint32_t base, uint32_t length, uint32_t packed_key, bool transfer = true);
   // Whether the current draw's stencil state can leave a nonzero value.
   bool DrawMayWriteNonzeroStencil(reg::RB_DEPTHCONTROL depth_control) const;
-  // A depth-only rectangle with an ALWAYS depth test, in guest pixels
-  // [x0, y0, x1, y1): `inner` has the depth of every sample overwritten,
-  // `outer` bounds every pixel the draw can touch.
-  struct OverwriteRect {
-    std::array<int32_t, 4> inner;
-    std::array<int32_t, 4> outer;
-  };
-  // Finds the draw's rectangles by running the vertex shader on the CPU, into
-  // overwrite_rects_. Whether stencil is rewritten too is returned separately.
+  using OverwriteRect = Fh1DepthOverwrite::Rect;
+  // Finds the draw's depth-overwrite rectangles (depth_overwrite_.rects()).
+  // Whether stencil is rewritten too is returned separately.
   bool GetDepthOverwriteRects(const Fh1NativeDrawInfo& draw, bool& stencil_overwritten);
   // Claims only the depth tiles the rectangles touch: covered tiles without a
   // transfer when no stencil would be lost, edge tiles with one. False when
@@ -210,7 +197,6 @@ class Fh1NativeExecutor {
   // when no stencil would be lost.
   void ClaimOverwrittenDepthTiles(const SurfaceKey& key, const std::array<int32_t, 4>& rect,
                                   bool stencil_overwritten);
-  std::vector<OverwriteRect> overwrite_rects_;
   // readback_resolve: copies of resolved ranges into guest RAM, as the
   // Vulkan backend does (the guest GPU writes resolves to RAM, which the CPU
   // may read, e.g. to compress car thumbnails). Double-buffered per range for
@@ -241,14 +227,6 @@ class Fh1NativeExecutor {
   // capture to read back (fh1_native_readback_new_resolves), and queueing it.
   bool IsOneOffResolve(uint32_t address, uint32_t length);
   void QueueResolveReadback(uint32_t address, uint32_t length);
-  class PositionExportSink : public ShaderInterpreter::ExportSink {
-   public:
-    void Export(ucode::ExportRegister export_register, const float* value,
-                uint32_t value_mask) override;
-    std::array<float, 4> position{};
-    uint32_t position_mask = 0;
-    bool killed = false;
-  };
   void TransferTiles(Surface& dest, const TileRun& run);
   // Depth destinations' transfers, batched until FlushTransfers so each
   // destination takes its barriers and nine passes once for all of them.
@@ -321,7 +299,7 @@ class Fh1NativeExecutor {
   const RegisterFile& register_file_;
   memory::Memory& memory_;
   DrawExtentEstimator draw_extent_estimator_;
-  ShaderInterpreter overwrite_interpreter_;
+  Fh1DepthOverwrite depth_overwrite_;
   Fh1NativeExecutorConfig config_;
 
   // The command processor's mirror and texture cache.
