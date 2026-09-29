@@ -1,6 +1,8 @@
 #include <rex/graphics/d3d12/fh1_native_executor.h>
 
 #include <algorithm>
+
+#include <fmt/format.h>
 #include <bit>
 #include <cfloat>
 #include <chrono>
@@ -2597,6 +2599,17 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
         command_processor_.GetDeferredCommandList().elided_render_target_binds());
     cpu_ns_ = {};
     cpu_frames_ = 0;
+    // Cumulative shared-memory uploads by kind (NP-2.8): requests that
+    // uploaded, page ranges and bytes.
+    using Kind = SharedMemory::UploadKind;
+    const auto stats = [this](Kind kind) {
+      const SharedMemory::UploadStats& s = native_memory_->upload_stats(kind);
+      return fmt::format("{}/{}/{:.1f}MB (repeat {:.1f}MB)", s.requests, s.ranges,
+                         double(s.bytes) / 1048576.0, double(s.repeat_bytes) / 1048576.0);
+    };
+    REXGPU_INFO("Shared memory uploads: vertex {} index {} texture {} memexport {} other {}",
+                stats(Kind::kVertex), stats(Kind::kIndex), stats(Kind::kTexture),
+                stats(Kind::kMemexport), stats(Kind::kOther));
   }
   if (gpu_frames_ && gpu_timestamp_frequency_) {
     const double scale = 1000.0 / double(gpu_timestamp_frequency_) / double(gpu_frames_);

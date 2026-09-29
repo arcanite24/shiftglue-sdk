@@ -647,6 +647,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     for (const PendingSharedMemoryRange& pending_range : pending_shared_memory_ranges) {
       pending_shared_memory_range_pairs.emplace_back(pending_range.start, pending_range.length);
     }
+    SharedMemory::UploadKindScope upload_kind(shared_memory(), SharedMemory::UploadKind::kTexture);
     batched_shared_memory_request_succeeded = shared_memory().RequestRanges(
         pending_shared_memory_range_pairs.data(), pending_shared_memory_range_pairs.size());
   }
@@ -1008,6 +1009,7 @@ bool TextureCache::LoadTextureData(Texture& texture) {
   for (size_t i = 0; i < pending_range_count; ++i) {
     pending_range_pairs[i] = std::make_pair(pending_ranges[i].start, pending_ranges[i].length);
   }
+  SharedMemory::UploadKindScope upload_kind(shared_memory(), SharedMemory::UploadKind::kTexture);
   if (!shared_memory().RequestRanges(pending_range_pairs, pending_range_count)) {
     texture_became_outdated_.store(true, std::memory_order_release);
     return false;

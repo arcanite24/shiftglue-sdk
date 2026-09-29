@@ -549,6 +549,21 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     return true;
   }
 
+  UploadStats& stats = upload_stats_[size_t(upload_kind_)];
+  ++stats.requests;
+  stats.ranges += upload_ranges_.size();
+  if (page_upload_frame_.empty()) {
+    page_upload_frame_.resize(size_t(kBufferSize) >> page_size_log2_);
+  }
+  for (const auto& range : upload_ranges_) {
+    stats.bytes += uint64_t(range.second) << page_size_log2_;
+    for (uint32_t page = range.first; page < range.first + range.second; ++page) {
+      if (page_upload_frame_[page] == upload_frame_) {
+        stats.repeat_bytes += uint64_t(1) << page_size_log2_;
+      }
+      page_upload_frame_[page] = upload_frame_;
+    }
+  }
   return UploadRanges(upload_ranges_);
 }
 

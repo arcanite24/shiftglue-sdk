@@ -2453,6 +2453,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
         continue;
       }
+      SharedMemory::UploadKindScope upload_kind(*shared_memory_, SharedMemory::UploadKind::kVertex);
       if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
         REXGPU_ERROR(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
@@ -2484,6 +2485,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
   }
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    SharedMemory::UploadKindScope upload_kind(*shared_memory_, SharedMemory::UploadKind::kMemexport);
     if (!shared_memory_->RequestRange(memexport_range.base_address_dwords << 2,
                                       memexport_range.size_bytes)) {
       REXGPU_ERROR(
@@ -2962,6 +2964,9 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     return false;
   }
   if (is_opening_frame) {
+    if (shared_memory_) {
+      shared_memory_->BeginUploadFrame();
+    }
     // Update the completed frame index, also obtaining the actual completed
     // frame number (since the CPU may be actually less than 3 frames behind)
     // before reclaiming resources tracked with the frame number.
