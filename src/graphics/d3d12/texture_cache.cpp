@@ -14,9 +14,17 @@
 #include <array>
 #include <cfloat>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <span>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/dbg.h>
@@ -29,6 +37,8 @@
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/xenos.h>
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
+#include <rex/hash.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/perf/counter.h>
@@ -39,6 +49,12 @@ REXCVAR_DECLARE(bool, fh1_texture_reload_probe);
 
 namespace rex::graphics::d3d12 {
 
+REXCVAR_DEFINE_STRING(texture_dump_dir, "", "GPU/D3D12",
+                      "Write each BC3 texture the title loads as <hash>.dds into this folder "
+                      "(texture modding)");
+REXCVAR_DEFINE_STRING(texture_replacement_dirs, "", "GPU/D3D12",
+                      "Folders of <hash>.dds BC3 texture replacements, separated by ';', "
+                      "earlier folders first; read when the first texture loads");
 REXCVAR_DEFINE_BOOL(fh1_direct_reflection_cube_import, true, "GPU/D3D12",
                     "Import FH1 reflection cubes directly into their host texture");
 
@@ -1613,7 +1629,285 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
   return std::unique_ptr<Texture>(new D3D12Texture(*this, key, resource.Get(), resource_state));
 }
 
+namespace {
+
+// Texture dumps and replacements (NP-10.3), for BC3 (DXT5) 2D textures: each
+// texture is named by the XXH3 hash of its guest base level, and a
+// replacement is a DDS file of the same size with at least as many levels.
+struct Bc3Image {
+  uint32_t width = 0, height = 0, levels = 0;
+  std::vector<uint8_t> data;  // levels in order, BC3 blocks row by row
+};
+
+constexpr uint32_t kDdsMagic = 0x20534444u;         // "DDS "
+constexpr uint32_t kFourCcDxt5 = 0x35545844u;       // "DXT5"
+constexpr uint32_t kFourCcDx10 = 0x30315844u;       // "DX10"
+
+size_t Bc3LevelBytes(uint32_t width, uint32_t height, uint32_t level) {
+  return size_t((std::max(width >> level, 1u) + 3) / 4) *
+         ((std::max(height >> level, 1u) + 3) / 4) * 16;
+}
+
+struct Bc3Source {
+  uint32_t width, height;
+  bool tiled, packed_mips;
+  uint32_t endianness;
+};
+
+// As texture_util::ImportBc3, from a texture's key and guest layout.
+bool UntileBc3(const Bc3Source& key, const texture_util::TextureGuestLayout& layout,
+               std::span<const uint8_t> base, std::span<const uint8_t> mips, uint32_t levels,
+               std::vector<uint8_t>& output) {
+  const uint32_t width = key.width, height = key.height;
+  constexpr uint32_t kMasks[] = {0, 1, 3, 2};
+  for (uint32_t mip = 0; mip < levels; ++mip) {
+    const uint32_t stored = std::min(mip, layout.packed_level);
+    const auto& level = mip ? layout.mips[stored] : layout.base;
+    const auto source = mip ? mips : base;
+    const uint32_t level_offset = mip ? layout.mip_offsets_bytes[stored] : 0;
+    uint32_t ox = 0, oy = 0, oz = 0;
+    if (key.packed_mips) {
+      texture_util::GetPackedMipOffset(width, height, 1, xenos::TextureFormat::k_DXT4_5, mip,
+                                       ox, oy, oz);
+    }
+    const uint32_t columns = (std::max(width >> mip, 1u) + 3) / 4;
+    const uint32_t rows = (std::max(height >> mip, 1u) + 3) / 4;
+    for (uint32_t y = 0; y < rows; ++y) {
+      for (uint32_t x = 0; x < columns; ++x) {
+        const uint64_t offset =
+            uint64_t(level_offset) +
+            (key.tiled ? uint64_t(uint32_t(texture_util::GetTiledOffset2D(
+                             int32_t(x + ox), int32_t(y + oy), level.row_pitch_bytes / 16, 4)))
+                       : uint64_t(y + oy) * level.row_pitch_bytes + uint64_t(x + ox) * 16);
+        if (offset > source.size() || source.size() - offset < 16) return false;
+        for (uint32_t i = 0; i < 16; ++i) {
+          output.push_back(source[size_t(offset) + (i ^ kMasks[key.endianness & 3])]);
+        }
+      }
+    }
+  }
+  return true;
+}
+
+void WriteDds(const std::filesystem::path& path, const Bc3Image& image) {
+  uint32_t header[32] = {};
+  header[0] = kDdsMagic;
+  header[1] = 124;
+  header[2] = 0x1 | 0x2 | 0x4 | 0x1000 | 0x20000 | 0x80000;  // caps..linear size
+  header[3] = image.height;
+  header[4] = image.width;
+  header[5] = uint32_t(Bc3LevelBytes(image.width, image.height, 0));
+  header[7] = image.levels;
+  header[19] = 32;           // pixel format size
+  header[20] = 0x4;          // fourcc
+  header[21] = kFourCcDxt5;
+  header[27] = 0x1000 | (image.levels > 1 ? 0x400000 | 0x8 : 0);
+  std::error_code error;
+  std::filesystem::create_directories(path.parent_path(), error);
+  FILE* file = _wfopen(path.c_str(), L"wb");
+  if (!file) return;
+  fwrite(header, sizeof(header), 1, file);
+  fwrite(image.data.data(), 1, image.data.size(), file);
+  fclose(file);
+}
+
+std::optional<Bc3Image> ReadDds(const std::filesystem::path& path) {
+  FILE* file = _wfopen(path.c_str(), L"rb");
+  if (!file) return std::nullopt;
+  std::vector<uint8_t> bytes;
+  uint8_t chunk[65536];
+  for (size_t read; (read = fread(chunk, 1, sizeof(chunk), file)) != 0;) {
+    bytes.insert(bytes.end(), chunk, chunk + read);
+  }
+  fclose(file);
+  const auto word = [&](size_t index) {
+    uint32_t value = 0;
+    std::memcpy(&value, bytes.data() + index * 4, 4);
+    return value;
+  };
+  if (bytes.size() < 128 || word(0) != kDdsMagic || word(1) != 124) return std::nullopt;
+  size_t data_offset = 128;
+  if (word(21) == kFourCcDx10) {
+    // DXGI_FORMAT_BC3_UNORM (77) or BC3_UNORM_SRGB (78), a 2D texture.
+    if (bytes.size() < 148 || (word(32) != 77 && word(32) != 78)) return std::nullopt;
+    data_offset = 148;
+  } else if (word(21) != kFourCcDxt5) {
+    return std::nullopt;
+  }
+  Bc3Image image;
+  image.height = word(3);
+  image.width = word(4);
+  image.levels = std::max(word(7), 1u);
+  size_t needed = 0;
+  for (uint32_t level = 0; level < image.levels; ++level) {
+    needed += Bc3LevelBytes(image.width, image.height, level);
+  }
+  if (!image.width || !image.height || bytes.size() - data_offset < needed) return std::nullopt;
+  image.data.assign(bytes.begin() + data_offset, bytes.begin() + data_offset + needed);
+  return image;
+}
+
+struct TextureReplacements {
+  std::mutex mutex;
+  bool scanned = false;
+  std::unordered_map<uint64_t, std::filesystem::path> files;
+  std::unordered_map<uint64_t, std::shared_ptr<const Bc3Image>> loaded;
+  std::unordered_set<uint64_t> dumped;
+  std::unordered_set<uint64_t> logged;
+};
+
+TextureReplacements& Replacements() {
+  static TextureReplacements replacements;
+  return replacements;
+}
+
+}  // namespace
+
+bool D3D12TextureCache::TryLoadTextureReplacement(Texture& texture) {
+  const TextureKey key = texture.key();
+  const std::string dump_dir = REXCVAR_GET(texture_dump_dir);
+  auto& state = Replacements();
+  {
+    std::lock_guard lock(state.mutex);
+    if (!state.scanned) {
+      state.scanned = true;
+      const std::string dirs = REXCVAR_GET(texture_replacement_dirs);
+      size_t start = 0;
+      while (start <= dirs.size()) {
+        const size_t end = std::min(dirs.find(';', start), dirs.size());
+        const std::filesystem::path dir = rex::to_path(dirs.substr(start, end - start));
+        std::error_code error;
+        if (end > start && std::filesystem::is_directory(dir, error)) {
+          for (const auto& entry : std::filesystem::directory_iterator(dir, error)) {
+            const auto stem = entry.path().stem().string();
+            if (entry.path().extension() != ".dds" || stem.size() != 16) continue;
+            uint64_t hash = 0;
+            if (std::sscanf(stem.c_str(), "%16llx", &hash) == 1) {
+              state.files.emplace(hash, entry.path());  // earlier folders win
+            }
+          }
+        }
+        start = end + 1;
+      }
+      if (!state.files.empty()) {
+        REXGPU_INFO("Texture replacements: {} files", state.files.size());
+      }
+    }
+    if (dump_dir.empty() && state.files.empty()) return false;
+  }
+  if (key.format != xenos::TextureFormat::k_DXT4_5 || key.scaled_resolve || !key.base_page ||
+      key.signed_separate || key.dimension != xenos::DataDimension::k2DOrStacked ||
+      key.GetDepthOrArraySize() != 1 || texture.force_load_3d_tiling() ||
+      IsDecompressionNeeded(key.format, key.GetWidth(), key.GetHeight())) {
+    return false;
+  }
+  const auto& layout = texture.guest_layout();
+  std::vector<uint8_t> base(layout.base.level_data_extent_bytes);
+  if (base.empty() || !shared_memory().CopyCpuRange(key.base_page << 12, {base.data(), base.size()})) {
+    return false;
+  }
+  const uint64_t hash = XXH3_64bits(base.data(), base.size());
+
+  if (!dump_dir.empty()) {
+    bool dump = false;
+    {
+      std::lock_guard lock(state.mutex);
+      dump = state.dumped.insert(hash).second;
+    }
+    if (dump) {
+      std::vector<uint8_t> mips(layout.mips_total_extent_bytes);
+      const bool have_mips = key.mip_max_level && key.mip_page && !mips.empty() &&
+                             shared_memory().CopyCpuRange(key.mip_page << 12,
+                                                          {mips.data(), mips.size()});
+      Bc3Image image{key.GetWidth(), key.GetHeight(), have_mips ? key.mip_max_level + 1u : 1u};
+      const Bc3Source source{key.GetWidth(), key.GetHeight(), bool(key.tiled),
+                             bool(key.packed_mips), uint32_t(key.endianness)};
+      if (UntileBc3(source, layout, base, mips, image.levels, image.data)) {
+        WriteDds(rex::to_path(dump_dir) / fmt::format("{:016X}.dds", hash), image);
+      }
+    }
+  }
+
+  std::shared_ptr<const Bc3Image> image;
+  {
+    std::lock_guard lock(state.mutex);
+    const auto file = state.files.find(hash);
+    if (file == state.files.end()) return false;
+    auto& slot = state.loaded[hash];
+    if (!slot) {
+      auto read = ReadDds(file->second);
+      if (!read) {
+        REXGPU_WARN("Texture replacement {} is not a BC3 DDS", file->second.string());
+        state.files.erase(file);
+        return false;
+      }
+      slot = std::make_shared<const Bc3Image>(std::move(*read));
+    }
+    image = slot;
+  }
+  auto& target = static_cast<D3D12Texture&>(texture);
+  auto* resource = target.resource();
+  const auto desc = resource->GetDesc();
+  const uint32_t levels = desc.MipLevels;
+  if (image->width != key.GetWidth() || image->height != key.GetHeight() ||
+      image->levels < levels || desc.DepthOrArraySize != 1 ||
+      (desc.Format != DXGI_FORMAT_BC3_UNORM && desc.Format != DXGI_FORMAT_BC3_TYPELESS &&
+       desc.Format != DXGI_FORMAT_BC3_UNORM_SRGB)) {
+    std::lock_guard lock(state.mutex);
+    if (state.logged.insert(hash).second) {
+      REXGPU_WARN("Texture replacement {:016X}: needs {}x{} BC3 with {} levels", hash,
+                   key.GetWidth(), key.GetHeight(), levels);
+    }
+    return false;
+  }
+  std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(levels);
+  std::vector<UINT> row_counts(levels);
+  std::vector<UINT64> row_bytes(levels);
+  UINT64 size = 0;
+  command_processor_.GetD3D12Provider().GetDevice()->GetCopyableFootprints(
+      &desc, 0, levels, 0, footprints.data(), row_counts.data(), row_bytes.data(), &size);
+  ID3D12Resource* upload = nullptr;
+  size_t upload_offset = 0;
+  auto* mapping = command_processor_.GetConstantBufferPool().Request(
+      command_processor_.GetCurrentFrame(), size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, &upload,
+      &upload_offset, nullptr);
+  if (!mapping) return false;
+  size_t source = 0;
+  for (uint32_t level = 0; level < levels; ++level) {
+    const size_t pitch = size_t((std::max(image->width >> level, 1u) + 3) / 4) * 16;
+    for (UINT row = 0; row < row_counts[level]; ++row) {
+      std::memcpy(mapping + footprints[level].Offset + size_t(row) * footprints[level].Footprint.RowPitch,
+                  image->data.data() + source + size_t(row) * pitch,
+                  std::min<size_t>(pitch, size_t(row_bytes[level])));
+    }
+    source += Bc3LevelBytes(image->width, image->height, level);
+  }
+  target.MarkAsUsed();
+  command_processor_.PushTransitionBarrier(
+      resource, target.SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST),
+      D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor_.SubmitBarriers();
+  for (uint32_t level = 0; level < levels; ++level) {
+    D3D12_TEXTURE_COPY_LOCATION from{}, to{};
+    from.pResource = upload;
+    from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    from.PlacedFootprint = footprints[level];
+    from.PlacedFootprint.Offset += upload_offset;
+    to.pResource = resource;
+    to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    to.SubresourceIndex = level;
+    command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+  }
+  std::lock_guard lock(state.mutex);
+  if (state.logged.insert(hash).second) {
+    REXGPU_INFO("Texture replacement {:016X}: {}x{}, {} levels", hash, image->width,
+                image->height, levels);
+  }
+  return true;
+}
+
 bool D3D12TextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_base, bool load_mips) {
+  if (TryLoadTextureReplacement(texture)) return true;
   // Linear single-level 8-bit textures (FH1's video planes, rewritten by the
   // CPU every frame) are copied straight from guest memory into the upload
   // footprint when the guest row pitch already matches it, instead of
