@@ -1,8 +1,33 @@
 #!/usr/bin/env bash
-# Compiles the FH1 native executor shaders into bytecode/d3d12_5_1 headers.
+# Compiles the FH1 native executor and texture cache shaders into
+# bytecode/d3d12_5_1 headers and, from the same HLSL, into vulkan_spirv
+# SPIR-V headers.
+#
+# SPIR-V comes from the vendored glslang's HLSL front end, so no DXC with
+# SPIR-V code generation is needed. Build glslangValidator once from
+# thirdparty/glslang with ENABLE_HLSL and ENABLE_GLSLANG_BINARIES and point
+# GLSLANG at it; without GLSLANG only the DXBC headers are written.
+#
+# Vulkan bindings, all in descriptor set 0 and by register class whatever the
+# resource type (--hlsl-iomap): b<n> is binding n, t<n> is binding 16 + n and
+# u<n> is binding 32 + n.
 set -euo pipefail
 cd "$(dirname "$0")"
 FXC="${FXC:-/c/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/fxc.exe}"
+GLSLANG="${GLSLANG:-}"
+compile_spirv() {  # profile file name defines...
+  local profile=$1 file=$2 name=$3
+  shift 3
+  [[ -n $GLSLANG ]] || return 0
+  local args=()
+  local define
+  for define in "$@"; do args+=("-D$define"); done
+  local stage=frag
+  [[ $profile == cs_* ]] && stage=comp
+  "$GLSLANG" -D -V -S "$stage" -e main "${args[@]}" --hlsl-iomap \
+    --shift-cbuffer-binding 0 --shift-texture-binding 16 --shift-UAV-binding 32 \
+    --vn "$name" -o "vulkan_spirv/$name.h" "$file" > /dev/null
+}
 compile() {  # profile file name defines...
   local profile=$1 file=$2 name=$3
   shift 3
@@ -11,6 +36,7 @@ compile() {  # profile file name defines...
   for define in "$@"; do args+=(//D "$define"); done
   "$FXC" //nologo //T "$profile" //E main //O3 "${args[@]}" //Vn "$name" \
     //Fh "bytecode/d3d12_5_1/$name.h" "$file" > /dev/null
+  compile_spirv "$profile" "$file" "$name" "$@"
 }
 for source_kind in color depth uint; do
   source_defines=()
@@ -47,4 +73,8 @@ for dest_kind in depth stencil; do
   done
   kind=2
 done
+# Texture cache: the scaled 32-bpp resolve buffer and reflection cube imports.
+# Their DXBC headers were built with other fxc flags and are kept as they are.
+compile_spirv cs_5_1 fh1_scaled_32bpp_2x.cs.hlsl fh1_scaled_32bpp_2x_cs
+compile_spirv cs_5_1 fh1_reflection_cube_import.cs.hlsl fh1_reflection_cube_import_cs
 echo compiled
