@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <string_view>
 
@@ -50,6 +51,19 @@ REXCVAR_DEFINE_INT32(wait_reg_mem_yield_us, 2000, "GPU",
     .range(0, 16000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_STRING(fh1_debug_skip_draws, "", "GPU",
+                      "Diagnostics: skip the draws with these indices in every frame, as "
+                      "<first>-<last> counted from each frame's first draw (bisecting a "
+                      "rendering fault in a frame replay)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(fh1_debug_null_fetch, "", "GPU",
+                      "Diagnostics: <draw>:<fetch constant> - that draw of every frame sees "
+                      "the texture fetch constant as invalid (a null texture)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_debug_log_draws, false, "GPU",
+                    "Diagnostics: log every draw's index in its frame, primitive type, index "
+                    "count and vertex and pixel shader hashes (for frame replays)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
@@ -1041,6 +1055,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
   ++observation_frame_sequence_;
+  debug_frame_draw_index_ = 0;
 
   ++counter_;
   return true;
@@ -1466,8 +1481,73 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 
       bool major_mode_explicit =
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
-      draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
-                                 is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
+      // Diagnostics for frame replays: which draw is which, and dropping a
+      // range of them.
+      static const auto skip_range = [] {
+        uint32_t first = 1, last = 0;
+        const std::string range = REXCVAR_GET(fh1_debug_skip_draws);
+        if (!range.empty() && std::sscanf(range.c_str(), "%u-%u", &first, &last) != 2) {
+          first = 1;
+          last = 0;
+        }
+        return std::make_pair(first, last);
+      }();
+      const uint32_t draw_index = debug_frame_draw_index_++;
+      if (REXCVAR_GET(fh1_debug_log_draws)) {
+        const RegisterFile& regs = *register_file_;
+        std::string textures;
+        if (active_pixel_shader_ && active_pixel_shader_->is_ucode_analyzed()) {
+          for (const auto& binding : active_pixel_shader_->texture_bindings()) {
+            const auto fetch = regs.GetTextureFetch(binding.fetch_constant);
+            const uint32_t* words =
+                &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + binding.fetch_constant * 6];
+            textures += fmt::format(
+                " t{}={:08X}:{}x{}:f{}:e{}:type{}:[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+                binding.fetch_constant, fetch.base_address << 12, fetch.size_2d.width + 1,
+                fetch.size_2d.height + 1, uint32_t(fetch.format), uint32_t(fetch.exp_adjust),
+                uint32_t(fetch.type), words[0], words[1], words[2], words[3], words[4], words[5]);
+          }
+        }
+        REXGPU_INFO(
+            "FH1 debug draw {} mode={} prim={} indices={} vs={:016X} ps={:016X} color0={:08X} "
+            "surface={:08X} mask={:08X} blend0={:08X} depth={:08X} vte={:08X} "
+            "window_scissor={:08X}/{:08X} copy_dest={:08X} copy_info={:08X} copy_ctrl={:08X}{}",
+            draw_index, regs[XE_GPU_REG_RB_MODECONTROL] & 7, uint32_t(vgt_draw_initiator.prim_type),
+            uint32_t(vgt_draw_initiator.num_indices),
+            active_vertex_shader_ ? active_vertex_shader_->ucode_data_hash() : 0,
+            active_pixel_shader_ ? active_pixel_shader_->ucode_data_hash() : 0,
+            regs[XE_GPU_REG_RB_COLOR_INFO], regs[XE_GPU_REG_RB_SURFACE_INFO],
+            regs[XE_GPU_REG_RB_COLOR_MASK], regs[XE_GPU_REG_RB_BLENDCONTROL0],
+            regs[XE_GPU_REG_RB_DEPTHCONTROL], regs[XE_GPU_REG_PA_CL_VTE_CNTL],
+            regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL], regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR],
+            regs[XE_GPU_REG_RB_COPY_DEST_BASE], regs[XE_GPU_REG_RB_COPY_DEST_INFO],
+            regs[XE_GPU_REG_RB_COPY_CONTROL], textures);
+      }
+      static const auto null_fetch = [] {
+        uint32_t draw = UINT32_MAX, fetch = 0;
+        const std::string value = REXCVAR_GET(fh1_debug_null_fetch);
+        if (!value.empty() && (std::sscanf(value.c_str(), "%u:%u", &draw, &fetch) != 2 ||
+                               fetch >= xenos::kTextureFetchConstantCount)) {
+          draw = UINT32_MAX;
+        }
+        return std::make_pair(draw, fetch);
+      }();
+      if (draw_index >= skip_range.first && draw_index <= skip_range.second) {
+        draw_succeeded = true;
+      } else {
+        // Through WriteRegister, so the backend sees the fetch constant change.
+        const uint32_t null_fetch_register =
+            XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + null_fetch.second * 6;
+        const uint32_t saved_fetch_word = register_file_->values[null_fetch_register];
+        if (draw_index == null_fetch.first) {
+          WriteRegister(null_fetch_register, saved_fetch_word & ~uint32_t(3));
+        }
+        draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
+                                   is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
+        if (draw_index == null_fetch.first) {
+          WriteRegister(null_fetch_register, saved_fetch_word);
+        }
+      }
       if (!draw_succeeded) {
         auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
         auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();

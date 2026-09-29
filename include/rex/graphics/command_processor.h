@@ -292,6 +292,8 @@ class CommandProcessor {
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;
   std::atomic<uint32_t> draw_resolution_scale_{1};
+  // The next draw's index in its frame (fh1_debug_skip_draws, fh1_debug_log_draws).
+  uint32_t debug_frame_draw_index_ = 0;
   uint64_t observation_frame_sequence_ = 1;
   bool paused_ = false;
 
