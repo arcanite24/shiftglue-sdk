@@ -3318,6 +3318,11 @@ void VulkanCommandProcessor::SubmitBarriersAndBeginFh1Rendering(
   in_render_pass_ = true;
 }
 
+system::GraphicsShaderTranslationObserver
+VulkanCommandProcessor::GetShaderTranslationObserver() const {
+  return graphics_system_->shader_translation_observer();
+}
+
 void VulkanCommandProcessor::Fh1AwaitAllQueueOperations() {
   const bool was_open = submission_open_;
   if (was_open) {

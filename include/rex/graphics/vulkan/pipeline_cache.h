@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include <rex/graphics/fh1_shader_pack.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/hash.h>
 #include <rex/platform.h>
@@ -380,6 +381,16 @@ class VulkanPipelineCache {
   string::StringBuffer ucode_disasm_buffer_;
   // Reusable shader translator on the command processor thread.
   std::unique_ptr<SpirvShaderTranslator> shader_translator_;
+  // FH1 precompiled SPIR-V (NP-12.6): translations looked up before the
+  // translator runs; misses are translated as before.
+  Fh1ShaderPack fh1_shader_pack_;
+  // The pack identity of this device and configuration (see
+  // Fh1ShaderPackConfig).
+  Fh1ShaderPack::Config Fh1ShaderPackConfig() const;
+  std::atomic<uint64_t> fh1_shader_pack_hits_{0};
+  std::atomic<uint64_t> fh1_shader_pack_misses_{0};
+  void ObserveTranslation(const VulkanShader& shader,
+                          const VulkanShader::VulkanTranslation& translation);
 
   struct LayoutUID {
     size_t uid;

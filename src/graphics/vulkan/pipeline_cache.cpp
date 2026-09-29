@@ -411,6 +411,23 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
   bool edram_fragment_shader_interlock =
       render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
 
+  if (title_id == 0x4D5309C9) {
+    const Fh1ShaderPack::Config pack_config = Fh1ShaderPackConfig();
+    const auto pack_path =
+        shader_storage_shareable_root / Fh1ShaderPack::FileName(title_id, pack_config);
+    std::string pack_error;
+    if (fh1_shader_pack_.Load(pack_path, pack_config, &pack_error)) {
+      REXGPU_INFO("Loaded {} FH1 precompiled SPIR-V shaders from {}", fh1_shader_pack_.size(),
+                  rex::path_to_utf8(pack_path));
+    } else if (pack_error != "unavailable") {
+      REXGPU_WARN("Ignoring FH1 precompiled shader pack {}: {}", rex::path_to_utf8(pack_path),
+                  pack_error);
+    } else {
+      REXGPU_INFO("No FH1 precompiled SPIR-V shader pack ({})",
+                  Fh1ShaderPack::FileName(title_id, pack_config));
+    }
+  }
+
   // Initialize the pipeline storage stream - read pipeline descriptions and
   // collect used shader modifications to translate.
   std::vector<PipelineStoredDescription> pipeline_stored_descriptions;
@@ -1232,15 +1249,138 @@ void VulkanPipelineCache::GetPipelineAndLayoutByHandle(
   }
 }
 
+Fh1ShaderPack::Config VulkanPipelineCache::Fh1ShaderPackConfig() const {
+  // Everything the translator's output depends on besides the translator
+  // version and scale: the device features and the render target setup.
+  const SpirvShaderTranslator::Features features(command_processor_.GetVulkanDevice());
+  const bool fsi =
+      render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+  const uint32_t words[] = {
+      features.spirv_version,
+      features.max_storage_buffer_range,
+      uint32_t(features.full_draw_index_uint32) | (uint32_t(features.vertex_pipeline_stores_and_atomics) << 1) |
+          (uint32_t(features.fragment_stores_and_atomics) << 2) |
+          (uint32_t(features.clip_distance) << 3) | (uint32_t(features.cull_distance) << 4) |
+          (uint32_t(features.image_view_format_swizzle) << 5) |
+          (uint32_t(features.signed_zero_inf_nan_preserve_float32) << 6) |
+          (uint32_t(features.denorm_flush_to_zero_float32) << 7) |
+          (uint32_t(features.rounding_mode_rte_float32) << 8) |
+          (uint32_t(features.fragment_shader_sample_interlock) << 9) |
+          (uint32_t(features.demote_to_helper_invocation) << 10) |
+          (uint32_t(features.sample_rate_shading) << 11) |
+          (uint32_t(render_target_cache_.msaa_2x_no_attachments_supported()) << 12)};
+  Fh1ShaderPack::Config config;
+  config.translator_version = SpirvShaderTranslator::Modification::kVersion;
+  config.backend = Fh1ShaderPack::Backend::kVulkan;
+  config.device_features = uint32_t(XXH3_64bits(words, sizeof(words)));
+  // As the capture manifest's flags: bit 1 EDRAM through fragment shader
+  // interlock, bit 2 gamma as 8-bit, bit 3 native 2x MSAA.
+  config.flags = (fsi ? 2u : 0u) | (!render_target_cache_.gamma_render_target_as_unorm16() ? 4u : 0u) |
+                 (render_target_cache_.msaa_2x_attachments_supported() ? 8u : 0u);
+  config.draw_resolution_scale_x = render_target_cache_.draw_resolution_scale_x();
+  config.draw_resolution_scale_y = render_target_cache_.draw_resolution_scale_y();
+  return config;
+}
+
+void VulkanPipelineCache::ObserveTranslation(const VulkanShader& shader,
+                                             const VulkanShader::VulkanTranslation& translation) {
+  auto observer = command_processor_.GetShaderTranslationObserver();
+  if (!observer) {
+    return;
+  }
+  std::vector<system::GraphicsShaderTextureBinding> texture_bindings;
+  for (const auto& binding : shader.GetTextureBindingsAfterTranslation()) {
+    texture_bindings.push_back({0, binding.fetch_constant, uint32_t(binding.dimension),
+                                binding.is_signed ? 1u : 0u});
+  }
+  std::vector<system::GraphicsShaderSamplerBinding> sampler_bindings;
+  for (const auto& binding : shader.GetSamplerBindingsAfterTranslation()) {
+    sampler_bindings.push_back({0, binding.fetch_constant, uint32_t(binding.mag_filter),
+                                uint32_t(binding.min_filter), uint32_t(binding.mip_filter),
+                                uint32_t(binding.aniso_filter)});
+  }
+  const Fh1ShaderPack::Config config = Fh1ShaderPackConfig();
+  system::GraphicsShaderTranslationObservation observation;
+  observation.stage = shader.type() == xenos::ShaderType::kVertex
+                          ? system::GraphicsShaderStage::kVertex
+                          : system::GraphicsShaderStage::kPixel;
+  observation.guest_hash = shader.ucode_data_hash();
+  observation.specialization_mask = translation.modification();
+  observation.bytecode = translation.translated_binary().data();
+  observation.bytecode_size = translation.translated_binary().size();
+  observation.translator_version = config.translator_version;
+  observation.backend = uint32_t(config.backend);
+  observation.device_features = config.device_features;
+  observation.bindless_resources = false;
+  observation.edram_rov = (config.flags & 2) != 0;
+  observation.gamma_render_target_as_unorm8 = (config.flags & 4) != 0;
+  observation.msaa_2x = (config.flags & 8) != 0;
+  observation.draw_resolution_scale_x = config.draw_resolution_scale_x;
+  observation.draw_resolution_scale_y = config.draw_resolution_scale_y;
+  observation.texture_bindings = texture_bindings.data();
+  observation.texture_binding_count = texture_bindings.size();
+  observation.sampler_bindings = sampler_bindings.data();
+  observation.sampler_binding_count = sampler_bindings.size();
+  observation.used_texture_mask = shader.GetUsedTextureMaskAfterTranslation();
+  observer(observation);
+}
+
 bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& translator,
                                                   VulkanShader::VulkanTranslation& translation) {
   VulkanShader& shader = static_cast<VulkanShader&>(translation.shader());
 
+  bool used_precompiled_shader = false;
+  if (const Fh1ShaderPack::Entry* precompiled = fh1_shader_pack_.Find(
+          shader.type(), shader.ucode_data_hash(), translation.modification())) {
+    std::vector<SpirvShader::TextureBinding> texture_bindings(
+        precompiled->texture_bindings.size());
+    std::memset(texture_bindings.data(), 0,
+                texture_bindings.size() * sizeof(SpirvShader::TextureBinding));
+    for (size_t i = 0; i < texture_bindings.size(); ++i) {
+      texture_bindings[i].fetch_constant = precompiled->texture_bindings[i].fetch_constant;
+      texture_bindings[i].dimension = precompiled->texture_bindings[i].dimension;
+      texture_bindings[i].is_signed = precompiled->texture_bindings[i].is_signed;
+    }
+    std::vector<SpirvShader::SamplerBinding> sampler_bindings(
+        precompiled->sampler_bindings.size());
+    std::memset(sampler_bindings.data(), 0,
+                sampler_bindings.size() * sizeof(SpirvShader::SamplerBinding));
+    for (size_t i = 0; i < sampler_bindings.size(); ++i) {
+      const auto& binding = precompiled->sampler_bindings[i];
+      sampler_bindings[i].fetch_constant = binding.fetch_constant;
+      sampler_bindings[i].mag_filter = binding.mag_filter;
+      sampler_bindings[i].min_filter = binding.min_filter;
+      sampler_bindings[i].mip_filter = binding.mip_filter;
+      sampler_bindings[i].aniso_filter = binding.aniso_filter;
+    }
+    used_precompiled_shader =
+        shader.LoadPrecompiledBindings(texture_bindings, sampler_bindings,
+                                       precompiled->used_texture_mask) &&
+        translation.LoadPrecompiledBinary(precompiled->bytecode);
+    if (used_precompiled_shader) {
+      fh1_shader_pack_hits_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
   // Perform translation.
   // If this fails the shader will be marked as invalid and ignored later.
-  if (!translator.TranslateAnalyzedShader(translation)) {
-    REXGPU_ERROR("Shader {:016X} translation failed; marking as ignored", shader.ucode_data_hash());
-    return false;
+  if (!used_precompiled_shader) {
+    if (fh1_shader_pack_.size()) {
+      // The runtime translates misses; a capture of the session adds them to
+      // the next pack.
+      const uint64_t misses = fh1_shader_pack_misses_.fetch_add(1, std::memory_order_relaxed);
+      if (misses < 64) {
+        REXGPU_INFO("FH1 precompiled SPIR-V miss {} for {:016X}/{:016X} ({} hits so far)",
+                    misses + 1, shader.ucode_data_hash(), translation.modification(),
+                    fh1_shader_pack_hits_.load(std::memory_order_relaxed));
+      }
+    }
+    if (!translator.TranslateAnalyzedShader(translation)) {
+      REXGPU_ERROR("Shader {:016X} translation failed; marking as ignored",
+                   shader.ucode_data_hash());
+      return false;
+    }
+    ObserveTranslation(shader, translation);
   }
   if (translation.GetOrCreateShaderModule() == VK_NULL_HANDLE) {
     return false;

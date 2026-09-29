@@ -11,6 +11,7 @@
  */
 
 #include <atomic>
+#include <span>
 #include <vector>
 
 #include <rex/graphics/pipeline/shader/shader.h>
@@ -58,6 +59,13 @@ class SpirvShader : public Shader {
     return sampler_bindings_;
   }
 
+  // Installs the bindings of a precompiled translation (a shader pack entry)
+  // in place of translating; false if another translation of the shader set
+  // different ones.
+  bool LoadPrecompiledBindings(std::span<const TextureBinding> texture_bindings,
+                               std::span<const SamplerBinding> sampler_bindings,
+                               uint32_t used_texture_mask);
+
  protected:
   Translation* CreateTranslationInstance(uint64_t modification) override;
 
@@ -65,6 +73,7 @@ class SpirvShader : public Shader {
   friend class SpirvShaderTranslator;
 
   std::atomic_flag bindings_setup_entered_ = ATOMIC_FLAG_INIT;
+  std::atomic<bool> bindings_setup_complete_ = false;
   std::vector<TextureBinding> texture_bindings_;
   std::vector<SamplerBinding> sampler_bindings_;
   uint32_t used_texture_mask_ = 0;

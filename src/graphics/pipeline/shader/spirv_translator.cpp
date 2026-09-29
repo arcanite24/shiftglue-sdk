@@ -1287,6 +1287,7 @@ void SpirvShaderTranslator::PostTranslation() {
       shader_binding.mip_filter = translator_binding.mip_filter;
       shader_binding.aniso_filter = translator_binding.aniso_filter;
     }
+    spirv_shader->bindings_setup_complete_.store(true, std::memory_order_release);
   }
 }
 
