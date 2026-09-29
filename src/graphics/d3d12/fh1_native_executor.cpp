@@ -405,7 +405,7 @@ bool Fh1NativeExecutor::Initialize(const Fh1NativeExecutorConfig& config) {
   native_textures_ = config_.textures;
   if (!native_memory_ || !native_textures_) return false;
 
-  tile_owners_.assign(xenos::kEdramTileCount, kNoOwner);
+  tiles_.Reset();
   scale_ = native_textures_->draw_resolution_scale_x();
   if (native_textures_->draw_resolution_scale_y() != scale_ || scale_ > 4) {
     REXGPU_ERROR("FH1 native executor: unsupported resolution scale {}x{}",
@@ -419,7 +419,6 @@ bool Fh1NativeExecutor::Initialize(const Fh1NativeExecutorConfig& config) {
                                                  *native_memory_, dump_frame,
                                                  Fh1FrameDump::RequestedPath());
   }
-  tile_stencil_nonzero_.assign(xenos::kEdramTileCount, 1);
 
   std::stringstream frames(REXCVAR_GET(fh1_native_dump_frames));
   std::string frame;
@@ -679,49 +678,15 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
 
 void Fh1NativeExecutor::ClaimTiles(uint32_t base, uint32_t length, uint32_t packed_key,
                                    bool transfer) {
-  length = std::min(length, xenos::kEdramTileCount);
-  if (!length) return;
-  // A surface that already owns the whole range needs no work; its cached
-  // claim is dropped whenever another surface takes any of its tiles.
-  auto last = last_claims_.find(packed_key);
-  if (last != last_claims_.end() && last->second.first == base &&
-      last->second.second >= length) {
-    return;
-  }
-  std::vector<TileRun> runs;
-  for (uint32_t i = 0; i < length; ++i) {
-    uint32_t& owner = tile_owners_[(base + i) & (xenos::kEdramTileCount - 1)];
-    if (owner == packed_key) continue;
-    ++tile_generation_;
-    if (owner != kNoOwner) {
-      if (!runs.empty() && runs.back().previous_owner == owner &&
-          runs.back().first + runs.back().count == base + i) {
-        ++runs.back().count;
-      } else {
-        runs.push_back({base + i, 1, owner});
-      }
-    }
-    owner = packed_key;
-  }
-  for (const TileRun& run : runs) last_claims_.erase(run.previous_owner);
-  // A partial claim must not extend a cached larger one.
-  if (transfer) {
-    last_claims_[packed_key] = {base, length};
-  } else {
-    last_claims_.erase(packed_key);
-  }
-  if (runs.empty() || !transfer) return;
+  const auto runs = tiles_.Claim(base, length, packed_key, transfer);
+  if (runs.empty()) return;
   Surface* dest = FindSurface(packed_key);
   if (!dest) return;
   for (const TileRun& run : runs) TransferTiles(*dest, run);
 }
 
 void Fh1NativeExecutor::MarkTileStencil(uint32_t base, uint32_t length, bool nonzero) {
-  length = std::min(length, xenos::kEdramTileCount);
-  ++tile_generation_;
-  for (uint32_t i = 0; i < length; ++i) {
-    tile_stencil_nonzero_[(base + i) & (xenos::kEdramTileCount - 1)] = nonzero;
-  }
+  tiles_.MarkStencil(base, length, nonzero);
 }
 
 uint32_t Fh1NativeExecutor::LayoutConstant(const Surface& surface) const {
@@ -837,57 +802,24 @@ void Fh1NativeExecutor::TransferTiles(Surface& dest, const TileRun& run) {
 }
 
 bool Fh1NativeExecutor::AnyTileStencil(uint32_t base, uint32_t count) const {
-  count = std::min(count, xenos::kEdramTileCount);
-  for (uint32_t i = 0; i < count; ++i) {
-    if (tile_stencil_nonzero_[(base + i) & (xenos::kEdramTileCount - 1)]) return true;
-  }
-  return false;
+  return tiles_.AnyStencil(base, count);
 }
 
 void Fh1NativeExecutor::ClaimTileRect(const SurfaceKey& key, uint32_t column_first,
                                       uint32_t row_first, uint32_t column_end,
                                       uint32_t row_end) {
-  if (column_first >= column_end || row_first >= row_end) return;
   const uint32_t packed_key = key.Pack();
-  auto tile = [&](uint32_t row, uint32_t column) -> uint32_t& {
-    return tile_owners_[(key.base_tiles + row * key.pitch_tiles + column) &
-                        (xenos::kEdramTileCount - 1)];
-  };
-  // One previous owner (unowned tiles have no content to keep) and none of
-  // the destination's own tiles, which a transfer would overwrite.
-  uint32_t previous_owner = kNoOwner;
-  bool single = true, own = false;
-  for (uint32_t row = row_first; single && row < row_end; ++row) {
-    for (uint32_t column = column_first; column < column_end; ++column) {
-      const uint32_t owner = tile(row, column);
-      if (owner == kNoOwner) continue;
-      if (owner == packed_key) {
-        own = true;
-        continue;
-      }
-      if (previous_owner != kNoOwner && owner != previous_owner) {
-        single = false;
-        break;
-      }
-      previous_owner = owner;
-    }
-  }
-  if (!single || (own && previous_owner != kNoOwner)) {
+  const auto claim = tiles_.ClaimRect(key.base_tiles, key.pitch_tiles, packed_key, column_first,
+                                      row_first, column_end, row_end);
+  if (claim.per_row) {
     for (uint32_t row = row_first; row < row_end; ++row) {
       ClaimTiles(key.base_tiles + row * key.pitch_tiles + column_first,
                  column_end - column_first, packed_key);
     }
     return;
   }
-  for (uint32_t row = row_first; row < row_end; ++row) {
-    for (uint32_t column = column_first; column < column_end; ++column) {
-      tile(row, column) = packed_key;
-    }
-  }
-  ++tile_generation_;
-  last_claims_.erase(packed_key);
+  const uint32_t previous_owner = claim.previous_owner;
   if (previous_owner == kNoOwner) return;
-  last_claims_.erase(previous_owner);
   Surface* dest = FindSurface(packed_key);
   if (!dest) return;
   const uint32_t msaa_x_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
@@ -1259,7 +1191,7 @@ void Fh1NativeExecutor::GetResolveSources(const SurfaceKey& resolve_key, int32_t
       const uint32_t tile =
           (resolve_key.base_tiles + uint32_t(row) * pitch + uint32_t(column)) &
           (xenos::kEdramTileCount - 1);
-      const uint32_t owner = tile_owners_[tile];
+      const uint32_t owner = tiles_.Owner(tile);
       if (!current_row.empty() && current_row.back().owner == owner &&
           current_row.back().column_end == column) {
         ++current_row.back().column_end;
@@ -1645,8 +1577,7 @@ void Fh1NativeExecutor::ClaimOverwrittenDepthTiles(const SurfaceKey& key,
   if (!stencil_overwritten) {
     for (uint32_t row = row_first; row < row_end; ++row) {
       for (uint32_t column = column_first; column < column_end; ++column) {
-        if (tile_stencil_nonzero_[(key.base_tiles + tile_index(row, column)) &
-                                  (xenos::kEdramTileCount - 1)]) {
+        if (tiles_.StencilNonzero(key.base_tiles + tile_index(row, column))) {
           return;
         }
       }
@@ -1731,7 +1662,7 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1NativeDrawInfo& draw) {
       draw.normalized_depth_control.z_write_enable &&
       draw.normalized_depth_control.zfunc == xenos::CompareFunction::kAlways;
   PrepareSignature signature;
-  signature.generation = tile_generation_;
+  signature.generation = tiles_.generation();
   signature.used_bits = used_bits;
   signature.length_tiles = length_tiles_32bpp;
   signature.stencil_written = depth_stencil_written;
@@ -1772,7 +1703,7 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1NativeDrawInfo& draw) {
   FlushTransfers();
   // A depth-overwriting draw may have claimed only its rectangles.
   if (used_bits == signature.used_bits && !may_overwrite_depth) {
-    signature.generation = tile_generation_;
+    signature.generation = tiles_.generation();
     last_prepare_ = signature;
   } else {
     last_prepare_ = {};

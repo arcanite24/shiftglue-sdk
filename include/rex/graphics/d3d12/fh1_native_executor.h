@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <rex/graphics/d3d12/fh1_frame_dump.h>
+#include <rex/graphics/fh1_edram_tiles.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/util/draw_extent_estimator.h>
@@ -171,14 +172,8 @@ class Fh1NativeExecutor {
     bool unowned = false;
   };
 
-  static constexpr uint32_t kNoOwner = UINT32_MAX;
-
-  // Contiguous claimed tiles that another surface owned.
-  struct TileRun {
-    uint32_t first = 0;
-    uint32_t count = 0;
-    uint32_t previous_owner = kNoOwner;
-  };
+  static constexpr uint32_t kNoOwner = Fh1EdramTiles::kNoOwner;
+  using TileRun = Fh1EdramTiles::Run;
   struct TransferPipelineKey {
     uint32_t dest_kind;  // 0 color, 1 depth, 2 + bit: stencil bit, kTransferDestUint
     DXGI_FORMAT dest_format;
@@ -384,11 +379,9 @@ class Fh1NativeExecutor {
   // [source kind: color, depth, raw color bits][msaa]
   Microsoft::WRL::ComPtr<ID3D12PipelineState> resolve_memory_pipelines_[3][2];
   std::map<uint32_t, Surface> surfaces_;
-  // EDRAM tile -> packed key of the surface that last wrote it.
-  std::vector<uint32_t> tile_owners_;
-  // EDRAM tile -> whether the low byte of its words (stencil when read as
-  // depth) may be nonzero.
-  std::vector<uint8_t> tile_stencil_nonzero_;
+  // EDRAM tile -> packed key of the surface that last wrote it, and whether
+  // the low byte of its words (stencil when read as depth) may be nonzero.
+  Fh1EdramTiles tiles_;
   // Resolution scale (symmetric): surfaces hold scale x scale host pixels per
   // guest pixel; rectangles are kept in guest pixels and scaled at use.
   uint32_t scale_ = 1;
@@ -401,9 +394,6 @@ class Fh1NativeExecutor {
     return (config_.depth_float24_round ? 1u : 0u) | (config_.gamma_as_unorm16 ? 2u : 0u) |
            (config_.fixed16_truncated ? 0u : 4u) | ((scale_ - 1) << 12);
   }
-  // Changes whenever tile ownership or a tile's stencil state could change, so
-  // a draw with the previous draw's targets and extent needs no work.
-  uint64_t tile_generation_ = 1;
   struct PrepareSignature {
     uint64_t generation = 0;
     uint32_t used_bits = 0;
@@ -414,8 +404,6 @@ class Fh1NativeExecutor {
   };
   PrepareSignature last_prepare_;
   void MarkTileStencil(uint32_t base, uint32_t length, bool nonzero);
-  // Last claim per surface, so repeated draws to one pass do not rewalk tiles.
-  std::map<uint32_t, std::pair<uint32_t, uint32_t>> last_claims_;
   std::deque<PendingDump> dumps_;
   std::set<uint64_t> dump_frames_;
   std::filesystem::path dump_directory_;
