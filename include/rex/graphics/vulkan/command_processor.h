@@ -206,6 +206,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Dynamic rendering for the FH1 native executor: begins the scope unless
   // the one identified by `id` is already open. Submission must be open.
   void SubmitBarriersAndBeginFh1Rendering(const VkRenderingInfo& rendering_info, uint64_t id);
+  bool IsFh1RenderingOpen(uint64_t id) const {
+    return in_render_pass_ && id && current_fh1_rendering_id_ == id;
+  }
   system::GraphicsShaderTranslationObserver GetShaderTranslationObserver() const;
   // Submits the open submission, waits for every queue operation and reopens
   // the submission if one was open (FH1 resolve read-backs).

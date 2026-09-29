@@ -489,7 +489,14 @@ void Fh1NativeExecutor::TransitionForSampling(Surface& surface, VkPipelineStageF
   Transition(surface, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, stage, VK_ACCESS_SHADER_READ_BIT);
 }
 
-void Fh1NativeExecutor::TransitionForAttachment(Surface& surface) {
+void Fh1NativeExecutor::TransitionForAttachment(Surface& surface, uint64_t open_rendering_id) {
+  const VkImageLayout layout = surface.key.is_depth
+                                   ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                                   : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  if (surface.layout == layout && command_processor_.IsFh1RenderingOpen(open_rendering_id)) {
+    attachment_barriers_skipped_ = true;
+    return;
+  }
   if (surface.key.is_depth) {
     Transition(surface, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, kDepthAttachmentStage,
                kDepthAttachmentAccess);
@@ -1427,6 +1434,7 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1DrawInfo& draw) {
 bool Fh1NativeExecutor::BindTargets(VulkanRenderTargetCache::RenderPassKey& key_out) {
   key_out = VulkanRenderTargetCache::RenderPassKey();
   bound_bits_ = 0;
+  attachment_barriers_skipped_ = false;
   if (!initialized_) return false;
   if (!pending_targets_valid_) {
     Skip("draw_targets_not_prepared");
@@ -1434,6 +1442,7 @@ bool Fh1NativeExecutor::BindTargets(VulkanRenderTargetCache::RenderPassKey& key_
   }
   const uint32_t used_bits = pending_used_bits_;
   const SurfaceKey* keys = pending_keys_;
+  const uint64_t rendering_id = DrawRenderingId(used_bits);
   key_out.msaa_samples = register_file_.Get<reg::RB_SURFACE_INFO>().msaa_samples;
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
     if (!(used_bits & (1u << i))) continue;
@@ -1442,7 +1451,7 @@ bool Fh1NativeExecutor::BindTargets(VulkanRenderTargetCache::RenderPassKey& key_
       Skip("draw_surface_create");
       return false;
     }
-    TransitionForAttachment(*surface);
+    TransitionForAttachment(*surface, rendering_id);
     switch (i) {
       case 0:
         key_out.depth_format = xenos::DepthRenderTargetFormat(keys[0].format);
@@ -1467,13 +1476,22 @@ bool Fh1NativeExecutor::BindTargets(VulkanRenderTargetCache::RenderPassKey& key_
   return true;
 }
 
+uint64_t Fh1NativeExecutor::DrawRenderingId(uint32_t used_bits) const {
+  // The scope is identified by the bound surfaces.
+  uint64_t id = 0x9E3779B97F4A7C15ull;
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (!(used_bits & (1u << i))) continue;
+    id = (id ^ (uint64_t(pending_keys_[i].Pack()) + i)) * 0x100000001B3ull;
+  }
+  id &= ~(uint64_t(1) << 63);
+  return id | 1;
+}
+
 void Fh1NativeExecutor::BeginDrawRendering() {
   VkRenderingAttachmentInfo colors[xenos::kMaxColorRenderTargets] = {};
   VkRenderingAttachmentInfo depth = {};
   uint32_t color_count = 0;
   uint32_t width = UINT32_MAX, height = UINT32_MAX;
-  // The scope is identified by the bound surfaces.
-  uint64_t id = 0x9E3779B97F4A7C15ull;
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
     if (!(bound_bits_ & (1u << i))) continue;
     Surface* surface = FindSurface(pending_keys_[i].Pack());
@@ -1488,7 +1506,6 @@ void Fh1NativeExecutor::BeginDrawRendering() {
     if (i) color_count = i;
     width = std::min(width, surface->width * scale_);
     height = std::min(height, surface->height * scale_);
-    id = (id ^ (uint64_t(surface->key.Pack()) + i)) * 0x100000001B3ull;
   }
   if (width == UINT32_MAX) {
     // No attachments: the surface pitch bounds the draw.
@@ -1499,8 +1516,22 @@ void Fh1NativeExecutor::BeginDrawRendering() {
     width = pitch_tiles * (xenos::kEdramTileWidthSamples >> msaa_x_log2) * scale_;
     height = SurfaceHeight(pitch_tiles, msaa) * scale_;
   }
-  id &= ~(uint64_t(1) << 63);
-  id |= 1;
+  const uint64_t id = DrawRenderingId(bound_bits_);
+  if (attachment_barriers_skipped_) {
+    attachment_barriers_skipped_ = false;
+    // Pending barriers (such as texture loads) end the rendering.
+    command_processor_.SubmitBarriers(false);
+    if (!command_processor_.IsFh1RenderingOpen(id)) {
+      // Writes in another rendering instance are ordered by a barrier.
+      Count("draw_attachment_barrier_late");
+      for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+        if (!(bound_bits_ & (1u << i))) continue;
+        if (Surface* surface = FindSurface(pending_keys_[i].Pack())) {
+          TransitionForAttachment(*surface);
+        }
+      }
+    }
+  }
   VkRenderingInfo info = {};
   info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
   info.renderArea.extent = {width, height};

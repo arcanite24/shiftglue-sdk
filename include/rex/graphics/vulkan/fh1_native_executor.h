@@ -163,7 +163,15 @@ class Fh1NativeExecutor {
   void Transition(Surface& surface, VkImageLayout layout, VkPipelineStageFlags stage,
                   VkAccessFlags access);
   void TransitionForSampling(Surface& surface, VkPipelineStageFlags stage);
-  void TransitionForAttachment(Surface& surface);
+  // With open_rendering_id, a surface that is already an attachment of that
+  // rendering, if it is still open, needs no barrier: its writes stay in
+  // rasterization order within one rendering.
+  void TransitionForAttachment(Surface& surface, uint64_t open_rendering_id = 0);
+  // The dynamic rendering scope of a draw to the prepared targets.
+  uint64_t DrawRenderingId(uint32_t used_bits) const;
+  // BindTargets relied on the open rendering; if it ends before the draw
+  // begins its rendering, the barriers are made there.
+  bool attachment_barriers_skipped_ = false;
   VkImageAspectFlags AspectMask(const Surface& surface) const;
 
   void ClaimTiles(uint32_t base, uint32_t length, uint32_t packed_key, bool transfer = true);
