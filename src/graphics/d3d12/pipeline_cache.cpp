@@ -738,6 +738,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
     fclose(analysis_catalog_file);
   }
   size_t shaders_translated = 0;
+  size_t shaders_missing = 0;
   for (const auto& [shader_hash, modification] : shader_translations_needed) {
     auto shader_it = shaders_.find(shader_hash);
     if (!analysis_catalog_valid || shader_it == shaders_.end()) {
@@ -747,8 +748,12 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
     auto* translation = static_cast<D3D12Shader::D3D12Translation*>(
         shader_it->second->GetOrCreateTranslation(modification));
     if (!TranslateAnalyzedShader(nullptr, *translation)) {
-      analysis_catalog_valid = false;
-      break;
+      // Not in the pack, and recorded as a miss for the next preparation:
+      // the pipelines that use it are not prewarmed, and the rest still are
+      // (a pack prepared at another scale can lack a few of the variants the
+      // catalogs name).
+      ++shaders_missing;
+      continue;
     }
     ++shaders_translated;
   }
@@ -760,8 +765,9 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
     return;
   }
   REXGPU_INFO(
-      "Loaded {} analyzed FH1 shaders and {} precompiled variants in {} milliseconds",
-      shaders_.size(), shaders_translated,
+      "Loaded {} analyzed FH1 shaders and {} precompiled variants ({} not in the pack) in {} "
+      "milliseconds",
+      shaders_.size(), shaders_translated, shaders_missing,
       (rex::chrono::Clock::QueryHostTickCount() - shader_storage_initialization_start) * 1000 /
           rex::chrono::Clock::QueryHostTickFrequency());
 #else
