@@ -53,8 +53,8 @@ REXCVAR_DEFINE_INT32(wait_reg_mem_yield_us, 2000, "GPU",
 
 REXCVAR_DEFINE_STRING(fh1_debug_skip_draws, "", "GPU",
                       "Diagnostics: skip the draws with these indices in every frame, as "
-                      "<first>-<last> counted from each frame's first draw (bisecting a "
-                      "rendering fault in a frame replay)")
+                      "<first>-<last>[,<first>-<last>...] counted from each frame's first draw "
+                      "(bisecting a rendering fault in a frame replay)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(fh1_debug_null_fetch, "", "GPU",
                       "Diagnostics: <draw>:<fetch constant> - that draw of every frame sees "
@@ -1483,14 +1483,18 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
       // Diagnostics for frame replays: which draw is which, and dropping a
       // range of them.
-      static const auto skip_range = [] {
-        uint32_t first = 1, last = 0;
-        const std::string range = REXCVAR_GET(fh1_debug_skip_draws);
-        if (!range.empty() && std::sscanf(range.c_str(), "%u-%u", &first, &last) != 2) {
-          first = 1;
-          last = 0;
+      static const auto skip_ranges = [] {
+        std::vector<std::pair<uint32_t, uint32_t>> ranges;
+        const std::string list = REXCVAR_GET(fh1_debug_skip_draws);
+        for (size_t start = 0; start < list.size();) {
+          const size_t end = std::min(list.find(',', start), list.size());
+          uint32_t first, last;
+          if (std::sscanf(list.substr(start, end - start).c_str(), "%u-%u", &first, &last) == 2) {
+            ranges.emplace_back(first, last);
+          }
+          start = end + 1;
         }
-        return std::make_pair(first, last);
+        return ranges;
       }();
       const uint32_t draw_index = debug_frame_draw_index_++;
       if (REXCVAR_GET(fh1_debug_log_draws)) {
@@ -1532,7 +1536,9 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
         }
         return std::make_pair(draw, fetch);
       }();
-      if (draw_index >= skip_range.first && draw_index <= skip_range.second) {
+      if (std::any_of(skip_ranges.begin(), skip_ranges.end(), [draw_index](const auto& range) {
+            return draw_index >= range.first && draw_index <= range.second;
+          })) {
         draw_succeeded = true;
       } else {
         // Through WriteRegister, so the backend sees the fetch constant change.
@@ -1540,7 +1546,11 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
             XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + null_fetch.second * 6;
         const uint32_t saved_fetch_word = register_file_->values[null_fetch_register];
         if (draw_index == null_fetch.first) {
-          WriteRegister(null_fetch_register, saved_fetch_word & ~uint32_t(3));
+          // A vertex type in a texture slot is invalid even with
+          // gpu_allow_invalid_fetch_constants, which binds the invalid type.
+          WriteRegister(null_fetch_register,
+                        (saved_fetch_word & ~uint32_t(3)) |
+                            uint32_t(xenos::FetchConstantType::kVertex));
         }
         draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                    is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
