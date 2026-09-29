@@ -1890,6 +1890,10 @@ bool PipelineCache::ConfigurePipeline(
     if (FirstMissingCatalogShader(vertex_shader->shader().ucode_data_hash())) {
       REXGPU_ERROR("FH1 vertex shader {:016X} is absent from the offline analysis catalog",
                    vertex_shader->shader().ucode_data_hash());
+      // Recorded like a pack miss, so the next graphics preparation adds its
+      // microcode to the corpus and the catalog (a language's text, for
+      // one, can use shaders the English capture never saw).
+      RecordFh1ShaderPackMiss(vertex_shader->shader(), 0);
     }
     return false;
 #endif
@@ -1938,6 +1942,7 @@ bool PipelineCache::ConfigurePipeline(
           if (FirstMissingCatalogShader(pixel_shader->shader().ucode_data_hash())) {
             REXGPU_ERROR("FH1 pixel shader {:016X} is absent from the offline analysis catalog",
                          pixel_shader->shader().ucode_data_hash());
+            RecordFh1ShaderPackMiss(pixel_shader->shader(), 0);
           }
           return false;
         }
@@ -4259,6 +4264,7 @@ bool PipelineCache::PrepareRuntimeDescriptionForQueuedCreation(
         if (!translation->shader().is_ucode_analyzed()) {
           REXGPU_ERROR("Queued FH1 {} shader {:016X} is absent from the offline analysis catalog",
                        shader_type, translation->shader().ucode_data_hash());
+          RecordFh1ShaderPackMiss(translation->shader(), translation->modification());
           return false;
         }
 #endif
