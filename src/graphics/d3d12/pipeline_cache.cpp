@@ -2165,18 +2165,28 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator* translator,
   bool used_precompiled_shader = false;
   if (const Fh1ShaderPack::Entry* precompiled = fh1_shader_pack_.Find(
           shader.type(), shader.ucode_data_hash(), translation.modification())) {
-    std::vector<DxbcShader::TextureBinding> texture_bindings;
-    texture_bindings.reserve(precompiled->texture_bindings.size());
-    for (const auto& binding : precompiled->texture_bindings) {
-      texture_bindings.push_back({binding.bindless_descriptor_index, binding.fetch_constant,
-                                  binding.dimension, binding.is_signed});
+    // Zero-filled: bindings are compared and hashed as bytes, padding too.
+    std::vector<DxbcShader::TextureBinding> texture_bindings(precompiled->texture_bindings.size());
+    std::memset(texture_bindings.data(), 0,
+                texture_bindings.size() * sizeof(DxbcShader::TextureBinding));
+    for (size_t i = 0; i < texture_bindings.size(); ++i) {
+      const auto& binding = precompiled->texture_bindings[i];
+      texture_bindings[i].bindless_descriptor_index = binding.bindless_descriptor_index;
+      texture_bindings[i].fetch_constant = binding.fetch_constant;
+      texture_bindings[i].dimension = binding.dimension;
+      texture_bindings[i].is_signed = binding.is_signed;
     }
-    std::vector<DxbcShader::SamplerBinding> sampler_bindings;
-    sampler_bindings.reserve(precompiled->sampler_bindings.size());
-    for (const auto& binding : precompiled->sampler_bindings) {
-      sampler_bindings.push_back({binding.bindless_descriptor_index, binding.fetch_constant,
-                                  binding.mag_filter, binding.min_filter, binding.mip_filter,
-                                  binding.aniso_filter});
+    std::vector<DxbcShader::SamplerBinding> sampler_bindings(precompiled->sampler_bindings.size());
+    std::memset(sampler_bindings.data(), 0,
+                sampler_bindings.size() * sizeof(DxbcShader::SamplerBinding));
+    for (size_t i = 0; i < sampler_bindings.size(); ++i) {
+      const auto& binding = precompiled->sampler_bindings[i];
+      sampler_bindings[i].bindless_descriptor_index = binding.bindless_descriptor_index;
+      sampler_bindings[i].fetch_constant = binding.fetch_constant;
+      sampler_bindings[i].mag_filter = binding.mag_filter;
+      sampler_bindings[i].min_filter = binding.min_filter;
+      sampler_bindings[i].mip_filter = binding.mip_filter;
+      sampler_bindings[i].aniso_filter = binding.aniso_filter;
     }
     if (!shader.LoadPrecompiledBindings(texture_bindings, sampler_bindings,
                                         precompiled->used_texture_mask) ||
