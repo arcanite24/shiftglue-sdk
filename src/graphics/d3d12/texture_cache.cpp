@@ -1003,6 +1003,10 @@ D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(
   bool mip_filter_bilinear_or_trilinear =
       mip_filter == xenos::TextureFilter::kPoint || mip_filter == xenos::TextureFilter::kLinear;
   bool mip_base_map = mip_filter == xenos::TextureFilter::kBaseMap;
+  if (REXCVAR_GET(force_trilinear_filtering) && has_mips && min_mag_linear &&
+      mip_filter == xenos::TextureFilter::kPoint) {
+    mip_filter = xenos::TextureFilter::kLinear;
+  }
 
   // TODO(Triang3l): Disable filtering for texture formats not supporting it.
   xenos::AnisoFilter aniso_filter = binding.aniso_filter == xenos::AnisoFilter::kUseFetchConst
@@ -1064,8 +1068,9 @@ void D3D12TextureCache::WriteSampler(SamplerParameters parameters,
   desc.AddressU = kAddressModeMap[uint32_t(parameters.clamp_x)];
   desc.AddressV = kAddressModeMap[uint32_t(parameters.clamp_y)];
   desc.AddressW = kAddressModeMap[uint32_t(parameters.clamp_z)];
-  // LOD biasing is performed in shaders.
-  desc.MipLODBias = 0.0f;
+  // The title's LOD bias is applied in shaders; this is the player's global
+  // offset on top of it (samplers are cached, so it applies after a restart).
+  desc.MipLODBias = float(REXCVAR_GET(texture_mip_lod_bias));
   desc.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
   switch (parameters.border_color) {
     case xenos::BorderColor::k_ABGR_White:

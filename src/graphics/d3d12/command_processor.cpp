@@ -3633,6 +3633,7 @@ D3D12CommandProcessor::SamplerInputs D3D12CommandProcessor::GetSamplerInputs(
                    (uint32_t(binding.min_filter) << 12) | (uint32_t(binding.mip_filter) << 16) |
                    (uint32_t(binding.aniso_filter) << 20);
   inputs.anisotropic_override = REXCVAR_GET(anisotropic_override);
+  inputs.force_trilinear = REXCVAR_GET(force_trilinear_filtering);
   inputs.valid = true;
   return inputs;
 }

@@ -39,6 +39,8 @@ REXCVAR_DECLARE(bool, snorm16_render_target_full_range);
 REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);
 REXCVAR_DECLARE(bool, gpu_3d_to_2d_texture);
 REXCVAR_DECLARE(int32_t, anisotropic_override);
+REXCVAR_DECLARE(bool, force_trilinear_filtering);
+REXCVAR_DECLARE(double, texture_mip_lod_bias);
 REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_render_to_texture);
 REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_soft);
 REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_hard);

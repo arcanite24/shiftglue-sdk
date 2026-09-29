@@ -804,12 +804,14 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::vector<D3D12TextureCache::SamplerParameters> current_samplers_vertex_;
   std::vector<D3D12TextureCache::SamplerParameters> current_samplers_pixel_;
   // What current_samplers_*_[i] was derived from: the fetch constant words,
-  // the binding's filter overrides and anisotropic_override. Unchanged inputs
+  // the binding's filter overrides, anisotropic_override and
+  // force_trilinear_filtering. Unchanged inputs
   // skip GetSamplerParameters, which runs for every sampler of every draw.
   struct SamplerInputs {
     std::array<uint32_t, 6> fetch{};
     uint32_t binding = 0;
     int32_t anisotropic_override = 0;
+    bool force_trilinear = false;
     bool valid = false;
     bool operator==(const SamplerInputs&) const = default;
   };
