@@ -13,6 +13,7 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -218,6 +219,8 @@ class UserProfile {
 
   uint64_t xuid() const { return xuid_; }
   std::string name() const { return name_; }
+  // A valid gamertag from `requested` ("User" when nothing usable is left).
+  static std::string SanitizeGamertag(std::string_view requested);
   uint32_t signin_state() const { return 1; }
   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
 

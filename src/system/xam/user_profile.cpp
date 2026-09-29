@@ -13,20 +13,43 @@
 
 #include <fmt/format.h>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
 
+REXCVAR_DEFINE_STRING(user_name, "User", "Kernel",
+                      "Gamertag the title shows for the signed-in profile (up to 15 letters, "
+                      "digits and spaces); the save directory does not depend on it")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex {
 namespace system {
 namespace xam {
+
+std::string UserProfile::SanitizeGamertag(std::string_view requested) {
+  // Xbox 360 gamertags: 1 to 15 characters, letters, digits and spaces, not
+  // starting with a digit or space.
+  std::string name;
+  for (char c : requested) {
+    const bool letter = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+    const bool digit = c >= '0' && c <= '9';
+    if ((letter || ((digit || c == ' ') && !name.empty())) && name.size() < 15) {
+      name.push_back(c);
+    }
+  }
+  while (!name.empty() && name.back() == ' ') {
+    name.pop_back();
+  }
+  return name.empty() ? std::string("User") : name;
+}
 
 UserProfile::UserProfile() {
   // 58410A1F checks the user XUID against a mask of 0x00C0000000000000 (3<<54),
   // if non-zero, it prevents the user from playing the game.
   // "You do not have permissions to perform this operation."
   xuid_ = 0xB13EBABEBABEBABE;
-  name_ = "User";
+  name_ = SanitizeGamertag(REXCVAR_GET(user_name));
 
   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=gfwl+live&start=195
   // https://github.com/arkem/py360/blob/master/py360/constants.py

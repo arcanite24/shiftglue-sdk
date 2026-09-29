@@ -13,6 +13,10 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <vector>
 
 #include <rex/cvar.h>
 #include <rex/kernel/xam/private.h>
@@ -21,6 +25,7 @@
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/string.h>
+#include <rex/ui/image_decode.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
 #include <rex/system/xenumerator.h>
@@ -29,6 +34,10 @@
 #include <rex/system/xtypes.h>
 
 REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
+REXCVAR_DEFINE_STRING(user_gamerpic, "", "Kernel",
+                      "Image file (PNG or JPEG) returned as the profile's gamer picture tile; "
+                      "empty shows a plain tile")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex {
 namespace kernel {
@@ -696,6 +705,40 @@ u32 XamReadTileToTexture_entry(u32 unknown, u32 title_id, u64 tile_id, u32 user_
 
   size_t size = size_t(stride) * size_t(height);
   std::memset(buffer_ptr, 0xFF, size);
+  // The tile is A8R8G8B8 in guest byte order (A, R, G, B); scale the chosen
+  // picture to it with nearest sampling.
+  static const auto picture = [] {
+    struct Picture {
+      std::vector<uint8_t> rgba;
+      int width = 0, height = 0;
+    } result;
+    const std::string path = REXCVAR_GET(user_gamerpic);
+    if (path.empty()) return result;
+    std::ifstream file(std::filesystem::path(path), std::ios::binary);
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)),
+                               std::istreambuf_iterator<char>());
+    result.rgba = rex::ui::DecodeImageRGBA(bytes.data(), bytes.size(), result.width,
+                                           result.height);
+    if (result.rgba.empty()) {
+      REXKRNL_WARN("user_gamerpic {} could not be decoded", path);
+    }
+    return result;
+  }();
+  const uint32_t width = stride / 4;
+  if (!picture.rgba.empty() && width && height) {
+    auto* out = static_cast<uint8_t*>(static_cast<void*>(buffer_ptr));
+    for (uint32_t y = 0; y < height; ++y) {
+      for (uint32_t x = 0; x < width; ++x) {
+        const size_t source = (size_t(y * uint32_t(picture.height) / height) * picture.width +
+                               x * uint32_t(picture.width) / width) * 4;
+        uint8_t* pixel = out + size_t(y) * stride + size_t(x) * 4;
+        pixel[0] = picture.rgba[source + 3];
+        pixel[1] = picture.rgba[source + 0];
+        pixel[2] = picture.rgba[source + 1];
+        pixel[3] = picture.rgba[source + 2];
+      }
+    }
+  }
 
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr, X_ERROR_SUCCESS);
