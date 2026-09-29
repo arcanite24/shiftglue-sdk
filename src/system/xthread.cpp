@@ -581,9 +581,21 @@ X_STATUS XThread::Create() {
     return X_STATUS_NO_MEMORY;
   }
 
-  // Set the thread name based on host ID (for easier debugging).
+  // Name guest threads by their start address, which is stable across runs
+  // and maps to the generated function, and log how the title created them.
   if (thread_name_.empty()) {
-    set_name(fmt::format("XThread{:04X}", thread_->system_id()));
+    if (guest_thread_) {
+      set_name(fmt::format("Guest {:08X}", creation_params_.start_address));
+    } else {
+      set_name(fmt::format("XThread{:04X}", thread_->system_id()));
+    }
+  }
+  if (guest_thread_) {
+    REXSYS_INFO(
+        "Guest thread {}: start {:08X} context {:08X} xapi {:08X} stack {:X} flags {:08X} cpu {}",
+        thread_name_, creation_params_.start_address, creation_params_.start_context,
+        creation_params_.xapi_thread_startup, creation_params_.stack_size,
+        creation_params_.creation_flags, cpu_index);
   }
 
   if (creation_params_.creation_flags & 0x60) {
