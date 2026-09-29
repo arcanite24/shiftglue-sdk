@@ -368,6 +368,10 @@ class Window {
     }
   }
 
+  // Sends a synthetic key press or release through the input listeners, as
+  // the platform would for a real key, for scripted tests. UI thread only.
+  void InjectKey(VirtualKey virtual_key, bool down);
+
  protected:
   // The receiver, which must never be instantiated in the Window object itself
   // (rather, usually it should be created as a local variable, because only

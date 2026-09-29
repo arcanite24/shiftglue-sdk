@@ -635,6 +635,16 @@ void Window::OnFileDrop(FileDropEvent& e, WindowDestructionReceiver& destruction
   }
 }
 
+void Window::InjectKey(VirtualKey virtual_key, bool down) {
+  KeyEvent e(this, virtual_key, 1, false, false, false, false, false);
+  WindowDestructionReceiver destruction_receiver(this);
+  if (down) {
+    OnKeyDown(e, destruction_receiver);
+  } else {
+    OnKeyUp(e, destruction_receiver);
+  }
+}
+
 void Window::OnKeyDown(KeyEvent& e, WindowDestructionReceiver& destruction_receiver) {
   PropagateEventThroughInputListeners(
       [&e](auto listener) {
