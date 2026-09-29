@@ -44,7 +44,9 @@ REXCVAR_DEFINE_BOOL(fh1_native_readback_new_resolves, true, "GPU/D3D12",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_native_gpu_profile, false, "GPU/D3D12",
                     "Measure the FH1 native executor's GPU time per phase (transfers, resolves, "
-                    "clears) with timestamp queries and report it with the periodic stats")
+                    "clears) with timestamp queries, and its CPU time per phase (target "
+                    "preparation and binding, transfers, resolves), and report them with the "
+                    "periodic stats")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::d3d12 {
@@ -245,12 +247,19 @@ Fh1NativeExecutor::Fh1NativeExecutor(D3D12CommandProcessor& command_processor,
 
 Fh1NativeExecutor::~Fh1NativeExecutor() { Shutdown(); }
 
+// Two clock reads per timed call, and target preparation and binding run for
+// every draw: about 3 % of the race's GPU commands thread (NP-9.3), so the
+// timers only run with fh1_native_gpu_profile.
 Fh1NativeExecutor::CpuTimer::CpuTimer(Fh1NativeExecutor& executor, CpuPhase phase)
     : executor_(executor),
       phase_(phase),
-      start_(std::chrono::steady_clock::now().time_since_epoch().count()) {}
+      start_(executor.cpu_timing_ ? std::chrono::steady_clock::now().time_since_epoch().count()
+                                  : 0) {}
 
 Fh1NativeExecutor::CpuTimer::~CpuTimer() {
+  if (!executor_.cpu_timing_) {
+    return;
+  }
   executor_.cpu_ns_[phase_] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::duration(
           std::chrono::steady_clock::now().time_since_epoch().count() - start_)).count());
@@ -352,6 +361,7 @@ bool Fh1NativeExecutor::Initialize(const Fh1NativeExecutorConfig& config) {
     if (!frame.empty()) dump_frames_.insert(std::strtoull(frame.c_str(), nullptr, 10));
   }
   dump_directory_ = std::filesystem::path(REXCVAR_GET(fh1_native_dump_dir));
+  cpu_timing_ = REXCVAR_GET(fh1_native_gpu_profile);
   if (REXCVAR_GET(fh1_native_gpu_profile)) {
     D3D12_QUERY_HEAP_DESC query_desc = {};
     query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
@@ -2123,17 +2133,19 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
       native_textures_ ? native_textures_->total_host_memory_usage() >> 20 : 0,
       native_textures_ ? native_textures_->scaled_resolve_committed_bytes() >> 20 : 0);
   if (cpu_frames_) {
-    // Transfers run inside target preparation and resolve clears.
-    const double frames = double(cpu_frames_);
-    REXGPU_INFO(
-        "FH1 native executor cpu ms/frame over {} frames: prepare_targets {:.3f} (transfers "
-        "{:.3f}) bind_targets {:.3f} resolves {:.3f}; render-target binds {} requested, {} "
-        "elided as repeats",
-        cpu_frames_, cpu_ns_[kCpuPrepareTargets] / frames / 1e6,
-        cpu_ns_[kCpuTransfers] / frames / 1e6, cpu_ns_[kCpuBindTargets] / frames / 1e6,
-        cpu_ns_[kCpuResolves] / frames / 1e6,
-        command_processor_.GetDeferredCommandList().render_target_binds(),
-        command_processor_.GetDeferredCommandList().elided_render_target_binds());
+    if (cpu_timing_) {
+      // Transfers run inside target preparation and resolve clears.
+      const double frames = double(cpu_frames_);
+      REXGPU_INFO(
+          "FH1 native executor cpu ms/frame over {} frames: prepare_targets {:.3f} (transfers "
+          "{:.3f}) bind_targets {:.3f} resolves {:.3f}",
+          cpu_frames_, cpu_ns_[kCpuPrepareTargets] / frames / 1e6,
+          cpu_ns_[kCpuTransfers] / frames / 1e6, cpu_ns_[kCpuBindTargets] / frames / 1e6,
+          cpu_ns_[kCpuResolves] / frames / 1e6);
+    }
+    REXGPU_INFO("FH1 native executor render-target binds {} requested, {} elided as repeats",
+                command_processor_.GetDeferredCommandList().render_target_binds(),
+                command_processor_.GetDeferredCommandList().elided_render_target_binds());
     cpu_ns_ = {};
     cpu_frames_ = 0;
     // Cumulative shared-memory uploads by kind (NP-2.8): requests that

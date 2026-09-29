@@ -364,6 +364,8 @@ class Fh1NativeExecutor {
   enum CpuPhase { kCpuPrepareTargets, kCpuTransfers, kCpuBindTargets, kCpuResolves, kCpuPhases };
   std::array<uint64_t, kCpuPhases> cpu_ns_{};
   uint64_t cpu_frames_ = 0;
+  // fh1_native_gpu_profile: whether CpuTimer measures.
+  bool cpu_timing_ = false;
   // Optional GPU timestamps around executor work (fh1_native_gpu_profile).
   enum GpuPhase {
     kGpuTransfers,
