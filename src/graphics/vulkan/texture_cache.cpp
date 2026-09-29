@@ -1792,6 +1792,18 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     copy_region.imageExtent.height =
         std::max((height * texture_resolution_scale_y) >> level, UINT32_C(1));
     copy_region.imageExtent.depth = std::max(depth >> level, UINT32_C(1));
+    if (level < level_packed) {
+      // Above 1x, a level's scaled size, (width * scale) >> level, can exceed
+      // the loaded data, (width >> level) * scale, when the guest size is odd
+      // at that level: copy only what was loaded (as the Direct3D 12 footprint
+      // copy does), not rows past the level's data or the buffer's end.
+      copy_region.imageExtent.width =
+          std::min(copy_region.imageExtent.width,
+                   std::max(width >> level, UINT32_C(1)) * texture_resolution_scale_x);
+      copy_region.imageExtent.height =
+          std::min(copy_region.imageExtent.height,
+                   std::max(height >> level, UINT32_C(1)) * texture_resolution_scale_y);
+    }
   }
 
   return true;
