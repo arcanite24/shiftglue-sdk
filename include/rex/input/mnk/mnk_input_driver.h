@@ -33,6 +33,7 @@ class MnkInputDriver final : public InputDriver,
   ~MnkInputDriver() override;
 
   X_STATUS Setup() override;
+  bool is_keyboard_and_mouse() const override { return true; }
 
   void EnumerateDevices(std::vector<DeviceInfo>& out) override;
   X_RESULT GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) override;

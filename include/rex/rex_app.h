@@ -89,6 +89,12 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
  public:
   ~ReXApp() override;
 
+  /// Host-drawn UI that owns input (a settings screen) holds a capture: while
+  /// any capture is held the guest reads untouched pads and no emulated
+  /// keyboard-and-mouse input. Captures nest; callable from any thread.
+  void AcquireGuestInputCapture() { guest_input_captures_.fetch_add(1, std::memory_order_acq_rel); }
+  void ReleaseGuestInputCapture() { guest_input_captures_.fetch_sub(1, std::memory_order_acq_rel); }
+
  protected:
   ReXApp(ui::WindowedAppContext& ctx, std::string_view name, PPCImageInfo ppc_info,
          std::string_view usage = "");
@@ -298,6 +304,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::filesystem::path cache_root_;
   std::filesystem::path metadata_root_;
   std::unique_ptr<Runtime> runtime_;
+  std::atomic<int> guest_input_captures_{0};
   std::unique_ptr<ui::Window> window_;
   std::thread module_thread_;
   system::object_ref<system::XThread> suspended_module_thread_;

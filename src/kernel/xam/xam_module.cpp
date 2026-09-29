@@ -29,6 +29,17 @@ bool xeXamIsUIActive() {
   return xam_dialogs_shown_ > 0;
 }
 
+void xeXamSetHostUIActive(bool active) {
+  constexpr uint32_t kXNotificationSystemUI = 0x9;
+  if (active) {
+    ++xam_dialogs_shown_;
+    REX_KERNEL_STATE()->BroadcastNotification(kXNotificationSystemUI, true);
+  } else {
+    --xam_dialogs_shown_;
+    REX_KERNEL_STATE()->BroadcastNotification(kXNotificationSystemUI, false);
+  }
+}
+
 XamModule::XamModule(Runtime* emulator, KernelState* kernel_state)
     : KernelModule(kernel_state, "xe:\\xam.xex"), loader_data_() {
   RegisterExportTable(export_resolver_);

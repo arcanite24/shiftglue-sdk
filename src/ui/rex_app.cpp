@@ -248,15 +248,15 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     ppc_info_.register_modules(runtime_->kernel_state());
   }
 
-  if (imgui_drawer_) {
-    auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
-    if (input_sys) {
-      input_sys->SetActiveCallback([this]() {
-        if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_)
-          return true;
-        return !imgui_drawer_->GetIO().WantCaptureMouse;
-      });
-    }
+  if (auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system())) {
+    input_sys->SetActiveCallback([this]() {
+      if (guest_input_captures_.load(std::memory_order_acquire) > 0)
+        return false;
+      if (!imgui_drawer_ ||
+          (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_))
+        return true;
+      return !imgui_drawer_->GetIO().WantCaptureMouse;
+    });
   }
 
   std::string xex_image = "game:\\default.xex";

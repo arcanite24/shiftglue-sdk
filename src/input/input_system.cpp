@@ -191,6 +191,7 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
+  std::lock_guard<std::mutex> lock(devices_mutex_);
   RefreshDevices();
   std::vector<DeviceId> ids;
   assignment_->DevicesForUser(user_index, ids);
@@ -213,11 +214,24 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
 }
 
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+  return GetMergedState(user_index, false, out_state);
+}
+
+X_RESULT InputSystem::GetHostPadState(uint32_t user_index, X_INPUT_STATE* out_state) {
+  InputDriver::host_read_ = true;
+  X_RESULT result = GetMergedState(user_index, true, out_state);
+  InputDriver::host_read_ = false;
+  return result;
+}
+
+X_RESULT InputSystem::GetMergedState(uint32_t user_index, bool host_pads_only,
+                                     X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
+  std::lock_guard<std::mutex> lock(devices_mutex_);
   RefreshDevices();
   std::vector<DeviceId> ids;
   assignment_->DevicesForUser(user_index, ids);
@@ -226,7 +240,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   bool any = false;
   for (DeviceId id : ids) {
     auto* driver = DriverForDevice(id);
-    if (!driver) {
+    if (!driver || (host_pads_only && driver->is_keyboard_and_mouse())) {
       continue;
     }
     X_INPUT_STATE state = {};
@@ -257,6 +271,7 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
+  std::lock_guard<std::mutex> lock(devices_mutex_);
   RefreshDevices();
   std::vector<DeviceId> ids;
   assignment_->DevicesForUser(user_index, ids);
@@ -299,6 +314,7 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
+  std::lock_guard<std::mutex> lock(devices_mutex_);
   RefreshDevices();
   std::vector<DeviceId> ids;
   assignment_->DevicesForUser(user_index, ids);

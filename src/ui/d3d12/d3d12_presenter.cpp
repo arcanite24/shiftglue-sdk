@@ -602,6 +602,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     // (and multiple threads can't paint the main target at the same time).
   }
 
+  SetPaintedGuestOutputRect(nullptr);
   if (guest_output_resource) {
     GuestOutputPaintFlow guest_output_flow = GetGuestOutputPaintFlow(
         guest_output_properties, paint_context_.swap_chain_width, paint_context_.swap_chain_height,
@@ -623,6 +624,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
       }
     }
 
+    SetPaintedGuestOutputRect(&guest_output_flow);
     if (guest_output_flow.effect_count) {
       ID3D12DescriptorHeap* view_heap = paint_context_.view_heap.Get();
       D3D12_CPU_DESCRIPTOR_HANDLE view_heap_cpu_start =

@@ -1283,6 +1283,15 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
   return flow;
 }
 
+void Presenter::SetPaintedGuestOutputRect(const GuestOutputPaintFlow* flow) {
+  if (!flow || !flow->effect_count) {
+    painted_guest_output_rect_.reset();
+    return;
+  }
+  const auto& size = flow->effect_output_sizes[flow->effect_count - 1];
+  painted_guest_output_rect_ = GuestOutputRect{flow->output_x, flow->output_y, size.first, size.second};
+}
+
 void Presenter::ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context) {
   // May be called by the implementations only when requested.
   assert_true(is_in_ui_thread_paint_);

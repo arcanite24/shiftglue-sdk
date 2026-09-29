@@ -10,6 +10,7 @@
  */
 
 #include <array>
+#include <cstring>
 #include <filesystem>
 
 #include <rex/assert.h>
@@ -223,6 +224,11 @@ X_RESULT XinputInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state
   out_state->gamepad.thumb_ly = native_state.state.Gamepad.sThumbLY;
   out_state->gamepad.thumb_rx = native_state.state.Gamepad.sThumbRX;
   out_state->gamepad.thumb_ry = native_state.state.Gamepad.sThumbRY;
+  if (!is_active()) {
+    // Simulate an untouched controller while host UI owns the input, as the
+    // SDL driver does.
+    std::memset(&out_state->gamepad, 0, sizeof(out_state->gamepad));
+  }
 
   return result;
 }

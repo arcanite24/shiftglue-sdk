@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <optional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -372,6 +373,19 @@ class Presenter {
   void AddUIDrawerFromUIThread(UIDrawer* drawer, size_t z_order);
   void RemoveUIDrawerFromUIThread(UIDrawer* drawer);
 
+  // Where the latest paint placed the guest output, in render target pixels
+  // (letterboxing and the overscan cutoff applied), or nullopt if it painted
+  // no guest output. UI drawers use it to lay out over the guest image.
+  struct GuestOutputRect {
+    int32_t x;
+    int32_t y;
+    uint32_t width;
+    uint32_t height;
+  };
+  std::optional<GuestOutputRect> GetPaintedGuestOutputRectFromUIThread() const {
+    return painted_guest_output_rect_;
+  }
+
   // Requests (re)painting with the UI if there's UI to draw.
   void RequestUIPaintFromUIThread();
 
@@ -680,6 +694,9 @@ class Presenter {
                                                uint32_t host_rt_width, uint32_t host_rt_height,
                                                uint32_t max_rt_width, uint32_t max_rt_height,
                                                const GuestOutputPaintConfig& config) const;
+  // Records the rectangle of a flow about to be painted, or of no guest output
+  // for null, for GetPaintedGuestOutputRectFromUIThread.
+  void SetPaintedGuestOutputRect(const GuestOutputPaintFlow* flow);
   // is_8bpc_out_ref is where to write whether the source actually has no more
   // than 8 bits of precision per channel (though the image provided by the
   // refresher may still have a higher storage precision) - if not written, it
@@ -990,6 +1007,8 @@ class Presenter {
   // Note: All the iteration logic involving this Z ordering must be the same as
   // in input handling (in the input listeners in the Window), but in reverse.
   std::multimap<size_t, UIDrawerReference> ui_drawers_;
+
+  std::optional<GuestOutputRect> painted_guest_output_rect_;
 
   size_t ui_draw_current_ = 0;
   size_t ui_draw_current_z_order_;

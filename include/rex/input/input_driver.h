@@ -50,6 +50,10 @@ class InputDriver {
     is_active_callback_ = is_active_callback;
   }
 
+  // Keyboard-and-mouse emulation rather than a physical pad; host UI pad reads
+  // (InputSystem::GetHostPadState) skip these drivers.
+  virtual bool is_keyboard_and_mouse() const { return false; }
+
  protected:
   explicit InputDriver(rex::ui::Window* window, size_t window_z_order)
       : window_(window), window_z_order_(window_z_order) {}
@@ -57,9 +61,16 @@ class InputDriver {
   rex::ui::Window* window() const { return window_; }
   size_t window_z_order() const { return window_z_order_; }
 
-  bool is_active() const { return !is_active_callback_ || is_active_callback_(); }
+  // Guest reads honour the active callback; host UI reads on this thread
+  // (InputSystem::GetHostPadState) always see the live device.
+  bool is_active() const {
+    return host_read_ || !is_active_callback_ || is_active_callback_();
+  }
 
  private:
+  friend class InputSystem;
+  static inline thread_local bool host_read_ = false;
+
   rex::ui::Window* window_;
   size_t window_z_order_;
   std::function<bool()> is_active_callback_ = nullptr;

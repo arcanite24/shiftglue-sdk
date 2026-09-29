@@ -22,6 +22,10 @@ namespace kernel {
 namespace xam {
 
 bool xeXamIsUIActive();
+// Host-drawn system UI (a settings screen over the title): while active, the
+// title sees the same XN_SYS_UI notification and XamIsUIActive state as for a
+// XAM dialog. Calls nest; each true needs a matching false.
+void xeXamSetHostUIActive(bool active);
 
 class XamModule : public system::KernelModule {
  public:

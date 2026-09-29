@@ -11,6 +11,7 @@
  */
 
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include <rex/input/device_assignment.h>
@@ -44,6 +45,10 @@ class InputSystem : public system::IInputSystem {
 
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state);
+  /// The user's merged physical pads for host-drawn UI: live even while the
+  /// active callback blocks the guest's input, and without keyboard-and-mouse
+  /// emulation (host UI reads the keyboard through window events).
+  X_RESULT GetHostPadState(uint32_t user_index, X_INPUT_STATE* out_state);
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags, X_INPUT_KEYSTROKE* out_keystroke);
 
@@ -51,12 +56,17 @@ class InputSystem : public system::IInputSystem {
   /// Re-enumerates every driver and notifies the assignment when the set
   /// changed.
   void RefreshDevices();
+  X_RESULT GetMergedState(uint32_t user_index, bool host_pads_only, X_INPUT_STATE* out_state);
   InputDriver* DriverForDevice(DeviceId id);
   const DeviceInfo* DeviceInfoFor(DeviceId id) const;
 
   rex::ui::Window* window_ = nullptr;
 
   std::vector<std::unique_ptr<InputDriver>> drivers_;
+
+  // The guest's polling threads and host UI on the UI thread share the device
+  // list, the assignment and the active-device tracker.
+  std::mutex devices_mutex_;
 
   std::unique_ptr<DeviceAssignment> assignment_;
   ActiveDeviceTracker active_devices_;
