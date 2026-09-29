@@ -50,6 +50,11 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
                       "GPU emulation")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU",
+                      "Graphics API the GPU plugin uses: any (its first compiled backend), "
+                      "d3d12 or vulkan")
+    .allowed({"any", "d3d12", "vulkan"})
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex {
 
@@ -314,7 +319,7 @@ bool ReXApp::SetupPresentation() {
   OnPreSetup(config_);
 
   if (!config_.graphics && !config_.gpu_plugin.empty()) {
-    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin);
+    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin, REXCVAR_GET(gpu_backend));
     if (!config_.graphics) {
       // Fatal by design: no silent headless fallback.
       auto msg =
