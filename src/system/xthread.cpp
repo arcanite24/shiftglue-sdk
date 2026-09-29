@@ -45,6 +45,10 @@ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
 REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
                     "Ignores game-specified thread affinities");
 
+REXCVAR_DEFINE_BOOL(latency_critical_thread_placement, false, "Kernel",
+                    "Run the main guest thread and the GPU command and vblank threads at "
+                    "above-normal priority, on performance cores of hybrid CPUs");
+
 namespace rex::system {
 
 bool IsReentryTraceEnabled() {
@@ -1034,9 +1038,20 @@ void XThread::SetPriority(int32_t increment) {
   } else {
     target_priority = rex::thread::ThreadPriority::kNormal;
   }
-  if (!REXCVAR_GET(ignore_thread_priorities)) {
+  if (!REXCVAR_GET(ignore_thread_priorities) && !latency_critical_) {
     thread_->set_priority(target_priority);
   }
+}
+
+void XThread::MarkLatencyCritical() {
+  if (!REXCVAR_GET(latency_critical_thread_placement) || !thread_) {
+    return;
+  }
+  latency_critical_ = true;
+  thread_->set_priority(rex::thread::ThreadPriority::kAboveNormal);
+  const bool performance_cores = thread_->PreferPerformanceCores();
+  REXSYS_INFO("Latency-critical thread {}: above-normal priority{}", thread_name_,
+              performance_cores ? ", performance cores" : "");
 }
 
 void XThread::SetAffinity(uint32_t affinity) {
@@ -1077,7 +1092,8 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
 
   if (rex::thread::logical_processor_count() >= 6) {
     if (!REXCVAR_GET(ignore_thread_affinities)) {
-      thread_->set_affinity_mask(uint64_t(1) << cpu_index);
+      const uint64_t core_mask = rex::thread::GuestCpuAffinityMask(cpu_index);
+      thread_->set_affinity_mask(core_mask ? core_mask : uint64_t(1) << cpu_index);
     }
   } else {
     REXSYS_WARN("Too few processor cores - scheduling will be wonky");

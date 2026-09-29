@@ -173,6 +173,12 @@ void install_signal_handler(SignalType type) {
 // TODO(dougvj)
 void EnableAffinityConfiguration() {}
 
+// The core topology is not read on POSIX yet; callers fall back to one
+// logical processor per guest hardware thread.
+uint64_t GuestCpuAffinityMask(uint8_t) {
+  return 0;
+}
+
 // uint64_t ticks() { return mach_absolute_time(); }
 
 uint32_t current_thread_system_id() {

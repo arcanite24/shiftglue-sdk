@@ -375,6 +375,10 @@ class XThread : public XObject {
   // 4 - core 2, thread 0 - xaudio
   // 5 - core 2, thread 1 - user
   void SetAffinity(uint32_t affinity);
+  // With latency_critical_thread_placement, raises this thread above normal
+  // priority (guest priority changes are then ignored) and prefers
+  // performance cores on hybrid CPUs. Call after Create.
+  void MarkLatencyCritical();
   uint8_t active_cpu() const;
   void SetActiveCpu(uint8_t cpu_index);
 
@@ -427,6 +431,7 @@ class XThread : public XObject {
   uint32_t stack_limit_ = 0;       // Low address
   bool guest_thread_ = false;
   bool main_thread_ = false;  // Entry-point thread
+  bool latency_critical_ = false;
   // Atomic: written by the thread itself in Exit/Terminate, read cross-thread by
   // KernelState::TerminateTitle's cooperative drain.
   std::atomic<bool> running_{false};

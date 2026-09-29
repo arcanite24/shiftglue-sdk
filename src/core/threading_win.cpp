@@ -15,6 +15,7 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
 
 #include <algorithm>
 #include <thread>
+#include <vector>
 
 #include <spdlog/spdlog.h>
 
@@ -413,6 +414,82 @@ std::unique_ptr<Timer> Timer::CreateSynchronizationTimer() {
   }
 }
 
+namespace {
+
+struct HostCore {
+  uint64_t mask;
+  BYTE efficiency;  // higher is more performant
+};
+
+// Physical cores of processor group 0, most performant first.
+const std::vector<HostCore>& HostCores() {
+  static const std::vector<HostCore> cores = [] {
+    std::vector<HostCore> result;
+    DWORD length = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length);
+    std::vector<uint8_t> buffer(length);
+    auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data());
+    if (!length || !GetLogicalProcessorInformationEx(RelationProcessorCore, info, &length)) {
+      return result;
+    }
+    for (DWORD offset = 0; offset < length;) {
+      auto* entry =
+          reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
+      const PROCESSOR_RELATIONSHIP& core = entry->Processor;
+      if (core.GroupCount && core.GroupMask[0].Group == 0) {
+        result.push_back({uint64_t(core.GroupMask[0].Mask), core.EfficiencyClass});
+      }
+      offset += entry->Size;
+    }
+    std::stable_sort(result.begin(), result.end(),
+                     [](const HostCore& a, const HostCore& b) { return a.efficiency > b.efficiency; });
+    return result;
+  }();
+  return cores;
+}
+
+// CPU set ids of the most performant class, or none when all are alike.
+const std::vector<ULONG>& PerformanceCpuSetIds() {
+  static const std::vector<ULONG> ids = [] {
+    std::vector<ULONG> result;
+    ULONG length = 0;
+    GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+    std::vector<uint8_t> buffer(length);
+    if (!length || !GetSystemCpuSetInformation(
+                       reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data()), length,
+                       &length, GetCurrentProcess(), 0)) {
+      return result;
+    }
+    BYTE lowest = 0xFF, highest = 0;
+    std::vector<std::pair<ULONG, BYTE>> sets;
+    for (ULONG offset = 0; offset < length;) {
+      auto* entry = reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+      if (entry->Type == CpuSetInformation) {
+        sets.emplace_back(entry->CpuSet.Id, entry->CpuSet.EfficiencyClass);
+        lowest = std::min(lowest, entry->CpuSet.EfficiencyClass);
+        highest = std::max(highest, entry->CpuSet.EfficiencyClass);
+      }
+      offset += entry->Size;
+    }
+    if (lowest != highest) {
+      for (const auto& [id, efficiency] : sets) {
+        if (efficiency == highest) {
+          result.push_back(id);
+        }
+      }
+    }
+    return result;
+  }();
+  return ids;
+}
+
+}  // namespace
+
+uint64_t GuestCpuAffinityMask(uint8_t guest_cpu) {
+  const std::vector<HostCore>& cores = HostCores();
+  return cores.empty() ? 0 : cores[guest_cpu % cores.size()].mask;
+}
+
 class Win32Thread : public Win32Handle<Thread> {
  public:
   explicit Win32Thread(HANDLE handle) : Win32Handle(handle) {}
@@ -438,6 +515,11 @@ class Win32Thread : public Win32Handle<Thread> {
 
   void set_affinity_mask(uint64_t new_affinity_mask) override {
     SetThreadAffinityMask(handle_, new_affinity_mask);
+  }
+
+  bool PreferPerformanceCores() override {
+    const std::vector<ULONG>& ids = PerformanceCpuSetIds();
+    return !ids.empty() && SetThreadSelectedCpuSets(handle_, ids.data(), ULONG(ids.size()));
   }
 
   struct ApcData {

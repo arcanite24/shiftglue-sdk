@@ -147,6 +147,7 @@ bool CommandProcessor::Initialize() {
       }));
   worker_thread_->set_name("GPU Commands");
   worker_thread_->Create();
+  worker_thread_->MarkLatencyCritical();
 
   return true;
 }

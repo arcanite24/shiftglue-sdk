@@ -566,6 +566,7 @@ object_ref<XThread> KernelState::PrepareModuleLaunch(object_ref<UserModule> modu
     REXSYS_ERROR("Could not create launch thread: {:08X}", result);
     return nullptr;
   }
+  thread->MarkLatencyCritical();
 
   return thread;
 }

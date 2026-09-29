@@ -88,6 +88,13 @@ class Fence {
 // Returns the total number of logical processors in the host system.
 uint32_t logical_processor_count();
 
+// Affinity mask of one host physical core (all its logical processors) for
+// guest hardware thread `guest_cpu` (0-5). The Xenon's three cores map onto
+// distinct host cores, most performant first, so honoured guest affinities
+// never stack two guest threads on one SMT core while cores are free. Zero
+// when the topology is unknown.
+uint64_t GuestCpuAffinityMask(uint8_t guest_cpu);
+
 // Enables the current process to set thread affinity.
 // Must be called at startup before attempting to set thread affinity.
 void EnableAffinityConfiguration();
@@ -442,6 +449,11 @@ class Thread : public WaitHandle {
   // mask must be a subset of the process affinity mask for the containing
   // process of a thread.
   virtual void set_affinity_mask(uint64_t new_affinity_mask) = 0;
+
+  // On hybrid CPUs, asks the scheduler to run this thread on the most
+  // performant cores (a soft preference, not an affinity). Returns false
+  // where every core is alike or the platform cannot express it.
+  virtual bool PreferPerformanceCores() { return false; }
 
   // Adds a user-mode asynchronous procedure call request to the thread queue.
   // When a user-mode APC is queued, the thread is not directed to call the APC

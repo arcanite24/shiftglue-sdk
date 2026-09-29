@@ -244,6 +244,7 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
   // vsync_worker_thread_->set_can_debugger_suspend(true);
   vsync_worker_thread_->set_name("GPU VSync");
   vsync_worker_thread_->Create();
+  vsync_worker_thread_->MarkLatencyCritical();
 
   return X_STATUS_SUCCESS;
 }
