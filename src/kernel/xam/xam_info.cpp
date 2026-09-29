@@ -15,6 +15,7 @@
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/string.h>
+#include <rex/system/flags.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 #include <rex/system/xenumerator.h>
@@ -183,19 +184,14 @@ u32 XGetGameRegion_entry() {
 }
 
 u32 XGetLanguage_entry() {
-  auto desired_language = XLanguage::kEnglish;
-
-  // Switch the language based on game region.
-  // TODO(benvanik): pull from xex header.
-  uint32_t game_region = XEX_REGION_NTSCU;
-  if (game_region & XEX_REGION_NTSCU) {
-    desired_language = XLanguage::kEnglish;
-  } else if (game_region & XEX_REGION_NTSCJ) {
-    desired_language = XLanguage::kJapanese;
+  // The console's language setting; titles pick regional variants (UK
+  // English, Latin American Spanish, ...) from it together with the locale
+  // (XGetLocale, from user_country).
+  const uint32_t language = REXCVAR_GET(user_language);
+  if (language > uint32_t(XLanguage::kInvalid) && language < uint32_t(XLanguage::kMaxLanguages)) {
+    return language;
   }
-  // Add more overrides?
-
-  return uint32_t(desired_language);
+  return uint32_t(XLanguage::kEnglish);
 }
 
 u32 XamGetCurrentTitleId_entry() {

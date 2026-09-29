@@ -34,7 +34,13 @@ enum class XLanguage : uint32_t {
   kSChinese = 10,
   kPolish = 11,
   kRussian = 12,
-  kMaxLanguages = 13
+  // Added by later dashboards (xeXamGetLanguageString has the same order).
+  kSwedish = 13,
+  kTurkish = 14,
+  kNorwegian = 15,
+  kDutch = 16,
+  kSChineseAlt = 17,
+  kMaxLanguages = 18
 };
 
 enum class XContentType : uint32_t {
