@@ -10,6 +10,7 @@
  */
 #pragma once
 
+#include <chrono>
 #include <rex/input/input_driver.h>
 #include <rex/ui/window.h>
 #include <rex/ui/window_listener.h>
@@ -85,6 +86,9 @@ class MnkInputDriver final : public InputDriver,
   // Filled on the UI thread, drained on the guest thread, hence the lock.
   float mouse_dx_ = 0.0f;
   float mouse_dy_ = 0.0f;
+  // Mouse steering position in [-1, 1] and when it was last advanced.
+  double steering_ = 0.0;
+  std::chrono::steady_clock::time_point last_state_time_ = std::chrono::steady_clock::now();
 
   // UI thread only.
   int32_t prev_mouse_x_ = 0;

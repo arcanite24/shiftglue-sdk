@@ -30,6 +30,14 @@ REXCVAR_DEFINE_BOOL(mnk_mouse, false, "Input",
                     "from the keybind_rstick_* keys only");
 REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
     .range(0.01, 10.0);
+REXCVAR_DEFINE_BOOL(mnk_mouse_steering, false, "Input",
+                    "Steer with the mouse: horizontal movement moves the left stick like a "
+                    "wheel that eases back to centre (mnk_steering_return); the camera stays on "
+                    "the keybind_rstick_* keys");
+REXCVAR_DEFINE_DOUBLE(mnk_steering_return, 1.5, "Input",
+                      "How fast mouse steering returns to centre, in full locks per second "
+                      "(0 keeps it where the mouse leaves it)")
+    .range(0.0, 10.0);
 
 REXCVAR_DEFINE_STRING(keybind_a, "Semicolon,Space", "Input/Keybinds/Controller", "A button");
 REXCVAR_DEFINE_STRING(keybind_b, "Quote,Backspace", "Input/Keybinds/Controller", "B button");
@@ -326,8 +334,9 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
 
   // Mouse look is opt in. Without this gate, keyboard input alone would hide
   // and lock the cursor, breaking the ImGui overlays.
-  QueueMouseCaptureUpdate(IsEnabled() && REXCVAR_GET(mnk_mouse) && IsMouseLookActive() &&
-                          has_focus_ && is_active());
+  QueueMouseCaptureUpdate(IsEnabled() &&
+                          (REXCVAR_GET(mnk_mouse) || REXCVAR_GET(mnk_mouse_steering)) &&
+                          IsMouseLookActive() && has_focus_ && is_active());
 
   if (!is_active() || !has_focus_) {
     if (out_state) {
@@ -405,11 +414,27 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_down)))
     ry -= INT16_MAX;
 
-  if (REXCVAR_GET(mnk_mouse) && IsMouseLookActive()) {
-    double sensitivity = REXCVAR_GET(mnk_sensitivity);
-    constexpr double kBaseScale = 200.0;
-    rx += static_cast<int32_t>(double(mouse_dx_) * sensitivity * kBaseScale);
-    ry += static_cast<int32_t>(double(-mouse_dy_) * sensitivity * kBaseScale);
+  const auto now = std::chrono::steady_clock::now();
+  const double elapsed = std::min(
+      0.1, std::chrono::duration<double>(now - last_state_time_).count());
+  last_state_time_ = now;
+  if (REXCVAR_GET(mnk_mouse_steering) && IsMouseLookActive()) {
+    // A virtual wheel: the mouse turns it, and it eases back to centre.
+    constexpr double kCountsPerLock = 400.0;
+    steering_ += double(mouse_dx_) * REXCVAR_GET(mnk_sensitivity) / kCountsPerLock;
+    const double centring = REXCVAR_GET(mnk_steering_return) * elapsed;
+    steering_ = steering_ > 0.0 ? std::max(0.0, steering_ - centring)
+                                : std::min(0.0, steering_ + centring);
+    steering_ = std::clamp(steering_, -1.0, 1.0);
+    lx += static_cast<int32_t>(steering_ * INT16_MAX);
+  } else {
+    steering_ = 0.0;
+    if (REXCVAR_GET(mnk_mouse) && IsMouseLookActive()) {
+      double sensitivity = REXCVAR_GET(mnk_sensitivity);
+      constexpr double kBaseScale = 200.0;
+      rx += static_cast<int32_t>(double(mouse_dx_) * sensitivity * kBaseScale);
+      ry += static_cast<int32_t>(double(-mouse_dy_) * sensitivity * kBaseScale);
+    }
   }
   // Drained unconditionally: deltas keep accumulating in OnMouseMove while the
   // mouse is off, and toggling it on would otherwise dump the whole backlog
