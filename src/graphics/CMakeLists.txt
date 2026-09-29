@@ -19,6 +19,7 @@ set(REXGPU_XENOS_SOURCES
     command_processor.cpp
     fh1_depth_overwrite.cpp
     fh1_edram_resolve.cpp
+    fh1_shader_pack.cpp
     util/draw_extent_estimator.cpp
     util/draw.cpp
     primitive_processor.cpp
@@ -60,8 +61,8 @@ set(REXGPU_XENOS_VULKAN_SOURCES
 
 # D3D12 backend
 if(REXGLUE_USE_D3D12)
-    # DXBC checksum is also used by FH1's runtime render-target conversion and
-    # geometry-shader generators.
+    # DXBC checksum: the translator and the geometry shader generator, both
+    # offline only (runtimes take geometry shaders from the pack).
     set(REXGPU_XENOS_DXBC_THIRDPARTY_SOURCES
         ${REXGLUE_ROOT}/thirdparty/dxbc/DXBCChecksum.cpp
     )
@@ -93,7 +94,6 @@ if(REXGLUE_USE_D3D12)
         d3d12/fh1_frame_census.cpp
         d3d12/fh1_native_executor.cpp
         d3d12/fh1_frame_dump.cpp
-        d3d12/fh1_shader_pack.cpp
         d3d12/pipeline_cache.cpp
     )
 endif()
@@ -108,7 +108,6 @@ endif()
 
 if(REXGLUE_USE_D3D12)
     list(APPEND REXGPU_XENOS_SOURCES
-        ${REXGPU_XENOS_DXBC_THIRDPARTY_SOURCES}
         ${REXGPU_XENOS_DXBC_SOURCES}
         ${REXGPU_XENOS_D3D12_SOURCES})
 endif()
@@ -117,7 +116,8 @@ add_library(rexgpu-fh1 SHARED ${REXGPU_XENOS_SOURCES})
 add_library(rex::gpu-fh1 ALIAS rexgpu-fh1)
 if(REXGLUE_USE_D3D12)
     set(REXGPU_FH1_PRODUCER_SOURCES ${REXGPU_XENOS_SOURCES}
-        ${REXGPU_FH1_SHADER_ANALYSIS_SOURCES} ${REXGPU_FH1_SHADER_PRODUCER_SOURCES})
+        ${REXGPU_FH1_SHADER_ANALYSIS_SOURCES} ${REXGPU_FH1_SHADER_PRODUCER_SOURCES}
+        ${REXGPU_XENOS_DXBC_THIRDPARTY_SOURCES})
     list(REMOVE_DUPLICATES REXGPU_FH1_PRODUCER_SOURCES)
     add_library(rexgpu-fh1-producer SHARED EXCLUDE_FROM_ALL ${REXGPU_FH1_PRODUCER_SOURCES})
     target_compile_definitions(rexgpu-fh1-producer PRIVATE

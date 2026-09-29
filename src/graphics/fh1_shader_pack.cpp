@@ -1,4 +1,4 @@
-#include <rex/graphics/d3d12/fh1_shader_pack.h>
+#include <rex/graphics/fh1_shader_pack.h>
 
 #include <algorithm>
 #include <array>
@@ -7,22 +7,30 @@
 #include <span>
 #include <tuple>
 
+#include <fmt/format.h>
+
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <Windows.h>
 #include <bcrypt.h>
+#else
+// The plugin has hidden visibility, so its own copy does not clash with the
+// runtime's (xboxkrnl_crypt.cpp compiles the same file).
+#include "thirdparty/crypto/sha256.cpp"
+#include "thirdparty/crypto/sha256.h"
+#endif
 
-namespace rex::graphics::d3d12 {
+namespace rex::graphics {
 namespace {
 
-constexpr uint32_t kVersion = 2;
-constexpr uint32_t kBytecodeFormatDxil = 1;
 constexpr uint32_t kKnownFlags = 0xF;
+constexpr uint32_t kKnownD3D12Features = Fh1ShaderPack::kD3D12FeatureSwitch;
 constexpr size_t kMaximumEntries = 65'535;
 constexpr size_t kMaximumBindings = 255;
 constexpr size_t kMaximumBytecodeSize = 16 * 1024 * 1024;
-constexpr size_t kMaximumPackSize = 512 * 1024 * 1024;
+constexpr size_t kMaximumPackSize = 1024 * 1024 * 1024;
 
 struct Header {
   char magic[8];
@@ -35,16 +43,18 @@ struct Header {
   uint64_t data_size;
   uint8_t content_sha256[32];
   uint32_t translator_version;
-  uint32_t vendor_id;
+  uint32_t backend;
+  uint32_t device_features;
   uint32_t flags;
   uint32_t draw_resolution_scale_x;
   uint32_t draw_resolution_scale_y;
-  uint32_t reserved[3];
+  uint32_t reserved[2];
 };
 static_assert(sizeof(Header) == 112);
 
 struct StoredEntry {
   uint32_t stage;
+  // Equal to the header's backend: 1 DXBC, 2 SPIR-V.
   uint32_t bytecode_format;
   uint64_t guest_hash;
   uint64_t modification;
@@ -81,6 +91,8 @@ bool RangeValid(uint64_t offset, uint64_t size, size_t total_size) {
 }
 
 bool Sha256(std::span<const uint8_t> bytes, std::array<uint8_t, 32>& digest_out) {
+#if defined(_WIN32)
+  // CNG uses the CPU's SHA extensions; packs are hundreds of megabytes.
   if (bytes.size() > std::numeric_limits<ULONG>::max()) {
     return false;
   }
@@ -94,18 +106,47 @@ bool Sha256(std::span<const uint8_t> bytes, std::array<uint8_t, 32>& digest_out)
       digest_out.data(), static_cast<ULONG>(digest_out.size()));
   BCryptCloseAlgorithmProvider(algorithm, 0);
   return BCRYPT_SUCCESS(status);
+#else
+  sha256::SHA256 hash;
+  hash.add(bytes.data(), bytes.size());
+  hash.getHash(digest_out.data());
+  return true;
+#endif
+}
+
+bool BytecodeMagicValid(Fh1ShaderPack::Backend backend, std::span<const uint8_t> bytecode) {
+  if (bytecode.size() < 4) {
+    return false;
+  }
+  if (backend == Fh1ShaderPack::Backend::kD3D12) {
+    return !std::memcmp(bytecode.data(), "DXBC", 4);
+  }
+  // SPIR-V: whole 32-bit words, little-endian magic 0x07230203.
+  static constexpr uint8_t kSpirvMagic[4] = {0x03, 0x02, 0x23, 0x07};
+  return bytecode.size() % 4 == 0 && !std::memcmp(bytecode.data(), kSpirvMagic, 4);
 }
 
 bool SameLayout(const Fh1ShaderPack::Entry& left, const Fh1ShaderPack::Entry& right) {
+  auto same_texture = [](const Fh1ShaderPack::TextureBinding& a,
+                         const Fh1ShaderPack::TextureBinding& b) {
+    return a.bindless_descriptor_index == b.bindless_descriptor_index &&
+           a.fetch_constant == b.fetch_constant && a.dimension == b.dimension &&
+           a.is_signed == b.is_signed;
+  };
+  auto same_sampler = [](const Fh1ShaderPack::SamplerBinding& a,
+                         const Fh1ShaderPack::SamplerBinding& b) {
+    return a.bindless_descriptor_index == b.bindless_descriptor_index &&
+           a.fetch_constant == b.fetch_constant && a.mag_filter == b.mag_filter &&
+           a.min_filter == b.min_filter && a.mip_filter == b.mip_filter &&
+           a.aniso_filter == b.aniso_filter;
+  };
   return left.used_texture_mask == right.used_texture_mask &&
-         left.texture_bindings.size() == right.texture_bindings.size() &&
-         left.sampler_bindings.size() == right.sampler_bindings.size() &&
-         (left.texture_bindings.empty() ||
-          !std::memcmp(left.texture_bindings.data(), right.texture_bindings.data(),
-                       left.texture_bindings.size() * sizeof(left.texture_bindings.front()))) &&
-         (left.sampler_bindings.empty() ||
-          !std::memcmp(left.sampler_bindings.data(), right.sampler_bindings.data(),
-                       left.sampler_bindings.size() * sizeof(left.sampler_bindings.front())));
+         std::equal(left.texture_bindings.begin(), left.texture_bindings.end(),
+                    right.texture_bindings.begin(), right.texture_bindings.end(),
+                    same_texture) &&
+         std::equal(left.sampler_bindings.begin(), left.sampler_bindings.end(),
+                    right.sampler_bindings.begin(), right.sampler_bindings.end(),
+                    same_sampler);
 }
 
 auto EntryKey(const Fh1ShaderPack::Entry& entry) {
@@ -113,6 +154,13 @@ auto EntryKey(const Fh1ShaderPack::Entry& entry) {
 }
 
 }  // namespace
+
+std::string Fh1ShaderPack::FileName(uint32_t title_id, const Config& config) {
+  return fmt::format("{:08X}.fh1-native-v{}.{}.{:02X}.{:02X}.{}x{}.pnsp", title_id, kVersion,
+                     config.backend == Backend::kVulkan ? "vulkan" : "d3d12",
+                     config.device_features, config.flags, config.draw_resolution_scale_x,
+                     config.draw_resolution_scale_y);
+}
 
 bool Fh1ShaderPack::Load(const std::filesystem::path& path, const Config& expected_config,
                          std::string* error_out) {
@@ -141,18 +189,23 @@ bool Fh1ShaderPack::Load(const std::filesystem::path& path, const Config& expect
 
   Header header;
   std::memcpy(&header, data.data(), sizeof(header));
-  const Config actual_config{header.translator_version, header.vendor_id, header.flags,
-                             header.draw_resolution_scale_x,
-                             header.draw_resolution_scale_y};
+  const Config actual_config{header.translator_version, Backend(header.backend),
+                             header.device_features, header.flags,
+                             header.draw_resolution_scale_x, header.draw_resolution_scale_y};
   constexpr char kMagic[8] = {'P', 'N', 'Y', 'N', 'S', 'H', 'P', 'K'};
+  const bool backend_known = header.backend == uint32_t(Backend::kD3D12) ||
+                             header.backend == uint32_t(Backend::kVulkan);
+  const bool features_known = header.backend != uint32_t(Backend::kD3D12) ||
+                              !(header.device_features & ~kKnownD3D12Features);
   if (std::memcmp(header.magic, kMagic, sizeof(kMagic)) || header.version != kVersion ||
       header.header_size != sizeof(Header) || header.entry_size != sizeof(StoredEntry) ||
       !header.entry_count || header.entry_count > kMaximumEntries ||
-      header.index_offset != sizeof(Header) || header.flags & ~kKnownFlags ||
-      actual_config != expected_config || header.reserved[0] || header.reserved[1] ||
-      header.reserved[2]) {
+      header.index_offset != sizeof(Header) || header.flags & ~kKnownFlags || !backend_known ||
+      !features_known || actual_config != expected_config || header.reserved[0] ||
+      header.reserved[1]) {
     return fail("incompatible_header");
   }
+  const Backend backend = Backend(header.backend);
   const uint64_t index_size = uint64_t(header.entry_count) * sizeof(StoredEntry);
   if (!RangeValid(header.index_offset, index_size, data.size()) ||
       header.data_offset != header.index_offset + index_size ||
@@ -173,12 +226,15 @@ bool Fh1ShaderPack::Load(const std::filesystem::path& path, const Config& expect
     std::memcpy(&stored,
                 data.data() + header.index_offset + uint64_t(index) * sizeof(StoredEntry),
                 sizeof(stored));
-    if ((stored.stage != 1 && stored.stage != 2) ||
-        stored.bytecode_format != kBytecodeFormatDxil || stored.reserved ||
-        !stored.bytecode_size || stored.bytecode_size > kMaximumBytecodeSize ||
+    const bool geometry = stored.stage == uint32_t(Stage::kGeometry);
+    if (stored.stage < uint32_t(Stage::kVertex) || stored.stage > uint32_t(Stage::kGeometry) ||
+        stored.bytecode_format != header.backend || stored.reserved || !stored.bytecode_size ||
+        stored.bytecode_size > kMaximumBytecodeSize ||
         stored.texture_binding_count > kMaximumBindings ||
         stored.sampler_binding_count > kMaximumBindings || stored.data_offset % 16 ||
-        stored.data_offset < previous_payload_end) {
+        stored.data_offset < previous_payload_end ||
+        (geometry && (stored.guest_hash || stored.texture_binding_count ||
+                      stored.sampler_binding_count || stored.used_texture_mask))) {
       return fail("invalid_entry");
     }
     const uint64_t texture_bytes =
@@ -195,21 +251,21 @@ bool Fh1ShaderPack::Load(const std::filesystem::path& path, const Config& expect
       }
     }
     const uint8_t* entry_data = data.data() + header.data_offset + stored.data_offset;
-    if (stored.bytecode_size < 4 || std::memcmp(entry_data, "DXBC", 4)) {
+    const std::span<const uint8_t> bytecode(entry_data, static_cast<size_t>(stored.bytecode_size));
+    if (!BytecodeMagicValid(backend, bytecode)) {
       return fail("invalid_bytecode");
     }
     std::array<uint8_t, 32> bytecode_digest;
-    if (!Sha256(std::span(entry_data, static_cast<size_t>(stored.bytecode_size)),
-                bytecode_digest) ||
+    if (!Sha256(bytecode, bytecode_digest) ||
         std::memcmp(bytecode_digest.data(), stored.bytecode_sha256, bytecode_digest.size())) {
       return fail("bytecode_hash_mismatch");
     }
 
     Entry entry;
-    entry.stage = stored.stage == 1 ? xenos::ShaderType::kVertex : xenos::ShaderType::kPixel;
+    entry.stage = Stage(stored.stage);
     entry.guest_hash = stored.guest_hash;
     entry.modification = stored.modification;
-    entry.bytecode = {entry_data, static_cast<size_t>(stored.bytecode_size)};
+    entry.bytecode = bytecode;
     const uint8_t* bindings_data = entry_data + stored.bytecode_size;
     uint32_t actual_texture_mask = 0;
     entry.texture_bindings.reserve(stored.texture_binding_count);
@@ -249,7 +305,7 @@ bool Fh1ShaderPack::Load(const std::filesystem::path& path, const Config& expect
     if (!entries_.empty() && EntryKey(entry) <= EntryKey(entries_.back())) {
       return fail("unsorted_or_duplicate_identity");
     }
-    if (!entries_.empty() && entry.stage == entries_.back().stage &&
+    if (!geometry && !entries_.empty() && entry.stage == entries_.back().stage &&
         entry.guest_hash == entries_.back().guest_hash && !SameLayout(entry, entries_.back())) {
       return fail("inconsistent_shader_layout");
     }
@@ -263,7 +319,7 @@ bool Fh1ShaderPack::Load(const std::filesystem::path& path, const Config& expect
   return true;
 }
 
-const Fh1ShaderPack::Entry* Fh1ShaderPack::Find(xenos::ShaderType stage, uint64_t guest_hash,
+const Fh1ShaderPack::Entry* Fh1ShaderPack::Find(Stage stage, uint64_t guest_hash,
                                                 uint64_t modification) const {
   const auto key = std::tuple(static_cast<uint32_t>(stage), guest_hash, modification);
   const auto found = std::lower_bound(entries_.begin(), entries_.end(), key,
@@ -273,4 +329,4 @@ const Fh1ShaderPack::Entry* Fh1ShaderPack::Find(xenos::ShaderType stage, uint64_
   return found != entries_.end() && EntryKey(*found) == key ? &*found : nullptr;
 }
 
-}  // namespace rex::graphics::d3d12
+}  // namespace rex::graphics

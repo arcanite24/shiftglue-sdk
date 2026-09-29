@@ -9,7 +9,10 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#if defined(REXGPU_FH1_SHADER_PRODUCER)
+// Only the offline producer builds geometry shaders.
 #include "thirdparty/dxbc/DXBCChecksum.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -459,21 +462,16 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
   }
 
   if (title_id == 0x4D5309C9) {
-    const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
     // Bit 1 (2) was the removed edram ROV path and is always clear.
     uint32_t pack_flags = bindless_resources_used_ ? 1u : 0u;
     pack_flags |= !host_config_.gamma_render_target_as_unorm16() ? 4u : 0u;
     pack_flags |= host_config_.msaa_2x_supported() ? 8u : 0u;
     const Fh1ShaderPack::Config pack_config{
-        DxbcShaderTranslator::Modification::kVersion,
-        static_cast<uint32_t>(provider.GetAdapterVendorID()), pack_flags,
-        host_config_.draw_resolution_scale_x(),
+        DxbcShaderTranslator::Modification::kVersion, Fh1ShaderPack::Backend::kD3D12,
+        Fh1ShaderPackDeviceFeatures(), pack_flags, host_config_.draw_resolution_scale_x(),
         host_config_.draw_resolution_scale_y()};
-    const auto pack_path = shader_storage_shareable_root /
-                           fmt::format("{:08X}.fh1-native-v2.{:04X}.{:02X}.{}x{}.pnsp", title_id,
-                                       pack_config.vendor_id, pack_config.flags,
-                                       pack_config.draw_resolution_scale_x,
-                                       pack_config.draw_resolution_scale_y);
+    const auto pack_path =
+        shader_storage_shareable_root / Fh1ShaderPack::FileName(title_id, pack_config);
     std::string pack_error;
     if (fh1_shader_pack_.Load(pack_path, pack_config, &pack_error)) {
       REXGPU_INFO("Loaded {} FH1 precompiled shaders from {}", fh1_shader_pack_.size(),
@@ -1348,13 +1346,23 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
            !corpus_error && it != end; it.increment(corpus_error)) {
         const std::string name = it->path().filename().string();
         uint64_t hash = 0, modification = 0;
-        char stage_name[8] = {};
+        char stage_name[9] = {};
         if (!it->is_regular_file() ||
-            std::sscanf(name.c_str(), "%6[a-z]-%16" SCNx64 "-%16" SCNx64 ".bin", stage_name,
+            std::sscanf(name.c_str(), "%8[a-z]-%16" SCNx64 "-%16" SCNx64 ".bin", stage_name,
                         &hash, &modification) != 3) {
           continue;
         }
         const std::string stage_string = stage_name;
+        if (stage_string == "geometry") {
+          // A runtime pack miss for a geometry shader: the key is the record.
+          if (!hash && modification <= UINT32_MAX) {
+            GeometryShaderKey key;
+            key.key = uint32_t(modification);
+            ObserveFh1GeometryShader(key);
+            ++recorded_misses;
+          }
+          continue;
+        }
         if (stage_string != "vertex" && stage_string != "pixel") continue;
         const xenos::ShaderType stage = stage_string == "vertex" ? xenos::ShaderType::kVertex
                                                                  : xenos::ShaderType::kPixel;
@@ -1471,14 +1479,18 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
         pipeline_runtime_description.pixel_shader = nullptr;
       }
       GeometryShaderKey pipeline_geometry_shader_key;
-      pipeline_runtime_description.geometry_shader =
-          GetGeometryShaderKey(
+      pipeline_runtime_description.geometry_shader = nullptr;
+      if (GetGeometryShaderKey(
               pipeline_description.geometry_shader,
               DxbcShaderTranslator::Modification(pipeline_description.vertex_shader_modification),
               DxbcShaderTranslator::Modification(pipeline_description.pixel_shader_modification),
-              pipeline_geometry_shader_key)
-              ? &GetGeometryShader(pipeline_geometry_shader_key)
-              : nullptr;
+              pipeline_geometry_shader_key)) {
+        pipeline_runtime_description.geometry_shader =
+            GetGeometryShader(pipeline_geometry_shader_key);
+        if (!pipeline_runtime_description.geometry_shader) {
+          continue;
+        }
+      }
       pipeline_runtime_description.root_signature = command_processor_.GetRootSignature(
           vertex_shader, pixel_shader,
           Shader::IsHostVertexShaderTypeDomain(
@@ -2020,14 +2032,17 @@ bool PipelineCache::ConfigurePipeline(
   }
 
   GeometryShaderKey geometry_shader_key;
-  runtime_description.geometry_shader =
-      GetGeometryShaderKey(
+  runtime_description.geometry_shader = nullptr;
+  if (GetGeometryShaderKey(
           description.geometry_shader,
           DxbcShaderTranslator::Modification(vertex_shader->modification()),
           DxbcShaderTranslator::Modification(pixel_shader ? pixel_shader->modification() : 0),
-          geometry_shader_key)
-          ? &GetGeometryShader(geometry_shader_key)
-          : nullptr;
+          geometry_shader_key)) {
+    runtime_description.geometry_shader = GetGeometryShader(geometry_shader_key);
+    if (!runtime_description.geometry_shader) {
+      return false;
+    }
+  }
 
   Pipeline* new_pipeline = new Pipeline;
   std::memcpy(&new_pipeline->description, &runtime_description, sizeof(runtime_description));
@@ -2097,6 +2112,20 @@ static std::string Fh1ShaderMissFileName(xenos::ShaderType stage, uint64_t hash,
                      modification);
 }
 
+void PipelineCache::RecordFh1GeometryShaderPackMiss(uint32_t key) {
+  if (fh1_shader_miss_root_.empty()) return;
+  std::lock_guard<std::mutex> lock(fh1_shader_miss_mutex_);
+  // Geometry shaders have no guest shader; the key is all the producer needs.
+  if (!fh1_recorded_shader_misses_.emplace(0, uint64_t(key) | (uint64_t(1) << 63)).second) {
+    return;
+  }
+  const std::filesystem::path directory = fh1_shader_miss_root_ / "fh1-shader-misses";
+  std::error_code error;
+  std::filesystem::create_directories(directory, error);
+  std::ofstream(directory / fmt::format("geometry-{:016X}-{:016X}.bin", 0, key),
+                std::ios::binary | std::ios::trunc);
+}
+
 void PipelineCache::RecordFh1ShaderPackMiss(const Shader& shader, uint64_t modification) {
   if (fh1_shader_miss_root_.empty() || shader.ucode_data().empty()) return;
   std::lock_guard<std::mutex> lock(fh1_shader_miss_mutex_);
@@ -2136,8 +2165,20 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator* translator,
   bool used_precompiled_shader = false;
   if (const Fh1ShaderPack::Entry* precompiled = fh1_shader_pack_.Find(
           shader.type(), shader.ucode_data_hash(), translation.modification())) {
-    if (!shader.LoadPrecompiledBindings(precompiled->texture_bindings,
-                                        precompiled->sampler_bindings,
+    std::vector<DxbcShader::TextureBinding> texture_bindings;
+    texture_bindings.reserve(precompiled->texture_bindings.size());
+    for (const auto& binding : precompiled->texture_bindings) {
+      texture_bindings.push_back({binding.bindless_descriptor_index, binding.fetch_constant,
+                                  binding.dimension, binding.is_signed});
+    }
+    std::vector<DxbcShader::SamplerBinding> sampler_bindings;
+    sampler_bindings.reserve(precompiled->sampler_bindings.size());
+    for (const auto& binding : precompiled->sampler_bindings) {
+      sampler_bindings.push_back({binding.bindless_descriptor_index, binding.fetch_constant,
+                                  binding.mag_filter, binding.min_filter, binding.mip_filter,
+                                  binding.aniso_filter});
+    }
+    if (!shader.LoadPrecompiledBindings(texture_bindings, sampler_bindings,
                                         precompiled->used_texture_mask) ||
         !translation.LoadPrecompiledBinary(precompiled->bytecode)) {
       REXGPU_ERROR("FH1 precompiled shader {:016X} has incompatible runtime state",
@@ -2262,15 +2303,7 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator* translator,
     observation.specialization_mask = translation.modification();
     observation.bytecode = translation.translated_binary().data();
     observation.bytecode_size = translation.translated_binary().size();
-    observation.translator_version = DxbcShaderTranslator::Modification::kVersion;
-    observation.vendor_id = static_cast<uint32_t>(provider.GetAdapterVendorID());
-    observation.bindless_resources = bindless_resources_used_;
-    observation.edram_rov = false;
-    observation.gamma_render_target_as_unorm8 =
-        !host_config_.gamma_render_target_as_unorm16();
-    observation.msaa_2x = host_config_.msaa_2x_supported();
-    observation.draw_resolution_scale_x = host_config_.draw_resolution_scale_x();
-    observation.draw_resolution_scale_y = host_config_.draw_resolution_scale_y();
+    FillFh1ShaderObservationConfig(observation);
     observation.texture_bindings = observed_texture_bindings.data();
     observation.texture_binding_count = observed_texture_bindings.size();
     observation.sampler_bindings = observed_sampler_bindings.data();
@@ -2278,12 +2311,30 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator* translator,
     observation.used_texture_mask = shader.GetUsedTextureMaskAfterTranslation();
     const uint64_t capture_start = rex::chrono::Clock::QueryHostTickCount();
     shader_translation_observer(observation);
+    if (shader.type() == xenos::ShaderType::kVertex) {
+      ObserveFh1GeometryShaders(DxbcShaderTranslator::Modification(translation.modification()));
+    }
     fh1_production_capture_ticks_.fetch_add(
         rex::chrono::Clock::QueryHostTickCount() - capture_start, std::memory_order_relaxed);
   }
 #endif
   return true;
 }
+
+#if defined(REXGPU_FH1_SHADER_PRODUCER)
+void PipelineCache::FillFh1ShaderObservationConfig(
+    system::GraphicsShaderTranslationObservation& observation) const {
+  observation.translator_version = DxbcShaderTranslator::Modification::kVersion;
+  observation.backend = uint32_t(Fh1ShaderPack::Backend::kD3D12);
+  observation.device_features = Fh1ShaderPackDeviceFeatures();
+  observation.bindless_resources = bindless_resources_used_;
+  observation.edram_rov = false;
+  observation.gamma_render_target_as_unorm8 = !host_config_.gamma_render_target_as_unorm16();
+  observation.msaa_2x = host_config_.msaa_2x_supported();
+  observation.draw_resolution_scale_x = host_config_.draw_resolution_scale_x();
+  observation.draw_resolution_scale_y = host_config_.draw_resolution_scale_y();
+}
+#endif
 
 void PipelineCache::SetupShaderBindingLayouts(D3D12Shader& shader) {
   // Set up texture and sampler binding layouts.
@@ -2749,6 +2800,7 @@ bool PipelineCache::GetGeometryShaderKey(
   return true;
 }
 
+#if defined(REXGPU_FH1_SHADER_PRODUCER)
 void PipelineCache::CreateDxbcGeometryShader(GeometryShaderKey key,
                                              std::vector<uint32_t>& shader_out) {
   shader_out.clear();
@@ -3794,15 +3846,95 @@ void PipelineCache::CreateDxbcGeometryShader(GeometryShaderKey key,
                           reinterpret_cast<unsigned int*>(&container_header.hash));
   }
 }
+void PipelineCache::ObserveFh1GeometryShaders(
+    DxbcShaderTranslator::Modification vertex_shader_modification) {
+  auto shader_translation_observer = command_processor_.GetShaderTranslationObserver();
+  if (!shader_translation_observer ||
+      vertex_shader_modification.vertex.host_vertex_shader_type !=
+          Shader::HostVertexShaderType::kVertex) {
+    return;
+  }
+  // The keys pipelines drawn with this translation can take: rectangle and
+  // quad lists (no point size or coordinates, which only points have) and
+  // point lists with and without generated point coordinates.
+  std::vector<GeometryShaderKey> keys;
+  for (PipelineGeometryShader type :
+       {PipelineGeometryShader::kPointList, PipelineGeometryShader::kRectangleList,
+        PipelineGeometryShader::kQuadList}) {
+    const bool points = type == PipelineGeometryShader::kPointList;
+    if (!points && vertex_shader_modification.vertex.output_point_size) {
+      continue;
+    }
+    for (uint32_t point_coordinates = 0; point_coordinates <= uint32_t(points);
+         ++point_coordinates) {
+      DxbcShaderTranslator::Modification pixel_shader_modification(0);
+      pixel_shader_modification.pixel.interpolator_mask =
+          vertex_shader_modification.vertex.interpolator_mask;
+      pixel_shader_modification.pixel.param_gen_point = point_coordinates;
+      GeometryShaderKey key;
+      if (GetGeometryShaderKey(type, vertex_shader_modification, pixel_shader_modification,
+                               key)) {
+        keys.push_back(key);
+      }
+    }
+  }
+  for (GeometryShaderKey key : keys) {
+    ObserveFh1GeometryShader(key);
+  }
+}
 
-const std::vector<uint32_t>& PipelineCache::GetGeometryShader(GeometryShaderKey key) {
-  auto it = geometry_shaders_.find(key);
-  if (it != geometry_shaders_.end()) {
-    return it->second;
+void PipelineCache::ObserveFh1GeometryShader(GeometryShaderKey key) {
+  auto shader_translation_observer = command_processor_.GetShaderTranslationObserver();
+  if (!shader_translation_observer) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(fh1_observed_geometry_shaders_mutex_);
+    if (!fh1_observed_geometry_shaders_.insert(key.key).second) {
+      return;
+    }
   }
   std::vector<uint32_t> shader;
   CreateDxbcGeometryShader(key, shader);
-  return geometry_shaders_.emplace(key, std::move(shader)).first->second;
+  system::GraphicsShaderTranslationObservation observation;
+  observation.stage = system::GraphicsShaderStage::kGeometry;
+  observation.guest_hash = 0;
+  observation.specialization_mask = key.key;
+  observation.bytecode = reinterpret_cast<const uint8_t*>(shader.data());
+  observation.bytecode_size = shader.size() * sizeof(uint32_t);
+  FillFh1ShaderObservationConfig(observation);
+  shader_translation_observer(observation);
+}
+#endif  // REXGPU_FH1_SHADER_PRODUCER
+
+const std::vector<uint32_t>* PipelineCache::GetGeometryShader(GeometryShaderKey key) {
+  auto it = geometry_shaders_.find(key);
+  if (it == geometry_shaders_.end()) {
+    std::vector<uint32_t> shader;
+    if (const Fh1ShaderPack::Entry* precompiled =
+            fh1_shader_pack_.Find(Fh1ShaderPack::Stage::kGeometry, 0, key.key)) {
+      shader.resize(precompiled->bytecode.size() / sizeof(uint32_t));
+      std::memcpy(shader.data(), precompiled->bytecode.data(),
+                  shader.size() * sizeof(uint32_t));
+    } else {
+#if defined(REXGPU_FH1_SHADER_PRODUCER)
+      CreateDxbcGeometryShader(key, shader);
+#else
+      REXGPU_ERROR("FH1 precompiled shader pack miss for geometry shader {:08X}", key.key);
+      RecordFh1GeometryShaderPackMiss(key.key);
+#endif
+    }
+    it = geometry_shaders_.emplace(key, std::move(shader)).first;
+  }
+  return it->second.empty() ? nullptr : &it->second;
+}
+
+uint32_t PipelineCache::Fh1ShaderPackDeviceFeatures() const {
+  // DxbcShaderTranslator::UseSwitchForControlFlow with dxbc_switch on.
+  return command_processor_.GetD3D12Provider().GetAdapterVendorID() !=
+                 ui::GraphicsProvider::GpuVendorID::kIntel
+             ? Fh1ShaderPack::kD3D12FeatureSwitch
+             : 0;
 }
 
 ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(

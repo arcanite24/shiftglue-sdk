@@ -18,6 +18,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <queue>
 #include <string>
 #include <thread>
@@ -27,7 +28,7 @@
 #include <vector>
 
 #include <rex/assert.h>
-#include <rex/graphics/d3d12/fh1_shader_pack.h>
+#include <rex/graphics/fh1_shader_pack.h>
 #include <rex/graphics/d3d12/host_render_config.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
@@ -282,6 +283,7 @@ class PipelineCache {
   // Shipping builds: keeps the microcode of each pack miss under the cache
   // root (fh1-shader-misses) so the next pack production translates it.
   void RecordFh1ShaderPackMiss(const Shader& shader, uint64_t modification);
+  void RecordFh1GeometryShaderPackMiss(uint32_t key);
   std::mutex fh1_shader_miss_mutex_;
   std::filesystem::path fh1_shader_miss_root_;
   std::set<std::pair<uint64_t, uint64_t>> fh1_recorded_shader_misses_;
@@ -303,8 +305,22 @@ class PipelineCache {
                                    DxbcShaderTranslator::Modification vertex_shader_modification,
                                    DxbcShaderTranslator::Modification pixel_shader_modification,
                                    GeometryShaderKey& key_out);
+#if defined(REXGPU_FH1_SHADER_PRODUCER)
+  // Offline only: runtimes take geometry shaders from the pack.
   static void CreateDxbcGeometryShader(GeometryShaderKey key, std::vector<uint32_t>& shader_out);
-  const std::vector<uint32_t>& GetGeometryShader(GeometryShaderKey key);
+  // Writes the geometry shaders pipelines drawn with a vertex shader
+  // translation may need to the translation observer (once per key).
+  void ObserveFh1GeometryShaders(DxbcShaderTranslator::Modification vertex_shader_modification);
+  void ObserveFh1GeometryShader(GeometryShaderKey key);
+  void FillFh1ShaderObservationConfig(
+      system::GraphicsShaderTranslationObservation& observation) const;
+  std::mutex fh1_observed_geometry_shaders_mutex_;
+  std::set<uint32_t> fh1_observed_geometry_shaders_;
+#endif
+  // Null (and a recorded pack miss) when the pack lacks the key.
+  const std::vector<uint32_t>* GetGeometryShader(GeometryShaderKey key);
+  // Device features in the pack identity (Fh1ShaderPack::Config).
+  uint32_t Fh1ShaderPackDeviceFeatures() const;
 
   ID3D12PipelineState* CreateD3D12Pipeline(
       const PipelineRuntimeDescription& runtime_description, Pipeline* pipeline);

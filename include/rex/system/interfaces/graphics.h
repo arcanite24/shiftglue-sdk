@@ -99,6 +99,8 @@ class NativeGuestOutputRendererRegistration {
 enum class GraphicsShaderStage : uint32_t {
   kVertex = 1,
   kPixel = 2,
+  // Host geometry shaders (guest hash 0, the key as the specialization).
+  kGeometry = 3,
 };
 
 struct GraphicsShaderTextureBinding {
@@ -126,7 +128,9 @@ struct GraphicsShaderTranslationObservation {
   const uint8_t* bytecode = nullptr;
   size_t bytecode_size = 0;
   uint32_t translator_version = 0;
-  uint32_t vendor_id = 0;
+  // rex::graphics::Fh1ShaderPack::Backend and its device feature bits.
+  uint32_t backend = 0;
+  uint32_t device_features = 0;
   bool bindless_resources = false;
   bool edram_rov = false;
   bool gamma_render_target_as_unorm8 = false;
