@@ -26,6 +26,7 @@
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/graphics/fh1_frame_dump.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
@@ -671,6 +672,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   // The FH1 native renderer (NP-12.4); guest draws, copies and clears go
   // through it instead of the render target cache when it initialized.
   std::unique_ptr<Fh1NativeExecutor> fh1_native_executor_;
+  // fh1_frame_dump_frame: records one frame for offline replay (at 1x).
+  std::unique_ptr<Fh1FrameDump> frame_dump_;
   // Identifies the open dynamic rendering scope of the executor (0: none).
   uint64_t current_fh1_rendering_id_ = 0;
 

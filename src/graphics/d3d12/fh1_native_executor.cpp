@@ -344,9 +344,10 @@ bool Fh1NativeExecutor::Initialize(const Fh1NativeExecutorConfig& config) {
   }
   // Frame dumps record and compare the 1x guest-memory mirror.
   if (const uint64_t dump_frame = scale_ == 1 ? Fh1FrameDump::RequestedFrame() : 0) {
-    frame_dump_ = std::make_unique<Fh1FrameDump>(command_processor_, register_file_, memory_,
-                                                 *native_memory_, dump_frame,
-                                                 Fh1FrameDump::RequestedPath());
+    frame_dump_ = std::make_unique<Fh1FrameDump>(
+        command_processor_, register_file_, memory_,
+        std::make_unique<D3D12Fh1FrameDumpMirror>(command_processor_, *native_memory_), dump_frame,
+        Fh1FrameDump::RequestedPath());
   }
 
   std::stringstream frames(REXCVAR_GET(fh1_native_dump_frames));
@@ -1114,52 +1115,6 @@ ID3D12PipelineState* Fh1NativeExecutor::GetResolveMemoryPipeline(uint32_t source
     return nullptr;
   }
   return pipeline.Get();
-}
-
-void Fh1NativeExecutor::RecordDrawInputs(uint32_t used_texture_mask, const Shader& vertex_shader,
-                                         uint32_t guest_dma_index_offset,
-                                         uint32_t guest_dma_index_size) {
-  if (!frame_dump_ || !frame_dump_->recording()) return;
-  for (const Shader::VertexBinding& binding : vertex_shader.vertex_bindings()) {
-    const xenos::xe_gpu_vertex_fetch_t fetch =
-        register_file_.GetVertexFetch(binding.fetch_constant);
-    if (fetch.type != xenos::FetchConstantType::kVertex || !fetch.size) continue;
-    frame_dump_->RecordGpuRange(fetch.address << 2, fetch.size << 2);
-  }
-  if (guest_dma_index_size) {
-    frame_dump_->RecordGpuRange(guest_dma_index_offset, guest_dma_index_size);
-  }
-  // Every level the fetch can reach, as the texture cache just loaded it.
-  for (uint32_t mask = used_texture_mask; mask; mask &= mask - 1) {
-    const auto fetch = register_file_.GetTextureFetch(uint32_t(std::countr_zero(mask)));
-    uint32_t width = 1, height = 1, depth = 1;
-    switch (fetch.dimension) {
-      case xenos::DataDimension::k1D:
-        width = fetch.size_1d.width + 1;
-        break;
-      case xenos::DataDimension::k3D:
-        width = fetch.size_3d.width + 1;
-        height = fetch.size_3d.height + 1;
-        depth = fetch.size_3d.depth + 1;
-        break;
-      default:
-        width = fetch.size_2d.width + 1;
-        height = fetch.size_2d.height + 1;
-        depth = fetch.size_2d.stack_depth + 1;
-        break;
-    }
-    const auto layout = texture_util::GetGuestTextureLayout(
-        fetch.dimension, fetch.pitch, width, height, depth, fetch.tiled, fetch.format,
-        fetch.packed_mips, true, fetch.mip_max_level);
-    const uint32_t base_size = layout.base.level_data_extent_bytes;
-    const uint32_t mip_size = layout.mips_total_extent_bytes;
-    if (fetch.base_address && base_size) {
-      frame_dump_->RecordGpuRange(fetch.base_address << 12, base_size);
-    }
-    if (fetch.mip_address && mip_size) {
-      frame_dump_->RecordGpuRange(fetch.mip_address << 12, mip_size);
-    }
-  }
 }
 
 bool Fh1NativeExecutor::DrawMayWriteNonzeroStencil(reg::RB_DEPTHCONTROL depth_control) const {

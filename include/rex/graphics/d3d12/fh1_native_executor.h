@@ -83,7 +83,12 @@ class Fh1NativeExecutor {
   }
   // Frame dumps: the guest ranges a draw reads, once the mirror holds them.
   void RecordDrawInputs(uint32_t used_texture_mask, const Shader& vertex_shader,
-                        uint32_t guest_dma_index_offset, uint32_t guest_dma_index_size);
+                        uint32_t guest_dma_index_offset, uint32_t guest_dma_index_size) {
+    if (frame_dump_) {
+      frame_dump_->RecordDrawInputs(used_texture_mask, vertex_shader, guest_dma_index_offset,
+                                    guest_dma_index_size);
+    }
+  }
 
   // In place of the Xenos render target cache's update: binds the surfaces
   // PrepareTargets derived and returns the bound slots and their formats as

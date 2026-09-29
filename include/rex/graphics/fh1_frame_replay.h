@@ -12,7 +12,7 @@ namespace rex::graphics {
 class CommandProcessor;
 class SharedMemory;
 
-// Offline replay of an FH1 frame dump (d3d12::Fh1FrameDump records them) on
+// Offline replay of an FH1 frame dump (Fh1FrameDump records them) on
 // any backend: with no title running, the dump's guest ranges are written to
 // guest memory, the registers and active shaders restored and the packets
 // executed; the front buffer `read_front_buffer` returns (the GPU's copy of

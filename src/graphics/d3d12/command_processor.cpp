@@ -5035,7 +5035,7 @@ bool D3D12CommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_addre
 
 void D3D12CommandProcessor::RunRequestedFrameReplay() {
   const int exit_code =
-      Fh1FrameDump::RunRequestedReplay(*this, *register_file_, *memory_, *shared_memory_);
+      RunRequestedFh1FrameReplay(*this, *register_file_, *memory_, *shared_memory_);
   if (exit_code < 0) return;
   fh1_native_executor_->LogStats(0);
   // A replay is a tool run with the title suspended: end the process here.

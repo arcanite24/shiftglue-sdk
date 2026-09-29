@@ -19,6 +19,7 @@ set(REXGPU_XENOS_SOURCES
     command_processor.cpp
     fh1_depth_overwrite.cpp
     fh1_edram_resolve.cpp
+    fh1_frame_dump.cpp
     fh1_frame_replay.cpp
     fh1_shader_pack.cpp
     util/draw_extent_estimator.cpp
@@ -51,6 +52,7 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     pipeline/render_target/cache.cpp
     vulkan/graphics_system.cpp
     vulkan/deferred_command_buffer.cpp
+    vulkan/fh1_frame_dump.cpp
     vulkan/fh1_native_executor.cpp
     vulkan/command_processor.cpp
     vulkan/pipeline_cache.cpp

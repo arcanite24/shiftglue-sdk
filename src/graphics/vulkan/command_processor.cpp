@@ -38,6 +38,7 @@
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/vulkan/fh1_frame_dump.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
@@ -1071,6 +1072,16 @@ bool VulkanCommandProcessor::SetupContext() {
     }
   }
 
+  // Frame dumps record and compare the 1x guest-memory mirror.
+  if (const uint64_t dump_frame = draw_resolution_scale_x == 1 && draw_resolution_scale_y == 1
+                                      ? Fh1FrameDump::RequestedFrame()
+                                      : 0) {
+    frame_dump_ = std::make_unique<Fh1FrameDump>(
+        *this, *register_file_, *memory_,
+        std::make_unique<VulkanFh1FrameDumpMirror>(*this, *shared_memory_), dump_frame,
+        Fh1FrameDump::RequestedPath());
+  }
+
   // Shared memory and EDRAM common bindings.
   VkDescriptorPoolSize descriptor_pool_sizes[1];
   descriptor_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -2068,6 +2079,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
                                          shared_memory_and_edram_descriptor_pool_);
 
+  frame_dump_.reset();
   fh1_native_executor_.reset();
 
   texture_cache_.reset();
@@ -2326,6 +2338,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   SCOPE_profile_cpu_f("gpu");
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
+  if (frame_dump_) {
+    frame_dump_->OnSwap(observation_frame_sequence_, frontbuffer_ptr);
+  }
   if (fh1_native_executor_) {
     fh1_native_executor_->OnSwap(frame_current_);
   }
@@ -4016,6 +4031,20 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
   texture_cache_->RequestTextures(used_texture_mask);
+  if (frame_dump_ && frame_dump_->recording()) {
+    // Frame dumps: the guest ranges the draw reads.
+    const bool guest_dma_indices = primitive_processing_result.index_buffer_type ==
+                                   PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA;
+    frame_dump_->RecordDrawInputs(
+        used_texture_mask, *vertex_shader,
+        guest_dma_indices ? primitive_processing_result.guest_index_base : 0,
+        guest_dma_indices
+            ? primitive_processing_result.host_draw_vertex_count *
+                  (primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
+                       ? uint32_t(sizeof(uint16_t))
+                       : uint32_t(sizeof(uint32_t)))
+            : 0);
+  }
 
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
   // Set up the render targets - this may perform dispatches and draws.
@@ -4603,6 +4632,9 @@ bool VulkanCommandProcessor::IssueCopy() {
     return false;
   }
 
+  if (frame_dump_) {
+    frame_dump_->RecordCopyInputs();
+  }
   if (fh1_native_executor_) {
     uint32_t written_address, written_length;
     return fh1_native_executor_->NativeResolve(written_address, written_length);
