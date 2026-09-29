@@ -292,6 +292,18 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   const auto& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
+  if (REXCVAR_GET(fh1_native_gpu_profile)) {
+    VkQueryPoolCreateInfo query_pool_info = {};
+    query_pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    query_pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    query_pool_info.queryCount = kGpuProfileSlots * kGpuProfileQueries;
+    if (dfn.vkCreateQueryPool(device, &query_pool_info, nullptr, &gpu_query_pool_) !=
+        VK_SUCCESS) {
+      gpu_query_pool_ = VK_NULL_HANDLE;
+      REXGPU_WARN("FH1 native executor (Vulkan): no timestamp query pool for the GPU profile");
+    }
+  }
+
   auto create_set_layout = [&](const VkDescriptorSetLayoutBinding* bindings, uint32_t count,
                                VkDescriptorSetLayout& layout_out) {
     VkDescriptorSetLayoutCreateInfo info = {};
@@ -341,6 +353,12 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
 }
 
 void Fh1NativeExecutor::Shutdown() {
+  if (gpu_query_pool_ != VK_NULL_HANDLE) {
+    const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+    vulkan_device->functions().vkDestroyQueryPool(vulkan_device->device(), gpu_query_pool_,
+                                                  nullptr);
+    gpu_query_pool_ = VK_NULL_HANDLE;
+  }
   if (initialized_) LogStats(frame_);
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
   if (!vulkan_device) return;
@@ -871,6 +889,7 @@ void Fh1NativeExecutor::ClaimTileRect(const SurfaceKey& key, uint32_t column_fir
 void Fh1NativeExecutor::TransferRects(Surface& dest, uint32_t previous_owner, const Rect* rects,
                                       uint32_t rect_count, uint32_t tile_count,
                                       bool tiles_stencil) {
+  GpuTimer gpu_timer(*this, kGpuTransfers);
   Surface* source = FindSurface(previous_owner);
   if (!source) return Skip("transfer_source_missing");
   if ((!dest.key.is_depth &&
@@ -896,6 +915,7 @@ void Fh1NativeExecutor::TransferRects(Surface& dest, uint32_t previous_owner, co
 }
 
 void Fh1NativeExecutor::FlushTransfers() {
+  GpuTimer gpu_timer(*this, kGpuTransfers);
   if (pending_transfers_.empty()) return;
   std::stable_sort(pending_transfers_.begin(), pending_transfers_.end(),
                    [](const PendingTransfer& a, const PendingTransfer& b) {
@@ -1504,6 +1524,7 @@ void Fh1NativeExecutor::NativeDrawIssued(const Fh1DrawInfo& draw) {
 
 void Fh1NativeExecutor::ClearSurfaceRect(Surface& surface, const Rect& guest_rect,
                                          uint32_t clear_value, uint32_t clear_value_lo) {
+  GpuTimer gpu_timer(*this, kGpuClears);
   const Rect rect = HostRect(guest_rect);
   VkClearAttachment clear = {};
   if (surface.key.is_depth) {
@@ -1580,6 +1601,7 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
                                         uint32_t dest_base, uint32_t dest_pitch,
                                         VkBuffer buffer, VkDeviceSize memory_offset,
                                         VkDeviceSize memory_range, bool unscaled_dest) {
+  GpuTimer gpu_timer(*this, kGpuResolves);
   Surface& surface = *source.surface;
   const bool depth = surface.key.is_depth;
   const bool msaa = surface.samples > 1;
@@ -1957,6 +1979,8 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
 
 void Fh1NativeExecutor::OnSwap(uint64_t frame) {
   if (!initialized_) return;
+  GpuEndFrame();
+  GpuDrain();
   frame_ = frame;
   if (frame % 600 == 0) LogStats(frame);
 }
@@ -1967,6 +1991,86 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
       "stats={{{}}}",
       frame, draws_, resolves_, surfaces_.size(), counters_.FormatSkips(),
       counters_.FormatStats());
+  if (gpu_frames_) {
+    const double tick_ns = command_processor_.GetVulkanDevice()->properties().timestampPeriod;
+    const double scale = tick_ns / 1e6 / double(gpu_frames_);
+    REXGPU_INFO(
+        "FH1 native executor (Vulkan) gpu ms/frame over {} frames: frame {:.3f} transfers "
+        "{:.3f} resolves {:.3f} clears {:.3f}",
+        gpu_frames_, gpu_ticks_[kGpuFrame] * scale, gpu_ticks_[kGpuTransfers] * scale,
+        gpu_ticks_[kGpuResolves] * scale, gpu_ticks_[kGpuClears] * scale);
+    gpu_ticks_ = {};
+    gpu_frames_ = 0;
+  }
+}
+
+uint32_t Fh1NativeExecutor::GpuBegin() {
+  if (gpu_query_pool_ == VK_NULL_HANDLE) return UINT32_MAX;
+  GpuProfileSlot& slot = gpu_slots_[gpu_slot_];
+  if (slot.pending) return UINT32_MAX;  // The previous results are not read yet.
+  auto& command_buffer = command_processor_.deferred_command_buffer();
+  const uint32_t base = gpu_slot_ * kGpuProfileQueries;
+  if (!slot.used) {
+    // Queries are reset outside rendering; the next draw begins it again.
+    command_processor_.EndRenderPass();
+    command_buffer.CmdVkResetQueryPool(gpu_query_pool_, base, kGpuProfileQueries);
+    // Query 0: where the frame's measured work starts.
+    command_buffer.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_query_pool_,
+                                       base);
+    slot.used = 1;
+  }
+  if (slot.used + 2 > kGpuProfileQueries) return UINT32_MAX;
+  const uint32_t query = slot.used++;
+  command_buffer.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_query_pool_,
+                                     base + query);
+  return query;
+}
+
+void Fh1NativeExecutor::GpuEnd(GpuPhase phase, uint32_t begin) {
+  if (begin == UINT32_MAX) return;
+  GpuProfileSlot& slot = gpu_slots_[gpu_slot_];
+  if (slot.used >= kGpuProfileQueries) return;
+  const uint32_t query = slot.used++;
+  command_processor_.deferred_command_buffer().CmdVkWriteTimestamp(
+      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_query_pool_,
+      gpu_slot_ * kGpuProfileQueries + query);
+  slot.spans.push_back({uint32_t(phase), begin, query});
+}
+
+void Fh1NativeExecutor::GpuEndFrame() {
+  if (gpu_query_pool_ == VK_NULL_HANDLE) return;
+  GpuProfileSlot& slot = gpu_slots_[gpu_slot_];
+  if (slot.pending || !slot.used || slot.used >= kGpuProfileQueries) return;
+  const uint32_t query = slot.used++;
+  command_processor_.deferred_command_buffer().CmdVkWriteTimestamp(
+      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_query_pool_,
+      gpu_slot_ * kGpuProfileQueries + query);
+  slot.spans.push_back({uint32_t(kGpuFrame), 0, query});
+  slot.submission = command_processor_.GetCurrentSubmission();
+  slot.pending = true;
+  gpu_slot_ = (gpu_slot_ + 1) % kGpuProfileSlots;
+}
+
+void Fh1NativeExecutor::GpuDrain() {
+  if (gpu_query_pool_ == VK_NULL_HANDLE) return;
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const uint64_t completed = command_processor_.GetCompletedSubmission();
+  std::vector<uint64_t> ticks;
+  for (uint32_t index = 0; index < kGpuProfileSlots; ++index) {
+    GpuProfileSlot& slot = gpu_slots_[index];
+    if (!slot.pending || slot.submission > completed) continue;
+    ticks.resize(slot.used);
+    if (vulkan_device->functions().vkGetQueryPoolResults(
+            vulkan_device->device(), gpu_query_pool_, index * kGpuProfileQueries, slot.used,
+            ticks.size() * sizeof(uint64_t), ticks.data(), sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+      for (const auto& [phase, begin, end] : slot.spans) {
+        if (ticks[end] > ticks[begin]) gpu_ticks_[phase] += ticks[end] - ticks[begin];
+      }
+      ++gpu_frames_;
+    }
+    slot = GpuProfileSlot();
+  }
 }
 
 }  // namespace rex::graphics::vulkan

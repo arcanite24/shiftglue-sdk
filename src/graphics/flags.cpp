@@ -25,6 +25,12 @@ REXCVAR_DEFINE_BOOL(gamma_render_target_as_unorm16, true, "GPU",
                     "Use R16G16B16A16_UNORM for gamma render targets (more accurate than sRGB)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_STRING(dump_shaders, "", "GPU", "Path to dump shaders to");
+REXCVAR_DEFINE_BOOL(fh1_native_gpu_profile, false, "GPU",
+                    "Measure the FH1 native executor's GPU time per phase (transfers, resolves, "
+                    "clears, and on Vulkan the whole frame) with timestamp queries, and its CPU "
+                    "time per phase (target preparation and binding, transfers, resolves), and "
+                    "report them with the periodic stats")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(gpu_debug_markers, false, "GPU",
                     "Insert debug markers into GPU command streams for tools "
                     "like PIX and RenderDoc. Automatically enabled when "

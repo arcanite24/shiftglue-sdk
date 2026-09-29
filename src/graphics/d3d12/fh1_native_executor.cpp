@@ -42,12 +42,6 @@ REXCVAR_DEFINE_BOOL(fh1_native_readback_new_resolves, true, "GPU/D3D12",
                     "captures the game reads on the CPU, such as the car thumbnails it saves. "
                     "Ranges resolved every frame are not read back")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(fh1_native_gpu_profile, false, "GPU/D3D12",
-                    "Measure the FH1 native executor's GPU time per phase (transfers, resolves, "
-                    "clears) with timestamp queries, and its CPU time per phase (target "
-                    "preparation and binding, transfers, resolves), and report them with the "
-                    "periodic stats")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::d3d12 {
 

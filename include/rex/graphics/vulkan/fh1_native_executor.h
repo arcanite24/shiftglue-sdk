@@ -276,6 +276,40 @@ class Fh1NativeExecutor {
   PrepareSignature last_prepare_;
 
   uint64_t frame_ = 0;
+
+  // fh1_native_gpu_profile: GPU time per phase, and from a frame's first
+  // timed phase to its swap, from timestamps in one query range per frame,
+  // read once the frame's submission has completed.
+  enum GpuPhase { kGpuTransfers, kGpuResolves, kGpuClears, kGpuFrame, kGpuPhases };
+  static constexpr uint32_t kGpuProfileSlots = 4;
+  static constexpr uint32_t kGpuProfileQueries = 2048;
+  struct GpuProfileSlot {
+    uint32_t used = 0;
+    uint64_t submission = 0;
+    bool pending = false;
+    // Phase, first query, last query.
+    std::vector<std::array<uint32_t, 3>> spans;
+  };
+  uint32_t GpuBegin();
+  void GpuEnd(GpuPhase phase, uint32_t begin);
+  void GpuEndFrame();
+  void GpuDrain();
+  class GpuTimer {
+   public:
+    GpuTimer(Fh1NativeExecutor& executor, GpuPhase phase)
+        : executor_(executor), phase_(phase), begin_(executor.GpuBegin()) {}
+    ~GpuTimer() { executor_.GpuEnd(phase_, begin_); }
+
+   private:
+    Fh1NativeExecutor& executor_;
+    GpuPhase phase_;
+    uint32_t begin_;
+  };
+  VkQueryPool gpu_query_pool_ = VK_NULL_HANDLE;
+  std::array<GpuProfileSlot, kGpuProfileSlots> gpu_slots_;
+  uint32_t gpu_slot_ = 0;
+  std::array<uint64_t, kGpuPhases> gpu_ticks_{};
+  uint64_t gpu_frames_ = 0;
   uint64_t draws_ = 0;
   uint64_t resolves_ = 0;
 };
