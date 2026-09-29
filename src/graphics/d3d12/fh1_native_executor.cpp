@@ -1176,53 +1176,14 @@ void Fh1NativeExecutor::GetResolveSources(const SurfaceKey& resolve_key, int32_t
   const uint32_t is_64bpp = resolve_key.Is64bpp() ? 1 : 0;
   const int32_t tile_width = int32_t((xenos::kEdramTileWidthSamples >> msaa_x_log2) >> is_64bpp);
   const int32_t tile_height = int32_t(xenos::kEdramTileHeightSamples >> msaa_y_log2);
-  const uint32_t pitch = resolve_key.pitch_tiles << is_64bpp;
-  const int32_t column_first = x0 / tile_width, column_end = (x1 + tile_width - 1) / tile_width;
-  const int32_t row_first = y0 / tile_height, row_end = (y1 + tile_height - 1) / tile_height;
-  struct Run {
-    int32_t column_first, column_end;
-    uint32_t owner;
-    size_t source;
-  };
-  std::vector<Run> previous_row, current_row;
-  for (int32_t row = row_first; row < row_end; ++row) {
-    current_row.clear();
-    for (int32_t column = column_first; column < column_end; ++column) {
-      const uint32_t tile =
-          (resolve_key.base_tiles + uint32_t(row) * pitch + uint32_t(column)) &
-          (xenos::kEdramTileCount - 1);
-      const uint32_t owner = tiles_.Owner(tile);
-      if (!current_row.empty() && current_row.back().owner == owner &&
-          current_row.back().column_end == column) {
-        ++current_row.back().column_end;
-      } else {
-        current_row.push_back({column, column + 1, owner, SIZE_MAX});
-      }
-    }
-    for (Run& run : current_row) {
-      // Extend the rectangle of an identical run in the previous tile row.
-      for (const Run& above : previous_row) {
-        if (above.column_first == run.column_first && above.column_end == run.column_end &&
-            above.owner == run.owner && above.source != SIZE_MAX) {
-          run.source = above.source;
-          sources_out[run.source].rect.bottom = (row + 1) * tile_height;
-          break;
-        }
-      }
-      if (run.source != SIZE_MAX) continue;
-      SourceRect source;
-      source.rect = {std::max(run.column_first * tile_width, x0), row * tile_height,
-                     std::min(run.column_end * tile_width, x1), (row + 1) * tile_height};
-      source.unowned = run.owner == kNoOwner;
-      source.surface = source.unowned ? nullptr : FindSurface(run.owner);
-      run.source = sources_out.size();
-      sources_out.push_back(source);
-    }
-    std::swap(previous_row, current_row);
-  }
-  for (SourceRect& source : sources_out) {
-    source.rect.top = std::max<LONG>(source.rect.top, y0);
-    source.rect.bottom = std::min<LONG>(source.rect.bottom, y1);
+  for (const auto& rect : tiles_.SplitByOwner(resolve_key.base_tiles,
+                                              resolve_key.pitch_tiles << is_64bpp, tile_width,
+                                              tile_height, x0, y0, x1, y1)) {
+    SourceRect source;
+    source.rect = {rect.left, rect.top, rect.right, rect.bottom};
+    source.unowned = rect.owner == kNoOwner;
+    source.surface = source.unowned ? nullptr : FindSurface(rect.owner);
+    sources_out.push_back(source);
   }
 }
 

@@ -132,6 +132,65 @@ class Fh1EdramTiles {
     return result;
   }
 
+  // A pixel rectangle [left, right) x [top, bottom) whose tiles one owner
+  // (or kNoOwner) holds.
+  struct OwnerRect {
+    int32_t left = 0, top = 0, right = 0, bottom = 0;
+    uint32_t owner = kNoOwner;
+  };
+
+  // Splits the pixel rectangle [x0, x1) x [y0, y1) of a surface at
+  // `base_tiles` with `pitch_tiles` (tiles of tile_width x tile_height
+  // pixels) into rectangles per owner: runs of one owner along each tile row,
+  // merged with an identical run in the row above.
+  std::vector<OwnerRect> SplitByOwner(uint32_t base_tiles, uint32_t pitch_tiles,
+                                      int32_t tile_width, int32_t tile_height, int32_t x0,
+                                      int32_t y0, int32_t x1, int32_t y1) const {
+    std::vector<OwnerRect> rects;
+    const int32_t column_first = x0 / tile_width,
+                  column_end = (x1 + tile_width - 1) / tile_width;
+    const int32_t row_first = y0 / tile_height, row_end = (y1 + tile_height - 1) / tile_height;
+    struct Run {
+      int32_t column_first, column_end;
+      uint32_t owner;
+      size_t rect;
+    };
+    std::vector<Run> previous_row, current_row;
+    for (int32_t row = row_first; row < row_end; ++row) {
+      current_row.clear();
+      for (int32_t column = column_first; column < column_end; ++column) {
+        const uint32_t owner = Owner(base_tiles + uint32_t(row) * pitch_tiles + uint32_t(column));
+        if (!current_row.empty() && current_row.back().owner == owner &&
+            current_row.back().column_end == column) {
+          ++current_row.back().column_end;
+        } else {
+          current_row.push_back({column, column + 1, owner, SIZE_MAX});
+        }
+      }
+      for (Run& run : current_row) {
+        for (const Run& above : previous_row) {
+          if (above.column_first == run.column_first && above.column_end == run.column_end &&
+              above.owner == run.owner && above.rect != SIZE_MAX) {
+            run.rect = above.rect;
+            rects[run.rect].bottom = (row + 1) * tile_height;
+            break;
+          }
+        }
+        if (run.rect != SIZE_MAX) continue;
+        run.rect = rects.size();
+        rects.push_back({std::max(run.column_first * tile_width, x0), row * tile_height,
+                         std::min(run.column_end * tile_width, x1), (row + 1) * tile_height,
+                         run.owner});
+      }
+      std::swap(previous_row, current_row);
+    }
+    for (OwnerRect& rect : rects) {
+      rect.top = std::max(rect.top, y0);
+      rect.bottom = std::min(rect.bottom, y1);
+    }
+    return rects;
+  }
+
   void MarkStencil(uint32_t base, uint32_t length, bool nonzero) {
     length = std::min(length, xenos::kEdramTileCount);
     ++generation_;
