@@ -18,6 +18,7 @@
 #include <disruptorplus/blocking_wait_strategy.hpp>
 
 #include <rex/assert.h>
+#include <rex/perf/counter.h>
 #include <rex/thread.h>
 #include <rex/thread/timer_queue.h>
 
@@ -99,6 +100,7 @@ class TimerQueue {
         }
       }
 
+      PERF_counter_inc(kTimerQueueWakeups);
       {
         // Check wait queue, invoke callbacks and reschedule
         std::forward_list<std::shared_ptr<WaitItem>> wait_items;
@@ -112,6 +114,7 @@ class TimerQueue {
                                                         std::memory_order_acq_rel)) {
             // Possibility to dispatch to a thread pool here
             assert_not_null(wait_item->callback_);
+            PERF_counter_inc(kTimerQueueCallbacks);
             wait_item->callback_(wait_item->userdata_);
 
             if (wait_item->interval_ != clock::duration::zero() &&

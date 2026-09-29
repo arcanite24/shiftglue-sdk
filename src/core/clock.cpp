@@ -17,6 +17,7 @@
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/math.h>
+#include <rex/perf/counter.h>
 
 REXCVAR_DEFINE_BOOL(clock_no_scaling, false, "Clock",
                     "Disable clock scaling (inverted: false = scaling enabled)");
@@ -84,7 +85,11 @@ void RecomputeGuestTickScalar() {
   // Keep this a rational calculation and reduce the fraction
   reduce_fraction(frac);
 
-  std::lock_guard<std::mutex> lock(tick_mutex_);
+  std::unique_lock<std::mutex> lock(tick_mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    PERF_counter_inc(kClockMutexContentions);
+    lock.lock();
+  }
   guest_tick_ratio_ = frac;
   const uint64_t host_now = Clock::QueryHostTickCount();
   const uint64_t guest_now = UpdateGuestClock();
@@ -158,7 +163,11 @@ void Clock::set_guest_time_scalar(double scalar) {
 }
 
 std::pair<uint64_t, uint64_t> Clock::guest_tick_ratio() {
-  std::lock_guard<std::mutex> lock(tick_mutex_);
+  std::unique_lock<std::mutex> lock(tick_mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    PERF_counter_inc(kClockMutexContentions);
+    lock.lock();
+  }
   return guest_tick_ratio_;
 }
 

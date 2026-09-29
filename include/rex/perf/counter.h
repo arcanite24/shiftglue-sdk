@@ -124,6 +124,13 @@ enum class CounterId : uint16_t {
   // thread (NP-9.1); append to preserve existing IDs.
   kTextureResolveReloadCpuTimeNs,
 
+  // The guest clock's ratio mutex found held, the timer queue thread's
+  // wake-ups and the timer callbacks it ran (NP-3.0); append to preserve
+  // existing IDs.
+  kClockMutexContentions,
+  kTimerQueueWakeups,
+  kTimerQueueCallbacks,
+
   kCount  // sentinel -- must be last
 };
 
