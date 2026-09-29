@@ -33,6 +33,9 @@ class XamUiProvider {
   virtual void ShowKeyboard(const std::string& title, const std::string& description,
                             const std::string& default_text, size_t max_length,
                             std::function<void(bool accepted, std::string text)> done) = 0;
+
+  // The achievements list (XamShowAchievementsUI); `done()` when closed.
+  virtual void ShowAchievements(std::function<void()> done) { done(); }
 };
 
 // Installs the provider (nullptr restores the built-in dialogs). The caller
