@@ -181,10 +181,13 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         // FH1 waits for two guest vblanks per rendered frame. Follow the
         // detected host refresh by default so completed source frames arrive
         // at the cadence the display can actually consume. The limit is read
-        // every tick so the in-game settings change it live.
+        // every tick so the in-game settings change it live. Host vsync only
+        // changes presentation: FH1 steps its simulation once per two
+        // vblanks, so the old 1 kHz vblank without vsync ran 500 simulation
+        // steps a second, and where a step is expensive (race central's
+        // paused screens) each frame spanned ever more vblanks.
         uint32_t render_fps_limit = UINT32_MAX;
-        uint64_t vsync_interval_ticks = 1;
-        uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
+        uint64_t interval_ticks = 1;
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
         while (vsync_worker_running_) {
           const uint32_t current_render_fps_limit =
@@ -193,12 +196,10 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             render_fps_limit = current_render_fps_limit;
             const double refresh_rate_hz = Fh1GuestVblankHzForRenderLimit(
                 render_fps_limit, REXCVAR_GET(video_mode_refresh_rate));
-            vsync_interval_ticks =
+            interval_ticks =
                 std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
           }
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
-          const bool vsync_enabled = REXCVAR_GET(vsync);
-          uint64_t interval_ticks = vsync_enabled ? vsync_interval_ticks : no_vsync_interval_ticks;
           while (current_time - last_frame_time >= interval_ticks) {
             if (perf::CriticalPathTraceEnabled()) {
               const uint64_t late_ticks = current_time - last_frame_time - interval_ticks;
@@ -213,8 +214,7 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             MarkVblank();
             last_frame_time += interval_ticks;
           }
-          if (!vsync_enabled ||
-              !REXCVAR_GET(pinyon_shift_fh1_vblank_deadline_wait)) {
+          if (!REXCVAR_GET(pinyon_shift_fh1_vblank_deadline_wait)) {
             rex::thread::Sleep(std::chrono::milliseconds(1));
             continue;
           }
