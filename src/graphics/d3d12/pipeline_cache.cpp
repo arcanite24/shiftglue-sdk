@@ -462,14 +462,9 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
   }
 
   if (title_id == 0x4D5309C9) {
-    // Bit 1 (2) was the removed edram ROV path and is always clear.
-    uint32_t pack_flags = bindless_resources_used_ ? 1u : 0u;
-    pack_flags |= !host_config_.gamma_render_target_as_unorm16() ? 4u : 0u;
-    pack_flags |= host_config_.msaa_2x_supported() ? 8u : 0u;
-    const Fh1ShaderPack::Config pack_config{
-        DxbcShaderTranslator::Modification::kVersion, Fh1ShaderPack::Backend::kD3D12,
-        Fh1ShaderPackDeviceFeatures(), pack_flags, host_config_.draw_resolution_scale_x(),
-        host_config_.draw_resolution_scale_y()};
+    fh1_shader_pack_directory_ = shader_storage_shareable_root;
+    const Fh1ShaderPack::Config pack_config =
+        Fh1ShaderPackConfig(host_config_.draw_resolution_scale_x());
     const auto pack_path =
         shader_storage_shareable_root / Fh1ShaderPack::FileName(title_id, pack_config);
     std::string pack_error;
@@ -1641,6 +1636,25 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
   assert_not_null(storage_write_thread_);
   storage_write_thread_->set_name("D3D12 Storage writer");
 #endif
+}
+
+Fh1ShaderPack::Config PipelineCache::Fh1ShaderPackConfig(uint32_t scale) const {
+  // Bit 1 (2) was the removed edram ROV path and is always clear.
+  uint32_t pack_flags = bindless_resources_used_ ? 1u : 0u;
+  pack_flags |= !host_config_.gamma_render_target_as_unorm16() ? 4u : 0u;
+  pack_flags |= host_config_.msaa_2x_supported() ? 8u : 0u;
+  return {DxbcShaderTranslator::Modification::kVersion, Fh1ShaderPack::Backend::kD3D12,
+          Fh1ShaderPackDeviceFeatures(), pack_flags, scale, scale};
+}
+
+bool PipelineCache::HasFh1ShaderPack(uint32_t scale) const {
+  if (fh1_shader_pack_directory_.empty()) {
+    return false;
+  }
+  std::error_code error;
+  return std::filesystem::is_regular_file(
+      fh1_shader_pack_directory_ / Fh1ShaderPack::FileName(0x4D5309C9, Fh1ShaderPackConfig(scale)),
+      error);
 }
 
 void PipelineCache::ShutdownShaderStorage() {

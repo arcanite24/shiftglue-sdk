@@ -66,6 +66,11 @@ class PipelineCache {
                                bool blocking);
   void ShutdownShaderStorage();
 
+  // Whether the FH1 shader pack for this device and configuration at `scale`
+  // is in the shader storage opened last. Shaders are not translated at run
+  // time, so the scale only switches to a prepared pack (NP-4.7).
+  bool HasFh1ShaderPack(uint32_t scale) const;
+
   void EndSubmission();
   bool IsCreatingPipelines();
 
@@ -286,6 +291,10 @@ class PipelineCache {
   void RecordFh1GeometryShaderPackMiss(uint32_t key);
   std::mutex fh1_shader_miss_mutex_;
   std::filesystem::path fh1_shader_miss_root_;
+  // Where InitializeShaderStorage looked for the FH1 shader pack.
+  std::filesystem::path fh1_shader_pack_directory_;
+  // The FH1 pack's configuration at `scale`.
+  Fh1ShaderPack::Config Fh1ShaderPackConfig(uint32_t scale) const;
   std::set<std::pair<uint64_t, uint64_t>> fh1_recorded_shader_misses_;
   void SetupShaderBindingLayouts(D3D12Shader& shader);
 

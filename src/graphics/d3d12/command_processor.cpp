@@ -187,6 +187,8 @@ void D3D12CommandProcessor::InvalidateVertexBufferResidencyRange(uint32_t first_
 void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                                     uint32_t title_id, bool blocking) {
   CommandProcessor::InitializeShaderStorage(cache_root, title_id, blocking);
+  shader_storage_cache_root_ = cache_root;
+  shader_storage_title_id_ = title_id;
   pipeline_cache_->InitializeShaderStorage(cache_root, title_id, blocking);
 }
 
@@ -1158,35 +1160,10 @@ bool D3D12CommandProcessor::SetupContext() {
     return false;
   }
 
-  texture_cache_ =
-      D3D12TextureCache::Create(*register_file_, *shared_memory_, draw_resolution_scale_x,
-                                draw_resolution_scale_y, *this, bindless_resources_used_);
-  if (!texture_cache_) {
-    REXGPU_ERROR("Failed to initialize the texture cache");
+  if (!CreateScaledComponents()) {
     return false;
   }
-
-  fh1_native_executor_ = std::make_unique<Fh1NativeExecutor>(*this, *register_file_, *memory_);
-  Fh1NativeExecutorConfig native_config;
-  native_config.msaa_2x_supported = host_render_config_->msaa_2x_supported();
-  native_config.gamma_as_unorm16 = host_render_config_->gamma_render_target_as_unorm16();
-  native_config.depth_float24_round = host_render_config_->depth_float24_round();
-  native_config.fixed16_truncated = host_render_config_->IsFixed16TruncatedToMinus1To1();
-  native_config.memory = shared_memory_.get();
-  native_config.textures = texture_cache_.get();
-  if (!fh1_native_executor_->Initialize(native_config)) {
-    REXGPU_ERROR("Failed to initialize the FH1 native executor");
-    fh1_native_executor_.reset();
-    // There is no EDRAM without the executor.
-    return false;
-  }
-
-  pipeline_cache_ = std::make_unique<PipelineCache>(
-      *this, *register_file_, *host_render_config_, bindless_resources_used_);
-  if (!pipeline_cache_->Initialize()) {
-    REXGPU_ERROR("Failed to initialize the graphics pipeline cache");
-    return false;
-  }
+  draw_resolution_scale_.store(draw_resolution_scale_x, std::memory_order_relaxed);
 
   D3D12_HEAP_FLAGS heap_flag_create_not_zeroed = provider.GetHeapFlagCreateNotZeroed();
 
@@ -1517,6 +1494,133 @@ bool D3D12CommandProcessor::SetupContext() {
   StartSubmissionWorker();
 
   return true;
+}
+
+bool D3D12CommandProcessor::CreateScaledComponents() {
+  texture_cache_ = D3D12TextureCache::Create(
+      *register_file_, *shared_memory_, host_render_config_->draw_resolution_scale_x(),
+      host_render_config_->draw_resolution_scale_y(), *this, bindless_resources_used_);
+  if (!texture_cache_) {
+    REXGPU_ERROR("Failed to initialize the texture cache");
+    return false;
+  }
+
+  fh1_native_executor_ = std::make_unique<Fh1NativeExecutor>(*this, *register_file_, *memory_);
+  Fh1NativeExecutorConfig native_config;
+  native_config.msaa_2x_supported = host_render_config_->msaa_2x_supported();
+  native_config.gamma_as_unorm16 = host_render_config_->gamma_render_target_as_unorm16();
+  native_config.depth_float24_round = host_render_config_->depth_float24_round();
+  native_config.fixed16_truncated = host_render_config_->IsFixed16TruncatedToMinus1To1();
+  native_config.memory = shared_memory_.get();
+  native_config.textures = texture_cache_.get();
+  if (!fh1_native_executor_->Initialize(native_config)) {
+    REXGPU_ERROR("Failed to initialize the FH1 native executor");
+    fh1_native_executor_.reset();
+    // There is no EDRAM without the executor.
+    return false;
+  }
+
+  pipeline_cache_ = std::make_unique<PipelineCache>(
+      *this, *register_file_, *host_render_config_, bindless_resources_used_);
+  if (!pipeline_cache_->Initialize()) {
+    REXGPU_ERROR("Failed to initialize the graphics pipeline cache");
+    return false;
+  }
+  return true;
+}
+
+void D3D12CommandProcessor::SwitchDrawResolutionScaleIfRequested() {
+  uint32_t scale_x, scale_y;
+  TextureCache::GetConfigDrawResolutionScale(scale_x, scale_y);
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  D3D12TextureCache::ClampDrawResolutionScaleToMaxSupported(scale_x, scale_y, provider);
+  const uint32_t previous_scale = host_render_config_->draw_resolution_scale_x();
+  if (scale_x == previous_scale && scale_y == host_render_config_->draw_resolution_scale_y()) {
+    declined_draw_resolution_scale_ = 0;
+    return;
+  }
+  // FH1's packs are square; unequal axes are also seen between the two cvar
+  // writes of one change.
+  if (scale_x != scale_y || scale_x == declined_draw_resolution_scale_) {
+    return;
+  }
+  if (scale_x > 4 || !pipeline_cache_->HasFh1ShaderPack(scale_x)) {
+    declined_draw_resolution_scale_ = scale_x;
+    REXGPU_WARN(
+        "Draw resolution scale {}x{} has no prepared shader pack; it applies after the next "
+        "shader preparation and restart",
+        scale_x, scale_y);
+    return;
+  }
+
+  // Between frames, with the GPU idle: the surfaces, textures, shaders and
+  // pipelines of the old scale go, and the guest's next frame renders into
+  // new ones. Guest memory (and the resolves read back into it) and the
+  // register file stay.
+  const auto start = std::chrono::steady_clock::now();
+  AwaitAllQueueOperationsCompletion();
+  fh1_native_executor_->FlushResolveReadbacks();
+  // The guest loads a shader once and draws with it until it loads another,
+  // so the active ones are reloaded into the new pipeline cache (as the
+  // big-endian microcode LoadShader takes).
+  const auto keep_ucode = [](const Shader* shader) {
+    std::vector<uint32_t> ucode;
+    if (shader) {
+      ucode = shader->ucode_data();
+      for (uint32_t& word : ucode) {
+        word = rex::byte_swap(word);
+      }
+    }
+    return ucode;
+  };
+  const std::vector<uint32_t> vertex_ucode = keep_ucode(active_vertex_shader_);
+  const std::vector<uint32_t> pixel_ucode = keep_ucode(active_pixel_shader_);
+  active_vertex_shader_ = nullptr;
+  active_pixel_shader_ = nullptr;
+  pipeline_cache_.reset();
+  fh1_native_executor_.reset();
+  texture_cache_.reset();
+
+  const auto create = [&](uint32_t scale) {
+    host_render_config_ = std::make_unique<D3D12HostRenderConfig>(scale, scale);
+    host_render_config_->Initialize(provider);
+    return CreateScaledComponents();
+  };
+  if (!create(scale_x)) {
+    REXGPU_ERROR("Could not switch to draw resolution scale {}x; staying at {}x", scale_x,
+                 previous_scale);
+    declined_draw_resolution_scale_ = scale_x;
+    pipeline_cache_.reset();
+    fh1_native_executor_.reset();
+    texture_cache_.reset();
+    if (!create(previous_scale)) {
+      REXGPU_ERROR("Could not restore draw resolution scale {}x", previous_scale);
+      device_removed_ = true;
+      return;
+    }
+  }
+  if (!shader_storage_cache_root_.empty()) {
+    // Blocking: the pipelines are created before the next frame instead of
+    // draws being skipped while they compile.
+    pipeline_cache_->InitializeShaderStorage(shader_storage_cache_root_,
+                                             shader_storage_title_id_, true);
+  }
+  if (!vertex_ucode.empty()) {
+    active_vertex_shader_ = LoadShader(xenos::ShaderType::kVertex, 0, vertex_ucode.data(),
+                                       uint32_t(vertex_ucode.size()));
+  }
+  if (!pixel_ucode.empty()) {
+    active_pixel_shader_ = LoadShader(xenos::ShaderType::kPixel, 0, pixel_ucode.data(),
+                                      uint32_t(pixel_ucode.size()));
+  }
+  viewport_cache_valid_ = false;
+  draw_resolution_scale_.store(host_render_config_->draw_resolution_scale_x(),
+                               std::memory_order_relaxed);
+  REXGPU_INFO("Switched the draw resolution scale from {}x to {}x in {} ms", previous_scale,
+              host_render_config_->draw_resolution_scale_x(),
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - start)
+                  .count());
 }
 
 void D3D12CommandProcessor::ShutdownContext() {
@@ -2161,6 +2265,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
   EndSubmission(true);
+
+  SwitchDrawResolutionScaleIfRequested();
 }
 
 void D3D12CommandProcessor::FlushCpuVisibleResults() {

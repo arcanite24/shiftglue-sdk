@@ -229,6 +229,14 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool SetupContext() override;
   void ShutdownContext() override;
 
+  // Creates the texture cache, the FH1 native executor and the pipeline cache
+  // at host_render_config_'s draw resolution scale.
+  bool CreateScaledComponents();
+  // Between frames, rebuilds the scale-dependent components when the draw
+  // resolution scale cvars name another scale with a prepared shader pack, so
+  // the scale changes without a restart (NP-4.7).
+  void SwitchDrawResolutionScaleIfRequested();
+
   void WriteRegister(uint32_t index, uint32_t value) override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
@@ -524,6 +532,12 @@ class D3D12CommandProcessor : public CommandProcessor {
   // targets).
   std::unique_ptr<D3D12HostRenderConfig> host_render_config_;
   std::unique_ptr<Fh1NativeExecutor> fh1_native_executor_;
+  // The shader storage the pipeline cache opened, to reopen at another scale.
+  std::filesystem::path shader_storage_cache_root_;
+  uint32_t shader_storage_title_id_ = 0;
+  // A requested scale that cannot be switched to (no prepared pack), so the
+  // request is reported once.
+  uint32_t declined_draw_resolution_scale_ = 0;
 
   std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> constant_buffer_pool_;
 

@@ -192,6 +192,8 @@ class IGraphicsSystem {
     (void)renderer;
   }
   virtual bool HasNativeGuestOutputRenderer() const { return false; }
+  // The draw resolution scale the renderer uses, 0 when unknown.
+  virtual uint32_t draw_resolution_scale() const { return 0; }
 
   // Guest GPU services reached from the xboxkrnl Vd* exports.
   virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data) {

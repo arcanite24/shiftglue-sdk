@@ -1037,6 +1037,7 @@ bool VulkanCommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to initialize the texture cache");
     return false;
   }
+  draw_resolution_scale_.store(draw_resolution_scale_x, std::memory_order_relaxed);
 
   if (REXCVAR_GET(vulkan_fh1_native_executor) && REXCVAR_GET(vulkan_dynamic_rendering) &&
       render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {

@@ -84,6 +84,7 @@ class GraphicsSystem : public system::IGraphicsSystem {
   bool HasNativeGuestOutputRenderer() const override {
     return native_guest_output_renderer_.IsRegistered();
   }
+  uint32_t draw_resolution_scale() const override;
   const system::NativeGuestOutputRendererRegistration&
   native_guest_output_renderer() const {
     return native_guest_output_renderer_;

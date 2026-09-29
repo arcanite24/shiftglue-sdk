@@ -90,6 +90,11 @@ class CommandProcessor {
 
   Shader* active_vertex_shader() const { return active_vertex_shader_; }
   Shader* active_pixel_shader() const { return active_pixel_shader_; }
+  // The draw resolution scale in use (any thread): the backend sets it at
+  // setup and when it switches scale at run time.
+  uint32_t draw_resolution_scale() const {
+    return draw_resolution_scale_.load(std::memory_order_relaxed);
+  }
   uint64_t bin_mask() const { return bin_mask_; }
   uint64_t bin_select() const { return bin_select_; }
 
@@ -286,6 +291,7 @@ class CommandProcessor {
 
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;
+  std::atomic<uint32_t> draw_resolution_scale_{1};
   uint64_t observation_frame_sequence_ = 1;
   bool paused_ = false;
 
