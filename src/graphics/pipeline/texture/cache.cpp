@@ -434,7 +434,7 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
         mips_outdated, texture.GetGuestBaseSize(), texture.GetGuestMipsSize(),
         uint32_t(key.scaled_resolve), texture.allocation_id(), texture.payload_generation());
   }
-  if (TryLoadTextureDataFromCpu(texture, base_outdated, mips_outdated)) {
+  if (TryLoadTextureDataFromCpu(texture, base_outdated, mips_outdated, resolve_sourced)) {
     texture.CompleteLoad(global_critical_region_.Acquire(), base_outdated, mips_outdated);
     texture.LogAction("Loaded from CPU");
     return false;

@@ -548,7 +548,12 @@ class TextureCache {
   bool LoadTextureData(Texture& texture);
   // Watches are armed before this call. Return false to use the resident-memory
   // loader; a successful CPU import must protect its source and own its upload.
-  virtual bool TryLoadTextureDataFromCpu(Texture&, bool, bool) { return false; }
+  // resolve_sourced: the outdated data was written by the GPU (a resolve), so
+  // guest memory may not hold it.
+  virtual bool TryLoadTextureDataFromCpu(Texture&, bool /*load_base*/, bool /*load_mips*/,
+                                         bool /*resolve_sourced*/) {
+    return false;
+  }
 
   // Writes the texture data (for base, mips or both - but not neither) from the
   // shared memory or the scaled resolve memory. The shared memory management is

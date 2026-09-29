@@ -1715,25 +1715,38 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
 
 namespace {
 
-// Texture dumps and replacements (NP-10.3), for BC-compressed 2D textures
-// (DXT1, DXT2/3 and DXT4/5): each texture is named by the XXH3 hash of its
-// guest base level, and a replacement is a DDS file of the same size and
-// format with at least as many levels.
+// Texture dumps and replacements (NP-10.3), for 2D textures the host loads
+// by copying (after untiling and byte swapping): DXT1, DXT2/3, DXT4/5, DXT5A
+// (BC4), DXN (BC5) and 8_8_8_8. Each texture is named by the XXH3 hash of its
+// guest base level, and a replacement is a DDS file of the same format, the
+// same size or 2x, 4x or 8x it, with at least as many levels.
 struct BcFormat {
   xenos::TextureFormat guest;
+  // 4 (BCn) or 1 (uncompressed) texels per block side.
+  uint32_t block_width;
   uint32_t block_bytes;
-  uint32_t fourcc;  // DDS pixel format
+  // DDS pixel format four-character code; 0 writes a DX10 header.
+  uint32_t fourcc;
+  // A second code DDS writers use for the format (BC4U, BC5U), or 0.
+  uint32_t fourcc_alternative;
   // DXGI formats a DX10 header may name, and the host resource may use.
   DXGI_FORMAT unorm, srgb, typeless;
 };
 
 constexpr BcFormat kBcFormats[] = {
-    {xenos::TextureFormat::k_DXT1, 8, 0x31545844u /* DXT1 */, DXGI_FORMAT_BC1_UNORM,
+    {xenos::TextureFormat::k_DXT1, 4, 8, 0x31545844u /* DXT1 */, 0, DXGI_FORMAT_BC1_UNORM,
      DXGI_FORMAT_BC1_UNORM_SRGB, DXGI_FORMAT_BC1_TYPELESS},
-    {xenos::TextureFormat::k_DXT2_3, 16, 0x33545844u /* DXT3 */, DXGI_FORMAT_BC2_UNORM,
+    {xenos::TextureFormat::k_DXT2_3, 4, 16, 0x33545844u /* DXT3 */, 0, DXGI_FORMAT_BC2_UNORM,
      DXGI_FORMAT_BC2_UNORM_SRGB, DXGI_FORMAT_BC2_TYPELESS},
-    {xenos::TextureFormat::k_DXT4_5, 16, 0x35545844u /* DXT5 */, DXGI_FORMAT_BC3_UNORM,
+    {xenos::TextureFormat::k_DXT4_5, 4, 16, 0x35545844u /* DXT5 */, 0, DXGI_FORMAT_BC3_UNORM,
      DXGI_FORMAT_BC3_UNORM_SRGB, DXGI_FORMAT_BC3_TYPELESS},
+    {xenos::TextureFormat::k_DXT5A, 4, 8, 0x31495441u /* ATI1 */, 0x55344342u /* BC4U */,
+     DXGI_FORMAT_BC4_UNORM, DXGI_FORMAT_BC4_UNORM, DXGI_FORMAT_BC4_TYPELESS},
+    {xenos::TextureFormat::k_DXN, 4, 16, 0x32495441u /* ATI2 */, 0x55354342u /* BC5U */,
+     DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_BC5_TYPELESS},
+    // Channels as stored (the fetch constant's swizzle picks them).
+    {xenos::TextureFormat::k_8_8_8_8, 1, 4, 0, 0, DXGI_FORMAT_R8G8B8A8_UNORM,
+     DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_TYPELESS},
 };
 
 const BcFormat* FindBcFormat(xenos::TextureFormat format) {
@@ -1752,9 +1765,13 @@ struct BcImage {
   std::vector<uint8_t> data;  // levels in order, blocks row by row
 };
 
+uint32_t BcBlocks(const BcFormat& format, uint32_t size, uint32_t level) {
+  return (std::max(size >> level, 1u) + format.block_width - 1) / format.block_width;
+}
+
 size_t BcLevelBytes(const BcFormat& format, uint32_t width, uint32_t height, uint32_t level) {
-  return size_t((std::max(width >> level, 1u) + 3) / 4) *
-         ((std::max(height >> level, 1u) + 3) / 4) * format.block_bytes;
+  return size_t(BcBlocks(format, width, level)) * BcBlocks(format, height, level) *
+         format.block_bytes;
 }
 
 struct BcSource {
@@ -1771,7 +1788,7 @@ bool UntileBc(const BcSource& key, const texture_util::TextureGuestLayout& layou
               std::vector<uint8_t>& output) {
   const uint32_t width = key.width, height = key.height;
   const uint32_t block = key.format->block_bytes;
-  const uint32_t block_log2 = block == 8 ? 3 : 4;
+  const uint32_t block_log2 = block == 4 ? 2 : block == 8 ? 3 : 4;
   // Byte permutations for none, 8-in-16, 8-in-32 and 16-in-32.
   constexpr uint32_t kMasks[] = {0, 1, 3, 2};
   for (uint32_t mip = 0; mip < levels; ++mip) {
@@ -1783,8 +1800,8 @@ bool UntileBc(const BcSource& key, const texture_util::TextureGuestLayout& layou
     if (key.packed_mips) {
       texture_util::GetPackedMipOffset(width, height, 1, key.format->guest, mip, ox, oy, oz);
     }
-    const uint32_t columns = (std::max(width >> mip, 1u) + 3) / 4;
-    const uint32_t rows = (std::max(height >> mip, 1u) + 3) / 4;
+    const uint32_t columns = BcBlocks(*key.format, width, mip);
+    const uint32_t rows = BcBlocks(*key.format, height, mip);
     for (uint32_t y = 0; y < rows; ++y) {
       for (uint32_t x = 0; x < columns; ++x) {
         const uint64_t offset =
@@ -1814,13 +1831,16 @@ void WriteDds(const std::filesystem::path& path, const BcImage& image) {
   header[7] = image.levels;
   header[19] = 32;  // pixel format size
   header[20] = 0x4;  // fourcc
-  header[21] = image.format->fourcc;
+  header[21] = image.format->fourcc ? image.format->fourcc : kFourCcDx10;
   header[27] = 0x1000 | (image.levels > 1 ? 0x400000 | 0x8 : 0);
+  // DX10 header: format, 2D, no flags, one array slice.
+  const uint32_t dx10[5] = {uint32_t(image.format->unorm), 3, 0, 1, 0};
   std::error_code error;
   std::filesystem::create_directories(path.parent_path(), error);
   FILE* file = _wfopen(path.c_str(), L"wb");
   if (!file) return;
   fwrite(header, sizeof(header), 1, file);
+  if (!image.format->fourcc) fwrite(dx10, sizeof(dx10), 1, file);
   fwrite(image.data.data(), 1, image.data.size(), file);
   fclose(file);
 }
@@ -1850,10 +1870,17 @@ std::optional<BcImage> ReadDds(const std::filesystem::path& path) {
       }
     }
     data_offset = 148;
-  } else {
+  } else if (word(20) & 0x4) {
     for (const auto& format : kBcFormats) {
-      if (word(21) == format.fourcc) image.format = &format;
+      if (format.fourcc && (word(21) == format.fourcc ||
+                            (format.fourcc_alternative && word(21) == format.fourcc_alternative))) {
+        image.format = &format;
+      }
     }
+  } else if ((word(20) & 0x40) && word(22) == 32 && word(23) == 0xFFu && word(24) == 0xFF00u &&
+             word(25) == 0xFF0000u) {
+    // Uncompressed 32 bits, R in the low byte (as the 8_8_8_8 dumps store it).
+    image.format = FindBcFormat(xenos::TextureFormat::k_8_8_8_8);
   }
   if (!image.format) return std::nullopt;
   image.height = word(3);
@@ -1982,7 +2009,7 @@ bool D3D12TextureCache::TryLoadTextureReplacement(Texture& texture) {
     if (!slot) {
       auto read = ReadDds(file->second);
       if (!read) {
-        REXGPU_WARN("Texture replacement {} is not a DXT1, DXT3 or DXT5 DDS",
+        REXGPU_WARN("Texture replacement {} is not a DDS of a supported format",
                     file->second.string());
         state.files.erase(file);
         state.loaded.erase(hash);
@@ -2050,8 +2077,7 @@ bool D3D12TextureCache::TryLoadTextureReplacement(Texture& texture) {
   if (!mapping) return false;
   size_t source = 0;
   for (uint32_t level = 0; level < levels; ++level) {
-    const size_t pitch =
-        size_t((std::max(image->width >> level, 1u) + 3) / 4) * format->block_bytes;
+    const size_t pitch = size_t(BcBlocks(*format, image->width, level)) * format->block_bytes;
     for (UINT row = 0; row < row_counts[level]; ++row) {
       std::memcpy(mapping + footprints[level].Offset +
                       size_t(row) * footprints[level].Footprint.RowPitch,
@@ -2099,8 +2125,19 @@ void D3D12TextureCache::OnTextureResourceSwitched(Texture& texture) {
   }
 }
 
-bool D3D12TextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_base, bool load_mips) {
-  if (TryLoadTextureReplacement(texture)) return true;
+bool D3D12TextureCache::TryLoadTextureDataFromCpu(Texture& texture, bool load_base, bool load_mips,
+                                                  bool resolve_sourced) {
+  // Resolve output is the title's own rendering, never a replacement; it
+  // loads into the guest-size resource.
+  if (resolve_sourced) {
+    auto& target = static_cast<D3D12Texture&>(texture);
+    if (target.uses_replacement_resource()) {
+      target.UseGuestResource();
+      OnTextureResourceSwitched(texture);
+    }
+  } else if (TryLoadTextureReplacement(texture)) {
+    return true;
+  }
   // Linear single-level 8-bit textures (FH1's video planes, rewritten by the
   // CPU every frame) are copied straight from guest memory into the upload
   // footprint when the guest row pitch already matches it, instead of

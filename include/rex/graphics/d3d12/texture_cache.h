@@ -327,7 +327,8 @@ class D3D12TextureCache final : public TextureCache {
     std::unordered_map<SRVDescriptorKey, uint32_t, SRVDescriptorKey::Hasher> srv_descriptors_;
   };
 
-  bool TryLoadTextureDataFromCpu(Texture& texture, bool load_base, bool load_mips) override;
+  bool TryLoadTextureDataFromCpu(Texture& texture, bool load_base, bool load_mips,
+                                 bool resolve_sourced) override;
   // Dumps and replaces DXT1/3/5 textures by the hash of their guest base level
   // (texture_dump_dir, texture_replacement_dirs); true when replaced.
   bool TryLoadTextureReplacement(Texture& texture);
