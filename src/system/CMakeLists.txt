@@ -9,6 +9,7 @@ set(REXSYSTEM_SOURCES
     user_module.cpp
     xthread.cpp
     xevent.cpp
+    gpu_write_signal.cpp
     xfile.cpp
     xmutant.cpp
     xsemaphore.cpp

@@ -33,6 +33,7 @@
 #include <rex/memory.h>
 #include <rex/memory/ring_buffer.h>
 #include <rex/stream.h>
+#include <rex/system/gpu_write_signal.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 
@@ -806,6 +807,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     }
   }
 
+  bool cpu_visible_write = false;
   switch (opcode) {
     case PM4_INTERRUPT:
     case PM4_XE_SWAP:
@@ -816,6 +818,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     case PM4_EVENT_WRITE_EXT:
     case PM4_EVENT_WRITE_ZPD:
       FlushCpuVisibleResults();
+      cpu_visible_write = true;
       break;
     default:
       break;
@@ -942,6 +945,8 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
 
   assert_true(reader->read_offset() ==
               (data_start_offset + (count * sizeof(uint32_t))) % reader->capacity());
+  // Wakes guest threads blocked on a fence word instead of polling it.
+  if (cpu_visible_write) system::SignalGpuWrite();
   return result;
 }
 
