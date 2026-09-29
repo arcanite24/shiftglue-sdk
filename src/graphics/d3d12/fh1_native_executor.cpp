@@ -123,74 +123,6 @@ constexpr uint32_t kRtvCapacity = 1024;
 constexpr uint32_t kDsvCapacity = 256;
 constexpr uint32_t kResolveMemoryConstantCount = 8;
 
-// Same rectangle derivation as draw_util::GetResolveInfo, in surface pixels
-// relative to the base in the color or depth info register.
-bool ResolveRectangle(const RegisterFile& regs, const memory::Memory& memory, int32_t& x0,
-                      int32_t& y0, int32_t& x1, int32_t& y1) {
-  xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(0);
-  if (fetch.type != xenos::FetchConstantType::kVertex || fetch.size != 3 * 2) return false;
-  const float* vertices =
-      reinterpret_cast<const float*>(memory.TranslatePhysical(fetch.address * sizeof(uint32_t)));
-  if (!vertices) return false;
-  const float half_pixel =
-      regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero ? 0.5f : 0.0f;
-  int32_t fixed[6];
-  for (size_t i = 0; i < 6; ++i) {
-    fixed[i] = ui::FloatToD3D11Fixed16p8(xenos::GpuSwap(vertices[i], fetch.endian) + half_pixel);
-  }
-  x0 = (std::min({fixed[0], fixed[2], fixed[4]}) + 127) >> 8;
-  y0 = (std::min({fixed[1], fixed[3], fixed[5]}) + 127) >> 8;
-  x1 = (std::max({fixed[0], fixed[2], fixed[4]}) + 127) >> 8;
-  y1 = (std::max({fixed[1], fixed[3], fixed[5]}) + 127) >> 8;
-  if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
-    const auto offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
-    x0 += offset.window_x_offset;
-    y0 += offset.window_y_offset;
-    x1 += offset.window_x_offset;
-    y1 += offset.window_y_offset;
-  }
-  draw_util::Scissor scissor;
-  draw_util::GetScissor(regs, scissor, false);
-  const int32_t right = int32_t(scissor.offset[0] + scissor.extent[0]);
-  const int32_t bottom = int32_t(scissor.offset[1] + scissor.extent[1]);
-  x0 = std::clamp(x0, int32_t(scissor.offset[0]), right);
-  y0 = std::clamp(y0, int32_t(scissor.offset[1]), bottom);
-  x1 = std::clamp(x1, int32_t(scissor.offset[0]), right);
-  y1 = std::clamp(y1, int32_t(scissor.offset[1]), bottom);
-  constexpr int32_t kAlign = int32_t(xenos::kResolveAlignmentPixels);
-  x0 &= ~(kAlign - 1);
-  y0 &= ~(kAlign - 1);
-  x1 = (x1 + kAlign - 1) & ~(kAlign - 1);
-  y1 = (y1 + kAlign - 1) & ~(kAlign - 1);
-  const int32_t pitch =
-      int32_t(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch & ~uint32_t(kAlign - 1));
-  x0 = std::min(x0, pitch);
-  x1 = std::min(x1, pitch);
-  return x0 < x1 && y0 < y1;
-}
-
-// Color formats whose guest EDRAM words the resolve shader can encode and
-// decode.
-bool IsResolveColorFormatSupported(xenos::ColorRenderTargetFormat format) {
-  switch (format) {
-    case xenos::ColorRenderTargetFormat::k_8_8_8_8:
-    case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
-    case xenos::ColorRenderTargetFormat::k_2_10_10_10:
-    case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
-    case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
-    case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
-    case xenos::ColorRenderTargetFormat::k_32_FLOAT:
-    case xenos::ColorRenderTargetFormat::k_16_16:
-    case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
-    case xenos::ColorRenderTargetFormat::k_16_16_16_16:
-    case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
-    case xenos::ColorRenderTargetFormat::k_32_32_FLOAT:
-      return true;
-    default:
-      return false;
-  }
-}
-
 // Formats whose guest EDRAM words are the host channel bits (16-bit or 32-bit
 // float channels besides 32_FLOAT): read and transferred through UINT views.
 DXGI_FORMAT ColorUintFormat(xenos::ColorRenderTargetFormat format) {
@@ -814,9 +746,9 @@ void Fh1NativeExecutor::TransferRects(Surface& dest, uint32_t previous_owner,
   Surface* source = FindSurface(previous_owner);
   if (!source) return Skip("transfer_source_missing");
   if ((!dest.key.is_depth &&
-       !IsResolveColorFormatSupported(xenos::ColorRenderTargetFormat(dest.key.format))) ||
+       !Fh1IsResolveColorFormatSupported(xenos::ColorRenderTargetFormat(dest.key.format))) ||
       (!source->key.is_depth &&
-       !IsResolveColorFormatSupported(xenos::ColorRenderTargetFormat(source->key.format)))) {
+       !Fh1IsResolveColorFormatSupported(xenos::ColorRenderTargetFormat(source->key.format)))) {
     return Skip("transfer_format");
   }
   Count("transfer");
@@ -1827,91 +1759,13 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
 
 
 bool Fh1NativeExecutor::PlanCopy(CopyPlan& plan) {
-  const RegisterFile& regs = register_file_;
   plan = CopyPlan();
-  if (!ResolveRectangle(regs, memory_, plan.x0, plan.y0, plan.x1, plan.y1)) {
-    plan.empty = true;
-    return false;
+  const Fh1ResolveFlags flags{config_.depth_float24_round, config_.gamma_as_unorm16,
+                              config_.fixed16_truncated};
+  if (!Fh1PlanResolve(register_file_, memory_, flags, plan)) return false;
+  if (plan.copy) {
+    GetResolveSources(plan.resolve_key, plan.x0, plan.y0, plan.x1, plan.y1, plan.sources);
   }
-  // As the render target cache does, so 16_16[_16_16] keep the guest's range.
-  if (!draw_util::GetResolveInfo(regs, memory_, 1, 1, config_.fixed16_truncated,
-                                 config_.fixed16_truncated, plan.info)) {
-    plan.skip = "resolve_info";
-    return false;
-  }
-  const auto copy_control = regs.Get<reg::RB_COPY_CONTROL>();
-  const auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
-  plan.msaa = uint32_t(surface_info.msaa_samples);
-  plan.pitch_tiles = PitchTiles(surface_info.surface_pitch, plan.msaa);
-  plan.copying_depth = plan.info.IsCopyingDepth();
-  plan.color_info =
-      plan.copying_depth
-          ? reg::RB_COLOR_INFO{}
-          : regs.Get<reg::RB_COLOR_INFO>(
-                reg::RB_COLOR_INFO::rt_register_indices[copy_control.copy_src_select]);
-  plan.depth_info = regs.Get<reg::RB_DEPTH_INFO>();
-  if (!plan.info.copy_dest_extent_length) return true;
-
-  const auto dest_info = plan.info.copy_dest_info;
-  plan.resolve_key =
-      plan.copying_depth
-          ? MakeDepthKey(plan.depth_info.depth_base, plan.pitch_tiles, plan.msaa,
-                         plan.depth_info.depth_format)
-          : MakeColorKey(plan.color_info.color_base, plan.pitch_tiles, plan.msaa,
-                         plan.color_info.color_format);
-  if (!plan.copying_depth) {
-    // Decode in the guest format the resolve names, not the storage key.
-    plan.resolve_key.format = uint32_t(plan.color_info.color_format);
-  }
-  uint32_t pack = UINT32_MAX, bpb_log2 = 2;
-  if (plan.copying_depth) {
-    pack = 4;
-    plan.kind = "depth" + std::to_string(uint32_t(plan.depth_info.depth_format));
-  } else {
-    switch (xenos::TextureFormat(dest_info.copy_dest_format)) {
-      case xenos::TextureFormat::k_8_8_8_8:
-        pack = 0;
-        break;
-      case xenos::TextureFormat::k_2_10_10_10:
-        pack = 1;
-        break;
-      case xenos::TextureFormat::k_32_FLOAT:
-        pack = 2;
-        break;
-      case xenos::TextureFormat::k_16_16_16_16_FLOAT:
-        pack = 3;
-        bpb_log2 = 3;
-        break;
-      default:
-        break;
-    }
-    plan.kind = "c" + std::to_string(uint32_t(plan.color_info.color_format)) + "->t" +
-                std::to_string(uint32_t(dest_info.copy_dest_format));
-  }
-  plan.kind += "/" + std::to_string(1u << plan.msaa) + "x/s" +
-               std::to_string(uint32_t(plan.info.copy_dest_coordinate_info.copy_sample_select));
-  if (pack == UINT32_MAX) {
-    plan.skip = "resolve_dest_format";
-  } else if (dest_info.copy_dest_array) {
-    plan.skip = "resolve_dest_array";
-  } else if (uint32_t(dest_info.copy_dest_endian) > 3) {
-    plan.skip = "resolve_dest_endian";
-  } else if (!plan.copying_depth && !IsResolveColorFormatSupported(plan.color_info.color_format)) {
-    plan.skip = "resolve_source_format";
-  }
-  if (plan.skip) return true;
-  const int32_t exp_bias = plan.copying_depth ? 0 : int32_t(dest_info.copy_dest_exp_bias);
-  plan.dest_info = pack | (uint32_t(dest_info.copy_dest_endian) << 3) |
-                   (uint32_t(!plan.copying_depth && dest_info.copy_dest_swap) << 6) |
-                   (uint32_t(config_.depth_float24_round) << 7) |
-                   ((uint32_t(exp_bias) & 0xFF) << 8) | (bpb_log2 << 16) |
-                   (uint32_t(config_.gamma_as_unorm16) << 18) |
-                   (uint32_t(!config_.fixed16_truncated) << 19);
-  plan.dest_base = regs[XE_GPU_REG_RB_COPY_DEST_BASE];
-  plan.dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>().copy_dest_pitch;
-  plan.sample_select = uint32_t(plan.info.copy_dest_coordinate_info.copy_sample_select);
-  GetResolveSources(plan.resolve_key, plan.x0, plan.y0, plan.x1, plan.y1, plan.sources);
-  plan.copy = true;
   return true;
 }
 
@@ -2117,7 +1971,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
       }
       const SurfaceKey& owner = source.surface->key;
       if (!owner.is_depth &&
-          !IsResolveColorFormatSupported(xenos::ColorRenderTargetFormat(owner.format))) {
+          !Fh1IsResolveColorFormatSupported(xenos::ColorRenderTargetFormat(owner.format))) {
         Skip("resolve_owner_format");
         complete = false;
         continue;
@@ -2150,7 +2004,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
           if (!source.surface || source.rect.left >= source.rect.right ||
               source.rect.top >= source.rect.bottom ||
               (!source.surface->key.is_depth &&
-               !IsResolveColorFormatSupported(
+               !Fh1IsResolveColorFormatSupported(
                    xenos::ColorRenderTargetFormat(source.surface->key.format)))) {
             continue;
           }

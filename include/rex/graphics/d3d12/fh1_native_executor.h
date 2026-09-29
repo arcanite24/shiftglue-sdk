@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <rex/graphics/d3d12/fh1_frame_dump.h>
+#include <rex/graphics/fh1_edram_resolve.h>
 #include <rex/graphics/fh1_edram_surfaces.h>
 #include <rex/graphics/fh1_edram_tiles.h>
 #include <rex/graphics/registers.h>
@@ -296,23 +297,7 @@ class Fh1NativeExecutor {
                        uint32_t dest_pitch, D3D12_GPU_VIRTUAL_ADDRESS target = 0,
                        bool unscaled_dest = false);
   // A guest copy: its rectangle, destination and the native sources.
-  struct CopyPlan {
-    bool empty = false;        // Nothing to copy or clear.
-    const char* skip = nullptr;
-    bool copy = false;         // The copy can run natively.
-    int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
-    draw_util::ResolveInfo info;
-    uint32_t msaa = 0;
-    uint32_t pitch_tiles = 0;
-    bool copying_depth = false;
-    reg::RB_COLOR_INFO color_info;
-    reg::RB_DEPTH_INFO depth_info;
-    SurfaceKey resolve_key;
-    uint32_t dest_info = 0;
-    uint32_t dest_base = 0;
-    uint32_t dest_pitch = 0;
-    uint32_t sample_select = 0;
-    std::string kind;
+  struct CopyPlan : Fh1ResolvePlan {
     std::vector<SourceRect> sources;
   };
   // False when there is nothing to do or the copy cannot be planned.

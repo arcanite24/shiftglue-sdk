@@ -17,6 +17,7 @@ set(REXGPU_XENOS_SOURCES
     # GPU system
     graphics_system.cpp
     command_processor.cpp
+    fh1_edram_resolve.cpp
     util/draw_extent_estimator.cpp
     util/draw.cpp
     primitive_processor.cpp
