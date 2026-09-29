@@ -1764,6 +1764,15 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     fh1_native_executor_->OnSwap(observation_frame_sequence_, frontbuffer_ptr,
                                  frontbuffer_width, frontbuffer_height, gamma_pwl);
   }
+  // The GPU commands thread's CPU time per frame: with the submission
+  // worker's, whether a frame is bound by command processing or by the GPU.
+  {
+    const int64_t cpu_ns = perf::CurrentThreadCpuTimeNs();
+    if (gpu_thread_cpu_ns_ && cpu_ns >= gpu_thread_cpu_ns_) {
+      PERF_counter_add(kFh1GpuThreadCpuTimeNs, cpu_ns - gpu_thread_cpu_ns_);
+    }
+    gpu_thread_cpu_ns_ = cpu_ns;
+  }
 
   SCOPE_profile_cpu_f("gpu");
   vertex_buffers_in_sync_[0] = 0;
@@ -2810,6 +2819,16 @@ bool D3D12CommandProcessor::AwaitFence(ID3D12Fence* fence, uint64_t value,
     return false;
   }
   PROFILE_CMD_BUFFER_STALL();
+  const auto wait_start = std::chrono::steady_clock::now();
+  const struct WaitTimer {
+    std::chrono::steady_clock::time_point start;
+    ~WaitTimer() {
+      PERF_counter_add(kGpuThreadFenceWaitNs,
+                       std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count());
+    }
+  } wait_timer{wait_start};
   for (;;) {
     const uint64_t completed = fence->GetCompletedValue();
     const HRESULT removal_reason = GetD3D12Provider().GetDevice()->GetDeviceRemovedReason();
@@ -3336,8 +3355,13 @@ void D3D12CommandProcessor::SubmissionWorkerMain() {
     submission_jobs_.pop_front();
     submission_worker_busy_ = true;
     lock.unlock();
+    const auto busy_start = std::chrono::steady_clock::now();
     ExecuteSubmission(*job.tape, job.command_allocator, job.submission, job.closing_frame);
     job.tape->Reset();
+    PERF_counter_add(kGpuSubmissionBusyNs,
+                     std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now() - busy_start)
+                         .count());
     lock.lock();
     submission_free_tapes_.push_back(std::move(job.tape));
     submission_worker_busy_ = false;
@@ -3351,9 +3375,14 @@ void D3D12CommandProcessor::AwaitSubmissionWorker() {
   if (!async_submission_) {
     return;
   }
+  const auto wait_start = std::chrono::steady_clock::now();
   std::unique_lock<std::mutex> lock(submission_worker_mutex_);
   submission_worker_idle_.wait(
       lock, [this]() { return submission_jobs_.empty() && !submission_worker_busy_; });
+  PERF_counter_add(kGpuThreadFenceWaitNs,
+                   std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now() - wait_start)
+                       .count());
 }
 
 bool D3D12CommandProcessor::CanEndSubmissionImmediately() const {

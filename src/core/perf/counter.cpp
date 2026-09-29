@@ -178,6 +178,10 @@ constexpr const char* kCounterNames[] = {
     "clock_mutex_contentions",
     "timer_queue_wakeups",
     "timer_queue_callbacks",
+    "gpu_thread_idle_ns",
+    "gpu_thread_reg_mem_wait_ns",
+    "gpu_thread_fence_wait_ns",
+    "gpu_submission_busy_ns",
 };
 static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
 
@@ -256,6 +260,10 @@ constexpr bool kIsGauge[] = {
     false,  // kClockMutexContentions
     false,  // kTimerQueueWakeups
     false,  // kTimerQueueCallbacks
+    false,  // kGpuThreadIdleNs
+    false,  // kGpuThreadRegMemWaitNs
+    false,  // kGpuThreadFenceWaitNs
+    false,  // kGpuSubmissionBusyNs
 };
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 

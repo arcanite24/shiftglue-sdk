@@ -490,6 +490,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::vector<std::unique_ptr<DeferredCommandList>> submission_free_tapes_;
   bool submission_worker_busy_ = false;
   bool submission_worker_stop_ = false;
+  // The GPU commands thread's CPU time at the previous swap.
+  int64_t gpu_thread_cpu_ns_ = 0;
 
   bool debug_markers_enabled_ = false;
 

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -224,6 +225,7 @@ void CommandProcessor::WorkerThreadMain() {
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
       PrepareForWait();
+      const auto idle_start = std::chrono::steady_clock::now();
       uint32_t loop_count = 0;
       do {
         // If we spin around too much, revert to a "low-power" state.
@@ -238,6 +240,10 @@ void CommandProcessor::WorkerThreadMain() {
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+      PERF_counter_add(kGpuThreadIdleNs,
+                       std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - idle_start)
+                           .count());
       ReturnFromWait();
       if (!worker_running_ || !pending_fns_.empty()) {
         continue;
@@ -1056,6 +1062,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   bool is_memory = (wait_info & 0x10) != 0;
 
   bool matched = false;
+  std::chrono::steady_clock::time_point wait_start{};
   do {
     uint32_t value = 0;
     if (is_memory) {
@@ -1096,6 +1103,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      if (wait_start == std::chrono::steady_clock::time_point{}) {
+        wait_start = std::chrono::steady_clock::now();
+      }
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();
@@ -1117,6 +1127,12 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+  if (wait_start != std::chrono::steady_clock::time_point{}) {
+    PERF_counter_add(kGpuThreadRegMemWaitNs,
+                     std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now() - wait_start)
+                         .count());
+  }
 
   return true;
 }

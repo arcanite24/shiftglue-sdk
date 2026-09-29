@@ -131,6 +131,15 @@ enum class CounterId : uint16_t {
   kTimerQueueWakeups,
   kTimerQueueCallbacks,
 
+  // Where the GPU commands thread's frame goes (NP-9.3), as wall time: the
+  // ring buffer empty (waiting for the title), WAIT_REG_MEM polls, and waits
+  // for GPU fences or the submission worker; and the submission worker's
+  // busy time (tape replay, ExecuteCommandLists). Append to preserve IDs.
+  kGpuThreadIdleNs,
+  kGpuThreadRegMemWaitNs,
+  kGpuThreadFenceWaitNs,
+  kGpuSubmissionBusyNs,
+
   kCount  // sentinel -- must be last
 };
 
