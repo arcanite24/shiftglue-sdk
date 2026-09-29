@@ -8,9 +8,10 @@
 # thirdparty/glslang with ENABLE_HLSL and ENABLE_GLSLANG_BINARIES and point
 # GLSLANG at it; without GLSLANG only the DXBC headers are written.
 #
-# Vulkan bindings, all in descriptor set 0 and by register class whatever the
-# resource type (--hlsl-iomap): b<n> is binding n, t<n> is binding 16 + n and
-# u<n> is binding 32 + n.
+# Vulkan: the constant buffers are push constants (FH1_SPIRV, see
+# fh1_push_constants.hlsli), and resources are in descriptor set 0 by register
+# class whatever their type (--hlsl-iomap): t<n> is binding 16 + n and u<n> is
+# binding 32 + n.
 set -euo pipefail
 cd "$(dirname "$0")"
 FXC="${FXC:-/c/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/fxc.exe}"
@@ -24,8 +25,8 @@ compile_spirv() {  # profile file name defines...
   for define in "$@"; do args+=("-D$define"); done
   local stage=frag
   [[ $profile == cs_* ]] && stage=comp
-  "$GLSLANG" -D -V -S "$stage" -e main "${args[@]}" --hlsl-iomap \
-    --shift-cbuffer-binding 0 --shift-texture-binding 16 --shift-UAV-binding 32 \
+  "$GLSLANG" -D -V -S "$stage" -e main -DFH1_SPIRV=1 "${args[@]}" --hlsl-iomap \
+    --shift-texture-binding 16 --shift-UAV-binding 32 \
     --vn "$name" -o "vulkan_spirv/$name.h" "$file" > /dev/null
 }
 compile() {  # profile file name defines...

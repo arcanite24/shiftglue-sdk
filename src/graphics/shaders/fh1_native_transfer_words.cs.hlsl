@@ -6,7 +6,9 @@
 // Variants: FH1_SOURCE_DEPTH / FH1_SOURCE_UINT / FH1_SOURCE_MSAA (see
 // fh1_native_edram.hlsli).
 
-cbuffer Fh1NativeTransferWordsConstants : register(b0) {
+#include "fh1_push_constants.hlsli"
+
+FH1_PUSH_CONSTANTS cbuffer Fh1NativeTransferWordsConstants FH1_CONSTANTS_REGISTER {
   uint fh1_rect_origin;     // x | y << 16, destination host pixels
   uint fh1_rect_size;       // width | height << 16
   uint fh1_dest_layout;     // Layout of the new owner, with its host sample mode.

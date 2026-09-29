@@ -6,7 +6,9 @@
 //
 // Variants: FH1_DEST_MSAA (per-sample shading).
 
-cbuffer Fh1NativeTransferConstants : register(b0) {
+#include "fh1_push_constants.hlsli"
+
+FH1_PUSH_CONSTANTS cbuffer Fh1NativeTransferConstants FH1_CONSTANTS_REGISTER {
   uint fh1_dest_layout;  // Layout of the new owner.
   uint fh1_dest_shape;   // Destination width in pixels | host samples << 16.
   uint fh1_flags;        // Stencil bit index 8:10.

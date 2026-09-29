@@ -12,7 +12,9 @@
 // Variants: FH1_SOURCE_MSAA (Texture2DMS sources), FH1_SOURCE_DEPTH (depth and
 // stencil sources instead of a color source).
 
-cbuffer Fh1NativeResolveMemoryConstants : register(b0) {
+#include "fh1_push_constants.hlsli"
+
+FH1_PUSH_CONSTANTS cbuffer Fh1NativeResolveMemoryConstants FH1_CONSTANTS_REGISTER {
   uint fh1_rect_origin;     // x | y << 16, resolve surface pixels
   uint fh1_rect_size;       // width | height << 16
   // Layouts: base_tiles 0:10, pitch_tiles (32bpp) 11:18, msaa 19:20,

@@ -1,6 +1,8 @@
 // FH1 reflection cube import: tiled, endian 8-in-32 R10G10B10A2.
 // Writes all six faces of one mip directly to the persistent host cube.
-cbuffer Load : register(b0) {
+#include "fh1_push_constants.hlsli"
+
+FH1_PUSH_CONSTANTS cbuffer Load FH1_CONSTANTS_REGISTER {
   uint flags, guest_offset, guest_pitch, guest_z_stride;
   uint3 size_blocks;
   uint face_stride;

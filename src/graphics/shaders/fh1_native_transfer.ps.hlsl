@@ -13,7 +13,9 @@
 
 #include "fh1_native_edram.hlsli"
 
-cbuffer Fh1NativeTransferConstants : register(b0) {
+#include "fh1_push_constants.hlsli"
+
+FH1_PUSH_CONSTANTS cbuffer Fh1NativeTransferConstants FH1_CONSTANTS_REGISTER {
   uint fh1_dest_layout;    // Layout of the new owner, with its host sample mode.
   uint fh1_source_layout;  // Layout of the previous owner, with its host sample mode.
   uint fh1_flags;          // FH1_FLAG_*, stencil bit index 8:10, scale - 1 12:13.

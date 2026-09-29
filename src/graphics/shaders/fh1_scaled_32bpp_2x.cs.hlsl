@@ -1,6 +1,8 @@
 // Qualified specialization: tiled 2D, 32 bits per pixel, endian 8-in-32, symmetric 2x.
 // Existing resolve buffer preserves partial updates and history; admission is in texture_cache.cpp.
-cbuffer Load : register(b0) {
+#include "fh1_push_constants.hlsli"
+
+FH1_PUSH_CONSTANTS cbuffer Load FH1_CONSTANTS_REGISTER {
  uint flags, guest_offset, guest_pitch, guest_z_stride;
  uint3 size_blocks; uint host_offset;
  uint host_pitch, height_texels;
