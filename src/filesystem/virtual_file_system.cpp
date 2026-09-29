@@ -49,6 +49,18 @@ bool VirtualFileSystem::UnregisterDevice(const std::string_view path) {
   return false;
 }
 
+bool VirtualFileSystem::ReplaceDevice(std::unique_ptr<Device> device) {
+  auto global_lock = global_critical_region_.Acquire();
+  for (auto& existing : devices_) {
+    if (existing->mount_path() == device->mount_path()) {
+      REXFS_DEBUG("Replaced device: {}", device->mount_path());
+      existing = std::move(device);
+      return true;
+    }
+  }
+  return false;
+}
+
 bool VirtualFileSystem::RegisterSymbolicLink(const std::string_view path,
                                              const std::string_view target) {
   auto global_lock = global_critical_region_.Acquire();
@@ -225,6 +237,14 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
 
     auto file_name = rex::string::utf8_find_name_from_guest_path(path);
     entry = parent_entry->GetChild(file_name);
+    // A device may resolve a file into another tree than its directory's (an
+    // overlay of mod files over the game's): ask it for the whole path too.
+    if (!root_entry) {
+      Entry* resolved = ResolvePath(path);
+      if (resolved && resolved != entry && !(resolved->attributes() & kFileAttributeDirectory)) {
+        entry = resolved;
+      }
+    }
   } else {
     entry = !root_entry ? ResolvePath(path) : root_entry->GetChild(path);
   }
@@ -234,8 +254,9 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
       return X_STATUS_FILE_IS_A_DIRECTORY;
     }
 
-    // If the cached entry does not exist on host anymore, invalidate it.
-    if (parent_entry) {
+    // If the cached entry does not exist on host anymore, invalidate it. Only
+    // for the parent's own children: an overlay entry lives in another tree.
+    if (parent_entry && entry->parent() == parent_entry) {
       const auto* host_path_entry = dynamic_cast<const HostPathEntry*>(parent_entry);
       if (host_path_entry) {
         const auto file_path = host_path_entry->host_path() / rex::to_path(entry->name());

@@ -33,6 +33,10 @@ class VirtualFileSystem {
 
   bool RegisterDevice(std::unique_ptr<Device> device);
   bool UnregisterDevice(const std::string_view path);
+  // Swaps the device mounted at `device`'s mount path for `device`, keeping
+  // its place in the lookup order (devices resolve in registration order, and
+  // a broader mount registered later must not start catching its paths).
+  bool ReplaceDevice(std::unique_ptr<Device> device);
 
   bool RegisterSymbolicLink(const std::string_view path, const std::string_view target);
   bool UnregisterSymbolicLink(const std::string_view path);
