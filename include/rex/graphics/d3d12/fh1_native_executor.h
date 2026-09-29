@@ -14,6 +14,7 @@
 #include <rex/graphics/d3d12/fh1_frame_dump.h>
 #include <rex/graphics/fh1_depth_overwrite.h>
 #include <rex/graphics/fh1_edram_resolve.h>
+#include <rex/graphics/fh1_executor_counters.h>
 #include <rex/graphics/fh1_edram_surfaces.h>
 #include <rex/graphics/fh1_edram_tiles.h>
 #include <rex/graphics/registers.h>
@@ -286,8 +287,8 @@ class Fh1NativeExecutor {
                   D3D12_RESOURCE_STATES new_state);
   void ClearSurfaceRect(Surface& surface, const D3D12_RECT& rect, uint32_t clear_value,
                         uint32_t clear_value_lo);
-  void Skip(const char* reason) { ++skips_[reason]; }
-  void Count(const char* stat) { ++stats_[stat]; }
+  void Skip(const char* reason) { counters_.Skip(reason); }
+  void Count(const char* stat) { counters_.Count(stat); }
   void LogOnce(uint64_t signature, const std::string& message);
   // Whether LogOnce can still log (checked before building a message).
   bool ShouldLog() const { return logged_.size() < 256; }
@@ -356,8 +357,7 @@ class Fh1NativeExecutor {
   std::set<uint64_t> dump_frames_;
   std::filesystem::path dump_directory_;
   uint64_t frame_ = 0;
-  std::map<std::string, uint64_t> skips_;
-  std::map<std::string, uint64_t> stats_;
+  Fh1ExecutorCounters counters_;
   std::set<uint64_t> logged_;
   uint64_t draws_ = 0;
   // CPU time on the GPU command thread, per phase, since the last stats line.

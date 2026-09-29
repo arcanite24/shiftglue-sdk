@@ -766,7 +766,7 @@ void Fh1NativeExecutor::TransferRects(Surface& dest, uint32_t previous_owner,
     pass_count = source_stencil ? 9 : 1;
     if (!source_stencil) Count("transfer_stencil_skipped");
   }
-  stats_["transfer_tile_passes"] += uint64_t(tile_count) * pass_count;
+  counters_.Count("transfer_tile_passes", uint64_t(tile_count) * pass_count);
   if (gpu_query_heap_) {
     transfer_volume_[source->key.Describe() + "->" + dest.key.Describe()] +=
         uint64_t(tile_count) * pass_count;
@@ -2103,14 +2103,8 @@ void Fh1NativeExecutor::GpuDrain() {
 }
 
 void Fh1NativeExecutor::LogStats(uint64_t frame) {
-  std::string skips;
-  for (const auto& [reason, count] : skips_) {
-    skips += (skips.empty() ? "" : ",") + reason + "=" + std::to_string(count);
-  }
-  std::string stats;
-  for (const auto& [name, count] : stats_) {
-    stats += (stats.empty() ? "" : ",") + name + "=" + std::to_string(count);
-  }
+  const std::string skips = counters_.FormatSkips();
+  const std::string stats = counters_.FormatStats();
   REXGPU_INFO(
       "FH1 native executor frame={} draws={} resolves={} surfaces={} skips={{{}}} stats={{{}}}",
       frame, draws_, resolves_, surfaces_.size(), skips, stats);
