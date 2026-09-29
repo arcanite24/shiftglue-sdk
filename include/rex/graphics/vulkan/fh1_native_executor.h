@@ -190,10 +190,14 @@ class Fh1NativeExecutor {
                          int32_t y1, std::vector<SourceRect>& sources_out);
   bool PlanCopy(CopyPlan& plan);
   bool Resolve(uint32_t* written_address, uint32_t* written_length);
+  // Resolves into `buffer` (the shared memory buffer, or at scale the
+  // texture cache's scaled resolve buffer) bound from `memory_offset`.
+  // unscaled_dest writes the guest layout from each guest pixel's first host
+  // pixel, for the guest memory copy of a resolve at scale.
   bool ResolveToMemory(const SourceRect& source, const SurfaceKey& resolve_key,
                        uint32_t sample_select, uint32_t dest_info, uint32_t dest_base,
-                       uint32_t dest_pitch, VkDeviceSize memory_offset,
-                       VkDeviceSize memory_range);
+                       uint32_t dest_pitch, VkBuffer buffer, VkDeviceSize memory_offset,
+                       VkDeviceSize memory_range, bool unscaled_dest = false);
   void ClearSurfaceRect(Surface& surface, const Rect& guest_rect, uint32_t clear_value,
                         uint32_t clear_value_lo);
   bool IsOneOffResolve(uint32_t address, uint32_t length);

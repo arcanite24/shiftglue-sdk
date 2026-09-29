@@ -278,8 +278,8 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   config_ = config;
   if (!config_.memory || !config_.textures || !config_.render_targets) return false;
   scale_ = config_.textures->draw_resolution_scale_x();
-  if (scale_ != 1 || config_.textures->draw_resolution_scale_y() != 1) {
-    REXGPU_WARN("FH1 native executor (Vulkan): resolution scale {}x{} is not supported yet",
+  if (config_.textures->draw_resolution_scale_y() != scale_ || scale_ > 4) {
+    REXGPU_WARN("FH1 native executor (Vulkan): resolution scale {}x{} is not supported",
                 config_.textures->draw_resolution_scale_x(),
                 config_.textures->draw_resolution_scale_y());
     return false;
@@ -1578,7 +1578,8 @@ void Fh1NativeExecutor::ClearSurfaceRect(Surface& surface, const Rect& guest_rec
 bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceKey& resolve_key,
                                         uint32_t sample_select, uint32_t dest_info,
                                         uint32_t dest_base, uint32_t dest_pitch,
-                                        VkDeviceSize memory_offset, VkDeviceSize memory_range) {
+                                        VkBuffer buffer, VkDeviceSize memory_offset,
+                                        VkDeviceSize memory_range, bool unscaled_dest) {
   Surface& surface = *source.surface;
   const bool depth = surface.key.is_depth;
   const bool msaa = surface.samples > 1;
@@ -1599,7 +1600,7 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
       {VK_NULL_HANDLE, surface.sampled_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
       {VK_NULL_HANDLE, surface.stencil_view ? surface.stencil_view : surface.sampled_view,
        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
-  VkDescriptorBufferInfo buffer = {config_.memory->buffer(), memory_offset, memory_range};
+  VkDescriptorBufferInfo buffer_info = {buffer, memory_offset, memory_range};
   VkWriteDescriptorSet writes[3] = {};
   for (uint32_t w = 0; w < 3; ++w) {
     writes[w].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1614,13 +1615,13 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   writes[1].pImageInfo = &images[1];
   writes[2].dstBinding = kBindingMemory;
   writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  writes[2].pBufferInfo = &buffer;
+  writes[2].pBufferInfo = &buffer_info;
   vulkan_device->functions().vkUpdateDescriptorSets(vulkan_device->device(), 3, writes, 0,
                                                     nullptr);
   const SurfaceKey& owner = surface.key;
   const uint32_t host_sample_mode =
       owner.msaa == uint32_t(xenos::MsaaSamples::k2X) ? (surface.samples == 4 ? 2u : 1u) : 0u;
-  const Rect rect = HostRect(source.rect);
+  const Rect rect = unscaled_dest ? source.rect : HostRect(source.rect);
   uint32_t constants[kComputeConstantCount];
   constants[0] = uint32_t(rect.left) | (uint32_t(rect.top) << 16);
   constants[1] = uint32_t(rect.right - rect.left) | (uint32_t(rect.bottom - rect.top) << 16);
@@ -1630,7 +1631,7 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
                             owner.is_depth, owner.format) |
                  (host_sample_mode << 27);
   constants[4] = sample_select;
-  constants[5] = dest_info | ((scale_ - 1) << 20);
+  constants[5] = dest_info | ((scale_ - 1) << 20) | (unscaled_dest ? 1u << 22 : 0u);
   constants[6] = dest_base;
   constants[7] = dest_pitch;
   auto& command_buffer = command_processor_.deferred_command_buffer();
@@ -1660,7 +1661,8 @@ bool Fh1NativeExecutor::NativeResolve(uint32_t& written_address, uint32_t& writt
   written_length = 0;
   if (!initialized_) return false;
   if (!Resolve(&written_address, &written_length)) return false;
-  if (written_length && IsOneOffResolve(written_address, written_length)) {
+  // At scale the resolve reads one-off captures back itself.
+  if (scale_ == 1 && written_length && IsOneOffResolve(written_address, written_length)) {
     QueueResolveReadback(written_address, written_length);
   }
   if (written_length && !REXCVAR_GET(fh1_resolve_dump_dir).empty() &&
@@ -1804,9 +1806,34 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     const VkDeviceSize offset =
         VkDeviceSize(std::min(plan.dest_base, extent_start)) & ~(alignment - 1);
     const VkDeviceSize range = VkDeviceSize(extent_start) + extent_length - offset;
-    config_.memory->RequestRange(extent_start, extent_length);
-    config_.memory->Use(VulkanSharedMemory::Usage::kComputeWrite,
-                        std::make_pair(extent_start, extent_length));
+    // At scale the destination is the texture cache's scaled resolve buffer
+    // from the scaled destination base, which the shader addresses relative
+    // to (as the D3D12 executor's scaled resolve range).
+    VkBuffer target = config_.memory->buffer();
+    VkDeviceSize target_offset = offset, target_range = range;
+    uint32_t dest_base = uint32_t(plan.dest_base - offset);
+    if (scale_ > 1) {
+      const uint32_t base = resolve_info.copy_dest_base;
+      const uint32_t range_unscaled = extent_start - base + extent_length;
+      uint64_t scaled_base, scaled_length, use_start, use_length;
+      if (!config_.textures->GetScaledResolveRange(base, range_unscaled, 2, scaled_base,
+                                                   scaled_length) ||
+          !config_.textures->GetScaledResolveRange(extent_start, extent_length, 2, use_start,
+                                                   use_length) ||
+          !config_.textures->CommitScaledResolveRange(base, range_unscaled, 2)) {
+        Skip("resolve_scaled_memory");
+        return false;
+      }
+      config_.textures->UseScaledResolveBufferForWrite(use_start, use_length);
+      target = config_.textures->scaled_resolve_buffer();
+      target_offset = scaled_base;
+      target_range = scaled_length;
+      dest_base = plan.dest_base - base;
+    } else {
+      config_.memory->RequestRange(extent_start, extent_length);
+      config_.memory->Use(VulkanSharedMemory::Usage::kComputeWrite,
+                          std::make_pair(extent_start, extent_length));
+    }
     bool complete = true;
     for (const SourceRect& source : plan.sources) {
       if (source.rect.left >= source.rect.right || source.rect.top >= source.rect.bottom) {
@@ -1832,11 +1859,34 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
         Count("resolve_through_alias");
       }
       if (!ResolveToMemory(source, plan.resolve_key, plan.sample_select, plan.dest_info,
-                           uint32_t(plan.dest_base - offset), plan.dest_pitch, offset, range)) {
+                           dest_base, plan.dest_pitch, target, target_offset, target_range)) {
         complete = false;
       }
     }
-    // Invalidates textures over the range.
+    // One-off captures the CPU reads also need the guest layout at scale:
+    // resolved again unscaled into the guest memory copy, from each guest
+    // pixel's first host pixel, and read back.
+    if (scale_ > 1 && written_address && IsOneOffResolve(extent_start, extent_length)) {
+      config_.memory->RequestRange(extent_start, extent_length);
+      config_.memory->Use(VulkanSharedMemory::Usage::kComputeWrite,
+                          std::make_pair(extent_start, extent_length));
+      bool unscaled_complete = true;
+      for (const SourceRect& source : plan.sources) {
+        if (!source.surface || source.rect.left >= source.rect.right ||
+            source.rect.top >= source.rect.bottom ||
+            (!source.surface->key.is_depth &&
+             !Fh1IsResolveColorFormatSupported(
+                 xenos::ColorRenderTargetFormat(source.surface->key.format)))) {
+          continue;
+        }
+        unscaled_complete &= ResolveToMemory(
+            source, plan.resolve_key, plan.sample_select, plan.dest_info,
+            uint32_t(plan.dest_base - offset), plan.dest_pitch, config_.memory->buffer(), offset,
+            range, true);
+      }
+      if (unscaled_complete) QueueResolveReadback(extent_start, extent_length);
+    }
+    // Invalidates textures over the range (and marks it scaled at scale).
     config_.textures->MarkRangeAsResolved(extent_start, extent_length);
     if (written_address) *written_address = extent_start;
     if (written_length) *written_length = extent_length;
