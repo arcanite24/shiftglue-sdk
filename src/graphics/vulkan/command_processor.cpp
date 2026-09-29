@@ -2410,8 +2410,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
 
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
-      [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
-       swap_post_effect,
+      [this, guest_output_width, guest_output_height, display_width, display_height,
+       frontbuffer_format, swap_texture_view, swap_post_effect,
        swap_source_needs_rb_swap](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         // In case the swap command is the only one in the frame.
         if (!BeginSubmission(true)) {
@@ -2921,6 +2921,30 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         // presenter so it can submit its own commands for displaying it to the
         // queue, and also need to submit the release barrier.
         EndSubmission(true);
+
+        // Notify the host of the presented guest output, as the D3D12 backend
+        // does (render tests count frames and capture here).
+        if (auto renderer = graphics_system_->native_guest_output_renderer().Get()) {
+          system::NativeGuestOutputRenderContext native_context;
+          native_context.backend = system::NativeGuestOutputBackend::kVulkan;
+          native_context.phase = system::NativeGuestOutputPhase::kPresented;
+          native_context.guest_output_width = guest_output_width;
+          native_context.guest_output_height = guest_output_height;
+          native_context.display_width = display_width;
+          native_context.display_height = display_height;
+          native_context.output_format = uint32_t(ui::vulkan::VulkanPresenter::kGuestOutputFormat);
+          native_context.device = device;
+          native_context.command_context = this;
+          native_context.guest_output = vulkan_context.image();
+          native_context.guest_output_state =
+              uint32_t(ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
+          native_context.submission = GetCurrentSubmission();
+          native_context.completed_submission = GetCompletedSubmission();
+          native_context.frame_sequence = presented_output_frames_;
+          native_context.use_pwl_gamma_ramp = use_pwl_gamma_ramp;
+          renderer(native_context);
+        }
+        ++presented_output_frames_;
         return true;
       });
 

@@ -523,6 +523,8 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   bool submission_open_ = false;
   uint64_t submission_completed_ = 0;
+  // Guest output frames presented, for the host's presented-output observer.
+  uint64_t presented_output_frames_ = 0;
   // In case vkQueueSubmit fails after something like a successful
   // vkQueueBindSparse, to wait correctly on the next attempt.
   std::vector<VkSemaphore> current_submission_wait_semaphores_;
