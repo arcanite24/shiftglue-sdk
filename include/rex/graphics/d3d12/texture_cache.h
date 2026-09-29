@@ -296,7 +296,7 @@ class D3D12TextureCache final : public TextureCache {
   };
 
   bool TryLoadTextureDataFromCpu(Texture& texture, bool load_base, bool load_mips) override;
-  // Dumps and replaces BC3 textures by the hash of their guest base level
+  // Dumps and replaces DXT1/3/5 textures by the hash of their guest base level
   // (texture_dump_dir, texture_replacement_dirs); true when replaced.
   bool TryLoadTextureReplacement(Texture& texture);
 
