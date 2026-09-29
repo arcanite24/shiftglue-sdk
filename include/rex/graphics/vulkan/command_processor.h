@@ -207,6 +207,30 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Dynamic rendering for the FH1 native executor: begins the scope unless
   // the one identified by `id` is already open. Submission must be open.
   void SubmitBarriersAndBeginFh1Rendering(const VkRenderingInfo& rendering_info, uint64_t id);
+  // vulkan_diagnostic_checkpoints: marks the command stream so a device loss
+  // reports the last draws, copies, texture loads and executor passes the GPU
+  // reached (marker: kind in bits 56+, frame in 32-55, value below).
+  enum class CheckpointKind : uint32_t {
+    kDraw = 1,
+    kCopy,
+    kTextureLoad,
+    kResolve,
+    kTransfer,
+    kClear,
+    kDrawEnd,
+    kTextureLoadEnd,
+  };
+  // Without a value, the current draw index in the frame.
+  void Checkpoint(CheckpointKind kind, uint32_t value = UINT32_MAX) {
+    if (value == UINT32_MAX) {
+      value = debug_frame_draw_index_ - 1;
+    }
+    if (checkpoints_enabled_) {
+      deferred_command_buffer_.CmdVkSetCheckpointNV(
+          (uint64_t(kind) << 56) | (uint64_t(observation_frame_sequence_ & 0xFFFFFF) << 32) |
+          value);
+    }
+  }
   bool IsFh1RenderingOpen(uint64_t id) const {
     return in_render_pass_ && id && current_fh1_rendering_id_ == id;
   }
@@ -318,6 +342,21 @@ class VulkanCommandProcessor : public CommandProcessor {
   void StopSubmissionWorker();
   void SubmissionWorkerMain();
   void AwaitSubmissionWorker();
+  void LogCheckpoints();
+  bool checkpoints_enabled_ = false;
+  // What each recent checkpointed draw was, for the device-loss report.
+  struct CheckpointDraw {
+    uint64_t marker = 0;
+    uint64_t vertex_shader = 0;
+    uint64_t pixel_shader = 0;
+    uint32_t primitive = 0;
+    uint32_t index_count = 0;
+  };
+  // The last 8 frames' first 8192 draws each (the CPU runs frames ahead).
+  std::vector<CheckpointDraw> checkpoint_draws_;
+  static size_t CheckpointDrawSlot(uint64_t frame, uint32_t index) {
+    return size_t((frame & 7) << 13) | (index & 8191);
+  }
   bool async_submission_ = false;
   uint32_t submission_split_draws_ = 0;
   uint32_t submission_draws_ = 0;

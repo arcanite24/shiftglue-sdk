@@ -22,6 +22,11 @@
 #include <rex/string.h>
 #include <rex/ui/vulkan/device.h>
 
+REXCVAR_DEFINE_BOOL(vulkan_diagnostic_checkpoints, false, "UI/Vulkan",
+                    "Diagnostics: on NVIDIA, mark draws, copies, texture loads and executor "
+                    "passes with VK_NV_device_diagnostic_checkpoints and log the last ones the "
+                    "GPU reached if the device is lost")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
                     "required for Vulkan GPU emulation")
@@ -236,6 +241,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_STRUCT_EXTENSION(EXT_custom_border_color)
       // Required for true null descriptors in bindless texture bindings.
       XE_UI_VULKAN_STRUCT_EXTENSION(EXT_robustness2)
+    }
+    if (REXCVAR_GET(vulkan_diagnostic_checkpoints)) {
+      // #207.
+      XE_UI_VULKAN_STRUCT_EXTENSION(NV_device_diagnostic_checkpoints)
     }
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
       // #237.
@@ -803,6 +812,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
   if (device->extensions_.ext_KHR_swapchain) {
 #include <rex/ui/vulkan/functions/device_khr_swapchain.inc>
+  }
+  if (device->extensions_.ext_NV_device_diagnostic_checkpoints) {
+#include <rex/ui/vulkan/functions/device_nv_device_diagnostic_checkpoints.inc>
   }
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 

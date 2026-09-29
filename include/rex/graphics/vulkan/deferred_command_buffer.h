@@ -268,6 +268,12 @@ class DeferredCommandBuffer {
   void CmdVkBeginRendering(const VkRenderingInfo* rendering_info);
   void CmdVkEndRendering() { WriteCommand(Command::kVkEndRendering, 0); }
 
+  void CmdVkSetCheckpointNV(uint64_t marker) {
+    auto& args = *reinterpret_cast<ArgsVkSetCheckpointNV*>(
+        WriteCommand(Command::kVkSetCheckpointNV, sizeof(ArgsVkSetCheckpointNV)));
+    args.marker = marker;
+  }
+
   void CmdVkWriteTimestamp(VkPipelineStageFlagBits pipeline_stage, VkQueryPool query_pool,
                            uint32_t query) {
     auto& args = *reinterpret_cast<ArgsVkWriteTimestamp*>(
@@ -387,6 +393,7 @@ class DeferredCommandBuffer {
     kVkPushConstants,
     kVkResetQueryPool,
     kVkWriteTimestamp,
+    kVkSetCheckpointNV,
     kVkSetBlendConstants,
     kVkSetDepthBias,
     kVkSetScissor,
@@ -537,6 +544,10 @@ class DeferredCommandBuffer {
     VkQueryPool query_pool;
     uint32_t first_query;
     uint32_t query_count;
+  };
+
+  struct ArgsVkSetCheckpointNV {
+    uint64_t marker;
   };
 
   struct ArgsVkWriteTimestamp {

@@ -3901,6 +3901,18 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     if (!BeginSubmission(true)) {
       return draw_fail("begin_submission");
     }
+    Checkpoint(CheckpointKind::kDraw);
+    if (checkpoints_enabled_) {
+      CheckpointDraw& draw = checkpoint_draws_[CheckpointDrawSlot(observation_frame_sequence_,
+                                                                  debug_frame_draw_index_ - 1)];
+      draw.marker = (uint64_t(CheckpointKind::kDraw) << 56) |
+                    (uint64_t(observation_frame_sequence_ & 0xFFFFFF) << 32) |
+                    (debug_frame_draw_index_ - 1);
+      draw.vertex_shader = vertex_shader->ucode_data_hash();
+      draw.pixel_shader = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
+      draw.primitive = uint32_t(prim_type);
+      draw.index_count = index_count;
+    }
 
     // Process primitives.
     if (!primitive_processor_->Process(primitive_processing_result)) {
@@ -4390,6 +4402,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
   }
+  Checkpoint(CheckpointKind::kDrawEnd);
   if (fh1_native_executor_) {
     fh1_native_executor_->NativeDrawIssued(fh1_draw);
   }
@@ -4632,6 +4645,7 @@ bool VulkanCommandProcessor::IssueCopy() {
     return false;
   }
 
+  Checkpoint(CheckpointKind::kCopy);
   if (frame_dump_) {
     frame_dump_->RecordCopyInputs();
   }
@@ -5229,6 +5243,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
       REXGPU_ERROR("Failed to await submission completion Vulkan fences");
       if (wait_result == VK_ERROR_DEVICE_LOST) {
         device_lost_ = true;
+        LogCheckpoints();
       }
     }
   }
@@ -5247,6 +5262,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     ++fences_awaited;
   }
   if (device_lost_) {
+    LogCheckpoints();
     if (graphics_system_) {
       graphics_system_->OnHostGpuLossFromAnyThread(true);
     }
@@ -5773,6 +5789,7 @@ bool VulkanCommandProcessor::ExecuteSubmission(
   if (submit_result != VK_SUCCESS) {
     REXGPU_ERROR("Failed to submit a Vulkan command buffer");
     if (submit_result == VK_ERROR_DEVICE_LOST) {
+      LogCheckpoints();
       if (!async_submission_) {
         device_lost_ = true;
       }
@@ -5785,7 +5802,64 @@ bool VulkanCommandProcessor::ExecuteSubmission(
   return recorded;
 }
 
+void VulkanCommandProcessor::LogCheckpoints() {
+  // Once: every later wait or submission reports the same loss.
+  static std::atomic<bool> logged{false};
+  if (!checkpoints_enabled_ || logged.exchange(true)) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
+      vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
+  uint32_t count = 0;
+  dfn.vkGetQueueCheckpointDataNV(queue_acquisition.queue(), &count, nullptr);
+  std::vector<VkCheckpointDataNV> checkpoints(count);
+  for (VkCheckpointDataNV& checkpoint : checkpoints) {
+    checkpoint.sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV;
+    checkpoint.pNext = nullptr;
+  }
+  dfn.vkGetQueueCheckpointDataNV(queue_acquisition.queue(), &count, checkpoints.data());
+  static const char* const kKinds[] = {"?",        "draw",     "copy",     "texture load",
+                                       "resolve",  "transfer", "clear",    "draw end",
+                                       "texture load end"};
+  REXGPU_ERROR("Vulkan device lost; {} last checkpoints reached:", count);
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint64_t marker = uint64_t(uintptr_t(checkpoints[i].pCheckpointMarker));
+    const uint32_t kind = uint32_t(marker >> 56);
+    REXGPU_ERROR("  stage {:08X}: {} {} (frame {})", uint32_t(checkpoints[i].stage),
+                 kind < std::size(kKinds) ? kKinds[kind] : "?", uint32_t(marker),
+                 uint32_t(marker >> 32) & 0xFFFFFF);
+  }
+  // The draws around the last one begun, as far as they were recorded.
+  uint32_t last_draw = UINT32_MAX;
+  uint64_t last_frame = 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint64_t marker = uint64_t(uintptr_t(checkpoints[i].pCheckpointMarker));
+    if ((marker >> 56) == uint64_t(CheckpointKind::kDraw) &&
+        (checkpoints[i].stage & VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT)) {
+      last_draw = uint32_t(marker);
+      last_frame = (marker >> 32) & 0xFFFFFF;
+    }
+  }
+  if (last_draw != UINT32_MAX) {
+    for (uint32_t index = last_draw >= 3 ? last_draw - 3 : 0; index <= last_draw + 3; ++index) {
+      const CheckpointDraw& draw = checkpoint_draws_[CheckpointDrawSlot(last_frame, index)];
+      if (draw.marker != ((uint64_t(CheckpointKind::kDraw) << 56) | (last_frame << 32) | index)) {
+        continue;
+      }
+      REXGPU_ERROR("  draw {}: vs {:016X} ps {:016X} primitive {} indices {}", index,
+                   draw.vertex_shader, draw.pixel_shader, draw.primitive, draw.index_count);
+    }
+  }
+}
+
 void VulkanCommandProcessor::StartSubmissionWorker() {
+  checkpoints_enabled_ = GetVulkanDevice()->extensions().ext_NV_device_diagnostic_checkpoints;
+  if (checkpoints_enabled_) {
+    checkpoint_draws_.resize(size_t(8) << 13);
+    REXGPU_INFO("Vulkan diagnostic checkpoints enabled");
+  }
   async_submission_ = REXCVAR_GET(vulkan_async_submission);
   submission_split_draws_ = uint32_t(std::max(0, REXCVAR_GET(vulkan_async_submission_split_draws)));
   if (!async_submission_) {

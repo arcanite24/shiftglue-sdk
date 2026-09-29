@@ -897,6 +897,7 @@ void Fh1NativeExecutor::TransferRects(Surface& dest, uint32_t previous_owner, co
                                       uint32_t rect_count, uint32_t tile_count,
                                       bool tiles_stencil) {
   GpuTimer gpu_timer(*this, kGpuTransfers);
+  command_processor_.Checkpoint(VulkanCommandProcessor::CheckpointKind::kTransfer);
   Surface* source = FindSurface(previous_owner);
   if (!source) return Skip("transfer_source_missing");
   if ((!dest.key.is_depth &&
@@ -923,6 +924,7 @@ void Fh1NativeExecutor::TransferRects(Surface& dest, uint32_t previous_owner, co
 
 void Fh1NativeExecutor::FlushTransfers() {
   GpuTimer gpu_timer(*this, kGpuTransfers);
+  command_processor_.Checkpoint(VulkanCommandProcessor::CheckpointKind::kTransfer);
   if (pending_transfers_.empty()) return;
   std::stable_sort(pending_transfers_.begin(), pending_transfers_.end(),
                    [](const PendingTransfer& a, const PendingTransfer& b) {
@@ -1556,6 +1558,7 @@ void Fh1NativeExecutor::NativeDrawIssued(const Fh1DrawInfo& draw) {
 void Fh1NativeExecutor::ClearSurfaceRect(Surface& surface, const Rect& guest_rect,
                                          uint32_t clear_value, uint32_t clear_value_lo) {
   GpuTimer gpu_timer(*this, kGpuClears);
+  command_processor_.Checkpoint(VulkanCommandProcessor::CheckpointKind::kClear);
   const Rect rect = HostRect(guest_rect);
   VkClearAttachment clear = {};
   if (surface.key.is_depth) {
@@ -1633,6 +1636,7 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
                                         VkBuffer buffer, VkDeviceSize memory_offset,
                                         VkDeviceSize memory_range, bool unscaled_dest) {
   GpuTimer gpu_timer(*this, kGpuResolves);
+  command_processor_.Checkpoint(VulkanCommandProcessor::CheckpointKind::kResolve);
   Surface& surface = *source.surface;
   const bool depth = surface.key.is_depth;
   const bool msaa = surface.samples > 1;

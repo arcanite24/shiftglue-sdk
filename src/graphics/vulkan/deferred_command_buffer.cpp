@@ -272,6 +272,12 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                                 args.query_count);
       } break;
 
+      case Command::kVkSetCheckpointNV: {
+        auto& args = *reinterpret_cast<const ArgsVkSetCheckpointNV*>(stream);
+        dfn.vkCmdSetCheckpointNV(command_buffer,
+                                 reinterpret_cast<const void*>(uintptr_t(args.marker)));
+      } break;
+
       case Command::kVkWriteTimestamp: {
         auto& args = *reinterpret_cast<const ArgsVkWriteTimestamp*>(stream);
         dfn.vkCmdWriteTimestamp(command_buffer, args.pipeline_stage, args.query_pool,

@@ -1224,6 +1224,8 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                                                bool load_mips) {
   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
   TextureKey texture_key = vulkan_texture.key();
+  command_processor_.Checkpoint(VulkanCommandProcessor::CheckpointKind::kTextureLoad,
+                                texture_key.base_page);
 
   // Get the pipeline.
   const HostFormatPair& host_format_pair = GetHostFormatPair(texture_key);
@@ -1617,6 +1619,8 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
       }
       command_processor_.SubmitBarriers(true);
       command_buffer.CmdVkDispatch(group_count_x, group_count_y, load_constants.size_blocks[2]);
+      command_processor_.Checkpoint(VulkanCommandProcessor::CheckpointKind::kTextureLoadEnd,
+                                    texture_key.base_page);
       load_constants.guest_offset += level_array_slice_stride_bytes_scaled;
       load_constants.host_offset += uint32_t(level_host_layout.slice_size_bytes);
     }

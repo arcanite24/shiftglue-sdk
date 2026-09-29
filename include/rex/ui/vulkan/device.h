@@ -202,6 +202,8 @@ class VulkanDevice {
     bool ext_1_3_KHR_maintenance4 = false;  // #414
     // Has optional features not implied by this being true.
     bool ext_1_3_KHR_dynamic_rendering = false;  // #55
+    // Only with vulkan_diagnostic_checkpoints.
+    bool ext_NV_device_diagnostic_checkpoints = false;  // #207
   };
 
   const Extensions& extensions() const { return extensions_; }
@@ -223,6 +225,8 @@ class VulkanDevice {
 #include <rex/ui/vulkan/functions/device_1_3_khr_maintenance4.inc>
     // VK_KHR_dynamic_rendering (#55, promoted to 1.3)
 #include <rex/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc>
+    // VK_NV_device_diagnostic_checkpoints (#207)
+#include <rex/ui/vulkan/functions/device_nv_device_diagnostic_checkpoints.inc>
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 #undef XE_UI_VULKAN_FUNCTION
   };
