@@ -46,6 +46,16 @@ REXCVAR_DEFINE_STRING(fh1_resolve_dump_dir, "", "GPU/D3D12",
                       "Diagnostics: write every resolve's output bytes (scaled when resolution "
                       "scaling is on) to this directory, waiting for the GPU after each")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_DOUBLE(fh1_hud_squeeze, 1.0, "GPU/D3D12",
+                      "Horizontal squeeze of FH1's HUD (its draws into the front buffer's "
+                      "2_10_10_10_AS_10_10_10_10 view), around the screen center: the Hor+ "
+                      "aspect scale keeps the HUD 16:9 when the image is stretched wider")
+    .range(1.0, 4.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(fh1_draw_log_frame, 0, "GPU/D3D12",
+                     "Diagnostics: log every draw of this frame (targets, VTE control, blend, "
+                     "textures) and its resolves")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(fh1_resolve_dump_frame, 0, "GPU/D3D12",
                      "Diagnostics: with fh1_resolve_dump_dir, dump only the resolves of this "
                      "frame (swap count; 0 dumps every frame)")
@@ -2402,6 +2412,17 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     previous_viewport_info_ = viewport_info;
     viewport_cache_valid_ = true;
   }
+  // FH1's HUD is the only thing drawn into the front buffer through its
+  // 2_10_10_10_AS_10_10_10_10 view (after the tonemap writes it as
+  // 2_10_10_10). Under Hor+ the image is stretched to the window, so the HUD
+  // is squeezed by the same scale to keep its proportions (NP-4.4).
+  const double hud_squeeze = REXCVAR_GET(fh1_hud_squeeze);
+  if (hud_squeeze > 1.0 && normalized_color_mask &&
+      regs.Get<reg::RB_COLOR_INFO>(XE_GPU_REG_RB_COLOR_INFO).color_format ==
+          xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10) {
+    viewport_info.ndc_scale[0] = float(viewport_info.ndc_scale[0] / hud_squeeze);
+    viewport_info.ndc_offset[0] = float(viewport_info.ndc_offset[0] / hud_squeeze);
+  }
 
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
@@ -2582,6 +2603,30 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   native_draw.vertex_shader = vertex_shader;
   native_draw.pixel_shader = pixel_shader;
 
+  if (REXCVAR_GET(fh1_draw_log_frame) &&
+      observation_frame_sequence_ == uint64_t(REXCVAR_GET(fh1_draw_log_frame))) {
+    const auto& regs = *register_file_;
+    const auto color_info = regs.Get<reg::RB_COLOR_INFO>(XE_GPU_REG_RB_COLOR_INFO);
+    std::string textures;
+    for (uint32_t mask = used_texture_mask; mask; mask &= mask - 1) {
+      const uint32_t index = uint32_t(std::countr_zero(mask));
+      const auto fetch = regs.GetTextureFetch(index);
+      textures += fmt::format(" t{}={:08X}:{}x{}:f{}", index, fetch.base_address << 12,
+                              fetch.size_2d.width + 1, fetch.size_2d.height + 1,
+                              uint32_t(fetch.format));
+    }
+    REXGPU_INFO(
+        "FH1 draw log frame={} vs={:016X} ps={:016X} verts={} vte={:08X} color0={:08X} "
+        "fmt={} mask={:X} pitch={} blend0={:08X} depth={:08X} window_offset={:08X}{}",
+        observation_frame_sequence_, vertex_shader->ucode_data_hash(),
+        pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+        primitive_processing_result.host_draw_vertex_count, regs[XE_GPU_REG_PA_CL_VTE_CNTL],
+        uint32_t(color_info.color_base) << 12, uint32_t(color_info.color_format),
+        normalized_color_mask, regs.Get<reg::RB_SURFACE_INFO>().surface_pitch,
+        regs[XE_GPU_REG_RB_BLENDCONTROL0], regs[XE_GPU_REG_RB_DEPTHCONTROL],
+        regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET], textures);
+  }
+
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
       PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
@@ -2704,6 +2749,15 @@ bool D3D12CommandProcessor::IssueCopy() {
   uint32_t written_length = 0;
   fh1_native_executor_->RecordCopyInputs();
   const bool copy_succeeded = fh1_native_executor_->NativeResolve(written_address, written_length);
+  if (REXCVAR_GET(fh1_draw_log_frame) &&
+      observation_frame_sequence_ == uint64_t(REXCVAR_GET(fh1_draw_log_frame))) {
+    REXGPU_INFO("FH1 draw log frame={} resolve address={:08X} length={} surface_info={:08X} "
+                "color0={:08X}",
+                observation_frame_sequence_, written_address, written_length,
+                (*register_file_)[XE_GPU_REG_RB_SURFACE_INFO],
+                uint32_t(register_file_->Get<reg::RB_COLOR_INFO>(XE_GPU_REG_RB_COLOR_INFO)
+                             .color_base) << 12);
+  }
   if (Fh1FrameCensus::Enabled()) {
     Fh1FrameCensus::ObserveCopy(*register_file_, observation_frame_sequence_,
                                 written_address, written_length, copy_succeeded);

@@ -64,6 +64,15 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
                     "Submit command buffer when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+#if REX_HAS_D3D12
+REXCVAR_DECLARE(double, fh1_hud_squeeze);
+#else
+REXCVAR_DEFINE_DOUBLE(fh1_hud_squeeze, 1.0, "GPU",
+                      "Horizontal squeeze of FH1's HUD around the screen center (the Hor+ "
+                      "aspect scale)")
+    .range(1.0, 4.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+#endif
 REXCVAR_DEFINE_BOOL(vulkan_fh1_native_executor, true, "GPU/Vulkan",
                     "Render FH1 with the native executor (EDRAM ownership, transfers "
                     "and resolves over native surfaces) instead of the generic render "
@@ -4034,6 +4043,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       normalized_depth_control,
       host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader(),
       host_render_targets_used, pixel_shader && pixel_shader->writes_depth(), viewport_info);
+  // FH1's HUD under Hor+, as on D3D12 (fh1_hud_squeeze): its draws into the
+  // front buffer's 2_10_10_10_AS_10_10_10_10 view keep 16:9 proportions.
+  const double hud_squeeze = REXCVAR_GET(fh1_hud_squeeze);
+  if (hud_squeeze > 1.0 && normalized_color_mask &&
+      regs.Get<reg::RB_COLOR_INFO>(XE_GPU_REG_RB_COLOR_INFO).color_format ==
+          xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10) {
+    viewport_info.ndc_scale[0] = float(viewport_info.ndc_scale[0] / hud_squeeze);
+    viewport_info.ndc_offset[0] = float(viewport_info.ndc_offset[0] / hud_squeeze);
+  }
 
   // Update dynamic graphics pipeline state.
   UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control);
