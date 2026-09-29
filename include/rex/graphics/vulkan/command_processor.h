@@ -207,6 +207,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Submits the open submission, waits for every queue operation and reopens
   // the submission if one was open (FH1 resolve read-backs).
   void Fh1AwaitAllQueueOperations();
+  // fh1_frame_replay: replays a frame dump (recorded on D3D12) on Vulkan and
+  // ends the process.
+  void RunRequestedFrameReplay() override;
   // Must be called before doing anything outside the render pass scope,
   // including adding pipeline barriers that are not a part of the render pass
   // scope. Submission must be open.

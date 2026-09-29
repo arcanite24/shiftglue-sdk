@@ -27,6 +27,7 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
+#include <rex/graphics/fh1_frame_replay.h>
 #include <rex/math.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/flags.h>
@@ -3331,6 +3332,53 @@ void VulkanCommandProcessor::SubmitBarriersAndBeginFh1Rendering(
 system::GraphicsShaderTranslationObserver
 VulkanCommandProcessor::GetShaderTranslationObserver() const {
   return graphics_system_->shader_translation_observer();
+}
+
+void VulkanCommandProcessor::RunRequestedFrameReplay() {
+  const int exit_code = RunFh1FrameReplay(
+      *this, *register_file_, *memory_, *shared_memory_,
+      [this](uint32_t address, uint32_t length, std::vector<uint8_t>& out) {
+        // The swap closed the frame's submission; the readback needs its own.
+        if ((!submission_open_ && !BeginSubmission(false)) ||
+            !shared_memory_->RequestRange(address, length)) {
+          return false;
+        }
+        const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+        const auto& dfn = vulkan_device->functions();
+        const VkDevice device = vulkan_device->device();
+        VkBuffer buffer;
+        VkDeviceMemory memory;
+        if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+                vulkan_device, length, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                ui::vulkan::util::MemoryPurpose::kReadback, buffer, memory)) {
+          return false;
+        }
+        shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+        SubmitBarriers(true);
+        const VkBufferCopy region = {address, 0, length};
+        deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), buffer, 1, &region);
+        Fh1AwaitAllQueueOperations();
+        bool read = false;
+        void* mapped = nullptr;
+        if (dfn.vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS) {
+          VkMappedMemoryRange range = {};
+          range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+          range.memory = memory;
+          range.size = VK_WHOLE_SIZE;
+          dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
+          std::memcpy(out.data(), mapped, length);
+          dfn.vkUnmapMemory(device, memory);
+          read = true;
+        }
+        dfn.vkDestroyBuffer(device, buffer, nullptr);
+        dfn.vkFreeMemory(device, memory, nullptr);
+        return read;
+      });
+  if (exit_code < 0) return;
+  if (fh1_native_executor_) fh1_native_executor_->LogStats(0);
+  // A replay is a tool run with the title suspended: end the process here.
+  rex::FlushLogging();
+  std::_Exit(exit_code);
 }
 
 void VulkanCommandProcessor::Fh1AwaitAllQueueOperations() {

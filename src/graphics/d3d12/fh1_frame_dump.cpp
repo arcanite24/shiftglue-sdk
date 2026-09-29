@@ -8,6 +8,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/shared_memory.h>
+#include <rex/graphics/fh1_frame_replay.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
@@ -17,10 +18,6 @@ REXCVAR_DEFINE_INT32(fh1_frame_dump_frame, 0, "GPU/D3D12",
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(fh1_frame_dump_path, "", "GPU/D3D12",
                       "File the recorded FH1 frame dump is written to")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_STRING(fh1_frame_replay, "", "GPU/D3D12",
-                      "Replay this FH1 frame dump instead of running the title; the result is "
-                      "written next to it")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::d3d12 {
@@ -319,120 +316,31 @@ void Fh1FrameDump::End(uint32_t frontbuffer_address) {
 int Fh1FrameDump::RunRequestedReplay(D3D12CommandProcessor& command_processor,
                                       RegisterFile& register_file, memory::Memory& memory,
                                       D3D12SharedMemory& shared_memory) {
-  const std::filesystem::path path(REXCVAR_GET(fh1_frame_replay));
-  if (path.empty()) return -1;
-  std::ifstream in(path, std::ios::binary);
-  char magic[8] = {};
-  uint64_t frame = 0;
-  uint32_t register_count = 0;
-  if (!in.read(magic, sizeof(magic)) || std::memcmp(magic, kMagic, sizeof(kMagic)) ||
-      !Get(in, frame) || !Get(in, register_count) ||
-      register_count > RegisterFile::kRegisterCount) {
-    REXGPU_ERROR("FH1 frame replay: {} is not a frame dump", path.string());
-    return 2;
-  }
-  std::vector<uint32_t> registers(register_count);
-  in.read(reinterpret_cast<char*>(registers.data()), register_count * 4);
-  // Shaders active at the start, loaded like IM_LOAD_IMMEDIATE would.
-  std::vector<uint32_t> packets;
-  uint32_t shader_count = 0;
-  Get(in, shader_count);
-  for (uint32_t i = 0; i < shader_count; ++i) {
-    uint32_t type = 0, size = 0;
-    Get(in, type);
-    Get(in, size);
-    std::vector<uint32_t> ucode(size);
-    in.read(reinterpret_cast<char*>(ucode.data()), size * 4);
-    packets.push_back(
-        Swap((3u << 30) | ((size + 2 - 1) << 16) | (uint32_t(PM4_IM_LOAD_IMMEDIATE) << 8)));
-    packets.push_back(Swap(type));
-    packets.push_back(Swap(size));
-    for (uint32_t dword : ucode) packets.push_back(Swap(dword));
-  }
-  uint32_t packet_count = 0;
-  Get(in, packet_count);
-  const size_t recorded_first = packets.size();
-  packets.resize(recorded_first + packet_count);
-  in.read(reinterpret_cast<char*>(packets.data() + recorded_first), packet_count * 4);
-  uint32_t block_count = 0;
-  Get(in, block_count);
-  uint64_t block_bytes = 0;
-  for (uint32_t i = 0; i < block_count; ++i) {
-    uint32_t address = 0, length = 0;
-    Get(in, address);
-    Get(in, length);
-    uint8_t* destination = memory.TranslatePhysical(address);
-    if (!destination || uint64_t(address) + length > kPhysicalSize) {
-      in.seekg(length, std::ios::cur);
-      continue;
-    }
-    in.read(reinterpret_cast<char*>(destination), length);
-    block_bytes += length;
-  }
-  uint32_t front_address = 0, front_length = 0, width = 0, height = 0, format = 0, tiled = 0;
-  Get(in, front_address);
-  Get(in, front_length);
-  Get(in, width);
-  Get(in, height);
-  Get(in, format);
-  Get(in, tiled);
-  std::vector<uint8_t> expected(front_length);
-  in.read(reinterpret_cast<char*>(expected.data()), front_length);
-  if (!in) {
-    REXGPU_ERROR("FH1 frame replay: {} is truncated", path.string());
-    return 2;
-  }
-
-  // Everything written above is new CPU data for the GPU mirror.
-  shared_memory.InvalidateAllPages();
-  std::memcpy(register_file.values, registers.data(), registers.size() * 4);
-  REXGPU_INFO("FH1 frame replay: frame {} from {} ({} packet dwords, {} blocks, {} MB)", frame,
-              path.string(), packet_count, block_count, block_bytes >> 20);
-  const bool executed = command_processor.ExecuteHostPackets(packets.data(), uint32_t(packets.size()));
-
-  // Compare the front buffer the replay resolved with the recorded one.
-  std::vector<uint8_t> actual(front_length);
-  // The swap closed the frame's submission; the readback needs its own.
-  if (front_length && command_processor.Fh1BeginSubmission() &&
-      shared_memory.RequestRange(front_address, front_length)) {
-    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
-    readback.Attach(CreateReadback(command_processor.GetD3D12Provider().GetDevice(),
-                                   (front_length + 0xFFFF) & ~0xFFFFu));
-    if (readback) {
-      shared_memory.UseAsCopySource();
-      command_processor.SubmitBarriers();
-      command_processor.GetDeferredCommandList().D3DCopyBufferRegion(
-          readback.Get(), 0, shared_memory.GetBuffer(), front_address, front_length);
-      command_processor.Fh1AwaitAllQueueOperations();
-      void* mapped = nullptr;
-      D3D12_RANGE range = {0, front_length};
-      if (SUCCEEDED(readback->Map(0, &range, &mapped))) {
-        std::memcpy(actual.data(), mapped, front_length);
+  return RunFh1FrameReplay(
+      command_processor, register_file, memory, shared_memory,
+      [&](uint32_t address, uint32_t length, std::vector<uint8_t>& out) {
+        // The swap closed the frame's submission; the readback needs its own.
+        if (!command_processor.Fh1BeginSubmission() ||
+            !shared_memory.RequestRange(address, length)) {
+          return false;
+        }
+        Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+        readback.Attach(CreateReadback(command_processor.GetD3D12Provider().GetDevice(),
+                                       (length + 0xFFFF) & ~0xFFFFu));
+        if (!readback) return false;
+        shared_memory.UseAsCopySource();
+        command_processor.SubmitBarriers();
+        command_processor.GetDeferredCommandList().D3DCopyBufferRegion(
+            readback.Get(), 0, shared_memory.GetBuffer(), address, length);
+        command_processor.Fh1AwaitAllQueueOperations();
+        void* mapped = nullptr;
+        D3D12_RANGE range = {0, length};
+        if (FAILED(readback->Map(0, &range, &mapped))) return false;
+        std::memcpy(out.data(), mapped, length);
         D3D12_RANGE written = {0, 0};
         readback->Unmap(0, &written);
-      }
-    }
-  }
-  uint64_t differing_words = 0;
-  for (uint32_t i = 0; i + 4 <= front_length; i += 4) {
-    differing_words += std::memcmp(expected.data() + i, actual.data() + i, 4) != 0;
-  }
-  std::filesystem::path result = path;
-  result += ".replay.bin";
-  std::ofstream(result, std::ios::binary)
-      .write(reinterpret_cast<const char*>(actual.data()), actual.size());
-  std::filesystem::path json = path;
-  json += ".replay.json";
-  std::ofstream(json) << "{\"frame\":" << frame << ",\"executed\":" << (executed ? "true" : "false")
-                      << ",\"packet_dwords\":" << packet_count << ",\"blocks\":" << block_count
-                      << ",\"front_address\":" << front_address
-                      << ",\"front_bytes\":" << front_length << ",\"width\":" << width
-                      << ",\"height\":" << height << ",\"format\":" << format
-                      << ",\"tiled\":" << tiled << ",\"differing_words\":" << differing_words
-                      << "}\n";
-  REXGPU_INFO("FH1 frame replay: done, {} of {} front buffer words differ ({})", differing_words,
-              front_length / 4, json.string());
-  return executed ? 0 : 1;
+        return true;
+      });
 }
 
 }  // namespace rex::graphics::d3d12

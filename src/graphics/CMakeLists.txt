@@ -19,6 +19,7 @@ set(REXGPU_XENOS_SOURCES
     command_processor.cpp
     fh1_depth_overwrite.cpp
     fh1_edram_resolve.cpp
+    fh1_frame_replay.cpp
     fh1_shader_pack.cpp
     util/draw_extent_estimator.cpp
     util/draw.cpp
