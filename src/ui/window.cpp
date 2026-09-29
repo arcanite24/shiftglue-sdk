@@ -645,6 +645,22 @@ void Window::InjectKey(VirtualKey virtual_key, bool down) {
   }
 }
 
+void Window::InjectMouseClick(MouseEvent::Button button, int32_t x, int32_t y) {
+  WindowDestructionReceiver destruction_receiver(this);
+  MouseEvent move(this, MouseEvent::Button::kNone, x, y);
+  OnMouseMove(move, destruction_receiver);
+  if (destruction_receiver.IsWindowDestroyed()) {
+    return;
+  }
+  MouseEvent down(this, button, x, y);
+  OnMouseDown(down, destruction_receiver);
+  if (destruction_receiver.IsWindowDestroyed()) {
+    return;
+  }
+  MouseEvent up(this, button, x, y);
+  OnMouseUp(up, destruction_receiver);
+}
+
 void Window::OnKeyDown(KeyEvent& e, WindowDestructionReceiver& destruction_receiver) {
   PropagateEventThroughInputListeners(
       [&e](auto listener) {

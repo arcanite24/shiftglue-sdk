@@ -371,6 +371,9 @@ class Window {
   // Sends a synthetic key press or release through the input listeners, as
   // the platform would for a real key, for scripted tests. UI thread only.
   void InjectKey(VirtualKey virtual_key, bool down);
+  // Moves the pointer to (x, y) in physical pixels and clicks `button` there
+  // through the input listeners, for scripted tests. UI thread only.
+  void InjectMouseClick(MouseEvent::Button button, int32_t x, int32_t y);
 
  protected:
   // The receiver, which must never be instantiated in the Window object itself
