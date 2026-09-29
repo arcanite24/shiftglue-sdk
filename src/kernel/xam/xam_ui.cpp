@@ -20,6 +20,7 @@
 REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
                     "Don't display any UI, using defaults for prompts as needed");
 #include <rex/kernel/xam/private.h>
+#include <rex/kernel/xam/ui_provider.h>
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/system/xtypes.h>
@@ -53,6 +54,58 @@ using namespace rex::system;
 // to create a listener (if they're insane enough do this).
 
 extern std::atomic<int> xam_dialogs_shown_;
+
+namespace {
+std::atomic<XamUiProvider*> xam_ui_provider_{nullptr};
+}  // namespace
+
+void SetXamUiProvider(XamUiProvider* provider) {
+  xam_ui_provider_.store(provider, std::memory_order_release);
+}
+
+XamUiProvider* GetXamUiProvider() {
+  return xam_ui_provider_.load(std::memory_order_acquire);
+}
+
+// Shows a dialog through the host provider: `show` runs on the UI thread and
+// calls its argument with the extended error (X_ERROR_SUCCESS or
+// X_ERROR_CANCELLED) when the player closes the dialog. Same notification and
+// completion behaviour as xeXamDispatchDialogEx.
+X_RESULT xeXamDispatchProvider(std::function<void(std::function<void(uint32_t)>)> show,
+                               uint32_t overlapped) {
+  auto pre = []() { REX_KERNEL_STATE()->BroadcastNotification(0x9, true); };
+  auto run = [show](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+    rex::ui::WindowedAppContext* app_context = REX_KERNEL_STATE()->emulator()->app_context();
+    rex::thread::Fence fence;
+    uint32_t outcome = X_ERROR_CANCELLED;
+    if (app_context && app_context->CallInUIThreadSynchronous([&show, &fence, &outcome]() {
+          show([&fence, &outcome](uint32_t error) {
+            outcome = error;
+            fence.Signal();
+          });
+        })) {
+      ++xam_dialogs_shown_;
+      fence.Wait();
+      --xam_dialogs_shown_;
+    }
+    extended_error = outcome;
+    length = 0;
+    return X_ERROR_SUCCESS;
+  };
+  auto post = []() {
+    rex::thread::Sleep(std::chrono::milliseconds(100));
+    REX_KERNEL_STATE()->BroadcastNotification(0x9, false);
+  };
+  if (!overlapped) {
+    pre();
+    uint32_t extended_error, length;
+    run(extended_error, length);
+    post();
+    return extended_error;
+  }
+  REX_KERNEL_STATE()->CompleteOverlappedDeferredEx(run, overlapped, pre, post);
+  return X_ERROR_IO_PENDING;
+}
 
 class XamDialog : public rex::ui::ImGuiDialog {
  public:
@@ -323,7 +376,22 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
     };
     const Runtime* emulator = REX_KERNEL_STATE()->emulator();
     ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
-    if (imgui_drawer) {
+    if (XamUiProvider* provider = GetXamUiProvider()) {
+      result = xeXamDispatchProvider(
+          [provider, title, text_str, buttons, active_button = uint32_t(active_button),
+           result_ptr](std::function<void(uint32_t)> finish) {
+            provider->ShowMessageBox(title, text_str, buttons, active_button,
+                                     [result_ptr, finish](uint32_t button) {
+                                       if (button == XamUiProvider::kCancelled) {
+                                         finish(X_ERROR_CANCELLED);
+                                         return;
+                                       }
+                                       *result_ptr = button;
+                                       finish(X_ERROR_SUCCESS);
+                                     });
+          },
+          overlapped.guest_address());
+    } else if (imgui_drawer) {
       result = xeXamDispatchDialog<MessageBoxDialog>(
           new MessageBoxDialog(imgui_drawer, title, text_str, buttons, active_button), close,
           overlapped.guest_address());
@@ -478,7 +546,24 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
                            REX_KERNEL_MEMORY()->TranslateVirtual(default_text.guest_address())))
                      : "";
 
-    if (imgui_drawer) {
+    if (XamUiProvider* provider = GetXamUiProvider()) {
+      result = xeXamDispatchProvider(
+          [provider, title_str, desc_str, def_text_str, buffer, buffer_length](
+              std::function<void(uint32_t)> finish) {
+            provider->ShowKeyboard(
+                title_str, desc_str, def_text_str, buffer_length,
+                [buffer, buffer_length, finish](bool accepted, std::string text) {
+                  if (!accepted) {
+                    finish(X_ERROR_CANCELLED);
+                    return;
+                  }
+                  rex::string::copy_and_swap_truncating(buffer, rex::string::to_utf16(text),
+                                                        buffer_length);
+                  finish(X_ERROR_SUCCESS);
+                });
+          },
+          overlapped.guest_address());
+    } else if (imgui_drawer) {
       uint32_t buffer_length_safe = buffer_length + 1;  // +1 for null terminator, just in case
       result = xeXamDispatchDialogEx<KeyboardInputDialog>(
           new KeyboardInputDialog(imgui_drawer, title_str, desc_str, def_text_str,
