@@ -23,6 +23,7 @@
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/perf/counter.h>
 #include <rex/math.h>
 #include <rex/stream.h>
 #include <rex/system/function_dispatcher.h>
@@ -2216,6 +2217,8 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
       if (protect_system_page_first != UINT32_MAX) {
         rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
                              (i - protect_system_page_first) * system_page_size_, protect_access);
+        PERF_counter_inc(kWriteWatchProtectCalls);
+        PERF_counter_add(kWriteWatchProtectPages, i - protect_system_page_first);
         protect_system_page_first = UINT32_MAX;
       }
     }
@@ -2224,6 +2227,8 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
     rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
                          (system_page_last + 1 - protect_system_page_first) * system_page_size_,
                          protect_access);
+    PERF_counter_inc(kWriteWatchProtectCalls);
+    PERF_counter_add(kWriteWatchProtectPages, system_page_last + 1 - protect_system_page_first);
   }
 }
 
@@ -2231,6 +2236,7 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
                                     uint32_t virtual_address, uint32_t length, bool is_write,
                                     bool unwatch_exact_range, bool unprotect,
                                     bool notify_access_observers) {
+  PERF_counter_inc(kWriteWatchTriggers);
 
   if (virtual_address < heap_base_) {
     if (heap_base_ - virtual_address >= length) {
@@ -2386,6 +2392,10 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
         std::min(access_system_page_first, system_page_first);
     uint32_t restore_page_last =
         std::max(access_system_page_last, system_page_last);
+    // One protection change per run of pages that end with the same access,
+    // not one system call (and TLB shootdown) per 4 KiB page.
+    uint32_t run_first = restore_page_first;
+    rex::memory::PageAccess run_access = rex::memory::PageAccess::kNoAccess;
     for (uint32_t i = restore_page_first; i <= restore_page_last; ++i) {
       uint64_t page_bit = uint64_t(1) << (i & 63);
       const SystemPageFlagsBlock& flags = system_page_flags_[i >> 6];
@@ -2399,8 +2409,18 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
                  page_access == rex::memory::PageAccess::kReadWrite) {
         page_access = rex::memory::PageAccess::kReadOnly;
       }
-      rex::memory::Protect(protect_base + i * system_page_size_, system_page_size_, page_access);
+      if (i != restore_page_first && page_access != run_access) {
+        rex::memory::Protect(protect_base + run_first * system_page_size_,
+                             (i - run_first) * system_page_size_, run_access);
+        PERF_counter_inc(kWriteWatchProtectCalls);
+        run_first = i;
+      }
+      run_access = page_access;
     }
+    rex::memory::Protect(protect_base + run_first * system_page_size_,
+                         (restore_page_last + 1 - run_first) * system_page_size_, run_access);
+    PERF_counter_inc(kWriteWatchProtectCalls);
+    PERF_counter_add(kWriteWatchProtectPages, restore_page_last + 1 - restore_page_first);
   }
 
   return true;

@@ -112,6 +112,14 @@ enum class CounterId : uint16_t {
   kTextureResolveReloads,
   kTextureResolveReloadBytes,
 
+  // Physical-memory write watches: triggers (a guest write fault or a host
+  // write into watched memory), and the protection changes (system calls)
+  // and pages that arming and releasing watches cost; append to preserve
+  // existing IDs.
+  kWriteWatchTriggers,
+  kWriteWatchProtectCalls,
+  kWriteWatchProtectPages,
+
   kCount  // sentinel -- must be last
 };
 
