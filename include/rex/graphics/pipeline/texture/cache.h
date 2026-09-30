@@ -487,6 +487,11 @@ class TextureCache {
     // Signed version of the texture if the data in the signed version is
     // different on the host.
     Texture* texture_signed;
+    // The fetch constant the binding was derived from; a rewrite with the same
+    // words needs no new derivation. Cleared with the binding, so textures
+    // that become outdated are looked at again.
+    uint32_t fetch_words[6];
+    bool fetch_words_valid;
 
     TextureBinding() { Reset(); }
 

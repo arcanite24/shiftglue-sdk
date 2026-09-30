@@ -562,6 +562,16 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     uint32_t index_bit = UINT32_C(1) << index;
     textures_remaining &= ~index_bit;
     TextureBinding& binding = texture_bindings_[index];
+    const uint32_t* fetch_words =
+        &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + index * 6];
+    if (binding.fetch_words_valid &&
+        !std::memcmp(binding.fetch_words, fetch_words, sizeof(binding.fetch_words))) {
+      // Rewritten with the same words: nothing about the binding changed.
+      texture_bindings_in_sync_ |= index_bit;
+      continue;
+    }
+    std::memcpy(binding.fetch_words, fetch_words, sizeof(binding.fetch_words));
+    binding.fetch_words_valid = true;
     xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(index);
     TextureKey old_key = binding.key;
     uint8_t old_swizzled_signs = binding.swizzled_signs;
