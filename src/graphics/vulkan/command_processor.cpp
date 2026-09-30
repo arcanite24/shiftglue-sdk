@@ -61,6 +61,9 @@ REXCVAR_DEFINE_BOOL(vulkan_present_on_submission_worker, true, "GPU/Vulkan",
                     "With vulkan_async_submission, publish and paint each frame on the "
                     "submission worker after the frame's submission instead of waiting for the "
                     "worker at every swap");
+REXCVAR_DEFINE_BOOL(vulkan_dedupe_float_constants, true, "GPU/Vulkan",
+                    "Gather float constants into host memory and reuse the last upload of the "
+                    "stage in the frame when the bytes are the same");
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -833,6 +836,7 @@ bool VulkanCommandProcessor::SetupContext() {
   // fullDrawIndexUint32 is not supported.
   guest_shader_pipeline_stages_ =
       VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+  dedupe_float_constants_ = REXCVAR_GET(vulkan_dedupe_float_constants);
   push_pixel_texture_descriptors_ = REXCVAR_GET(vulkan_push_texture_descriptors) &&
                                    vulkan_device->extensions().ext_KHR_push_descriptor;
   guest_shader_vertex_stages_ = VK_SHADER_STAGE_VERTEX_BIT;
@@ -7107,6 +7111,44 @@ void GatherFloatConstants(uint8_t* out, const uint64_t (&bitmap)[4], const uint3
 
 }  // namespace
 
+bool VulkanCommandProcessor::UploadFloatConstants(uint32_t stage, const uint64_t (&map)[4],
+                                                  uint32_t count, const uint32_t* first,
+                                                  size_t alignment) {
+  const uint32_t buffer_index = stage ? SpirvShaderTranslator::kConstantBufferFloatPixel
+                                      : SpirvShaderTranslator::kConstantBufferFloatVertex;
+  VkDescriptorBufferInfo& buffer_info = current_constant_buffer_infos_[buffer_index];
+  // A binding is needed even without float constants.
+  const size_t size = sizeof(float) * 4 * std::max(count, UINT32_C(1));
+  float_constant_scratch_.resize(size);
+  if (count) {
+    // Cached memory: much faster to gather into than the upload memory, and
+    // the upload is then one contiguous write.
+    GatherFloatConstants(float_constant_scratch_.data(), map, first);
+  } else {
+    std::memset(float_constant_scratch_.data(), 0, size);
+  }
+  FloatConstantUpload& last = last_float_constant_uploads_[stage];
+  if (last.frame == frame_current_ && last.bytes.size() == size &&
+      !std::memcmp(last.bytes.data(), float_constant_scratch_.data(), size)) {
+    // The same bytes: the shader reads them the same way whatever map
+    // produced them.
+    buffer_info = last.info;
+  } else {
+    uint8_t* mapping = uniform_buffer_pool_->Request(frame_current_, size, alignment,
+                                                     buffer_info.buffer, buffer_info.offset);
+    if (!mapping) {
+      return false;
+    }
+    buffer_info.range = VkDeviceSize(size);
+    std::memcpy(mapping, float_constant_scratch_.data(), size);
+    last.frame = frame_current_;
+    last.info = buffer_info;
+    last.bytes.swap(float_constant_scratch_);
+  }
+  current_constant_buffers_up_to_date_ |= UINT32_C(1) << buffer_index;
+  return true;
+}
+
 bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
                                             const VulkanShader* pixel_shader) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -7188,6 +7230,15 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
                                               << SpirvShaderTranslator::kConstantBufferSystem;
     }
     // Vertex shader float constants.
+    if (dedupe_float_constants_ &&
+        !(current_constant_buffers_up_to_date_ &
+          (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatVertex))) {
+      if (!UploadFloatConstants(0, current_float_constant_map_vertex_, float_constant_count_vertex,
+                                &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X],
+                                uniform_buffer_alignment)) {
+        return false;
+      }
+    }
     if (!(current_constant_buffers_up_to_date_ &
           (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatVertex))) {
       VkDescriptorBufferInfo& buffer_info =
@@ -7212,6 +7263,15 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
                                               << SpirvShaderTranslator::kConstantBufferFloatVertex;
     }
     // Pixel shader float constants.
+    if (dedupe_float_constants_ &&
+        !(current_constant_buffers_up_to_date_ &
+          (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatPixel))) {
+      if (!UploadFloatConstants(1, current_float_constant_map_pixel_, float_constant_count_pixel,
+                                &regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X],
+                                uniform_buffer_alignment)) {
+        return false;
+      }
+    }
     if (!(current_constant_buffers_up_to_date_ &
           (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatPixel))) {
       VkDescriptorBufferInfo& buffer_info =
