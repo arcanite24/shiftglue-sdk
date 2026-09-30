@@ -266,6 +266,34 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
             reinterpret_cast<const uint8_t*>(stream) + sizeof(ArgsVkPushConstants));
       } break;
 
+      case Command::kVkPushTextureDescriptorSet: {
+        auto& args = *reinterpret_cast<const ArgsVkPushTextureDescriptorSet*>(stream);
+        const VkDescriptorImageInfo* infos = reinterpret_cast<const VkDescriptorImageInfo*>(
+            reinterpret_cast<const uint8_t*>(stream) +
+            rex::align(sizeof(ArgsVkPushTextureDescriptorSet), alignof(VkDescriptorImageInfo)));
+        VkWriteDescriptorSet writes[2];
+        uint32_t write_count = 0;
+        for (uint32_t i = 0; i < 2; ++i) {
+          const uint32_t count = i ? args.sampler_count : args.texture_count;
+          if (!count) {
+            continue;
+          }
+          VkWriteDescriptorSet& write = writes[write_count++];
+          write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+          write.pNext = nullptr;
+          write.dstSet = VK_NULL_HANDLE;
+          write.dstBinding = i ? args.texture_count : 0;
+          write.dstArrayElement = 0;
+          write.descriptorCount = count;
+          write.descriptorType = i ? VK_DESCRIPTOR_TYPE_SAMPLER : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+          write.pImageInfo = infos + (i ? args.texture_count : 0);
+          write.pBufferInfo = nullptr;
+          write.pTexelBufferView = nullptr;
+        }
+        dfn.vkCmdPushDescriptorSetKHR(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, args.layout,
+                                      args.set, write_count, writes);
+      } break;
+
       case Command::kVkResetQueryPool: {
         auto& args = *reinterpret_cast<const ArgsVkResetQueryPool*>(stream);
         dfn.vkCmdResetQueryPool(command_buffer, args.query_pool, args.first_query,

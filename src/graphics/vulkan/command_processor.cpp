@@ -54,6 +54,9 @@
 #include <rex/ui/vulkan/util.h>
 
 // Legacy backend compatibility aliases for shared readback controls.
+REXCVAR_DEFINE_BOOL(vulkan_push_texture_descriptors, true, "GPU/Vulkan",
+                    "Push pixel shader texture descriptors (VK_KHR_push_descriptor) instead of "
+                    "allocating and writing a descriptor set per change");
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -826,6 +829,8 @@ bool VulkanCommandProcessor::SetupContext() {
   // fullDrawIndexUint32 is not supported.
   guest_shader_pipeline_stages_ =
       VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+  push_pixel_texture_descriptors_ = REXCVAR_GET(vulkan_push_texture_descriptors) &&
+                                   vulkan_device->extensions().ext_KHR_push_descriptor;
   guest_shader_vertex_stages_ = VK_SHADER_STAGE_VERTEX_BIT;
   if (device_properties.tessellationShader) {
     guest_shader_pipeline_stages_ |= VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT |
@@ -3580,7 +3585,10 @@ VkDescriptorSetLayout VulkanCommandProcessor::GetTextureDescriptorSetLayout(bool
   VkDescriptorSetLayoutCreateInfo descriptor_set_layout_create_info;
   descriptor_set_layout_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
   descriptor_set_layout_create_info.pNext = nullptr;
-  descriptor_set_layout_create_info.flags = 0;
+  descriptor_set_layout_create_info.flags =
+      !is_vertex && PixelTexturesPushed(binding_count)
+          ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR
+          : 0;
   descriptor_set_layout_create_info.bindingCount = uint32_t(binding_count);
   descriptor_set_layout_create_info.pBindings = descriptor_set_layout_bindings_.data();
   VkDescriptorSetLayout texture_descriptor_set_layout;
@@ -3663,7 +3671,8 @@ const VulkanPipelineCache::PipelineLayoutProvider* VulkanCommandProcessor::GetPi
   auto emplaced_pair = pipeline_layouts_.emplace(
       std::piecewise_construct, std::forward_as_tuple(pipeline_layout_key),
       std::forward_as_tuple(pipeline_layout, descriptor_set_layout_textures_vertex,
-                            descriptor_set_layout_textures_pixel));
+                            descriptor_set_layout_textures_pixel,
+                            PixelTexturesPushed(texture_count_pixel + sampler_count_pixel)));
   // unordered_map insertion doesn't invalidate element references.
   return &emplaced_pair.first->second;
 }
@@ -4225,6 +4234,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         descriptor_sets_kept = std::min(
             descriptor_sets_kept, uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesPixel));
       }
+      current_graphics_descriptor_sets_bound_up_to_date_ &=
+          (UINT32_C(1) << descriptor_sets_kept) - 1;
     } else {
       // No or unknown pipeline layout previously bound - all bindings are in an
       // indeterminate state.
@@ -7279,6 +7290,44 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
           descriptor_write_image_info_.data() + vertex_sampler_image_info_offset)) {
     write_vertex_textures = false;
   }
+  // Pushed pixel textures: no set to allocate or write, only a push recorded
+  // after the binds when the contents or the layout changed.
+  const bool push_pixel_textures =
+      write_pixel_textures && current_guest_graphics_pipeline_layout_->textures_pixel_pushed();
+  bool pixel_textures_push_needed = false;
+  if (push_pixel_textures) {
+    write_pixel_textures = false;
+    const uint32_t pixel_bit = UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
+    const VkDescriptorSetLayout pixel_layout =
+        current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref();
+    const VkDescriptorImageInfo* pixel_textures =
+        descriptor_write_image_info_.data() + pixel_texture_image_info_offset;
+    const VkDescriptorImageInfo* pixel_samplers =
+        descriptor_write_image_info_.data() + pixel_sampler_image_info_offset;
+    LastTextureDescriptorSet& last = last_pushed_pixel_textures_;
+    bool same = (current_graphics_descriptor_sets_bound_up_to_date_ & pixel_bit) &&
+                last.layout == pixel_layout && last.texture_count == texture_count_pixel &&
+                last.sampler_count == sampler_count_pixel;
+    for (uint32_t i = 0; same && i < texture_count_pixel + sampler_count_pixel; ++i) {
+      const VkDescriptorImageInfo& a = last.infos[i];
+      const VkDescriptorImageInfo& b =
+          i < texture_count_pixel ? pixel_textures[i] : pixel_samplers[i - texture_count_pixel];
+      same = a.sampler == b.sampler && a.imageView == b.imageView &&
+             a.imageLayout == b.imageLayout;
+    }
+    if (!same) {
+      pixel_textures_push_needed = true;
+      last.layout = pixel_layout;
+      last.texture_count = texture_count_pixel;
+      last.sampler_count = sampler_count_pixel;
+      last.infos.assign(pixel_textures, pixel_textures + texture_count_pixel);
+      last.infos.insert(last.infos.end(), pixel_samplers, pixel_samplers + sampler_count_pixel);
+    }
+    // A later non-pushed layout must not take this slot as a bound set.
+    current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel] =
+        VK_NULL_HANDLE;
+    current_graphics_descriptor_set_values_up_to_date_ |= pixel_bit;
+  }
   if (write_pixel_textures &&
       ReuseTextureDescriptorSet(
           true, texture_count_pixel, sampler_count_pixel,
@@ -7435,7 +7484,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   if (!texture_count_vertex && !sampler_count_vertex) {
     descriptor_sets_needed &= ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex);
   }
-  if (!texture_count_pixel && !sampler_count_pixel) {
+  if ((!texture_count_pixel && !sampler_count_pixel) || push_pixel_textures) {
     descriptor_sets_needed &= ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel);
   }
   uint32_t descriptor_sets_remaining =
@@ -7461,6 +7510,17 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     descriptor_sets_remaining &= ~((UINT32_C(1) << descriptor_set_mask_tzcnt) - 1);
   }
   current_graphics_descriptor_sets_bound_up_to_date_ |= descriptor_sets_needed;
+  if (push_pixel_textures) {
+    if (pixel_textures_push_needed) {
+      deferred_command_buffer_.CmdVkPushTextureDescriptorSet(
+          current_guest_graphics_pipeline_layout_->GetPipelineLayout(),
+          SpirvShaderTranslator::kDescriptorSetTexturesPixel, texture_count_pixel,
+          sampler_count_pixel, descriptor_write_image_info_.data() + pixel_texture_image_info_offset,
+          descriptor_write_image_info_.data() + pixel_sampler_image_info_offset);
+    }
+    current_graphics_descriptor_sets_bound_up_to_date_ |=
+        UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
+  }
 
   return true;
 }

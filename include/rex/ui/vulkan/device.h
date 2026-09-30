@@ -190,6 +190,7 @@ class VulkanDevice {
   struct Extensions {
     bool ext_KHR_swapchain = false;                     // #2
     bool ext_1_1_KHR_dedicated_allocation = false;      // #128
+    bool ext_KHR_push_descriptor = false;               // #81
     bool ext_EXT_shader_stencil_export = false;         // #141
     bool ext_1_1_KHR_get_memory_requirements2 = false;  // #147
     bool ext_1_2_KHR_image_format_list = false;         // #148
@@ -231,6 +232,8 @@ class VulkanDevice {
 #include <rex/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc>
     // VK_NV_device_diagnostic_checkpoints (#207)
 #include <rex/ui/vulkan/functions/device_nv_device_diagnostic_checkpoints.inc>
+    // VK_KHR_push_descriptor (#81)
+#include <rex/ui/vulkan/functions/device_khr_push_descriptor.inc>
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 #undef XE_UI_VULKAN_FUNCTION
   };

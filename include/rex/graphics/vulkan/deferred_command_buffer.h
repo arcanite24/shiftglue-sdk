@@ -312,6 +312,27 @@ class DeferredCommandBuffer {
     std::memcpy(args_ptr + sizeof(ArgsVkPushConstants), values, size);
   }
 
+  // Pushes a guest texture set (sampled images at bindings 0 and up, then
+  // samplers) to a push descriptor set layout.
+  void CmdVkPushTextureDescriptorSet(VkPipelineLayout layout, uint32_t set,
+                                     uint32_t texture_count, uint32_t sampler_count,
+                                     const VkDescriptorImageInfo* textures,
+                                     const VkDescriptorImageInfo* samplers) {
+    const size_t infos_offset =
+        rex::align(sizeof(ArgsVkPushTextureDescriptorSet), alignof(VkDescriptorImageInfo));
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(WriteCommand(
+        Command::kVkPushTextureDescriptorSet,
+        infos_offset + sizeof(VkDescriptorImageInfo) * (texture_count + sampler_count)));
+    auto& args = *reinterpret_cast<ArgsVkPushTextureDescriptorSet*>(args_ptr);
+    args.layout = layout;
+    args.set = set;
+    args.texture_count = texture_count;
+    args.sampler_count = sampler_count;
+    VkDescriptorImageInfo* infos = reinterpret_cast<VkDescriptorImageInfo*>(args_ptr + infos_offset);
+    std::memcpy(infos, textures, sizeof(VkDescriptorImageInfo) * texture_count);
+    std::memcpy(infos + texture_count, samplers, sizeof(VkDescriptorImageInfo) * sampler_count);
+  }
+
   void CmdVkSetBlendConstants(const float* blend_constants) {
     auto& args = *reinterpret_cast<ArgsVkSetBlendConstants*>(
         WriteCommand(Command::kVkSetBlendConstants, sizeof(ArgsVkSetBlendConstants)));
@@ -391,6 +412,7 @@ class DeferredCommandBuffer {
     kVkEndRendering,
     kVkPipelineBarrier,
     kVkPushConstants,
+    kVkPushTextureDescriptorSet,
     kVkResetQueryPool,
     kVkWriteTimestamp,
     kVkSetCheckpointNV,
@@ -576,6 +598,15 @@ class DeferredCommandBuffer {
     uint32_t offset;
     uint32_t size;
     // Followed by `size` bytes of values.
+  };
+
+  struct ArgsVkPushTextureDescriptorSet {
+    VkPipelineLayout layout;
+    uint32_t set;
+    uint32_t texture_count;
+    uint32_t sampler_count;
+    // Followed by aligned VkDescriptorImageInfo[texture_count + sampler_count].
+    static_assert(alignof(VkDescriptorImageInfo) <= alignof(uintmax_t));
   };
 
   struct ArgsVkSetBlendConstants {

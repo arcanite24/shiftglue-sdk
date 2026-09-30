@@ -432,10 +432,12 @@ class VulkanCommandProcessor : public CommandProcessor {
    public:
     explicit PipelineLayout(VkPipelineLayout pipeline_layout,
                             VkDescriptorSetLayout descriptor_set_layout_textures_vertex_ref,
-                            VkDescriptorSetLayout descriptor_set_layout_textures_pixel_ref)
+                            VkDescriptorSetLayout descriptor_set_layout_textures_pixel_ref,
+                            bool textures_pixel_pushed)
         : pipeline_layout_(pipeline_layout),
           descriptor_set_layout_textures_vertex_ref_(descriptor_set_layout_textures_vertex_ref),
-          descriptor_set_layout_textures_pixel_ref_(descriptor_set_layout_textures_pixel_ref) {}
+          descriptor_set_layout_textures_pixel_ref_(descriptor_set_layout_textures_pixel_ref),
+          textures_pixel_pushed_(textures_pixel_pushed) {}
     VkPipelineLayout GetPipelineLayout() const override { return pipeline_layout_; }
     VkDescriptorSetLayout descriptor_set_layout_textures_vertex_ref() const {
       return descriptor_set_layout_textures_vertex_ref_;
@@ -443,11 +445,14 @@ class VulkanCommandProcessor : public CommandProcessor {
     VkDescriptorSetLayout descriptor_set_layout_textures_pixel_ref() const {
       return descriptor_set_layout_textures_pixel_ref_;
     }
+    // The pixel texture set is a push descriptor set layout.
+    bool textures_pixel_pushed() const { return textures_pixel_pushed_; }
 
    private:
     VkPipelineLayout pipeline_layout_;
     VkDescriptorSetLayout descriptor_set_layout_textures_vertex_ref_;
     VkDescriptorSetLayout descriptor_set_layout_textures_pixel_ref_;
+    bool textures_pixel_pushed_;
   };
 
   struct UsedSingleTransientDescriptor {
@@ -979,6 +984,17 @@ class VulkanCommandProcessor : public CommandProcessor {
     std::vector<VkDescriptorImageInfo> infos;
   };
   LastTextureDescriptorSet last_texture_descriptor_sets_[2];
+  // Pixel texture sets are pushed rather than allocated and written when the
+  // device has VK_KHR_push_descriptor and the set has at most
+  // kMaxPushedTextureBindings bindings (the minimum maxPushDescriptors).
+  static constexpr uint32_t kMaxPushedTextureBindings = 32;
+  bool push_pixel_texture_descriptors_ = false;
+  bool PixelTexturesPushed(size_t binding_count) const {
+    return push_pixel_texture_descriptors_ && binding_count &&
+           binding_count <= kMaxPushedTextureBindings;
+  }
+  // The last pushed pixel texture contents (set is unused).
+  LastTextureDescriptorSet last_pushed_pixel_textures_;
   std::vector<SamplerCacheEntry> sampler_cache_pixel_;
 
   // Cache render pass currently started in the command buffer with the

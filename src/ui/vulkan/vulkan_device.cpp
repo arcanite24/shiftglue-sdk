@@ -220,6 +220,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_sampler_mirror_clamp_to_edge, 1, 2)
     // #70. Must be enabled for VK_KHR_sampler_ycbcr_conversion.
     XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_maintenance1, 1, 1)
+    // #81.
+    XE_UI_VULKAN_STRUCT_EXTENSION(KHR_push_descriptor)
     // #141.
     XE_UI_VULKAN_STRUCT_EXTENSION(EXT_shader_stencil_export)
     // #148.
@@ -826,6 +828,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
   if (device->extensions_.ext_NV_device_diagnostic_checkpoints) {
 #include <rex/ui/vulkan/functions/device_nv_device_diagnostic_checkpoints.inc>
+  }
+  if (device->extensions_.ext_KHR_push_descriptor) {
+#include <rex/ui/vulkan/functions/device_khr_push_descriptor.inc>
   }
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 
