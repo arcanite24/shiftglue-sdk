@@ -54,6 +54,10 @@
 #include <rex/ui/vulkan/util.h>
 
 // Legacy backend compatibility aliases for shared readback controls.
+REXCVAR_DEFINE_BOOL(vulkan_cached_uniform_memory, true, "GPU/Vulkan",
+                    "Put the per-draw uniform (constant) upload pages in host-cached memory "
+                    "rather than write-combined memory")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(gpu_state_hash_memos, true, "GPU/Vulkan",
                     "Key the per-draw shader, pipeline and viewport memos by the register "
                     "state's content hash, so a draw reuses the derivations of any earlier "
@@ -857,7 +861,8 @@ bool VulkanCommandProcessor::SetupContext() {
   uniform_buffer_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
       vulkan_device, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
       rex::align(std::max(ui::GraphicsUploadBufferPool::kDefaultPageSize, size_t(16384)),
-                 size_t(device_properties.minUniformBufferOffsetAlignment)));
+                 size_t(device_properties.minUniformBufferOffsetAlignment)),
+      REXCVAR_GET(vulkan_cached_uniform_memory));
 
   // Descriptor set layouts that don't depend on the setup of other subsystems.
   VkShaderStageFlags guest_shader_stages =

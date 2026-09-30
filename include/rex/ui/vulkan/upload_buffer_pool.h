@@ -19,8 +19,11 @@ namespace vulkan {
 
 class VulkanUploadBufferPool : public GraphicsUploadBufferPool {
  public:
+  // With prefer_cached, pages go to host-cached memory where available rather
+  // than write-combined: many small scattered CPU writes, each read once by
+  // the GPU, such as per-draw constants.
   VulkanUploadBufferPool(const VulkanDevice* vulkan_device, VkBufferUsageFlags usage,
-                         size_t page_size = kDefaultPageSize);
+                         size_t page_size = kDefaultPageSize, bool prefer_cached = false);
 
   uint8_t* Request(uint64_t submission_index, size_t size, size_t alignment, VkBuffer& buffer_out,
                    VkDeviceSize& offset_out);
@@ -53,6 +56,7 @@ class VulkanUploadBufferPool : public GraphicsUploadBufferPool {
   uint32_t memory_type_ = UINT32_MAX;
 
   VkBufferUsageFlags usage_;
+  bool prefer_cached_;
 };
 
 }  // namespace vulkan

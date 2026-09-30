@@ -27,11 +27,12 @@ namespace vulkan {
 // try not to waste that padding.
 VulkanUploadBufferPool::VulkanUploadBufferPool(const VulkanDevice* const vulkan_device,
                                                const VkBufferUsageFlags usage,
-                                               const size_t page_size)
+                                               const size_t page_size, const bool prefer_cached)
     : GraphicsUploadBufferPool(size_t(
           rex::round_up(VkDeviceSize(page_size), vulkan_device->properties().nonCoherentAtomSize))),
       vulkan_device_(vulkan_device),
-      usage_(usage) {}
+      usage_(usage),
+      prefer_cached_(prefer_cached) {}
 
 uint8_t* VulkanUploadBufferPool::Request(uint64_t submission_index, size_t size, size_t alignment,
                                          VkBuffer& buffer_out, VkDeviceSize& offset_out) {
@@ -89,7 +90,7 @@ GraphicsUploadBufferPool::Page* VulkanUploadBufferPool::CreatePageImplementation
     VkMemoryRequirements memory_requirements;
     dfn.vkGetBufferMemoryRequirements(device, buffer, &memory_requirements);
     memory_type_ = util::ChooseHostMemoryType(vulkan_device_->memory_types(),
-                                              memory_requirements.memoryTypeBits, false);
+                                              memory_requirements.memoryTypeBits, prefer_cached_);
     if (memory_type_ == UINT32_MAX) {
       REXLOG_ERROR(
           "No host-visible memory types can store an Vulkan upload buffer with "
@@ -98,6 +99,13 @@ GraphicsUploadBufferPool::Page* VulkanUploadBufferPool::CreatePageImplementation
       memory_type_ = kMemoryTypeUnavailable;
       dfn.vkDestroyBuffer(device, buffer, nullptr);
       return nullptr;
+    }
+    {
+      const VulkanDevice::MemoryTypes& types = vulkan_device_->memory_types();
+      const uint32_t bit = UINT32_C(1) << memory_type_;
+      REXLOG_INFO("Vulkan upload pool (usage 0x{:X}): memory type {}, device-local {}, cached {}",
+                  uint32_t(usage_), memory_type_, (types.device_local & bit) != 0,
+                  (types.host_cached & bit) != 0);
     }
     allocation_size_ = memory_requirements.size;
     if (allocation_size_ > page_size_) {
@@ -110,7 +118,7 @@ GraphicsUploadBufferPool::Page* VulkanUploadBufferPool::CreatePageImplementation
         VkMemoryRequirements memory_requirements_expanded;
         dfn.vkGetBufferMemoryRequirements(device, buffer_expanded, &memory_requirements_expanded);
         uint32_t memory_type_expanded = util::ChooseHostMemoryType(
-            vulkan_device_->memory_types(), memory_requirements.memoryTypeBits, false);
+            vulkan_device_->memory_types(), memory_requirements.memoryTypeBits, prefer_cached_);
         if (memory_requirements_expanded.size <= allocation_size_ &&
             memory_type_expanded != UINT32_MAX) {
           page_size_ = size_t(allocation_size_);
