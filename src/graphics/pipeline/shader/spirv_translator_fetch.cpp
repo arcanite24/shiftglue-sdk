@@ -1449,12 +1449,22 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
               builder_->makeFloatConstant(instr.attributes.lod_bias));
         }
 
+        // A cube fetch with the LOD computed from the pixel's derivatives
+        // samples with implicit LOD plus the bias, as the Xenos does. Given
+        // the coordinate derivatives as explicit gradients, Nvidia's Vulkan
+        // driver picks other levels of a cube than Direct3D 12 does for the
+        // same gradients: FH1's car paint got different reflection colors,
+        // which its HDR math turned into a green glow around traffic cars.
+        bool cube_implicit_lod = use_computed_lod &&
+                                 instr.dimension == xenos::FetchOpDimension::kCube &&
+                                 !instr.attributes.use_register_gradients;
+
         // Calculate the gradients for sampling the texture if needed.
         // 2D vectors for k1D (because 1D images are emulated as 2D arrays),
         // k2D.
         // 3D vectors for k3DOrStacked, kCube.
         spv::Id gradients_h = spv::NoResult, gradients_v = spv::NoResult;
-        if (use_computed_lod) {
+        if (use_computed_lod && !cube_implicit_lod) {
           // TODO(Triang3l): Gradient exponent adjustment is currently not done
           // in getCompTexLOD, so not doing it here too for now. Apply the
           // gradient exponent biases from the word 4 of the fetch constant in
@@ -1615,9 +1625,13 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
 
         // Sample the texture.
         spv::ImageOperandsMask image_operands_mask =
-            use_computed_lod ? spv::ImageOperandsGradMask : spv::ImageOperandsLodMask;
+            cube_implicit_lod
+                ? spv::ImageOperandsBiasMask
+                : (use_computed_lod ? spv::ImageOperandsGradMask : spv::ImageOperandsLodMask);
         spv::Id sample_result_unsigned, sample_result_signed;
-        if (!use_computed_lod) {
+        if (cube_implicit_lod) {
+          texture_parameters.bias = lod;
+        } else if (!use_computed_lod) {
           texture_parameters.lod = lod;
         }
         if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked) {
@@ -1837,7 +1851,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           sample_result_signed =
               if_data_is_3d.createMergePhi(sample_result_signed_3d, sample_result_signed_stacked);
         } else {
-          if (use_computed_lod) {
+          if (use_computed_lod && !cube_implicit_lod) {
             texture_parameters.gradX = gradients_h;
             texture_parameters.gradY = gradients_v;
           }
