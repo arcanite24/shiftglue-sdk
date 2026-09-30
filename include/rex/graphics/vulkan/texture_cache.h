@@ -106,6 +106,9 @@ class VulkanTextureCache final : public TextureCache {
   // ended, and a new one must be started) in case of sampler count overflow, so
   // samplers may be freed, and UseSamplers may take their slots.
   uint64_t GetSubmissionToAwaitOnSamplerOverflow(uint32_t overflowed_sampler_count) const;
+  // Destroys every sampler, so UseSampler creates them again with the current
+  // texture_mip_lod_bias. No submission may still use them.
+  void ClearSamplers();
 
   // Returns the 2D view of the front buffer texture (for fragment shader
   // reading - the barrier will be pushed in the command processor if needed),

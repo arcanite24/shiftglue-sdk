@@ -697,6 +697,8 @@ void VulkanCommandProcessor::InvalidateVertexBufferResidencyRange(uint32_t first
 void VulkanCommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                                      uint32_t title_id, bool blocking) {
   CommandProcessor::InitializeShaderStorage(cache_root, title_id, blocking);
+  shader_storage_cache_root_ = cache_root;
+  shader_storage_title_id_ = title_id;
   pipeline_cache_->InitializeShaderStorage(cache_root, title_id, blocking);
 }
 
@@ -780,12 +782,10 @@ std::string VulkanCommandProcessor::GetWindowTitleText() const {
       default:
         break;
     }
-    uint32_t draw_resolution_scale_x =
-        texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1;
-    uint32_t draw_resolution_scale_y =
-        texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1;
-    if (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1) {
-      title << ' ' << draw_resolution_scale_x << 'x' << draw_resolution_scale_y;
+    // Readable while the scale is being switched (along X; FH1's is square).
+    const uint32_t scale = draw_resolution_scale();
+    if (scale > 1) {
+      title << ' ' << scale << 'x' << scale;
     }
   }
   title << " - HEAVILY INCOMPLETE, early development";
@@ -1019,13 +1019,10 @@ bool VulkanCommandProcessor::SetupContext() {
         "polygon modes will fall back to solid fill");
   }
 
-  // Requires the transient descriptor set layouts.
-  render_target_cache_ = std::make_unique<VulkanRenderTargetCache>(
-      *register_file_, *memory_, draw_resolution_scale_x, draw_resolution_scale_y, *this);
-  if (!render_target_cache_->Initialize(shared_memory_binding_count)) {
-    REXGPU_ERROR("Failed to initialize the render target cache");
+  if (!CreateScaledComponents(draw_resolution_scale_x, draw_resolution_scale_y)) {
     return false;
   }
+  draw_resolution_scale_.store(draw_resolution_scale_x, std::memory_order_relaxed);
 
   // Shared memory and EDRAM descriptor set layout.
   bool edram_fragment_shader_interlock =
@@ -1067,50 +1064,6 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
 
-  pipeline_cache_ = std::make_unique<VulkanPipelineCache>(
-      *this, *register_file_, *render_target_cache_, guest_shader_vertex_stages_);
-  if (!pipeline_cache_->Initialize()) {
-    REXGPU_ERROR("Failed to initialize the graphics pipeline cache");
-    return false;
-  }
-
-  // Requires the transient descriptor set layouts.
-  texture_cache_ =
-      VulkanTextureCache::Create(*register_file_, *shared_memory_, draw_resolution_scale_x,
-                                 draw_resolution_scale_y, *this, guest_shader_pipeline_stages_);
-  if (!texture_cache_) {
-    REXGPU_ERROR("Failed to initialize the texture cache");
-    return false;
-  }
-  draw_resolution_scale_.store(draw_resolution_scale_x, std::memory_order_relaxed);
-
-  if (REXCVAR_GET(vulkan_fh1_native_executor) && REXCVAR_GET(vulkan_dynamic_rendering) &&
-      render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
-    fh1_native_executor_ = std::make_unique<Fh1NativeExecutor>(*this, *register_file_, *memory_);
-    Fh1VulkanExecutorConfig native_config;
-    native_config.msaa_2x_supported = render_target_cache_->msaa_2x_attachments_supported();
-    native_config.gamma_as_unorm16 = render_target_cache_->gamma_render_target_as_unorm16();
-    native_config.depth_float24_round = render_target_cache_->depth_float24_round();
-    native_config.fixed16_truncated = render_target_cache_->IsFixedRG16TruncatedToMinus1To1();
-    native_config.memory = shared_memory_.get();
-    native_config.textures = texture_cache_.get();
-    native_config.render_targets = render_target_cache_.get();
-    if (!fh1_native_executor_->Initialize(native_config)) {
-      REXGPU_WARN("FH1 native executor unavailable; using the render target cache");
-      fh1_native_executor_.reset();
-    }
-  }
-
-  // Frame dumps record and compare the 1x guest-memory mirror.
-  if (const uint64_t dump_frame = draw_resolution_scale_x == 1 && draw_resolution_scale_y == 1
-                                      ? Fh1FrameDump::RequestedFrame()
-                                      : 0) {
-    frame_dump_ = std::make_unique<Fh1FrameDump>(
-        *this, *register_file_, *memory_,
-        std::make_unique<VulkanFh1FrameDumpMirror>(*this, *shared_memory_), dump_frame,
-        Fh1FrameDump::RequestedPath());
-  }
-
   // Shared memory and EDRAM common bindings.
   VkDescriptorPoolSize descriptor_pool_sizes[1];
   descriptor_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1143,48 +1096,7 @@ bool VulkanCommandProcessor::SetupContext() {
         "EDRAM");
     return false;
   }
-  VkDescriptorBufferInfo
-      shared_memory_descriptor_buffers_info[SharedMemory::kBufferSize / (128 << 20)];
-  uint32_t shared_memory_binding_range =
-      SharedMemory::kBufferSize >> shared_memory_binding_count_log2;
-  for (uint32_t i = 0; i < shared_memory_binding_count; ++i) {
-    VkDescriptorBufferInfo& shared_memory_descriptor_buffer_info =
-        shared_memory_descriptor_buffers_info[i];
-    shared_memory_descriptor_buffer_info.buffer = shared_memory_->buffer();
-    shared_memory_descriptor_buffer_info.offset = shared_memory_binding_range * i;
-    shared_memory_descriptor_buffer_info.range = shared_memory_binding_range;
-  }
-  VkWriteDescriptorSet write_descriptor_sets[2];
-  VkWriteDescriptorSet& write_descriptor_set_shared_memory = write_descriptor_sets[0];
-  write_descriptor_set_shared_memory.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-  write_descriptor_set_shared_memory.pNext = nullptr;
-  write_descriptor_set_shared_memory.dstSet = shared_memory_and_edram_descriptor_set_;
-  write_descriptor_set_shared_memory.dstBinding = 0;
-  write_descriptor_set_shared_memory.dstArrayElement = 0;
-  write_descriptor_set_shared_memory.descriptorCount = shared_memory_binding_count;
-  write_descriptor_set_shared_memory.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  write_descriptor_set_shared_memory.pImageInfo = nullptr;
-  write_descriptor_set_shared_memory.pBufferInfo = shared_memory_descriptor_buffers_info;
-  write_descriptor_set_shared_memory.pTexelBufferView = nullptr;
-  VkDescriptorBufferInfo edram_descriptor_buffer_info;
-  if (edram_fragment_shader_interlock) {
-    edram_descriptor_buffer_info.buffer = render_target_cache_->edram_buffer();
-    edram_descriptor_buffer_info.offset = 0;
-    edram_descriptor_buffer_info.range = VK_WHOLE_SIZE;
-    VkWriteDescriptorSet& write_descriptor_set_edram = write_descriptor_sets[1];
-    write_descriptor_set_edram.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write_descriptor_set_edram.pNext = nullptr;
-    write_descriptor_set_edram.dstSet = shared_memory_and_edram_descriptor_set_;
-    write_descriptor_set_edram.dstBinding = 1;
-    write_descriptor_set_edram.dstArrayElement = 0;
-    write_descriptor_set_edram.descriptorCount = 1;
-    write_descriptor_set_edram.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    write_descriptor_set_edram.pImageInfo = nullptr;
-    write_descriptor_set_edram.pBufferInfo = &edram_descriptor_buffer_info;
-    write_descriptor_set_edram.pTexelBufferView = nullptr;
-  }
-  dfn.vkUpdateDescriptorSets(device, 1 + uint32_t(edram_fragment_shader_interlock),
-                             write_descriptor_sets, 0, nullptr);
+  WriteSharedMemoryAndEdramDescriptorSet();
 
   // Swap objects.
 
@@ -1999,6 +1911,305 @@ bool VulkanCommandProcessor::SetupContext() {
   return true;
 }
 
+bool VulkanCommandProcessor::CreateScaledComponents(uint32_t draw_resolution_scale_x,
+                                                    uint32_t draw_resolution_scale_y) {
+  const uint32_t shared_memory_binding_count =
+      UINT32_C(1) << SpirvShaderTranslator::GetSharedMemoryStorageBufferCountLog2(
+          GetVulkanDevice()->properties().maxStorageBufferRange);
+
+  // Requires the transient descriptor set layouts.
+  render_target_cache_ = std::make_unique<VulkanRenderTargetCache>(
+      *register_file_, *memory_, draw_resolution_scale_x, draw_resolution_scale_y, *this);
+  if (!render_target_cache_->Initialize(shared_memory_binding_count)) {
+    REXGPU_ERROR("Failed to initialize the render target cache");
+    return false;
+  }
+
+  pipeline_cache_ = std::make_unique<VulkanPipelineCache>(
+      *this, *register_file_, *render_target_cache_, guest_shader_vertex_stages_);
+  if (!pipeline_cache_->Initialize()) {
+    REXGPU_ERROR("Failed to initialize the graphics pipeline cache");
+    return false;
+  }
+
+  // Requires the transient descriptor set layouts.
+  texture_cache_ =
+      VulkanTextureCache::Create(*register_file_, *shared_memory_, draw_resolution_scale_x,
+                                 draw_resolution_scale_y, *this, guest_shader_pipeline_stages_);
+  if (!texture_cache_) {
+    REXGPU_ERROR("Failed to initialize the texture cache");
+    return false;
+  }
+  // A new texture cache has no samplers yet.
+  sampler_mip_lod_bias_ = REXCVAR_GET(texture_mip_lod_bias);
+
+  if (REXCVAR_GET(vulkan_fh1_native_executor) && REXCVAR_GET(vulkan_dynamic_rendering) &&
+      render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
+    fh1_native_executor_ = std::make_unique<Fh1NativeExecutor>(*this, *register_file_, *memory_);
+    Fh1VulkanExecutorConfig native_config;
+    native_config.msaa_2x_supported = render_target_cache_->msaa_2x_attachments_supported();
+    native_config.gamma_as_unorm16 = render_target_cache_->gamma_render_target_as_unorm16();
+    native_config.depth_float24_round = render_target_cache_->depth_float24_round();
+    native_config.fixed16_truncated = render_target_cache_->IsFixedRG16TruncatedToMinus1To1();
+    native_config.memory = shared_memory_.get();
+    native_config.textures = texture_cache_.get();
+    native_config.render_targets = render_target_cache_.get();
+    if (!fh1_native_executor_->Initialize(native_config)) {
+      REXGPU_WARN("FH1 native executor unavailable; using the render target cache");
+      fh1_native_executor_.reset();
+    }
+  }
+
+  // Frame dumps record and compare the 1x guest-memory mirror. One made
+  // earlier at 1x (it only reads guest memory and the shared memory) stays.
+  if (draw_resolution_scale_x != 1 || draw_resolution_scale_y != 1) {
+    frame_dump_.reset();
+  } else if (const uint64_t dump_frame = frame_dump_ ? 0 : Fh1FrameDump::RequestedFrame()) {
+    frame_dump_ = std::make_unique<Fh1FrameDump>(
+        *this, *register_file_, *memory_,
+        std::make_unique<VulkanFh1FrameDumpMirror>(*this, *shared_memory_), dump_frame,
+        Fh1FrameDump::RequestedPath());
+  }
+  return true;
+}
+
+void VulkanCommandProcessor::WriteSharedMemoryAndEdramDescriptorSet() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const uint32_t shared_memory_binding_count_log2 =
+      SpirvShaderTranslator::GetSharedMemoryStorageBufferCountLog2(
+          vulkan_device->properties().maxStorageBufferRange);
+  const uint32_t shared_memory_binding_count = UINT32_C(1) << shared_memory_binding_count_log2;
+  const bool edram_fragment_shader_interlock =
+      render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+  VkDescriptorBufferInfo
+      shared_memory_descriptor_buffers_info[SharedMemory::kBufferSize / (128 << 20)];
+  uint32_t shared_memory_binding_range =
+      SharedMemory::kBufferSize >> shared_memory_binding_count_log2;
+  for (uint32_t i = 0; i < shared_memory_binding_count; ++i) {
+    VkDescriptorBufferInfo& shared_memory_descriptor_buffer_info =
+        shared_memory_descriptor_buffers_info[i];
+    shared_memory_descriptor_buffer_info.buffer = shared_memory_->buffer();
+    shared_memory_descriptor_buffer_info.offset = shared_memory_binding_range * i;
+    shared_memory_descriptor_buffer_info.range = shared_memory_binding_range;
+  }
+  VkWriteDescriptorSet write_descriptor_sets[2];
+  VkWriteDescriptorSet& write_descriptor_set_shared_memory = write_descriptor_sets[0];
+  write_descriptor_set_shared_memory.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  write_descriptor_set_shared_memory.pNext = nullptr;
+  write_descriptor_set_shared_memory.dstSet = shared_memory_and_edram_descriptor_set_;
+  write_descriptor_set_shared_memory.dstBinding = 0;
+  write_descriptor_set_shared_memory.dstArrayElement = 0;
+  write_descriptor_set_shared_memory.descriptorCount = shared_memory_binding_count;
+  write_descriptor_set_shared_memory.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  write_descriptor_set_shared_memory.pImageInfo = nullptr;
+  write_descriptor_set_shared_memory.pBufferInfo = shared_memory_descriptor_buffers_info;
+  write_descriptor_set_shared_memory.pTexelBufferView = nullptr;
+  VkDescriptorBufferInfo edram_descriptor_buffer_info;
+  if (edram_fragment_shader_interlock) {
+    edram_descriptor_buffer_info.buffer = render_target_cache_->edram_buffer();
+    edram_descriptor_buffer_info.offset = 0;
+    edram_descriptor_buffer_info.range = VK_WHOLE_SIZE;
+    VkWriteDescriptorSet& write_descriptor_set_edram = write_descriptor_sets[1];
+    write_descriptor_set_edram.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write_descriptor_set_edram.pNext = nullptr;
+    write_descriptor_set_edram.dstSet = shared_memory_and_edram_descriptor_set_;
+    write_descriptor_set_edram.dstBinding = 1;
+    write_descriptor_set_edram.dstArrayElement = 0;
+    write_descriptor_set_edram.descriptorCount = 1;
+    write_descriptor_set_edram.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write_descriptor_set_edram.pImageInfo = nullptr;
+    write_descriptor_set_edram.pBufferInfo = &edram_descriptor_buffer_info;
+    write_descriptor_set_edram.pTexelBufferView = nullptr;
+  }
+  vulkan_device->functions().vkUpdateDescriptorSets(
+      vulkan_device->device(), 1 + uint32_t(edram_fragment_shader_interlock),
+      write_descriptor_sets, 0, nullptr);
+}
+
+void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
+  if (device_lost_) {
+    return;
+  }
+  uint32_t scale_x, scale_y;
+  TextureCache::GetConfigDrawResolutionScale(scale_x, scale_y);
+  const uint32_t previous_scale_x = texture_cache_->draw_resolution_scale_x();
+  const uint32_t previous_scale_y = texture_cache_->draw_resolution_scale_y();
+  if (scale_x == previous_scale_x && scale_y == previous_scale_y) {
+    declined_draw_resolution_scale_ = 0;
+    return;
+  }
+  // Square, as on D3D12; unequal axes are also seen between the two cvar
+  // writes of one change. A frame left open (a swap without a source) is
+  // closed by the next swap first.
+  if (scale_x != scale_y || scale_x == declined_draw_resolution_scale_ || frame_open_) {
+    return;
+  }
+  if (scale_x > 4) {
+    declined_draw_resolution_scale_ = scale_x;
+    REXGPU_WARN(
+        "Draw resolution scale {}x{} is above the 4x the scale switches to while running; it "
+        "applies after a restart",
+        scale_x, scale_y);
+    return;
+  }
+
+  // Between frames, with the GPU idle: the render targets, surfaces,
+  // textures, samplers, shaders and pipelines of the old scale go, and the
+  // guest's next frame renders into new ones. Guest memory (and the resolves
+  // read back into it), the register file, the shared memory, the primitive
+  // processor and the descriptor and pipeline layouts stay. There is no
+  // shader pack to check: shaders are translated at run time.
+  const auto start = std::chrono::steady_clock::now();
+  if (!AwaitAllQueueOperationsCompletion()) {
+    return;
+  }
+  // The presenter's step for the frame just swapped may still be queued.
+  AwaitSubmissionWorker();
+  if (fh1_native_executor_) {
+    fh1_native_executor_->FlushResolveReadbacks();
+  }
+  // The guest loads a shader once and draws with it until it loads another,
+  // so the active ones are reloaded into the new pipeline cache (as the
+  // big-endian microcode LoadShader takes).
+  const auto keep_ucode = [](const Shader* shader) {
+    std::vector<uint32_t> ucode;
+    if (shader) {
+      ucode = shader->ucode_data();
+      for (uint32_t& word : ucode) {
+        word = rex::byte_swap(word);
+      }
+    }
+    return ucode;
+  };
+  const std::vector<uint32_t> vertex_ucode = keep_ucode(active_vertex_shader_);
+  const std::vector<uint32_t> pixel_ucode = keep_ucode(active_pixel_shader_);
+  active_vertex_shader_ = nullptr;
+  active_pixel_shader_ = nullptr;
+  // The shared memory and EDRAM descriptor set layout, and with it every
+  // pipeline layout, is for this render target path; the executor draws
+  // FH1 differently from the render target cache.
+  const RenderTargetCache::Path path = render_target_cache_->GetPath();
+  const bool native_executor = fh1_native_executor_ != nullptr;
+  const auto destroy = [this]() {
+    fh1_native_executor_.reset();
+    texture_cache_.reset();
+    pipeline_cache_.reset();
+    render_target_cache_.reset();
+  };
+  const auto create = [&](uint32_t x, uint32_t y) {
+    return CreateScaledComponents(x, y) && render_target_cache_->GetPath() == path &&
+           (fh1_native_executor_ != nullptr) == native_executor;
+  };
+  destroy();
+  if (!create(scale_x, scale_y)) {
+    REXGPU_ERROR("Could not switch to draw resolution scale {}x; staying at {}x", scale_x,
+                 previous_scale_x);
+    declined_draw_resolution_scale_ = scale_x;
+    destroy();
+    if (!create(previous_scale_x, previous_scale_y)) {
+      REXGPU_ERROR("Could not restore draw resolution scale {}x{}", previous_scale_x,
+                   previous_scale_y);
+      device_lost_ = true;
+      if (graphics_system_) {
+        graphics_system_->OnHostGpuLossFromAnyThread(true);
+      }
+      return;
+    }
+  }
+  // The EDRAM buffer (fragment shader interlock) is the new render target
+  // cache's.
+  WriteSharedMemoryAndEdramDescriptorSet();
+  ResetCachedDrawState();
+  if (!shader_storage_cache_root_.empty()) {
+    // Blocking: the stored pipelines are created before the next frame instead
+    // of while it draws.
+    pipeline_cache_->InitializeShaderStorage(shader_storage_cache_root_,
+                                             shader_storage_title_id_, true);
+  }
+  if (!vertex_ucode.empty()) {
+    active_vertex_shader_ = LoadShader(xenos::ShaderType::kVertex, 0, vertex_ucode.data(),
+                                       uint32_t(vertex_ucode.size()));
+  }
+  if (!pixel_ucode.empty()) {
+    active_pixel_shader_ = LoadShader(xenos::ShaderType::kPixel, 0, pixel_ucode.data(),
+                                      uint32_t(pixel_ucode.size()));
+  }
+  draw_resolution_scale_.store(texture_cache_->draw_resolution_scale_x(),
+                               std::memory_order_relaxed);
+  REXGPU_INFO("Switched the draw resolution scale from {}x to {}x in {} ms", previous_scale_x,
+              texture_cache_->draw_resolution_scale_x(),
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - start)
+                  .count());
+}
+
+void VulkanCommandProcessor::RecreateSamplersIfMipLodBiasChanged() {
+  const double mip_lod_bias = REXCVAR_GET(texture_mip_lod_bias);
+  if (mip_lod_bias == sampler_mip_lod_bias_ || device_lost_ || frame_open_) {
+    return;
+  }
+  // The bias is baked into the samplers the texture cache keeps by their
+  // parameters; they go once the frames in flight are done with them.
+  const auto start = std::chrono::steady_clock::now();
+  if (!AwaitAllQueueOperationsCompletion()) {
+    return;
+  }
+  AwaitSubmissionWorker();
+  texture_cache_->ClearSamplers();
+  ResetSamplerBindings();
+  REXGPU_INFO("Applied the texture LOD bias {} (was {}) in {} ms", mip_lod_bias,
+              sampler_mip_lod_bias_,
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - start)
+                  .count());
+  sampler_mip_lod_bias_ = mip_lod_bias;
+}
+
+void VulkanCommandProcessor::ResetSamplerBindings() {
+  assert_false(submission_open_);
+  sampler_cache_vertex_.clear();
+  sampler_cache_pixel_.clear();
+  current_samplers_vertex_.clear();
+  current_samplers_pixel_.clear();
+  // Descriptors compare equal by handle, and a new sampler or view may reuse
+  // a destroyed one's.
+  for (LastTextureDescriptorSet& last : last_texture_descriptor_sets_) {
+    last = {};
+  }
+  last_pushed_pixel_textures_ = {};
+  // As when a frame opens.
+  std::memset(current_graphics_descriptor_sets_, 0, sizeof(current_graphics_descriptor_sets_));
+  current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram] =
+      shared_memory_and_edram_descriptor_set_;
+  current_graphics_descriptor_set_values_up_to_date_ =
+      UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram;
+  current_graphics_descriptor_sets_bound_up_to_date_ = 0;
+}
+
+void VulkanCommandProcessor::ResetCachedDrawState() {
+  ResetSamplerBindings();
+  // Keyed by shader, translation and pipeline cache entry addresses, which the
+  // new caches may reuse.
+  std::fill_n(pipeline_memos_.get(), kStateMemoCount, PipelineMemo());
+  std::fill_n(translation_memos_.get(), kStateMemoCount, TranslationMemo());
+  std::fill_n(viewport_memos_.get(), kStateMemoCount, ViewportMemo());
+  std::fill_n(sampler_parameters_memos_.get(), kSamplerParametersMemoCount,
+              SamplerParametersMemo());
+  current_render_pass_ = VK_NULL_HANDLE;
+  current_framebuffer_ = nullptr;
+  current_fh1_rendering_id_ = 0;
+  current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
+  current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+  current_external_compute_pipeline_ = VK_NULL_HANDLE;
+  current_guest_graphics_pipeline_layout_ = nullptr;
+  // The system constants hold the scale and the texture cache's swizzles and
+  // signs; every constant buffer is uploaded again.
+  std::memset(&system_constants_, 0, sizeof(system_constants_));
+  current_constant_buffers_up_to_date_ = 0;
+  std::memset(current_float_constant_map_vertex_, 0, sizeof(current_float_constant_map_vertex_));
+  std::memset(current_float_constant_map_pixel_, 0, sizeof(current_float_constant_map_pixel_));
+}
+
 void VulkanCommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
   StopSubmissionWorker();
@@ -2405,6 +2616,14 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
+  IssueSwapImpl(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  // Settings that rebuild host objects apply between frames.
+  SwitchDrawResolutionScaleIfRequested();
+  RecreateSamplersIfMipLodBiasChanged();
+}
+
+void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                           uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
   PERF_counter_add(kDrawCalls, pending_draw_calls_);
   pending_draw_calls_ = 0;

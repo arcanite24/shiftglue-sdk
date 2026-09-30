@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <condition_variable>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -300,6 +301,29 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool SetupContext() override;
   void ShutdownContext() override;
 
+  // Creates the render target cache, the pipeline cache, the texture cache,
+  // the FH1 native executor and (at 1x) the frame dump at a draw resolution
+  // scale.
+  bool CreateScaledComponents(uint32_t draw_resolution_scale_x,
+                              uint32_t draw_resolution_scale_y);
+  // Points the shared memory and EDRAM descriptor set at the shared memory and
+  // at the render target cache's EDRAM buffer.
+  void WriteSharedMemoryAndEdramDescriptorSet();
+  // Between frames, rebuilds the scale-dependent components when the draw
+  // resolution scale cvars name another square scale from 1x to 4x, so the
+  // scale changes without a restart (NP-4.7).
+  void SwitchDrawResolutionScaleIfRequested();
+  // Between frames, destroys the samplers when texture_mip_lod_bias differs
+  // from the bias they were created with, so they are created again with it.
+  void RecreateSamplersIfMipLodBiasChanged();
+  // Forgets the samplers and texture descriptors draws reuse. The GPU must be
+  // done with every submission and none may be open.
+  void ResetSamplerBindings();
+  // Forgets everything draws reuse from the render target, pipeline and
+  // texture caches (pipelines, translations, viewports, samplers, descriptors
+  // and the bound state), as after they are created again. Same conditions.
+  void ResetCachedDrawState();
+
   void WriteRegister(uint32_t index, uint32_t value) override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
@@ -312,6 +336,8 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
+  void IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                     uint32_t frontbuffer_height);
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -794,6 +820,15 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::unique_ptr<VulkanPipelineCache> pipeline_cache_;
 
   std::unique_ptr<VulkanTextureCache> texture_cache_;
+
+  // The shader storage the pipeline cache opened, to reopen at another scale.
+  std::filesystem::path shader_storage_cache_root_;
+  uint32_t shader_storage_title_id_ = 0;
+  // A requested scale that cannot be switched to, so the request is reported
+  // once.
+  uint32_t declined_draw_resolution_scale_ = 0;
+  // texture_mip_lod_bias when the texture cache's samplers were last dropped.
+  double sampler_mip_lod_bias_ = 0.0;
 
   VkDescriptorPool shared_memory_and_edram_descriptor_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet shared_memory_and_edram_descriptor_set_;

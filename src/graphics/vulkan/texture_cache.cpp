@@ -438,14 +438,7 @@ VulkanTextureCache::~VulkanTextureCache() {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
-  for (const std::pair<const SamplerParameters, Sampler>& sampler_pair : samplers_) {
-    dfn.vkDestroySampler(device, sampler_pair.second.sampler, nullptr);
-  }
-  samplers_.clear();
-  custom_border_color_sampler_count_ = 0;
-  COUNT_profile_set("gpu/texture_cache/vulkan/samplers", 0);
-  sampler_used_last_ = nullptr;
-  sampler_used_first_ = nullptr;
+  ClearSamplers();
 
   ShutdownScaledResolveBuffer();
 
@@ -866,8 +859,8 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
   sampler_create_info.addressModeV = kAddressModeMap[uint32_t(parameters.clamp_y)];
   sampler_create_info.addressModeW = kAddressModeMap[uint32_t(parameters.clamp_z)];
   // The title's LOD bias is applied in shaders; this is the player's global
-  // offset on top of it (samplers are cached, so it applies after a restart),
-  // within the device's limit.
+  // offset on top of it, within the device's limit. Samplers are cached, so
+  // when it changes the command processor clears them between frames.
   {
     const float max_bias = command_processor_.GetVulkanDevice()->properties().maxSamplerLodBias;
     sampler_create_info.mipLodBias =
@@ -986,6 +979,20 @@ uint64_t VulkanTextureCache::GetSubmissionToAwaitOnSamplerOverflow(
     sampler_used = sampler_used_next;
   }
   return sampler_used->second.last_usage_submission;
+}
+
+void VulkanTextureCache::ClearSamplers() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  for (const std::pair<const SamplerParameters, Sampler>& sampler_pair : samplers_) {
+    dfn.vkDestroySampler(device, sampler_pair.second.sampler, nullptr);
+  }
+  samplers_.clear();
+  custom_border_color_sampler_count_ = 0;
+  COUNT_profile_set("gpu/texture_cache/vulkan/samplers", 0);
+  sampler_used_last_ = nullptr;
+  sampler_used_first_ = nullptr;
 }
 
 VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t& width_scaled_out,

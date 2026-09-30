@@ -822,12 +822,10 @@ std::string D3D12CommandProcessor::GetWindowTitleText() const {
   title << "Direct3D 12";
   if (host_render_config_) {
     title << " - RTV/DSV";
-    uint32_t draw_resolution_scale_x =
-        texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1;
-    uint32_t draw_resolution_scale_y =
-        texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1;
-    if (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1) {
-      title << ' ' << draw_resolution_scale_x << 'x' << draw_resolution_scale_y;
+    // The scale is square, and readable while it is being switched.
+    const uint32_t scale = draw_resolution_scale();
+    if (scale > 1) {
+      title << ' ' << scale << 'x' << scale;
     }
   }
   return title.str();
@@ -1164,6 +1162,7 @@ bool D3D12CommandProcessor::SetupContext() {
     return false;
   }
   draw_resolution_scale_.store(draw_resolution_scale_x, std::memory_order_relaxed);
+  sampler_mip_lod_bias_ = REXCVAR_GET(texture_mip_lod_bias);
 
   D3D12_HEAP_FLAGS heap_flag_create_not_zeroed = provider.GetHeapFlagCreateNotZeroed();
 
@@ -1621,6 +1620,34 @@ void D3D12CommandProcessor::SwitchDrawResolutionScaleIfRequested() {
               std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::steady_clock::now() - start)
                   .count());
+}
+
+void D3D12CommandProcessor::RewriteSamplersIfMipLodBiasChanged() {
+  const double mip_lod_bias = REXCVAR_GET(texture_mip_lod_bias);
+  if (mip_lod_bias == sampler_mip_lod_bias_ || device_removed_) {
+    return;
+  }
+  // Bindless sampler descriptors are written once per parameters and reused,
+  // so the heap is refilled from the start once the GPU no longer reads it;
+  // bindful ones are written into the frame's heap again at the next draw.
+  const auto start = std::chrono::steady_clock::now();
+  if (bindless_resources_used_) {
+    if (!AwaitAllQueueOperationsCompletion()) {
+      return;
+    }
+    texture_cache_bindless_sampler_map_.clear();
+    sampler_bindless_heap_allocated_ = 0;
+  }
+  cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
+  cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
+  bindful_samplers_written_vertex_ = false;
+  bindful_samplers_written_pixel_ = false;
+  REXGPU_INFO("Applied the texture LOD bias {} (was {}) in {} ms", mip_lod_bias,
+              sampler_mip_lod_bias_,
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - start)
+                  .count());
+  sampler_mip_lod_bias_ = mip_lod_bias;
 }
 
 void D3D12CommandProcessor::ShutdownContext() {
@@ -2267,6 +2294,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   EndSubmission(true);
 
   SwitchDrawResolutionScaleIfRequested();
+  RewriteSamplersIfMipLodBiasChanged();
 }
 
 void D3D12CommandProcessor::FlushCpuVisibleResults() {

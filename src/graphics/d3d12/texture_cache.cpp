@@ -1111,7 +1111,8 @@ void D3D12TextureCache::WriteSampler(SamplerParameters parameters,
   desc.AddressV = kAddressModeMap[uint32_t(parameters.clamp_y)];
   desc.AddressW = kAddressModeMap[uint32_t(parameters.clamp_z)];
   // The title's LOD bias is applied in shaders; this is the player's global
-  // offset on top of it (samplers are cached, so it applies after a restart).
+  // offset on top of it. Sampler descriptors are reused, so when it changes
+  // the command processor writes them again between frames.
   desc.MipLODBias = float(REXCVAR_GET(texture_mip_lod_bias));
   desc.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
   switch (parameters.border_color) {

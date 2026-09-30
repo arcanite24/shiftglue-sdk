@@ -236,6 +236,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   // resolution scale cvars name another scale with a prepared shader pack, so
   // the scale changes without a restart (NP-4.7).
   void SwitchDrawResolutionScaleIfRequested();
+  // Between frames, has the sampler descriptors written again when
+  // texture_mip_lod_bias differs from the bias they were written with.
+  void RewriteSamplersIfMipLodBiasChanged();
 
   void WriteRegister(uint32_t index, uint32_t value) override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
@@ -538,6 +541,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   // A requested scale that cannot be switched to (no prepared pack), so the
   // request is reported once.
   uint32_t declined_draw_resolution_scale_ = 0;
+  // texture_mip_lod_bias when the sampler descriptors were last invalidated.
+  double sampler_mip_lod_bias_ = 0.0;
 
   std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> constant_buffer_pool_;
 

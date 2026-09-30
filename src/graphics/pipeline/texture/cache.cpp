@@ -80,7 +80,7 @@ REXCVAR_DEFINE_DOUBLE(texture_mip_lod_bias, 0.0, "GPU",
                       "Added to every texture's mip level: negative is sharper (and can shimmer), "
                       "positive is softer")
     .range(-3.0, 3.0)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(draw_resolution_scale_x, 1, "GPU", "Draw resolution scale X (1 = no scaling)")
     .range(1, 8)
