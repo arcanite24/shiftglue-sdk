@@ -57,6 +57,10 @@
 REXCVAR_DEFINE_BOOL(vulkan_push_texture_descriptors, true, "GPU/Vulkan",
                     "Push pixel shader texture descriptors (VK_KHR_push_descriptor) instead of "
                     "allocating and writing a descriptor set per change");
+REXCVAR_DEFINE_BOOL(vulkan_present_on_submission_worker, true, "GPU/Vulkan",
+                    "With vulkan_async_submission, publish and paint each frame on the "
+                    "submission worker after the frame's submission instead of waiting for the "
+                    "worker at every swap");
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -1989,6 +1993,10 @@ bool VulkanCommandProcessor::SetupContext() {
 void VulkanCommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
   StopSubmissionWorker();
+  if (present_deferred_presenter_) {
+    present_deferred_presenter_->SetGuestOutputPublishDeferrer(nullptr);
+    present_deferred_presenter_ = nullptr;
+  }
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -2410,6 +2418,22 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   if (!BeginSubmission(true)) {
     REXGPU_ERROR("XELOG_GPU PRESENT: BeginSubmission FAILED");
     return;
+  }
+
+  if (async_submission_ && REXCVAR_GET(vulkan_present_on_submission_worker) &&
+      present_deferred_presenter_ != presenter) {
+    if (present_deferred_presenter_) {
+      AwaitSubmissionWorker();
+      present_deferred_presenter_->SetGuestOutputPublishDeferrer(nullptr);
+    }
+    presenter->SetGuestOutputPublishDeferrer(
+        [this](std::function<void()> step) { DeferPresentStep(std::move(step)); });
+    present_deferred_presenter_ = presenter;
+  }
+  // The presenter's previous step owns its mailbox until it has run; it has
+  // nearly always run a frame later.
+  if (present_steps_done_.load(std::memory_order_acquire) != present_steps_queued_) {
+    AwaitSubmissionWorker();
   }
 
   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
@@ -3065,7 +3089,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           native_context.completed_submission = GetCompletedSubmission();
           native_context.frame_sequence = presented_output_frames_;
           native_context.use_pwl_gamma_ramp = use_pwl_gamma_ramp;
-          renderer(native_context);
+          if (present_deferred_presenter_) {
+            // After the image is published, as when the swap waited.
+            pending_present_notify_ = [renderer, native_context]() { renderer(native_context); };
+          } else {
+            renderer(native_context);
+          }
         }
         ++presented_output_frames_;
         return true;
@@ -5807,8 +5836,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 
     submission_open_ = false;
     // The presenter queues work reading the guest output right after the
-    // swap, so the frame must be on the queue first.
-    if (is_swap) {
+    // swap, so the frame must be on the queue first, unless the presenter's
+    // step runs on the worker after it.
+    if (is_swap && !present_deferred_presenter_) {
       AwaitSubmissionWorker();
     }
   }
@@ -6065,20 +6095,45 @@ void VulkanCommandProcessor::SubmissionWorkerMain() {
     submission_worker_busy_ = true;
     lock.unlock();
     const auto busy_start = std::chrono::steady_clock::now();
-    ExecuteSubmission(*job.tape, job.command_buffer, job.wait_semaphores, job.wait_stage_masks,
-                      job.fence);
-    job.tape->Reset();
+    if (job.tape) {
+      ExecuteSubmission(*job.tape, job.command_buffer, job.wait_semaphores, job.wait_stage_masks,
+                        job.fence);
+      job.tape->Reset();
+    } else if (job.callback) {
+      job.callback();
+    }
     PERF_counter_add(kGpuSubmissionBusyNs,
                      std::chrono::duration_cast<std::chrono::nanoseconds>(
                          std::chrono::steady_clock::now() - busy_start)
                          .count());
     lock.lock();
-    submission_free_tapes_.push_back(std::move(job.tape));
+    if (job.tape) {
+      submission_free_tapes_.push_back(std::move(job.tape));
+    }
     submission_worker_busy_ = false;
     if (submission_jobs_.empty()) {
       submission_worker_idle_.notify_all();
     }
   }
+}
+
+void VulkanCommandProcessor::DeferPresentStep(std::function<void()> step) {
+  std::function<void()> notify = std::move(pending_present_notify_);
+  pending_present_notify_ = nullptr;
+  ++present_steps_queued_;
+  SubmissionJob job;
+  job.callback = [this, step = std::move(step), notify = std::move(notify)]() {
+    step();
+    if (notify) {
+      notify();
+    }
+    present_steps_done_.fetch_add(1, std::memory_order_release);
+  };
+  {
+    std::lock_guard<std::mutex> lock(submission_worker_mutex_);
+    submission_jobs_.push_back(std::move(job));
+  }
+  submission_worker_wake_.notify_one();
 }
 
 void VulkanCommandProcessor::AwaitSubmissionWorker() {

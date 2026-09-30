@@ -1080,6 +1080,16 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
   if (refresher_succeeded) {
     image_instance.ever_successfully_refreshed = true;
   }
+  // Deferred: the refresher's work reaches the queue later, and the step
+  // signals after it.
+  if (!IsGuestOutputPublishDeferred()) {
+    GuestOutputRefreshSubmitted(mailbox_index);
+  }
+  return refresher_succeeded;
+}
+
+void VulkanPresenter::GuestOutputRefreshSubmitted(uint32_t mailbox_index) {
+  GuestOutputImageInstance& image_instance = guest_output_images_[mailbox_index];
   // Even if the refresher has returned false, it still might have submitted
   // some commands referencing the image. It's better to put an excessive
   // signal and wait slightly longer, for nothing important, while shutting down
@@ -1102,8 +1112,6 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
       fence_acqusition.SubmissionSucceededSignalFailed();
     }
   }
-
-  return refresher_succeeded;
 }
 
 VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(

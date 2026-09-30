@@ -145,6 +145,7 @@ class VulkanPresenter final : public Presenter {
                               uint32_t frontbuffer_height,
                               std::function<bool(GuestOutputRefreshContext& context)> refresher,
                               bool& is_8bpc_out_ref) override;
+  void GuestOutputRefreshSubmitted(uint32_t mailbox_index) override;
 
   PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override;
 

@@ -338,6 +338,9 @@ class VulkanCommandProcessor : public CommandProcessor {
     std::vector<VkSemaphore> wait_semaphores;
     std::vector<VkPipelineStageFlags> wait_stage_masks;
     VkFence fence = VK_NULL_HANDLE;
+    // Without a tape: work to run on the worker after the jobs before it (the
+    // presenter's publish and paint).
+    std::function<void()> callback;
   };
   // Replays `tape` into `command_buffer` and submits it signaling `fence`;
   // on failure still signals the fence (an empty submission) unless the
@@ -374,6 +377,16 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::vector<std::unique_ptr<DeferredCommandBuffer>> submission_free_tapes_;
   bool submission_worker_busy_ = false;
   bool submission_worker_stop_ = false;
+  // The presenter's publish-and-paint step runs on the submission worker after
+  // the swap's submission instead of the swap waiting for the worker
+  // (vulkan_present_on_submission_worker).
+  ui::Presenter* present_deferred_presenter_ = nullptr;
+  uint64_t present_steps_queued_ = 0;
+  std::atomic<uint64_t> present_steps_done_{0};
+  // The render-test notification of the frame being published, run after
+  // the step.
+  std::function<void()> pending_present_notify_;
+  void DeferPresentStep(std::function<void()> step);
 
   struct SparseBufferBind {
     VkBuffer buffer;
