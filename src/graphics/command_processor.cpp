@@ -528,8 +528,33 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   }
 }
 
+namespace {
+// Whether writing the registers [first, last] needs more than storing the
+// values: the side effects in CommandProcessor::WriteRegister, and the shader
+// constants the backends' WriteRegister overrides track.
+bool RegisterRangeHasWriteSideEffects(uint32_t first, uint32_t last) {
+  auto overlaps = [first, last](uint32_t range_first, uint32_t range_last) {
+    return first <= range_last && last >= range_first;
+  };
+  return overlaps(XE_GPU_REG_SCRATCH_REG0, XE_GPU_REG_SCRATCH_REG7) ||
+         overlaps(XE_GPU_REG_COHER_STATUS_HOST, XE_GPU_REG_COHER_STATUS_HOST) ||
+         overlaps(XE_GPU_REG_DC_LUT_RW_INDEX, XE_GPU_REG_DC_LUT_30_COLOR) ||
+         overlaps(XE_GPU_REG_SHADER_CONSTANT_000_X, XE_GPU_REG_SHADER_CONSTANT_LOOP_31);
+}
+}  // namespace
+
 void CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
                                              uint32_t num_registers) {
+  if (!num_registers) {
+    return;
+  }
+  // Most type-0 runs are plain state registers: store them in one swap-copy
+  // instead of a virtual WriteRegister per register.
+  if (uint64_t(start_index) + num_registers <= RegisterFile::kRegisterCount &&
+      !RegisterRangeHasWriteSideEffects(start_index, start_index + num_registers - 1)) {
+    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    return;
+  }
   for (uint32_t i = 0; i < num_registers; ++i) {
     uint32_t data = memory::load_and_swap<uint32_t>(base + i);
     WriteRegister(start_index + i, data);

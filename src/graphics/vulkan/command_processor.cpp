@@ -2251,6 +2251,21 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
   }
   uint32_t end_index = start_index + num_registers - 1;
 
+  // A run crossing constant class boundaries is written class by class, so
+  // every part takes a bulk path below instead of one register at a time.
+  static constexpr uint32_t kClassBoundaries[] = {
+      XE_GPU_REG_SHADER_CONSTANT_000_X, XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0,
+      XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5 + 1, XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031,
+      XE_GPU_REG_SHADER_CONSTANT_LOOP_31 + 1};
+  for (uint32_t boundary : kClassBoundaries) {
+    if (start_index < boundary && end_index >= boundary) {
+      const uint32_t head = boundary - start_index;
+      WriteRegistersFromMem(start_index, base, head);
+      WriteRegistersFromMem(boundary, base + head, num_registers - head);
+      return;
+    }
+  }
+
   auto range_has_any_constant_usage = [](const uint64_t* usage_map, uint32_t first_constant,
                                          uint32_t last_constant) -> bool {
     if (first_constant > last_constant) {
