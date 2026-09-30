@@ -307,6 +307,11 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
+  uint64_t HashShaderMicrocode(const uint32_t* host_address,
+                               uint32_t dword_count) const override;
+  Shader* LoadShaderHashed(xenos::ShaderType shader_type, uint32_t guest_address,
+                           const uint32_t* host_address, uint32_t dword_count,
+                           uint64_t hash) override;
 
   bool IssueDrawImpl(xenos::PrimitiveType prim_type, uint32_t index_count,
                      IndexBufferInfo* index_buffer_info, bool major_mode_explicit);

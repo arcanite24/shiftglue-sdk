@@ -73,6 +73,9 @@ class VulkanPipelineCache {
 
   VulkanShader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                            uint32_t dword_count);
+  // With the microcode hash already computed (XXH3 of the microcode).
+  VulkanShader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
+                           uint32_t dword_count, uint64_t data_hash);
   // Analyze shader microcode on the translator thread.
   void AnalyzeShaderUcode(Shader& shader) { shader.AnalyzeUcode(ucode_disasm_buffer_); }
 
@@ -326,8 +329,6 @@ class VulkanPipelineCache {
     bool operator!=(const GeometryShaderKey& other_key) const { return !(*this == other_key); }
   };
 
-  VulkanShader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
-                           uint32_t dword_count, uint64_t data_hash);
 
   // Can be called from multiple threads.
   bool TranslateAnalyzedShader(SpirvShaderTranslator& translator,

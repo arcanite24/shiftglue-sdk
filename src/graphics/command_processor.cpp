@@ -390,6 +390,12 @@ void CommandProcessor::ExecuteRecordBatch(RecordBatch& batch) {
         batch.fns[words[i + 1]]();
         i += 2;
         break;
+      case kRecordDraw: {
+        DrawRecord record;
+        std::memcpy(&record, words + i + 1, sizeof(record));
+        ExecuteDrawRecord(record);
+        i += 1 + kDrawRecordWords;
+      } break;
       default:
         assert_always();
         return;
@@ -482,6 +488,7 @@ void CommandProcessor::PublishRecordBatch() {
   }
   record_ready_.notify_one();
   record_batch_ = next ? std::move(next) : std::make_unique<RecordBatch>();
+  record_batch_draws_ = 0;
 }
 
 void CommandProcessor::RecordSync() {
@@ -1742,9 +1749,44 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   reader->AdvanceRead(count_remaining * sizeof(uint32_t));
 
   if (draw_succeeded) {
-    RecordCall([this, packet, opcode_name, vgt_draw_initiator, is_indexed,
-                index_buffer_info]() mutable {
-    bool draw_succeeded = true;
+    DrawRecord record;
+    record.packet = packet;
+    record.initiator = vgt_draw_initiator.value;
+    record.is_indexed = is_indexed;
+    record.index_buffer_info = index_buffer_info;
+    record.opcode_name = opcode_name;
+    if (!record_split_) {
+      ExecuteDrawRecord(record);
+    } else {
+      // A plain record rather than a closure: the draw's state is too large
+      // for std::function's inline storage, and a heap allocation per draw
+      // freed on the other thread costs more than the copy.
+      std::vector<uint32_t>& words = record_batch_->words;
+      const size_t offset = words.size();
+      words.resize(offset + 1 + kDrawRecordWords);
+      words[offset] = kRecordDraw;
+      std::memcpy(words.data() + offset + 1, &record, sizeof(record));
+      if (++record_batch_draws_ >= 32) {
+        PublishRecordBatch();
+      }
+    }
+  }
+
+  // If read the packed correctly, but merely couldn't execute it (because of,
+  // for instance, features not supported by the host), don't terminate command
+  // buffer processing as that would leave rendering in a way more inconsistent
+  // state than just a single dropped draw command.
+  return true;
+}
+
+void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
+  const uint32_t packet = record.packet;
+  const char* opcode_name = record.opcode_name;
+  reg::VGT_DRAW_INITIATOR vgt_draw_initiator;
+  vgt_draw_initiator.value = record.initiator;
+  const bool is_indexed = record.is_indexed;
+  IndexBufferInfo index_buffer_info = record.index_buffer_info;
+  bool draw_succeeded = true;
     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
     if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
       // TODO(Triang3l): Don't drop the draw call completely if the vertex
@@ -1863,14 +1905,6 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
             uint32_t(rb_modecontrol.edram_mode));
       }
     }
-    });
-  }
-
-  // If read the packed correctly, but merely couldn't execute it (because of,
-  // for instance, features not supported by the host), don't terminate command
-  // buffer processing as that would leave rendering in a way more inconsistent
-  // state than just a single dropped draw command.
-  return true;
 }
 
 bool CommandProcessor::ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, uint32_t packet,
@@ -1998,9 +2032,12 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
     assert_unhandled_case(shader_type);
     return false;
   }
-  RecordCall([this, shader_type, addr, size_dwords]() {
-    auto shader =
-        LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
+  const uint32_t* ucode = memory_->TranslatePhysical<uint32_t*>(addr);
+  // Hashing the microcode is most of a shader load; the decoder has time.
+  const uint64_t ucode_hash = record_split_ ? HashShaderMicrocode(ucode, size_dwords) : 0;
+  RecordCall([this, shader_type, addr, ucode, size_dwords, ucode_hash]() {
+    auto shader = ucode_hash ? LoadShaderHashed(shader_type, addr, ucode, size_dwords, ucode_hash)
+                             : LoadShader(shader_type, addr, ucode, size_dwords);
     if (shader_type == xenos::ShaderType::kVertex) {
       active_vertex_shader_ = shader;
     } else {

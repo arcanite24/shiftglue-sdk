@@ -242,6 +242,19 @@ class CommandProcessor {
 
   virtual Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                              const uint32_t* host_address, uint32_t dword_count) = 0;
+  // With the microcode hash computed by the caller (the decoder while split);
+  // backends that hash the same way take it, others hash again.
+  virtual uint64_t HashShaderMicrocode(const uint32_t* host_address, uint32_t dword_count) const {
+    (void)host_address;
+    (void)dword_count;
+    return 0;
+  }
+  virtual Shader* LoadShaderHashed(xenos::ShaderType shader_type, uint32_t guest_address,
+                                   const uint32_t* host_address, uint32_t dword_count,
+                                   uint64_t hash) {
+    (void)hash;
+    return LoadShader(shader_type, guest_address, host_address, dword_count);
+  }
 
   virtual bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                          IndexBufferInfo* index_buffer_info, bool major_mode_explicit) = 0;
@@ -343,6 +356,20 @@ class CommandProcessor {
   static constexpr uint32_t kRecordRun = 0;
   static constexpr uint32_t kRecordOne = 1;
   static constexpr uint32_t kRecordCall = 2;
+  struct DrawRecord {
+    uint32_t packet;
+    uint32_t initiator;
+    uint32_t is_indexed;
+    uint32_t padding;
+    IndexBufferInfo index_buffer_info;
+    const char* opcode_name;
+  };
+  static constexpr uint32_t kRecordDraw = 3;
+  static constexpr size_t kDrawRecordWords = (sizeof(DrawRecord) + 3) / 4;
+  // The draw half of a draw packet (registers already written): the backend
+  // draw and its failure reporting.
+  void ExecuteDrawRecord(const DrawRecord& record);
+  uint32_t record_batch_draws_ = 0;
   void StartRecordThread();
   void StopRecordThread();
   void RecordThreadMain();

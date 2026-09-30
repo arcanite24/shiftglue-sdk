@@ -3815,6 +3815,20 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
 }
 
+uint64_t VulkanCommandProcessor::HashShaderMicrocode(const uint32_t* host_address,
+                                                     uint32_t dword_count) const {
+  // As VulkanPipelineCache::LoadShader; never 0 in practice, which the caller
+  // reads as "not hashed".
+  return XXH3_64bits(host_address, dword_count * sizeof(uint32_t));
+}
+
+Shader* VulkanCommandProcessor::LoadShaderHashed(xenos::ShaderType shader_type,
+                                                 uint32_t guest_address,
+                                                 const uint32_t* host_address,
+                                                 uint32_t dword_count, uint64_t hash) {
+  return pipeline_cache_->LoadShader(shader_type, host_address, dword_count, hash);
+}
+
 bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
