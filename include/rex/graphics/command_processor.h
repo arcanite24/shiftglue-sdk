@@ -395,6 +395,10 @@ class CommandProcessor {
   void RecordThreadMain();
   void ExecuteRecordBatch(RecordBatch& batch);
   bool record_split_ = false;
+  // gpu_record_elide_unchanged_registers, read when the split starts.
+  bool elide_unchanged_registers_ = false;
+  // Appends a register run (big-endian source words) to the record batch.
+  void RecordRegisterRun(uint32_t start_index, const uint32_t* base, uint32_t num_registers);
   std::unique_ptr<RegisterFile> decode_register_file_;
   std::unordered_map<uint32_t, uint32_t> decode_extended_register_values_;
   std::unique_ptr<RecordBatch> record_batch_;

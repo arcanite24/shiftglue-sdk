@@ -49,6 +49,11 @@ REXCVAR_DEFINE_BOOL(gpu_record_thread, false, "GPU",
                     "thread while a second applies register writes and records draws "
                     "(backends that support it; Vulkan)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(gpu_record_elide_unchanged_registers, true, "GPU",
+                    "With gpu_record_thread, the decoder drops register writes that leave a "
+                    "plain state register or shader constant unchanged, so the recorder neither "
+                    "applies them nor invalidates what depends on them")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(wait_reg_mem_yield_us, 2000, "GPU",
                      "With vsync, how long a WAIT_REG_MEM poll yields before it sleeps (the "
                      "sleep is at least a millisecond, which can outlast the wait); 0 sleeps at "
@@ -328,6 +333,7 @@ void CommandProcessor::StartRecordThread() {
   record_thread_->set_name("GPU Recorder");
   record_thread_->Create();
   record_thread_->MarkLatencyCritical();
+  elide_unchanged_registers_ = REXCVAR_GET(gpu_record_elide_unchanged_registers);
   record_split_ = true;
   REXGPU_INFO("GPU commands: decoding and recording on separate threads");
 }
@@ -408,9 +414,26 @@ void CommandProcessor::ExecuteRecordBatch(RecordBatch& batch) {
   }
 }
 
+namespace {
+// Registers whose write does something beyond storing the value, whatever the
+// value: scratch writeback, the coherency status, the gamma ramp (its index
+// auto-increments on the recorder only), and the event and draw initiators.
+bool RegisterWriteAlwaysMatters(uint32_t index) {
+  return (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) ||
+         index == XE_GPU_REG_COHER_STATUS_HOST ||
+         (index >= XE_GPU_REG_DC_LUT_RW_INDEX && index <= XE_GPU_REG_DC_LUT_30_COLOR) ||
+         (index >= XE_GPU_REG_VGT_EVENT_INITIATOR && index <= XE_GPU_REG_VGT_DRAW_INITIATOR);
+}
+}  // namespace
+
 void CommandProcessor::PacketWriteRegister(uint32_t index, uint32_t value) {
   if (!record_split_) {
     WriteRegister(index, value);
+    return;
+  }
+  if (elide_unchanged_registers_ && index < RegisterFile::kRegisterCount &&
+      decode_register_file_->values[index] == value && !RegisterWriteAlwaysMatters(index)) {
+    // The recorder's register file already holds this value.
     return;
   }
   if (index < RegisterFile::kRegisterCount) {
@@ -445,11 +468,42 @@ void CommandProcessor::PacketWriteRegistersFromMem(uint32_t start_index, const u
     }
     return;
   }
+  if (elide_unchanged_registers_) {
+    // Record only the sub-runs that change a register (or whose write always
+    // matters); the rest would leave the recorder's register file as it is.
+    uint32_t* shadow = decode_register_file_->values + start_index;
+    uint32_t i = 0;
+    while (i < num_registers) {
+      if (shadow[i] == rex::byte_swap(base[i]) && !RegisterWriteAlwaysMatters(start_index + i)) {
+        ++i;
+        continue;
+      }
+      uint32_t end = i;
+      do {
+        shadow[end] = rex::byte_swap(base[end]);
+        ++end;
+      } while (end < num_registers &&
+               (shadow[end] != rex::byte_swap(base[end]) ||
+                RegisterWriteAlwaysMatters(start_index + end)));
+      if (start_index + i <= XE_GPU_REG_COHER_STATUS_HOST &&
+          start_index + end > XE_GPU_REG_COHER_STATUS_HOST) {
+        decode_register_file_->values[XE_GPU_REG_COHER_STATUS_HOST] |= UINT32_C(0x80000000);
+      }
+      RecordRegisterRun(start_index + i, base + i, end - i);
+      i = end;
+    }
+    return;
+  }
   memory::copy_and_swap(decode_register_file_->values + start_index, base, num_registers);
   if (start_index <= XE_GPU_REG_COHER_STATUS_HOST &&
       start_index + num_registers > XE_GPU_REG_COHER_STATUS_HOST) {
     decode_register_file_->values[XE_GPU_REG_COHER_STATUS_HOST] |= UINT32_C(0x80000000);
   }
+  RecordRegisterRun(start_index, base, num_registers);
+}
+
+void CommandProcessor::RecordRegisterRun(uint32_t start_index, const uint32_t* base,
+                                         uint32_t num_registers) {
   std::vector<uint32_t>& words = record_batch_->words;
   const size_t offset = words.size();
   words.resize(offset + 3 + num_registers);
