@@ -304,12 +304,15 @@ inline void emitAtomicStoreConditional(BuilderContext& ctx, const char* ptr_type
   ctx.println("{}.u32;", ctx.r(ctx.insn.operands[2]));
   ctx.println("\t{}.lt = 0;", ctx.cr(0));
   ctx.println("\t{}.gt = 0;", ctx.cr(0));
+  // A std::atomic compare-exchange (acquire-release) rather than the
+  // full-barrier __sync builtin. The expected value is a same-width copy,
+  // since a failed exchange writes the current value back into it.
   ctx.println(
-      "\t{}.eq = __sync_bool_compare_and_swap(reinterpret_cast<{}*>(REX_RAW_ADDR({})), "
-      "{}.{}, {}({}.{}));",
-      ctx.cr(0), ptr_type, ctx.ea(), ctx.reserved(), field, bswap_func, ctx.r(ctx.insn.operands[0]),
-      field);
-  ctx.println("\t{}.so = {}.so;", ctx.cr(0), ctx.xer());
+      "\t{{ {} expected = {}({}.{}); {}.eq = reinterpret_cast<std::atomic<{}>*>("
+      "REX_RAW_ADDR({}))->compare_exchange_strong(expected, {}({}({}.{})), "
+      "std::memory_order_acq_rel, std::memory_order_acquire); }}",
+      ptr_type, ptr_type, ctx.reserved(), field, ctx.cr(0), ptr_type, ctx.ea(), ptr_type,
+      bswap_func, ctx.r(ctx.insn.operands[0]), field);
 }
 
 //=============================================================================
