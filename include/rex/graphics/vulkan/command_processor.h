@@ -994,6 +994,20 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint64_t submission = 0;
   };
   std::vector<SamplerCacheEntry> sampler_cache_vertex_;
+  // Sampler parameters by fetch words, binding filters and the filtering
+  // cvars (a pure function of them), direct-mapped, behind the per-slot cache:
+  // a slot whose sampler changed from the last draw usually finds a state seen
+  // before.
+  struct SamplerParametersMemo {
+    std::array<uint32_t, 6> fetch{};
+    uint32_t binding = UINT32_MAX;
+    int32_t anisotropic_override = 0;
+    bool force_trilinear = false;
+    VulkanTextureCache::SamplerParameters parameters;
+  };
+  static constexpr size_t kSamplerParametersMemoCount = 1024;
+  std::unique_ptr<SamplerParametersMemo[]> sampler_parameters_memos_{
+      new SamplerParametersMemo[kSamplerParametersMemoCount]};
   // The last texture descriptor set written per stage (vertex, pixel) and its
   // contents; transient sets stay alive until their frame completes.
   struct LastTextureDescriptorSet {

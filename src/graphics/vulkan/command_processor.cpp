@@ -4163,7 +4163,25 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
             cached.binding = binding;
             cached.anisotropic_override = anisotropic_override;
             cached.force_trilinear = force_trilinear;
-            cached.parameters = texture_cache_->GetSamplerParameters(shader_sampler_binding);
+            uint64_t memo_hash = uint64_t(binding) * UINT64_C(0x9E3779B97F4A7C15);
+            for (uint32_t word = 0; word < 6; ++word) {
+              memo_hash = (memo_hash ^ fetch[word]) * UINT64_C(0xBF58476D1CE4E5B9);
+            }
+            SamplerParametersMemo& memo =
+                sampler_parameters_memos_[size_t(memo_hash >> 54) &
+                                          (kSamplerParametersMemoCount - 1)];
+            if (memo.binding == binding && !std::memcmp(memo.fetch.data(), fetch, sizeof(memo.fetch)) &&
+                memo.anisotropic_override == anisotropic_override &&
+                memo.force_trilinear == force_trilinear) {
+              cached.parameters = memo.parameters;
+            } else {
+              cached.parameters = texture_cache_->GetSamplerParameters(shader_sampler_binding);
+              memo.fetch = cached.fetch;
+              memo.binding = binding;
+              memo.anisotropic_override = anisotropic_override;
+              memo.force_trilinear = force_trilinear;
+              memo.parameters = cached.parameters;
+            }
             cached.sampler = VK_NULL_HANDLE;
           }
           shader_samplers.emplace_back(cached.parameters, VK_NULL_HANDLE);
