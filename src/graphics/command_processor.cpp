@@ -359,7 +359,12 @@ void CommandProcessor::RecordThreadMain() {
       batch = std::move(record_queue_.front());
       record_queue_.pop_front();
     }
+    const auto busy_start = std::chrono::steady_clock::now();
     ExecuteRecordBatch(*batch);
+    PERF_counter_add(kGpuRecorderBusyNs,
+                     std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now() - busy_start)
+                         .count());
     batch->words.clear();
     batch->fns.clear();
     {

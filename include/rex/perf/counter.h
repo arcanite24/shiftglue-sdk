@@ -139,6 +139,8 @@ enum class CounterId : uint16_t {
   kGpuThreadRegMemWaitNs,
   kGpuThreadFenceWaitNs,
   kGpuSubmissionBusyNs,
+  // Time the GPU recorder (gpu_record_thread) spent running recorded work.
+  kGpuRecorderBusyNs,
 
   kCount  // sentinel -- must be last
 };
