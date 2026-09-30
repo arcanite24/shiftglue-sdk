@@ -6148,6 +6148,7 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
   transient_descriptor_allocator_uniform_buffer_.Reset();
   transient_descriptor_allocator_uniform_buffer_dynamic_.Reset();
   constants_descriptor_sets_frame_.clear();
+  last_constants_descriptor_set_ = VK_NULL_HANDLE;
 }
 
 void VulkanCommandProcessor::SplitPendingBarrier() {
@@ -7297,6 +7298,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     if (constants_descriptor_sets_frame_index_ != frame_current_) {
       constants_descriptor_sets_frame_.clear();
       constants_descriptor_sets_frame_index_ = frame_current_;
+      last_constants_descriptor_set_ = VK_NULL_HANDLE;
     }
     ConstantsDescriptorSetKey constants_key;
     for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
@@ -7305,8 +7307,13 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       current_constant_dynamic_offsets_[i] = uint32_t(current_constant_buffer_infos_[i].offset);
     }
     VkDescriptorSet constants_descriptor_set;
-    auto constants_set_it = constants_descriptor_sets_frame_.find(constants_key);
-    if (constants_set_it != constants_descriptor_sets_frame_.end()) {
+    auto constants_set_it = constants_descriptor_sets_frame_.end();
+    if (last_constants_descriptor_set_ != VK_NULL_HANDLE &&
+        last_constants_descriptor_set_key_ == constants_key) {
+      // Consecutive draws nearly always share buffers and sizes.
+      constants_descriptor_set = last_constants_descriptor_set_;
+    } else if ((constants_set_it = constants_descriptor_sets_frame_.find(constants_key)) !=
+               constants_descriptor_sets_frame_.end()) {
       constants_descriptor_set = constants_set_it->second;
     } else {
       if (!constants_transient_descriptors_free_.empty()) {
@@ -7344,6 +7351,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         write_constants.pTexelBufferView = nullptr;
       }
     }
+    last_constants_descriptor_set_key_ = constants_key;
+    last_constants_descriptor_set_ = constants_descriptor_set;
     write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants;
     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetConstants] =
         constants_descriptor_set;

@@ -727,6 +727,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::unordered_map<ConstantsDescriptorSetKey, VkDescriptorSet, ConstantsDescriptorSetKeyHasher>
       constants_descriptor_sets_frame_;
   uint64_t constants_descriptor_sets_frame_index_ = 0;
+  ConstantsDescriptorSetKey last_constants_descriptor_set_key_;
+  VkDescriptorSet last_constants_descriptor_set_ = VK_NULL_HANDLE;
   uint32_t current_constant_dynamic_offsets_[SpirvShaderTranslator::kConstantBufferCount] = {};
   VkDescriptorBufferInfo
       constants_descriptor_write_infos_[SpirvShaderTranslator::kConstantBufferCount] = {};
