@@ -51,8 +51,8 @@ struct Fh1VulkanExecutorConfig {
 // the executor tracks from the guest registers. Ownership transfers and
 // resolves use the same shaders as D3D12, compiled to SPIR-V. Guest draws
 // render with dynamic rendering into the surfaces BindTargets selects.
-// At present only 1x resolution scale; frame dumps and the GPU profile are
-// D3D12 only.
+// Scales 1x to 4x; the GPU profile (fh1_native_gpu_profile) times its phases
+// and the texture loads as on D3D12.
 class Fh1NativeExecutor {
  public:
   Fh1NativeExecutor(VulkanCommandProcessor& command_processor, const RegisterFile& register_file,
@@ -78,6 +78,12 @@ class Fh1NativeExecutor {
   void FlushResolveReadbacks();
   void OnSwap(uint64_t frame);
   void LogStats(uint64_t frame);
+  // Texture loads (untile and copy) timed with the GPU profile, split by
+  // whether a resolve wrote the texture's memory.
+  uint32_t BeginTextureLoadGpuTiming() { return GpuBegin(); }
+  void EndTextureLoadGpuTiming(uint32_t begin, bool resolve_sourced) {
+    GpuEnd(resolve_sourced ? kGpuTextureReloads : kGpuTextureLoads, begin);
+  }
 
  private:
   using SurfaceKey = Fh1SurfaceKey;
@@ -288,7 +294,15 @@ class Fh1NativeExecutor {
   // fh1_native_gpu_profile: GPU time per phase, and from a frame's first
   // timed phase to its swap, from timestamps in one query range per frame,
   // read once the frame's submission has completed.
-  enum GpuPhase { kGpuTransfers, kGpuResolves, kGpuClears, kGpuFrame, kGpuPhases };
+  enum GpuPhase {
+    kGpuTransfers,
+    kGpuResolves,
+    kGpuClears,
+    kGpuTextureReloads,
+    kGpuTextureLoads,
+    kGpuFrame,
+    kGpuPhases
+  };
   static constexpr uint32_t kGpuProfileSlots = 4;
   static constexpr uint32_t kGpuProfileQueries = 2048;
   struct GpuProfileSlot {
@@ -320,6 +334,8 @@ class Fh1NativeExecutor {
   uint64_t gpu_frames_ = 0;
   uint64_t draws_ = 0;
   uint64_t resolves_ = 0;
+  // Tile passes per source -> destination surface pair while profiling.
+  std::map<std::string, uint64_t> transfer_volume_;
 };
 
 }  // namespace rex::graphics::vulkan

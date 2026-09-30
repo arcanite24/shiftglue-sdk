@@ -207,6 +207,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Dynamic rendering for the FH1 native executor: begins the scope unless
   // the one identified by `id` is already open. Submission must be open.
   void SubmitBarriersAndBeginFh1Rendering(const VkRenderingInfo& rendering_info, uint64_t id);
+  // Pipeline barrier commands and FH1 renderings recorded since the last call.
+  Fh1NativeExecutor* GetFh1NativeExecutor() const { return fh1_native_executor_.get(); }
+  uint64_t TakeBarrierBatchCount() { return std::exchange(barrier_batch_count_, 0); }
+  uint64_t TakeRenderingBeginCount() { return std::exchange(rendering_begin_count_, 0); }
   // vulkan_diagnostic_checkpoints: marks the command stream so a device loss
   // reports the last draws, copies, texture loads and executor passes the GPU
   // reached. Each marker is a serial number; a ring keeps what each recent
@@ -852,6 +856,8 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint64_t submission = 0;
   };
   FrameTimingSlot frame_timing_slots_[kMaxFramesInFlight] = {};
+  uint64_t barrier_batch_count_ = 0;
+  uint64_t rendering_begin_count_ = 0;
   struct ActiveOcclusionQuery {
     uint32_t sample_count_address = 0;
     uint32_t host_index = UINT32_MAX;

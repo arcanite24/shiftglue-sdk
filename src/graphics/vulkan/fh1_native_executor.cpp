@@ -917,6 +917,10 @@ void Fh1NativeExecutor::TransferRects(Surface& dest, uint32_t previous_owner, co
     if (!source_stencil) Count("transfer_stencil_skipped");
   }
   counters_.Count("transfer_tile_passes", uint64_t(tile_count) * pass_count);
+  if (gpu_query_pool_ != VK_NULL_HANDLE) {
+    transfer_volume_[source->key.Describe() + "->" + dest.key.Describe()] +=
+        uint64_t(tile_count) * pass_count;
+  }
   for (uint32_t i = 0; i < rect_count; ++i) {
     pending_transfers_.push_back({dest.key.Pack(), previous_owner, rects[i], source_stencil});
   }
@@ -2031,12 +2035,30 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
     const double scale = tick_ns / 1e6 / double(gpu_frames_);
     REXGPU_INFO(
         "FH1 native executor (Vulkan) gpu ms/frame over {} frames: frame {:.3f} transfers "
-        "{:.3f} resolves {:.3f} clears {:.3f}",
+        "{:.3f} resolves {:.3f} clears {:.3f} texture_reloads {:.3f} texture_loads {:.3f}",
         gpu_frames_, gpu_ticks_[kGpuFrame] * scale, gpu_ticks_[kGpuTransfers] * scale,
-        gpu_ticks_[kGpuResolves] * scale, gpu_ticks_[kGpuClears] * scale);
+        gpu_ticks_[kGpuResolves] * scale, gpu_ticks_[kGpuClears] * scale,
+        gpu_ticks_[kGpuTextureReloads] * scale, gpu_ticks_[kGpuTextureLoads] * scale);
     gpu_ticks_ = {};
     gpu_frames_ = 0;
   }
+  if (!transfer_volume_.empty()) {
+    std::vector<std::pair<uint64_t, std::string>> volume;
+    for (const auto& [pair, tiles] : transfer_volume_) volume.emplace_back(tiles, pair);
+    std::sort(volume.begin(), volume.end(), std::greater<>());
+    std::string top;
+    for (size_t i = 0; i < volume.size() && i < 8; ++i) {
+      top += fmt::format("{}{}={}", i ? " " : "", volume[i].second, volume[i].first);
+    }
+    REXGPU_INFO("FH1 native executor (Vulkan) transfer tile-passes: {}", top);
+    transfer_volume_.clear();
+  }
+  const uint64_t window_frames = frame >= 600 ? 600 : std::max<uint64_t>(frame, 1);
+  REXGPU_INFO(
+      "FH1 native executor (Vulkan) per frame over {} frames: renderings {:.1f} barrier "
+      "batches {:.1f}",
+      window_frames, double(command_processor_.TakeRenderingBeginCount()) / double(window_frames),
+      double(command_processor_.TakeBarrierBatchCount()) / double(window_frames));
 }
 
 uint32_t Fh1NativeExecutor::GpuBegin() {

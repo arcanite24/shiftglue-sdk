@@ -26,6 +26,7 @@
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
+#include <rex/graphics/vulkan/fh1_native_executor.h>
 #include <rex/graphics/vulkan/texture_cache.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -1222,6 +1223,20 @@ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unsca
 
 bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                                bool load_mips) {
+  // GPU time of the load for fh1_native_gpu_profile, split by resolve-sourced
+  // reloads and other loads.
+  Fh1NativeExecutor* const gpu_profile_executor = command_processor_.GetFh1NativeExecutor();
+  const uint32_t load_gpu_timing =
+      gpu_profile_executor ? gpu_profile_executor->BeginTextureLoadGpuTiming() : UINT32_MAX;
+  const bool loaded = LoadTextureDataFromResidentMemoryUntimed(texture, load_base, load_mips);
+  if (gpu_profile_executor) {
+    gpu_profile_executor->EndTextureLoadGpuTiming(load_gpu_timing, loading_resolve_sourced());
+  }
+  return loaded;
+}
+
+bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& texture,
+                                                                 bool load_base, bool load_mips) {
   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
   TextureKey texture_key = vulkan_texture.key();
   if (command_processor_.checkpoints_enabled()) {

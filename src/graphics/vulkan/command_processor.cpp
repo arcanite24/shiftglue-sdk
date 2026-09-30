@@ -3175,6 +3175,7 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
     return false;
   }
   EndRenderPass();
+  barrier_batch_count_ += pending_barriers_.size();
   for (auto it = pending_barriers_.cbegin(); it != pending_barriers_.cend(); ++it) {
     auto it_next = std::next(it);
     bool is_last = it_next == pending_barriers_.cend();
@@ -3375,6 +3376,7 @@ void VulkanCommandProcessor::SubmitBarriersAndBeginFh1Rendering(
   }
   EndRenderPass();
   deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
+  ++rendering_begin_count_;
   current_render_pass_ = VK_NULL_HANDLE;
   current_framebuffer_ = nullptr;
   current_fh1_rendering_id_ = id;
