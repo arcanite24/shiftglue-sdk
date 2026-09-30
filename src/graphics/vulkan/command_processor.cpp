@@ -4216,14 +4216,46 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   // textures.
   VkPipeline pipeline;
   void* pipeline_handle = nullptr;
-  if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
-                                          primitive_processing_result, normalized_depth_control,
-                                          normalized_color_mask,
-                                          fh1_native_executor_
-                                              ? fh1_render_pass_key
-                                              : render_target_cache_->last_update_render_pass_key(),
-                                          pipeline, pipeline_layout_provider, &pipeline_handle)) {
-    return draw_fail("configure_pipeline");
+  const VulkanRenderTargetCache::RenderPassKey pipeline_render_pass_key =
+      fh1_native_executor_ ? fh1_render_pass_key
+                           : render_target_cache_->last_update_render_pass_key();
+  PipelineMemo& memo = pipeline_memo_;
+  if (memo.handle && memo.state_epoch == state_epoch_ &&
+      memo.vertex_translation == vertex_shader_translation &&
+      memo.pixel_translation == pixel_shader_translation &&
+      memo.host_primitive_type == uint32_t(primitive_processing_result.host_primitive_type) &&
+      memo.tessellation_mode == uint32_t(primitive_processing_result.tessellation_mode) &&
+      memo.host_primitive_reset_enabled ==
+          primitive_processing_result.host_primitive_reset_enabled &&
+      memo.normalized_depth_control == normalized_depth_control.value &&
+      memo.normalized_color_mask == normalized_color_mask &&
+      memo.render_pass_key == pipeline_render_pass_key.key) {
+    // The description would be the same: the register state it reads has not
+    // changed, nor have the shaders, primitive or render pass.
+    pipeline = memo.pipeline;
+    pipeline_layout_provider = memo.layout;
+    pipeline_handle = memo.handle;
+  } else {
+    if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
+                                            primitive_processing_result, normalized_depth_control,
+                                            normalized_color_mask, pipeline_render_pass_key,
+                                            pipeline, pipeline_layout_provider,
+                                            &pipeline_handle)) {
+      memo.handle = nullptr;
+      return draw_fail("configure_pipeline");
+    }
+    memo.state_epoch = state_epoch_;
+    memo.vertex_translation = vertex_shader_translation;
+    memo.pixel_translation = pixel_shader_translation;
+    memo.host_primitive_type = uint32_t(primitive_processing_result.host_primitive_type);
+    memo.tessellation_mode = uint32_t(primitive_processing_result.tessellation_mode);
+    memo.host_primitive_reset_enabled = primitive_processing_result.host_primitive_reset_enabled;
+    memo.normalized_depth_control = normalized_depth_control.value;
+    memo.normalized_color_mask = normalized_color_mask;
+    memo.render_pass_key = pipeline_render_pass_key.key;
+    memo.pipeline = pipeline;
+    memo.layout = pipeline_layout_provider;
+    memo.handle = pipeline_handle;
   }
   bool pipeline_is_placeholder = false;
   // Reload the current handle state to observe async hot-swap completions that

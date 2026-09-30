@@ -997,6 +997,23 @@ class VulkanCommandProcessor : public CommandProcessor {
     std::vector<VkDescriptorImageInfo> infos;
   };
   LastTextureDescriptorSet last_texture_descriptor_sets_[2];
+  // The last pipeline configured, reused while the register state epoch and
+  // the other inputs of the pipeline description are the same.
+  struct PipelineMemo {
+    uint64_t state_epoch = 0;
+    const void* vertex_translation = nullptr;
+    const void* pixel_translation = nullptr;
+    uint32_t host_primitive_type = 0;
+    uint32_t tessellation_mode = 0;
+    bool host_primitive_reset_enabled = false;
+    uint32_t normalized_depth_control = 0;
+    uint32_t normalized_color_mask = 0;
+    uint32_t render_pass_key = 0;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const VulkanPipelineCache::PipelineLayoutProvider* layout = nullptr;
+    void* handle = nullptr;
+  };
+  PipelineMemo pipeline_memo_;
   // Pixel texture sets are pushed rather than allocated and written when the
   // device has VK_KHR_push_descriptor and the set has at most
   // kMaxPushedTextureBindings bindings (the minimum maxPushDescriptors).
