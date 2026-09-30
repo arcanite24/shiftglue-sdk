@@ -671,6 +671,25 @@ class TextureCache {
   bool loading_resolve_sourced_ = false;
 
   std::array<TextureBinding, xenos::kTextureFetchConstantCount> texture_bindings_;
+  // Recent derivations per fetch constant: while no binding has been reset
+  // (a texture destroyed or outdated), the binding for the same six words
+  // is the same, so a slot switching between a few textures skips the
+  // derivation and the texture lookup.
+  struct BindingMemo {
+    uint64_t epoch = 0;
+    uint32_t fetch_words[6] = {};
+    TextureKey key;
+    uint32_t host_swizzle = 0;
+    uint8_t swizzled_signs = 0;
+    bool normalized_fixed_point = false;
+    Texture* texture = nullptr;
+    Texture* texture_signed = nullptr;
+  };
+  static constexpr uint32_t kBindingMemoWays = 4;
+  std::array<std::array<BindingMemo, kBindingMemoWays>, xenos::kTextureFetchConstantCount>
+      binding_memos_;
+  std::array<uint8_t, xenos::kTextureFetchConstantCount> binding_memo_next_ = {};
+  uint64_t binding_memo_epoch_ = 1;
   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch
   // constants again and again.
   uint32_t texture_bindings_in_sync_ = 0;

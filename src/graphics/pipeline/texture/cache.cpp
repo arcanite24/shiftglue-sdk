@@ -572,6 +572,42 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     }
     std::memcpy(binding.fetch_words, fetch_words, sizeof(binding.fetch_words));
     binding.fetch_words_valid = true;
+    const BindingMemo* memo = nullptr;
+    for (const BindingMemo& entry : binding_memos_[index]) {
+      if (entry.epoch == binding_memo_epoch_ &&
+          !std::memcmp(entry.fetch_words, fetch_words, sizeof(entry.fetch_words))) {
+        memo = &entry;
+        break;
+      }
+    }
+    if (memo) {
+      // As the derivation below would do for these words.
+      const bool changed =
+          binding.key != memo->key || binding.host_swizzle != memo->host_swizzle ||
+          texture_util::IsAnySignNotSigned(binding.swizzled_signs) !=
+              texture_util::IsAnySignNotSigned(memo->swizzled_signs) ||
+          texture_util::IsAnySignSigned(binding.swizzled_signs) !=
+              texture_util::IsAnySignSigned(memo->swizzled_signs);
+      Texture* const old_texture = binding.texture;
+      Texture* const old_texture_signed = binding.texture_signed;
+      binding.key = memo->key;
+      binding.host_swizzle = memo->host_swizzle;
+      binding.swizzled_signs = memo->swizzled_signs;
+      binding.normalized_fixed_point = memo->normalized_fixed_point;
+      binding.texture = memo->texture;
+      binding.texture_signed = memo->texture_signed;
+      texture_bindings_in_sync_ |= index_bit;
+      if (changed) {
+        bindings_changed |= index_bit;
+      }
+      if (binding.texture != old_texture) {
+        queue_pending_texture_load(binding.texture);
+      }
+      if (binding.texture_signed != old_texture_signed) {
+        queue_pending_texture_load(binding.texture_signed);
+      }
+      continue;
+    }
     xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(index);
     TextureKey old_key = binding.key;
     uint8_t old_swizzled_signs = binding.swizzled_signs;
@@ -661,6 +697,17 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     }
     if (load_signed_data) {
       queue_pending_texture_load(binding.texture_signed);
+    }
+    if (binding.texture || binding.texture_signed) {
+      BindingMemo& entry = binding_memos_[index][binding_memo_next_[index]++ % kBindingMemoWays];
+      entry.epoch = binding_memo_epoch_;
+      std::memcpy(entry.fetch_words, fetch_words, sizeof(entry.fetch_words));
+      entry.key = binding.key;
+      entry.host_swizzle = binding.host_swizzle;
+      entry.swizzled_signs = binding.swizzled_signs;
+      entry.normalized_fixed_point = binding.normalized_fixed_point;
+      entry.texture = binding.texture;
+      entry.texture_signed = binding.texture_signed;
     }
   }
 
@@ -1140,6 +1187,8 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
 }
 
 void TextureCache::ResetTextureBindings(bool from_destructor) {
+  // Remembered derivations may name destroyed or outdated textures.
+  ++binding_memo_epoch_;
   uint32_t bindings_reset = 0;
   for (size_t i = 0; i < texture_bindings_.size(); ++i) {
     TextureBinding& binding = texture_bindings_[i];
