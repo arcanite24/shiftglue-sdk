@@ -293,6 +293,20 @@ class Fh1NativeExecutor {
     }
   };
   PrepareSignature recent_prepares_[4];
+  // The last completed preparation by register state epoch: with the same
+  // state, shaders and tiles, its targets and claims still hold.
+  struct PrepareMemo {
+    uint64_t state_epoch = 0;
+    const Shader* vertex_shader = nullptr;
+    uint32_t depth_control = 0;
+    uint32_t color_mask = 0;
+    bool rasterization_done = false;
+    uint64_t generation = 0;
+    uint32_t used_bits = 0;
+    SurfaceKey keys[5];
+  };
+  PrepareMemo prepare_memo_;
+  void PrepareTargetsImpl(const Fh1DrawInfo& draw);
   uint32_t recent_prepare_next_ = 0;
 
   uint64_t frame_ = 0;

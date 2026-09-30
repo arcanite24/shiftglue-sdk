@@ -4041,25 +4041,58 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       return false;
     }
 
-    // Shader modifications.
-    vertex_shader_modification = pipeline_cache_->GetCurrentVertexShaderModification(
-        *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask,
-        ps_param_gen_pos != UINT32_MAX);
-    pixel_shader_modification = pixel_shader ? pipeline_cache_->GetCurrentPixelShaderModification(
-                                                   *pixel_shader, interpolator_mask,
-                                                   ps_param_gen_pos, normalized_depth_control)
-                                             : SpirvShaderTranslator::Modification(0);
+    // Shader modifications, and the translations, which with the same
+    // register state and shaders are the last draw's.
+    TranslationMemo& translation_memo = translation_memo_;
+    const uint32_t guest_prim_type = uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type);
+    if (translation_memo.state_epoch == state_epoch_ &&
+        translation_memo.guest_prim_type == guest_prim_type &&
+        translation_memo.vertex_shader == vertex_shader &&
+        translation_memo.pixel_shader == pixel_shader &&
+        translation_memo.host_vertex_shader_type ==
+            uint32_t(primitive_processing_result.host_vertex_shader_type) &&
+        translation_memo.interpolator_mask == interpolator_mask &&
+        translation_memo.ps_param_gen_pos == ps_param_gen_pos &&
+        translation_memo.depth_control == normalized_depth_control.value) {
+      vertex_shader_modification = translation_memo.vertex_modification;
+      pixel_shader_modification = translation_memo.pixel_modification;
+      vertex_shader_translation = translation_memo.vertex_translation;
+      pixel_shader_translation = translation_memo.pixel_translation;
+    } else {
+      vertex_shader_modification = pipeline_cache_->GetCurrentVertexShaderModification(
+          *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask,
+          ps_param_gen_pos != UINT32_MAX);
+      pixel_shader_modification =
+          pixel_shader ? pipeline_cache_->GetCurrentPixelShaderModification(
+                             *pixel_shader, interpolator_mask, ps_param_gen_pos,
+                             normalized_depth_control)
+                       : SpirvShaderTranslator::Modification(0);
 
-    // Translate the shaders now to obtain the sampler bindings.
-    vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
-        vertex_shader->GetOrCreateTranslation(vertex_shader_modification.value));
-    pixel_shader_translation =
-        pixel_shader ? static_cast<VulkanShader::VulkanTranslation*>(
-                           pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
-                     : nullptr;
-    if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
-                                                  pixel_shader_translation)) {
-      return draw_fail("shader_translation");
+      // Translate the shaders now to obtain the sampler bindings.
+      vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
+          vertex_shader->GetOrCreateTranslation(vertex_shader_modification.value));
+      pixel_shader_translation =
+          pixel_shader ? static_cast<VulkanShader::VulkanTranslation*>(
+                             pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
+                       : nullptr;
+      if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
+                                                    pixel_shader_translation)) {
+        translation_memo.state_epoch = 0;
+        return draw_fail("shader_translation");
+      }
+      translation_memo.state_epoch = state_epoch_;
+      translation_memo.vertex_shader = vertex_shader;
+      translation_memo.pixel_shader = pixel_shader;
+      translation_memo.host_vertex_shader_type =
+          uint32_t(primitive_processing_result.host_vertex_shader_type);
+      translation_memo.guest_prim_type = guest_prim_type;
+      translation_memo.interpolator_mask = interpolator_mask;
+      translation_memo.ps_param_gen_pos = ps_param_gen_pos;
+      translation_memo.depth_control = normalized_depth_control.value;
+      translation_memo.vertex_modification = vertex_shader_modification;
+      translation_memo.pixel_modification = pixel_shader_modification;
+      translation_memo.vertex_translation = vertex_shader_translation;
+      translation_memo.pixel_translation = pixel_shader_translation;
     }
 
     // Obtain the samplers. Note that the bindings don't depend on the shader
@@ -4202,6 +4235,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     fh1_draw.normalized_color_mask = normalized_color_mask;
     fh1_draw.vertex_shader = vertex_shader;
     fh1_draw.pixel_shader = pixel_shader;
+    fh1_draw.state_epoch = state_epoch_;
     fh1_native_executor_->PrepareTargets(fh1_draw);
     if (!fh1_native_executor_->BindTargets(fh1_render_pass_key)) {
       return draw_fail("fh1_bind_targets");
@@ -4328,20 +4362,33 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   // life. Or even disregard the viewport bounds range in the fragment shader
   // interlocks case completely - apply the viewport and the scissor offset
   // directly to pixel address and to things like ps_param_gen.
-  draw_util::GetHostViewportInfo(
-      regs, draw_resolution_scale_x, draw_resolution_scale_y, false,
-      device_properties.maxViewportDimensions[0], device_properties.maxViewportDimensions[1], true,
-      normalized_depth_control,
-      host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader(),
-      host_render_targets_used, pixel_shader && pixel_shader->writes_depth(), viewport_info);
-  // FH1's HUD under Hor+, as on D3D12 (fh1_hud_squeeze): its draws into the
-  // front buffer's 2_10_10_10_AS_10_10_10_10 view keep 16:9 proportions.
-  const double hud_squeeze = REXCVAR_GET(fh1_hud_squeeze);
-  if (hud_squeeze > 1.0 && normalized_color_mask &&
-      regs.Get<reg::RB_COLOR_INFO>(XE_GPU_REG_RB_COLOR_INFO).color_format ==
-          xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10) {
-    viewport_info.ndc_scale[0] = float(viewport_info.ndc_scale[0] / hud_squeeze);
-    viewport_info.ndc_offset[0] = float(viewport_info.ndc_offset[0] / hud_squeeze);
+  ViewportMemo& viewport_memo = viewport_memo_;
+  if (viewport_memo.state_epoch == state_epoch_ &&
+      viewport_memo.pixel_shader == pixel_shader &&
+      viewport_memo.depth_control == normalized_depth_control.value &&
+      viewport_memo.color_mask == normalized_color_mask) {
+    viewport_info = viewport_memo.info;
+  } else {
+    draw_util::GetHostViewportInfo(
+        regs, draw_resolution_scale_x, draw_resolution_scale_y, false,
+        device_properties.maxViewportDimensions[0], device_properties.maxViewportDimensions[1],
+        true, normalized_depth_control,
+        host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader(),
+        host_render_targets_used, pixel_shader && pixel_shader->writes_depth(), viewport_info);
+    // FH1's HUD under Hor+, as on D3D12 (fh1_hud_squeeze): its draws into the
+    // front buffer's 2_10_10_10_AS_10_10_10_10 view keep 16:9 proportions.
+    const double hud_squeeze = REXCVAR_GET(fh1_hud_squeeze);
+    if (hud_squeeze > 1.0 && normalized_color_mask &&
+        regs.Get<reg::RB_COLOR_INFO>(XE_GPU_REG_RB_COLOR_INFO).color_format ==
+            xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10) {
+      viewport_info.ndc_scale[0] = float(viewport_info.ndc_scale[0] / hud_squeeze);
+      viewport_info.ndc_offset[0] = float(viewport_info.ndc_offset[0] / hud_squeeze);
+    }
+    viewport_memo.state_epoch = state_epoch_;
+    viewport_memo.pixel_shader = pixel_shader;
+    viewport_memo.depth_control = normalized_depth_control.value;
+    viewport_memo.color_mask = normalized_color_mask;
+    viewport_memo.info = viewport_info;
   }
 
   // Update dynamic graphics pipeline state.

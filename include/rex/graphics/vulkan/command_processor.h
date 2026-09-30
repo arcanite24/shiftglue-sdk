@@ -1014,6 +1014,32 @@ class VulkanCommandProcessor : public CommandProcessor {
     void* handle = nullptr;
   };
   PipelineMemo pipeline_memo_;
+  // Shader modifications and translations by register state epoch.
+  struct TranslationMemo {
+    uint64_t state_epoch = 0;
+    const void* vertex_shader = nullptr;
+    const void* pixel_shader = nullptr;
+    uint32_t host_vertex_shader_type = 0;
+    // Both modifications read whether the guest primitive is a point list.
+    uint32_t guest_prim_type = 0;
+    uint32_t interpolator_mask = 0;
+    uint32_t ps_param_gen_pos = 0;
+    uint32_t depth_control = 0;
+    SpirvShaderTranslator::Modification vertex_modification;
+    SpirvShaderTranslator::Modification pixel_modification;
+    VulkanShader::VulkanTranslation* vertex_translation = nullptr;
+    VulkanShader::VulkanTranslation* pixel_translation = nullptr;
+  };
+  TranslationMemo translation_memo_;
+  // Host viewport information by register state epoch.
+  struct ViewportMemo {
+    uint64_t state_epoch = 0;
+    const void* pixel_shader = nullptr;
+    uint32_t depth_control = 0;
+    uint32_t color_mask = 0;
+    draw_util::ViewportInfo info;
+  };
+  ViewportMemo viewport_memo_;
   // Pixel texture sets are pushed rather than allocated and written when the
   // device has VK_KHR_push_descriptor and the set has at most
   // kMaxPushedTextureBindings bindings (the minimum maxPushDescriptors).

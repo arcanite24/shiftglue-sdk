@@ -1357,6 +1357,41 @@ void Fh1NativeExecutor::ClaimOverwrittenDepthTiles(const SurfaceKey& key,
 
 void Fh1NativeExecutor::PrepareTargets(const Fh1DrawInfo& draw) {
   if (!initialized_) return;
+  // The extent estimate reads vertices when clipping is off.
+  const bool memo_allowed = draw.state_epoch && !draw.memexport &&
+                            !register_file_.Get<reg::PA_CL_CLIP_CNTL>().clip_disable;
+  PrepareMemo& memo = prepare_memo_;
+  if (memo_allowed && memo.state_epoch == draw.state_epoch &&
+      memo.vertex_shader == draw.vertex_shader &&
+      memo.depth_control == draw.normalized_depth_control.value &&
+      memo.color_mask == draw.normalized_color_mask &&
+      memo.rasterization_done == draw.rasterization_done &&
+      memo.generation == tiles_.generation()) {
+    pending_targets_valid_ = true;
+    pending_used_bits_ = memo.used_bits;
+    std::memcpy(pending_keys_, memo.keys, sizeof(memo.keys));
+    return;
+  }
+  PrepareTargetsImpl(draw);
+  const bool may_overwrite_depth =
+      pending_used_bits_ == 1 && draw.normalized_depth_control.z_enable &&
+      draw.normalized_depth_control.z_write_enable &&
+      draw.normalized_depth_control.zfunc == xenos::CompareFunction::kAlways;
+  if (memo_allowed && !may_overwrite_depth) {
+    memo.state_epoch = draw.state_epoch;
+    memo.vertex_shader = draw.vertex_shader;
+    memo.depth_control = draw.normalized_depth_control.value;
+    memo.color_mask = draw.normalized_color_mask;
+    memo.rasterization_done = draw.rasterization_done;
+    memo.generation = tiles_.generation();
+    memo.used_bits = pending_used_bits_;
+    std::memcpy(memo.keys, pending_keys_, sizeof(memo.keys));
+  } else {
+    memo.state_epoch = 0;
+  }
+}
+
+void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
   pending_targets_valid_ = true;
   pending_used_bits_ = 0;
   if (draw.memexport) return;

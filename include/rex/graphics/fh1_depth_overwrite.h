@@ -31,6 +31,9 @@ struct Fh1DrawInfo {
   uint32_t normalized_color_mask = 0;
   const Shader* vertex_shader = nullptr;
   const Shader* pixel_shader = nullptr;
+  // The command processor's register state epoch (0: unknown), for reusing
+  // derivations while it holds.
+  uint64_t state_epoch = 0;
 };
 
 class Fh1DepthOverwrite {
