@@ -1224,8 +1224,19 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                                                bool load_mips) {
   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
   TextureKey texture_key = vulkan_texture.key();
-  command_processor_.Checkpoint(VulkanCommandProcessor::CheckpointKind::kTextureLoad,
-                                texture_key.base_page);
+  if (command_processor_.checkpoints_enabled()) {
+    command_processor_.Checkpoint(
+        VulkanCommandProcessor::CheckpointKind::kTextureLoad, texture_key.base_page,
+        fmt::format("format {} dimension {} {}x{}x{} pitch {} tiled {} scaled {} mips {} "
+                    "packed {} base {:08X} mip {:08X} load base {} mips {}",
+                    uint32_t(texture_key.format), uint32_t(texture_key.dimension),
+                    texture_key.GetWidth(), texture_key.GetHeight(),
+                    texture_key.GetDepthOrArraySize(), uint32_t(texture_key.pitch),
+                    bool(texture_key.tiled), bool(texture_key.scaled_resolve),
+                    uint32_t(texture_key.mip_max_level), bool(texture_key.packed_mips),
+                    texture_key.base_page << 12, texture_key.mip_page << 12, load_base,
+                    load_mips));
+  }
 
   // Get the pipeline.
   const HostFormatPair& host_format_pair = GetHostFormatPair(texture_key);
@@ -1871,6 +1882,16 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
       vulkan_texture_cache.command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
+  if (vulkan_texture_cache.command_processor_.checkpoints_enabled()) {
+    std::string views;
+    for (const auto& view_pair : views_) {
+      views += fmt::format(" {:X}", uint64_t(view_pair.second));
+    }
+    const_cast<VulkanCommandProcessor&>(vulkan_texture_cache.command_processor_)
+        .NoteCheckpoint(fmt::format("destroy texture {:08X} {}x{} scaled {} image {:X} views{}",
+                                    key().base_page << 12, key().GetWidth(), key().GetHeight(),
+                                    bool(key().scaled_resolve), uint64_t(image_), views));
+  }
   for (const auto& view_pair : views_) {
     dfn.vkDestroyImageView(device, view_pair.second, nullptr);
   }

@@ -3901,17 +3901,12 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     if (!BeginSubmission(true)) {
       return draw_fail("begin_submission");
     }
-    Checkpoint(CheckpointKind::kDraw);
     if (checkpoints_enabled_) {
-      CheckpointDraw& draw = checkpoint_draws_[CheckpointDrawSlot(observation_frame_sequence_,
-                                                                  debug_frame_draw_index_ - 1)];
-      draw.marker = (uint64_t(CheckpointKind::kDraw) << 56) |
-                    (uint64_t(observation_frame_sequence_ & 0xFFFFFF) << 32) |
-                    (debug_frame_draw_index_ - 1);
-      draw.vertex_shader = vertex_shader->ucode_data_hash();
-      draw.pixel_shader = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
-      draw.primitive = uint32_t(prim_type);
-      draw.index_count = index_count;
+      Checkpoint(CheckpointKind::kDraw, UINT32_MAX,
+                 fmt::format("vs {:016X} ps {:016X} primitive {} indices {}",
+                             vertex_shader->ucode_data_hash(),
+                             pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+                             uint32_t(prim_type), index_count));
     }
 
     // Process primitives.
@@ -5802,6 +5797,37 @@ bool VulkanCommandProcessor::ExecuteSubmission(
   return recorded;
 }
 
+void VulkanCommandProcessor::Checkpoint(CheckpointKind kind, uint32_t value,
+                                        std::string detail) {
+  if (!checkpoints_enabled_) {
+    return;
+  }
+  if (value == UINT32_MAX) {
+    value = debug_frame_draw_index_ - 1;
+  }
+  const uint64_t serial = ++checkpoint_serial_;
+  CheckpointRecord& record = checkpoint_records_[serial & (kCheckpointRecords - 1)];
+  record.serial = serial;
+  record.kind = kind;
+  record.frame = uint32_t(observation_frame_sequence_);
+  record.value = value;
+  record.detail = std::move(detail);
+  deferred_command_buffer_.CmdVkSetCheckpointNV(serial);
+}
+
+void VulkanCommandProcessor::NoteCheckpoint(std::string detail) {
+  if (!checkpoints_enabled_) {
+    return;
+  }
+  const uint64_t serial = ++checkpoint_serial_;
+  CheckpointRecord& record = checkpoint_records_[serial & (kCheckpointRecords - 1)];
+  record.serial = serial;
+  record.kind = CheckpointKind::kNote;
+  record.frame = uint32_t(observation_frame_sequence_);
+  record.value = debug_frame_draw_index_ - 1;
+  record.detail = std::move(detail);
+}
+
 void VulkanCommandProcessor::LogCheckpoints() {
   // Once: every later wait or submission reports the same loss.
   static std::atomic<bool> logged{false};
@@ -5822,34 +5848,47 @@ void VulkanCommandProcessor::LogCheckpoints() {
   dfn.vkGetQueueCheckpointDataNV(queue_acquisition.queue(), &count, checkpoints.data());
   static const char* const kKinds[] = {"?",        "draw",     "copy",     "texture load",
                                        "resolve",  "transfer", "clear",    "draw end",
-                                       "texture load end"};
-  REXGPU_ERROR("Vulkan device lost; {} last checkpoints reached:", count);
-  for (uint32_t i = 0; i < count; ++i) {
-    const uint64_t marker = uint64_t(uintptr_t(checkpoints[i].pCheckpointMarker));
-    const uint32_t kind = uint32_t(marker >> 56);
-    REXGPU_ERROR("  stage {:08X}: {} {} (frame {})", uint32_t(checkpoints[i].stage),
-                 kind < std::size(kKinds) ? kKinds[kind] : "?", uint32_t(marker),
-                 uint32_t(marker >> 32) & 0xFFFFFF);
-  }
-  // The draws around the last one begun, as far as they were recorded.
-  uint32_t last_draw = UINT32_MAX;
-  uint64_t last_frame = 0;
-  for (uint32_t i = 0; i < count; ++i) {
-    const uint64_t marker = uint64_t(uintptr_t(checkpoints[i].pCheckpointMarker));
-    if ((marker >> 56) == uint64_t(CheckpointKind::kDraw) &&
-        (checkpoints[i].stage & VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT)) {
-      last_draw = uint32_t(marker);
-      last_frame = (marker >> 32) & 0xFFFFFF;
+                                       "texture load end", "note"};
+  auto describe = [&](uint64_t serial) {
+    const CheckpointRecord& record = checkpoint_records_[serial & (kCheckpointRecords - 1)];
+    if (record.serial != serial) {
+      return fmt::format("#{} (no longer recorded)", serial);
     }
+    const uint32_t kind = uint32_t(record.kind);
+    return fmt::format("#{} {} {} (frame {}) {}", serial,
+                       kind < std::size(kKinds) ? kKinds[kind] : "?", record.value,
+                       record.frame, record.detail);
+  };
+  uint64_t finished = 0, begun = 0;
+  REXGPU_ERROR("Vulkan device lost; {} last checkpoints reached (last recorded #{}):", count,
+               checkpoint_serial_);
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint64_t serial = uint64_t(uintptr_t(checkpoints[i].pCheckpointMarker));
+    REXGPU_ERROR("  stage {:08X}: {}", uint32_t(checkpoints[i].stage), describe(serial));
+    if (checkpoints[i].stage & VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT) finished = serial;
+    if (checkpoints[i].stage & VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT) begun = serial;
   }
-  if (last_draw != UINT32_MAX) {
-    for (uint32_t index = last_draw >= 3 ? last_draw - 3 : 0; index <= last_draw + 3; ++index) {
-      const CheckpointDraw& draw = checkpoint_draws_[CheckpointDrawSlot(last_frame, index)];
-      if (draw.marker != ((uint64_t(CheckpointKind::kDraw) << 56) | (last_frame << 32) | index)) {
-        continue;
+  // The work after the last finished marker, up to the last begun one: the
+  // command that did not finish is among the first of these.
+  if (finished) {
+    for (uint64_t serial = finished > 40 ? finished - 40 : 1; serial <= finished; ++serial) {
+      REXGPU_ERROR("  before: {}", describe(serial));
+    }
+    const uint64_t last = std::min(std::max(begun, finished + 24), finished + 64);
+    for (uint64_t serial = finished + 1; serial <= last && serial <= checkpoint_serial_;
+         ++serial) {
+      REXGPU_ERROR("  after: {}", describe(serial));
+    }
+    // Every texture destruction still recorded: a view that the unfinished
+    // work uses may be among them.
+    const uint64_t first_recorded =
+        checkpoint_serial_ >= kCheckpointRecords ? checkpoint_serial_ - kCheckpointRecords + 1 : 1;
+    for (uint64_t serial = first_recorded; serial <= checkpoint_serial_; ++serial) {
+      const CheckpointRecord& record = checkpoint_records_[serial & (kCheckpointRecords - 1)];
+      if (record.serial == serial && record.kind == CheckpointKind::kNote &&
+          record.detail.rfind("destroy", 0) == 0) {
+        REXGPU_ERROR("  destroyed: {}", describe(serial));
       }
-      REXGPU_ERROR("  draw {}: vs {:016X} ps {:016X} primitive {} indices {}", index,
-                   draw.vertex_shader, draw.pixel_shader, draw.primitive, draw.index_count);
     }
   }
 }
@@ -5857,7 +5896,7 @@ void VulkanCommandProcessor::LogCheckpoints() {
 void VulkanCommandProcessor::StartSubmissionWorker() {
   checkpoints_enabled_ = GetVulkanDevice()->extensions().ext_NV_device_diagnostic_checkpoints;
   if (checkpoints_enabled_) {
-    checkpoint_draws_.resize(size_t(8) << 13);
+    checkpoint_records_.resize(kCheckpointRecords);
     REXGPU_INFO("Vulkan diagnostic checkpoints enabled");
   }
   async_submission_ = REXCVAR_GET(vulkan_async_submission);
@@ -7142,6 +7181,15 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel] =
         write_textures[0].dstSet;
+  }
+  if (checkpoints_enabled_ && write_pixel_textures && texture_count_pixel) {
+    std::string views;
+    for (uint32_t i = 0; i < texture_count_pixel; ++i) {
+      views += fmt::format(" t{}={:X}", (*textures_pixel)[i].fetch_constant,
+                           uint64_t(descriptor_write_image_info_[pixel_texture_image_info_offset + i]
+                                        .imageView));
+    }
+    NoteCheckpoint("pixel textures" + views);
   }
   // Write.
   if (write_descriptor_set_count) {
