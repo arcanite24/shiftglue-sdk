@@ -22,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -698,9 +699,37 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Direct3D 12 PIX warnings.
   static constexpr uint32_t kLinkedTypeDescriptorPoolSetCount = 32768;
   static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBuffer;
+  static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBufferDynamic;
   static const VkDescriptorPoolSize kDescriptorPoolSizeStorageBuffer;
   static const VkDescriptorPoolSize kDescriptorPoolSizeTextures[2];
   ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_uniform_buffer_;
+  ui::vulkan::LinkedTypeDescriptorSetAllocator
+      transient_descriptor_allocator_uniform_buffer_dynamic_;
+  // Guest draw constants sets of the current frame by buffers and ranges;
+  // draws pass the offsets dynamically.
+  struct ConstantsDescriptorSetKey {
+    VkBuffer buffers[SpirvShaderTranslator::kConstantBufferCount] = {};
+    uint32_t ranges[SpirvShaderTranslator::kConstantBufferCount] = {};
+    bool operator==(const ConstantsDescriptorSetKey& other) const {
+      return std::memcmp(this, &other, sizeof(*this)) == 0;
+    }
+  };
+  struct ConstantsDescriptorSetKeyHasher {
+    size_t operator()(const ConstantsDescriptorSetKey& key) const {
+      size_t hash = 0;
+      for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
+        hash = hash * 1099511628211ull ^ size_t(reinterpret_cast<uintptr_t>(key.buffers[i]));
+        hash = hash * 1099511628211ull ^ key.ranges[i];
+      }
+      return hash;
+    }
+  };
+  std::unordered_map<ConstantsDescriptorSetKey, VkDescriptorSet, ConstantsDescriptorSetKeyHasher>
+      constants_descriptor_sets_frame_;
+  uint64_t constants_descriptor_sets_frame_index_ = 0;
+  uint32_t current_constant_dynamic_offsets_[SpirvShaderTranslator::kConstantBufferCount] = {};
+  VkDescriptorBufferInfo
+      constants_descriptor_write_infos_[SpirvShaderTranslator::kConstantBufferCount] = {};
   ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_storage_buffer_;
   std::deque<UsedSingleTransientDescriptor> single_transient_descriptors_used_;
   std::array<std::vector<VkDescriptorSet>, size_t(SingleTransientDescriptorLayout::kCount)>
