@@ -283,7 +283,9 @@ float4 DecodeColor64(uint2 words, uint format) {
 // Host sample of a guest sample index in a surface.
 uint HostSample(uint guest_sample, uint msaa, uint host_mode) {
   uint host_sample = guest_sample;
-  if (msaa == 1u && host_mode == 1u) {
+  if (host_mode == 3u) {
+    host_sample = 0u;  // Single-sampled MSAA surface.
+  } else if (msaa == 1u && host_mode == 1u) {
     host_sample = guest_sample ^ 1u;  // Native 2x: host 1 is the top sample.
   } else if (msaa == 1u && host_mode == 2u) {
     host_sample = guest_sample ? 3u : 0u;  // 2x stored as 4x.
@@ -294,7 +296,9 @@ uint HostSample(uint guest_sample, uint msaa, uint host_mode) {
 // Guest sample index of a host sample in a surface.
 uint GuestSample(uint host_sample, uint msaa, uint host_mode) {
   uint guest_sample = host_sample;
-  if (msaa == 1u && host_mode == 1u) {
+  if (host_mode == 3u) {
+    guest_sample = 0u;
+  } else if (msaa == 1u && host_mode == 1u) {
     guest_sample = host_sample ^ 1u;
   } else if (msaa == 1u && host_mode == 2u) {
     guest_sample = host_sample ? 1u : 0u;

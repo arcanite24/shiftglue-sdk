@@ -290,6 +290,11 @@ class Fh1NativeExecutor {
   PrepareSignature last_prepare_;
 
   uint64_t frame_ = 0;
+  // fh1_scaled_msaa_single_sample at a scale above 1x.
+  bool single_sample_msaa_ = false;
+  // The layout constant's host sample mode: 0 native, 1 native 2x, 2 2x
+  // stored as 4x, 3 every guest sample in one host sample.
+  static uint32_t HostSampleMode(const Surface& surface);
 
   // fh1_native_gpu_profile: GPU time per phase, and from a frame's first
   // timed phase to its swap, from timestamps in one query range per frame,

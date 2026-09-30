@@ -21,6 +21,12 @@
 #include <rex/ui/vulkan/util.h>
 
 
+REXCVAR_DEFINE_BOOL(fh1_scaled_msaa_single_sample, false, "GPU",
+                    "Above 1x resolution scale, keep the guest's 2x and 4x MSAA surfaces as "
+                    "single-sampled images (Vulkan): every guest sample of a pixel is its one "
+                    "host sample. Much less GPU work at 3x and 4x; edges lose their MSAA")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 #if REX_HAS_D3D12
 REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
 REXCVAR_DECLARE(int32_t, fh1_resolve_dump_frame);
@@ -278,6 +284,10 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   config_ = config;
   if (!config_.memory || !config_.textures || !config_.render_targets) return false;
   scale_ = config_.textures->draw_resolution_scale_x();
+  single_sample_msaa_ = scale_ >= 2 && REXCVAR_GET(fh1_scaled_msaa_single_sample);
+  if (single_sample_msaa_) {
+    REXGPU_INFO("FH1 native executor (Vulkan): MSAA surfaces single-sampled at {}x", scale_);
+  }
   if (config_.textures->draw_resolution_scale_y() != scale_ || scale_ > 4) {
     REXGPU_WARN("FH1 native executor (Vulkan): resolution scale {}x{} is not supported",
                 config_.textures->draw_resolution_scale_x(),
@@ -543,8 +553,9 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
   surface.key = key;
   surface.width = key.pitch_tiles * (xenos::kEdramTileWidthSamples >> msaa_x_log2);
   surface.height = SurfaceHeight(key.pitch_tiles, key.msaa);
-  surface.samples = key.msaa == uint32_t(xenos::MsaaSamples::k2X) && !config_.msaa_2x_supported
-                        ? 4
+  surface.samples = single_sample_msaa_ ? 1u
+                    : key.msaa == uint32_t(xenos::MsaaSamples::k2X) && !config_.msaa_2x_supported
+                        ? 4u
                         : 1u << key.msaa;
   if (key.is_depth) {
     surface.format =
@@ -637,10 +648,17 @@ void Fh1NativeExecutor::MarkTileStencil(uint32_t base, uint32_t length, bool non
   tiles_.MarkStencil(base, length, nonzero);
 }
 
+uint32_t Fh1NativeExecutor::HostSampleMode(const Surface& surface) {
+  const SurfaceKey& key = surface.key;
+  if (key.msaa != uint32_t(xenos::MsaaSamples::k1X) && surface.samples == 1) {
+    return 3u;  // Every guest sample in the one host sample.
+  }
+  return key.msaa == uint32_t(xenos::MsaaSamples::k2X) ? (surface.samples == 4 ? 2u : 1u) : 0u;
+}
+
 uint32_t Fh1NativeExecutor::LayoutConstant(const Surface& surface) const {
   const SurfaceKey& key = surface.key;
-  const uint32_t host_sample_mode =
-      key.msaa == uint32_t(xenos::MsaaSamples::k2X) ? (surface.samples == 4 ? 2u : 1u) : 0u;
+  const uint32_t host_sample_mode = HostSampleMode(surface);
   return PackLayout(key.base_tiles, key.pitch_tiles, key.msaa, key.Is64bpp(), key.is_depth,
                     key.format) |
          (host_sample_mode << 27);
@@ -1449,7 +1467,9 @@ bool Fh1NativeExecutor::BindTargets(VulkanRenderTargetCache::RenderPassKey& key_
   const uint32_t used_bits = pending_used_bits_;
   const SurfaceKey* keys = pending_keys_;
   const uint64_t rendering_id = DrawRenderingId(used_bits);
-  key_out.msaa_samples = register_file_.Get<reg::RB_SURFACE_INFO>().msaa_samples;
+  key_out.msaa_samples = single_sample_msaa_
+                             ? xenos::MsaaSamples::k1X
+                             : register_file_.Get<reg::RB_SURFACE_INFO>().msaa_samples;
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
     if (!(used_bits & (1u << i))) continue;
     Surface* surface = FindSurface(keys[i].Pack());
@@ -1680,8 +1700,7 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   vulkan_device->functions().vkUpdateDescriptorSets(vulkan_device->device(), 3, writes, 0,
                                                     nullptr);
   const SurfaceKey& owner = surface.key;
-  const uint32_t host_sample_mode =
-      owner.msaa == uint32_t(xenos::MsaaSamples::k2X) ? (surface.samples == 4 ? 2u : 1u) : 0u;
+  const uint32_t host_sample_mode = HostSampleMode(surface);
   const Rect rect = unscaled_dest ? source.rect : HostRect(source.rect);
   uint32_t constants[kComputeConstantCount];
   constants[0] = uint32_t(rect.left) | (uint32_t(rect.top) << 16);
