@@ -15,6 +15,8 @@
 #include <atomic>
 #include <cstring>
 #include <functional>
+#include <deque>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -245,6 +247,29 @@ class CommandProcessor {
                          IndexBufferInfo* index_buffer_info, bool major_mode_explicit) = 0;
   virtual bool IssueCopy() = 0;
 
+  // Decode/record split (gpu_record_thread, PB-2.11): this thread keeps
+  // decoding PM4 against a shadow register file while a recorder thread
+  // applies the register writes and runs the backend work (draws, copies,
+  // shader loads, swaps) in the same order. Packets whose effects the CPU
+  // sees wait for the recorder first. Backends opt in.
+  virtual bool SupportsRecordThread() const { return false; }
+  bool record_split() const { return record_split_; }
+  // The register file the decoder reads: the shadow while split.
+  RegisterFile& decode_regs() { return record_split_ ? *decode_register_file_ : *register_file_; }
+  // Register writes from packets: applied directly, or recorded while split.
+  void PacketWriteRegister(uint32_t index, uint32_t value);
+  // `base` is guest (big-endian) data; recorded by copy while split.
+  void PacketWriteRegistersFromMem(uint32_t start_index, const uint32_t* base,
+                                   uint32_t num_registers);
+  // Runs `fn` on the recorder in order (directly when not split).
+  void RecordCall(std::function<void()> fn);
+  // Hands the recorded work so far to the recorder.
+  void PublishRecordBatch();
+  // Returns once the recorder has run everything recorded so far; the
+  // recorder is then idle until the next publish, so this thread may touch
+  // backend state until it records again.
+  void RecordSync();
+
   // "Actual" is for the command processor thread, to be read by the
   // implementations.
   SwapPostEffect GetActualSwapPostEffect() const { return swap_post_effect_actual_; }
@@ -309,6 +334,33 @@ class CommandProcessor {
 #endif  // REX_HAS_VULKAN
 
  private:
+  struct RecordBatch {
+    // Records: kRecordRun start count dwords..., kRecordOne index value,
+    // kRecordCall function-index.
+    std::vector<uint32_t> words;
+    std::vector<std::function<void()>> fns;
+  };
+  static constexpr uint32_t kRecordRun = 0;
+  static constexpr uint32_t kRecordOne = 1;
+  static constexpr uint32_t kRecordCall = 2;
+  void StartRecordThread();
+  void StopRecordThread();
+  void RecordThreadMain();
+  void ExecuteRecordBatch(RecordBatch& batch);
+  bool record_split_ = false;
+  std::unique_ptr<RegisterFile> decode_register_file_;
+  std::unordered_map<uint32_t, uint32_t> decode_extended_register_values_;
+  std::unique_ptr<RecordBatch> record_batch_;
+  std::mutex record_mutex_;
+  std::condition_variable record_ready_;
+  std::condition_variable record_done_;
+  std::deque<std::unique_ptr<RecordBatch>> record_queue_;
+  std::vector<std::unique_ptr<RecordBatch>> record_free_;
+  uint64_t record_published_ = 0;
+  uint64_t record_completed_ = 0;
+  bool record_stop_ = false;
+  system::object_ref<system::XHostThread> record_thread_;
+
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
   reg::DC_LUT_PWL_DATA gamma_ramp_pwl_rgb_[128][3] = {};
   uint32_t gamma_ramp_rw_component_ = 0;

@@ -313,6 +313,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
+  bool SupportsRecordThread() const override { return true; }
 
  private:
   struct CommandBuffer {

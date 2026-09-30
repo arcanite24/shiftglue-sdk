@@ -44,6 +44,11 @@ REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 // commands thread, its bottleneck; yielding first ends those waits sooner
 // (NP-9.3: race frames 16.76-16.92 against 17.05-17.23 ms mean over three
 // interleaved pairs).
+REXCVAR_DEFINE_BOOL(gpu_record_thread, false, "GPU",
+                    "Split the GPU commands thread: decode the guest's command stream on one "
+                    "thread while a second applies register writes and records draws "
+                    "(backends that support it; Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(wait_reg_mem_yield_us, 2000, "GPU",
                      "With vsync, how long a WAIT_REG_MEM poll yields before it sleeps (the "
                      "sleep is at least a millisecond, which can outlast the wait); 0 sleeps at "
@@ -234,12 +239,20 @@ void CommandProcessor::WorkerThreadMain() {
     rex::FatalError("Unable to setup command processor internal state");
     return;
   }
+  if (REXCVAR_GET(gpu_record_thread) && SupportsRecordThread()) {
+    StartRecordThread();
+  }
 
   while (worker_running_) {
     while (!pending_fns_.empty()) {
       auto fn = std::move(pending_fns_.front());
       pending_fns_.pop();
-      fn();
+      if (record_split_) {
+        RecordCall(std::move(fn));
+        PublishRecordBatch();
+      } else {
+        fn();
+      }
     }
 
     uint32_t write_ptr_index = write_ptr_index_.load();
@@ -248,7 +261,10 @@ void CommandProcessor::WorkerThreadMain() {
       // We've run out of commands to execute.
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
-      PrepareForWait();
+      PublishRecordBatch();
+      if (!record_split_) {
+        PrepareForWait();
+      }
       const auto idle_start = std::chrono::steady_clock::now();
       uint32_t loop_count = 0;
       do {
@@ -268,7 +284,9 @@ void CommandProcessor::WorkerThreadMain() {
                        std::chrono::duration_cast<std::chrono::nanoseconds>(
                            std::chrono::steady_clock::now() - idle_start)
                            .count());
-      ReturnFromWait();
+      if (!record_split_) {
+        ReturnFromWait();
+      }
       if (!worker_running_ || !pending_fns_.empty()) {
         continue;
       }
@@ -289,7 +307,190 @@ void CommandProcessor::WorkerThreadMain() {
     // but no games seem to actually use it.
   }
 
+  StopRecordThread();
   ShutdownContext();
+}
+
+void CommandProcessor::StartRecordThread() {
+  decode_register_file_ = std::make_unique<RegisterFile>();
+  std::memcpy(decode_register_file_->values, register_file_->values,
+              sizeof(decode_register_file_->values));
+  decode_extended_register_values_ = extended_register_values_;
+  record_batch_ = std::make_unique<RecordBatch>();
+  record_stop_ = false;
+  record_published_ = 0;
+  record_completed_ = 0;
+  record_thread_ = system::object_ref<system::XHostThread>(
+      new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
+        RecordThreadMain();
+        return 0;
+      }));
+  record_thread_->set_name("GPU Recorder");
+  record_thread_->Create();
+  record_thread_->MarkLatencyCritical();
+  record_split_ = true;
+  REXGPU_INFO("GPU commands: decoding and recording on separate threads");
+}
+
+void CommandProcessor::StopRecordThread() {
+  if (!record_split_) {
+    return;
+  }
+  RecordSync();
+  {
+    std::lock_guard<std::mutex> lock(record_mutex_);
+    record_stop_ = true;
+  }
+  record_ready_.notify_all();
+  record_thread_->Wait(0, 0, 0, nullptr);
+  record_thread_.reset();
+  record_split_ = false;
+}
+
+void CommandProcessor::RecordThreadMain() {
+  for (;;) {
+    std::unique_ptr<RecordBatch> batch;
+    {
+      std::unique_lock<std::mutex> lock(record_mutex_);
+      record_ready_.wait(lock, [this]() { return record_stop_ || !record_queue_.empty(); });
+      if (record_queue_.empty()) {
+        return;
+      }
+      batch = std::move(record_queue_.front());
+      record_queue_.pop_front();
+    }
+    ExecuteRecordBatch(*batch);
+    batch->words.clear();
+    batch->fns.clear();
+    {
+      std::lock_guard<std::mutex> lock(record_mutex_);
+      record_free_.push_back(std::move(batch));
+      ++record_completed_;
+    }
+    record_done_.notify_all();
+  }
+}
+
+void CommandProcessor::ExecuteRecordBatch(RecordBatch& batch) {
+  const uint32_t* words = batch.words.data();
+  const size_t count = batch.words.size();
+  for (size_t i = 0; i < count;) {
+    switch (words[i]) {
+      case kRecordRun: {
+        const uint32_t start = words[i + 1];
+        const uint32_t run = words[i + 2];
+        WriteRegistersFromMem(start, const_cast<uint32_t*>(words + i + 3), run);
+        i += 3 + run;
+      } break;
+      case kRecordOne:
+        WriteRegister(words[i + 1], words[i + 2]);
+        i += 3;
+        break;
+      case kRecordCall:
+        batch.fns[words[i + 1]]();
+        i += 2;
+        break;
+      default:
+        assert_always();
+        return;
+    }
+  }
+}
+
+void CommandProcessor::PacketWriteRegister(uint32_t index, uint32_t value) {
+  if (!record_split_) {
+    WriteRegister(index, value);
+    return;
+  }
+  if (index < RegisterFile::kRegisterCount) {
+    uint32_t shadow_value = value;
+    if (index == XE_GPU_REG_COHER_STATUS_HOST) {
+      // As CommandProcessor::WriteRegister: dirty until WAIT_REG_MEM syncs.
+      shadow_value |= UINT32_C(0x80000000);
+    }
+    decode_register_file_->values[index] = shadow_value;
+  } else {
+    decode_extended_register_values_.insert_or_assign(index, value);
+  }
+  std::vector<uint32_t>& words = record_batch_->words;
+  words.push_back(kRecordOne);
+  words.push_back(index);
+  words.push_back(value);
+}
+
+void CommandProcessor::PacketWriteRegistersFromMem(uint32_t start_index, const uint32_t* base,
+                                                   uint32_t num_registers) {
+  if (!num_registers) {
+    return;
+  }
+  if (!record_split_) {
+    WriteRegistersFromMem(start_index, const_cast<uint32_t*>(base), num_registers);
+    return;
+  }
+  if (uint64_t(start_index) + num_registers > RegisterFile::kRegisterCount) {
+    // Out of the register file: one at a time, as the unsplit path does.
+    for (uint32_t i = 0; i < num_registers; ++i) {
+      PacketWriteRegister(start_index + i, memory::load_and_swap<uint32_t>(base + i));
+    }
+    return;
+  }
+  memory::copy_and_swap(decode_register_file_->values + start_index, base, num_registers);
+  if (start_index <= XE_GPU_REG_COHER_STATUS_HOST &&
+      start_index + num_registers > XE_GPU_REG_COHER_STATUS_HOST) {
+    decode_register_file_->values[XE_GPU_REG_COHER_STATUS_HOST] |= UINT32_C(0x80000000);
+  }
+  std::vector<uint32_t>& words = record_batch_->words;
+  const size_t offset = words.size();
+  words.resize(offset + 3 + num_registers);
+  words[offset] = kRecordRun;
+  words[offset + 1] = start_index;
+  words[offset + 2] = num_registers;
+  std::memcpy(words.data() + offset + 3, base, sizeof(uint32_t) * num_registers);
+  if (words.size() >= 65536) {
+    PublishRecordBatch();
+  }
+}
+
+void CommandProcessor::RecordCall(std::function<void()> fn) {
+  if (!record_split_) {
+    fn();
+    return;
+  }
+  RecordBatch& batch = *record_batch_;
+  batch.words.push_back(kRecordCall);
+  batch.words.push_back(uint32_t(batch.fns.size()));
+  batch.fns.push_back(std::move(fn));
+  // Small batches keep the recorder close behind the decoder.
+  if (batch.fns.size() >= 32) {
+    PublishRecordBatch();
+  }
+}
+
+void CommandProcessor::PublishRecordBatch() {
+  if (!record_split_ || record_batch_->words.empty()) {
+    return;
+  }
+  std::unique_ptr<RecordBatch> next;
+  {
+    std::lock_guard<std::mutex> lock(record_mutex_);
+    record_queue_.push_back(std::move(record_batch_));
+    ++record_published_;
+    if (!record_free_.empty()) {
+      next = std::move(record_free_.back());
+      record_free_.pop_back();
+    }
+  }
+  record_ready_.notify_one();
+  record_batch_ = next ? std::move(next) : std::make_unique<RecordBatch>();
+}
+
+void CommandProcessor::RecordSync() {
+  if (!record_split_) {
+    return;
+  }
+  PublishRecordBatch();
+  std::unique_lock<std::mutex> lock(record_mutex_);
+  record_done_.wait(lock, [this]() { return record_completed_ == record_published_; });
 }
 
 void CommandProcessor::Pause() {
@@ -370,11 +571,15 @@ void CommandProcessor::UpdateWritePointer(uint32_t value) {
 }
 
 uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
+  // Only the decoder reads registers through this (WAIT_REG_MEM, REG_TO_MEM,
+  // COND_WRITE), so while split it reads the decoder's shadow.
   if (index < RegisterFile::kRegisterCount) {
-    return register_file_->values[index];
+    return (record_split_ ? decode_register_file_.get() : register_file_)->values[index];
   }
-  auto it = extended_register_values_.find(index);
-  return it != extended_register_values_.end() ? it->second : 0;
+  const auto& extended =
+      record_split_ ? decode_extended_register_values_ : extended_register_values_;
+  auto it = extended.find(index);
+  return it != extended.end() ? it->second : 0;
 }
 
 void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
@@ -569,13 +774,12 @@ void CommandProcessor::WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint
   memory::RingBuffer::ReadRange range = ring->BeginRead(size_t(num_registers) * sizeof(uint32_t));
   if (range.first_length != 0) {
     uint32_t first_count = uint32_t(range.first_length / sizeof(uint32_t));
-    WriteRegistersFromMem(base, reinterpret_cast<uint32_t*>(const_cast<uint8_t*>(range.first)),
-                          first_count);
+    PacketWriteRegistersFromMem(base, reinterpret_cast<const uint32_t*>(range.first), first_count);
     base += first_count;
   }
   if (range.second_length != 0) {
-    WriteRegistersFromMem(base, reinterpret_cast<uint32_t*>(const_cast<uint8_t*>(range.second)),
-                          uint32_t(range.second_length / sizeof(uint32_t)));
+    PacketWriteRegistersFromMem(base, reinterpret_cast<const uint32_t*>(range.second),
+                                uint32_t(range.second_length / sizeof(uint32_t)));
   }
   ring->EndRead(range);
 }
@@ -607,27 +811,27 @@ void CommandProcessor::WriteREGISTERSRangeFromRing(memory::RingBuffer* ring, uin
 
 void CommandProcessor::WriteALURangeFromMem(uint32_t start_index, uint32_t* base,
                                             uint32_t num_registers) {
-  WriteRegistersFromMem(start_index + 0x4000, base, num_registers);
+  PacketWriteRegistersFromMem(start_index + 0x4000, base, num_registers);
 }
 
 void CommandProcessor::WriteFetchRangeFromMem(uint32_t start_index, uint32_t* base,
                                               uint32_t num_registers) {
-  WriteRegistersFromMem(start_index + 0x4800, base, num_registers);
+  PacketWriteRegistersFromMem(start_index + 0x4800, base, num_registers);
 }
 
 void CommandProcessor::WriteBoolRangeFromMem(uint32_t start_index, uint32_t* base,
                                              uint32_t num_registers) {
-  WriteRegistersFromMem(start_index + 0x4900, base, num_registers);
+  PacketWriteRegistersFromMem(start_index + 0x4900, base, num_registers);
 }
 
 void CommandProcessor::WriteLoopRangeFromMem(uint32_t start_index, uint32_t* base,
                                              uint32_t num_registers) {
-  WriteRegistersFromMem(start_index + 0x4908, base, num_registers);
+  PacketWriteRegistersFromMem(start_index + 0x4908, base, num_registers);
 }
 
 void CommandProcessor::WriteREGISTERSRangeFromMem(uint32_t start_index, uint32_t* base,
                                                   uint32_t num_registers) {
-  WriteRegistersFromMem(start_index + 0x2000, base, num_registers);
+  PacketWriteRegistersFromMem(start_index + 0x2000, base, num_registers);
 }
 
 void CommandProcessor::MakeCoherent() {
@@ -643,7 +847,7 @@ void CommandProcessor::MakeCoherent() {
   // https://cgit.freedesktop.org/xorg/driver/xf86-video-radeonhd/tree/src/r6xx_accel.c?id=3f8b6eccd9dba116cc4801e7f80ce21a879c67d2#n454
 
   // Volatile because this may be called from the WAIT_REG_MEM loop.
-  volatile uint32_t* regs_volatile = register_file_->values;
+  volatile uint32_t* regs_volatile = decode_regs().values;
   auto status_host = rex::memory::Reinterpret<reg::COHER_STATUS_HOST>(
       uint32_t(regs_volatile[XE_GPU_REG_COHER_STATUS_HOST]));
   uint32_t base_host = regs_volatile[XE_GPU_REG_COHER_BASE_HOST];
@@ -690,8 +894,16 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
     }
   } while (reader.read_count());
 
-  FlushCpuVisibleResults();
-  OnPrimaryBufferEnd();
+  if (record_split_) {
+    RecordCall([this]() {
+      FlushCpuVisibleResults();
+      OnPrimaryBufferEnd();
+    });
+    PublishRecordBatch();
+  } else {
+    FlushCpuVisibleResults();
+    OnPrimaryBufferEnd();
+  }
 
   return write_index;
 }
@@ -816,7 +1028,7 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
   }
   for (uint32_t m = 0; m < count; m++) {
     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
-    WriteRegister(base_index, reg_data);
+    PacketWriteRegister(base_index, reg_data);
   }
 
   return true;
@@ -829,8 +1041,8 @@ bool CommandProcessor::ExecutePacketType1(memory::RingBuffer* reader, uint32_t p
   uint32_t reg_index_2 = (packet >> 11) & 0x7FF;
   uint32_t reg_data_1 = reader->ReadAndSwap<uint32_t>();
   uint32_t reg_data_2 = reader->ReadAndSwap<uint32_t>();
-  WriteRegister(reg_index_1, reg_data_1);
-  WriteRegister(reg_index_2, reg_data_2);
+  PacketWriteRegister(reg_index_1, reg_data_1);
+  PacketWriteRegister(reg_index_2, reg_data_2);
   return true;
 }
 
@@ -873,7 +1085,18 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     case PM4_EVENT_WRITE_SHD:
     case PM4_EVENT_WRITE_EXT:
     case PM4_EVENT_WRITE_ZPD:
-      FlushCpuVisibleResults();
+      if (!record_split_) {
+        FlushCpuVisibleResults();
+      } else if (opcode != PM4_EVENT_WRITE_EXT && opcode != PM4_XE_SWAP &&
+                 opcode != PM4_EVENT_WRITE_SHD && opcode != PM4_INTERRUPT) {
+        // The CPU may read what the draws before this wrote: let the
+        // recorder finish them first. Screen extents are constant; the swap,
+        // fence writes and interrupts are recorded in order like draws, so
+        // the title sees a fence only once the recorder has consumed the
+        // draws before it.
+        RecordCall([this]() { FlushCpuVisibleResults(); });
+        RecordSync();
+      }
       cpu_visible_write = true;
       break;
     default:
@@ -1031,13 +1254,19 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
 
   // generate interrupt from the command stream
   uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
-  for (int n = 0; n < 6; n++) {
-    if (cpu_mask & (1 << n)) {
-      if (graphics_system_) {
-        graphics_system_->DispatchInterruptCallback(1, n);
+  RecordCall([this, cpu_mask]() {
+    if (record_split_) {
+      FlushCpuVisibleResults();
+    }
+    for (int n = 0; n < 6; n++) {
+      if (cpu_mask & (1 << n)) {
+        if (graphics_system_) {
+          graphics_system_->DispatchInterruptCallback(1, n);
+        }
       }
     }
-  }
+  });
+  PublishRecordBatch();
   return true;
 }
 
@@ -1073,14 +1302,15 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
-  // FH1's VdSwap packet ordinal pairs with its ordered title source markers.
-  rex::perf::TraceCriticalPath("consumed_swap",
-                               int64_t(observation_frame_sequence_),
-                               int64_t(frontbuffer_ptr));
-  IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
-
-  ++observation_frame_sequence_;
-  debug_frame_draw_index_ = 0;
+  RecordCall([this, frontbuffer_ptr, frontbuffer_width, frontbuffer_height]() {
+    // FH1's VdSwap packet ordinal pairs with its ordered title source markers.
+    rex::perf::TraceCriticalPath("consumed_swap", int64_t(observation_frame_sequence_),
+                                 int64_t(frontbuffer_ptr));
+    IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+    ++observation_frame_sequence_;
+    debug_frame_draw_index_ = 0;
+  });
+  PublishRecordBatch();
 
   ++counter_;
   return true;
@@ -1155,10 +1385,14 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
     if (!matched) {
       if (wait_start == std::chrono::steady_clock::time_point{}) {
         wait_start = std::chrono::steady_clock::now();
+        // Let the recorder work through what was decoded while this waits.
+        PublishRecordBatch();
       }
       // Wait.
       if (wait >= 0x100) {
-        PrepareForWait();
+        if (!record_split_) {
+          PrepareForWait();
+        }
         if (!REXCVAR_GET(vsync)) {
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
@@ -1169,7 +1403,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
         }
         rex::thread::SyncMemory();
-        ReturnFromWait();
+        if (!record_split_) {
+          ReturnFromWait();
+        }
 
         if (!worker_running_) {
           // Short-circuited exit.
@@ -1197,22 +1433,22 @@ bool CommandProcessor::ExecutePacketType3_REG_RMW(memory::RingBuffer* reader, ui
   uint32_t rmw_info = reader->ReadAndSwap<uint32_t>();
   uint32_t and_mask = reader->ReadAndSwap<uint32_t>();
   uint32_t or_mask = reader->ReadAndSwap<uint32_t>();
-  uint32_t value = register_file_->values[rmw_info & 0x1FFF];
+  uint32_t value = decode_regs().values[rmw_info & 0x1FFF];
   if ((rmw_info >> 31) & 0x1) {
     // & reg
-    value &= register_file_->values[and_mask & 0x1FFF];
+    value &= decode_regs().values[and_mask & 0x1FFF];
   } else {
     // & imm
     value &= and_mask;
   }
   if ((rmw_info >> 30) & 0x1) {
     // | reg
-    value |= register_file_->values[or_mask & 0x1FFF];
+    value |= decode_regs().values[or_mask & 0x1FFF];
   } else {
     // | imm
     value |= or_mask;
   }
-  WriteRegister(rmw_info & 0x1FFF, value);
+  PacketWriteRegister(rmw_info & 0x1FFF, value);
   return true;
 }
 
@@ -1307,7 +1543,7 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
       memory::store(memory_->TranslatePhysical(write_reg_addr), write_data);
     } else {
       // Register.
-      WriteRegister(write_reg_addr, write_data);
+      PacketWriteRegister(write_reg_addr, write_data);
     }
   }
   return true;
@@ -1318,7 +1554,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE(memory::RingBuffer* reader
   // generate an event that creates a write to memory when completed
   uint32_t initiator = reader->ReadAndSwap<uint32_t>();
   // Writeback initiator.
-  WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
+  PacketWriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
   if (count == 1) {
     // Just an event flag? Where does this write?
   } else {
@@ -1337,7 +1573,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   uint32_t value = reader->ReadAndSwap<uint32_t>();
 
   // Writeback initiator.
-  WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
+  PacketWriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
   uint32_t data_value;
   if ((initiator >> 31) & 0x1) {
     // Write counter (GPU vblank counter?).
@@ -1349,7 +1585,16 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
-  memory::store(memory_->TranslatePhysical(address), data_value);
+  if (!record_split_) {
+    memory::store(memory_->TranslatePhysical(address), data_value);
+    return true;
+  }
+  RecordCall([this, address, data_value]() {
+    FlushCpuVisibleResults();
+    memory::store(memory_->TranslatePhysical(address), data_value);
+    system::SignalGpuWrite();
+  });
+  PublishRecordBatch();
   return true;
 }
 
@@ -1359,7 +1604,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
   uint32_t initiator = reader->ReadAndSwap<uint32_t>();
   uint32_t address = reader->ReadAndSwap<uint32_t>();
   // Writeback initiator.
-  WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
+  PacketWriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
 
@@ -1386,7 +1631,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
   assert_true(count == 1);
   uint32_t initiator = reader->ReadAndSwap<uint32_t>();
   // Writeback initiator.
-  WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
+  PacketWriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
 
   // Occlusion queries without host queries: the packet is sent on query
   // begin and end; report a fixed number of passed samples at the end, which
@@ -1427,7 +1672,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   reg::VGT_DRAW_INITIATOR vgt_draw_initiator;
   vgt_draw_initiator.value = reader->ReadAndSwap<uint32_t>();
   --count_remaining;
-  WriteRegister(XE_GPU_REG_VGT_DRAW_INITIATOR, vgt_draw_initiator.value);
+  PacketWriteRegister(XE_GPU_REG_VGT_DRAW_INITIATOR, vgt_draw_initiator.value);
 
   bool draw_succeeded = true;
   // TODO(Triang3l): Remove IndexBufferInfo and replace handling of all this
@@ -1449,7 +1694,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
       }
       uint32_t vgt_dma_base = reader->ReadAndSwap<uint32_t>();
       --count_remaining;
-      WriteRegister(XE_GPU_REG_VGT_DMA_BASE, vgt_dma_base);
+      PacketWriteRegister(XE_GPU_REG_VGT_DMA_BASE, vgt_dma_base);
       reg::VGT_DMA_SIZE vgt_dma_size;
       assert_not_zero(count_remaining);
       if (!count_remaining) {
@@ -1458,7 +1703,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
       }
       vgt_dma_size.value = reader->ReadAndSwap<uint32_t>();
       --count_remaining;
-      WriteRegister(XE_GPU_REG_VGT_DMA_SIZE, vgt_dma_size.value);
+      PacketWriteRegister(XE_GPU_REG_VGT_DMA_SIZE, vgt_dma_size.value);
 
       uint32_t index_size_bytes = vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16
                                       ? sizeof(uint16_t)
@@ -1497,6 +1742,9 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   reader->AdvanceRead(count_remaining * sizeof(uint32_t));
 
   if (draw_succeeded) {
+    RecordCall([this, packet, opcode_name, vgt_draw_initiator, is_indexed,
+                index_buffer_info]() mutable {
+    bool draw_succeeded = true;
     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
     if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
       // TODO(Triang3l): Don't drop the draw call completely if the vertex
@@ -1615,6 +1863,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
             uint32_t(rb_modecontrol.edram_mode));
       }
     }
+    });
   }
 
   // If read the packed correctly, but merely couldn't execute it (because of,
@@ -1745,19 +1994,19 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
   uint32_t size_dwords = start_size & 0xFFFF;  // dwords
   assert_true(start == 0);
 
-  auto shader =
-      LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
-  switch (shader_type) {
-    case xenos::ShaderType::kVertex:
-      active_vertex_shader_ = shader;
-      break;
-    case xenos::ShaderType::kPixel:
-      active_pixel_shader_ = shader;
-      break;
-    default:
-      assert_unhandled_case(shader_type);
-      return false;
+  if (shader_type != xenos::ShaderType::kVertex && shader_type != xenos::ShaderType::kPixel) {
+    assert_unhandled_case(shader_type);
+    return false;
   }
+  RecordCall([this, shader_type, addr, size_dwords]() {
+    auto shader =
+        LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
+    if (shader_type == xenos::ShaderType::kVertex) {
+      active_vertex_shader_ = shader;
+    } else {
+      active_pixel_shader_ = shader;
+    }
+  });
   return true;
 }
 
@@ -1775,18 +2024,33 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer* 
   assert_true(start == 0);
   assert_true(reader->read_count() >= size_dwords * 4);
   assert_true(count - 2 >= size_dwords);
-  auto shader = LoadShader(shader_type, uint32_t(reader->read_ptr()),
-                           reinterpret_cast<uint32_t*>(reader->read_ptr()), size_dwords);
-  switch (shader_type) {
-    case xenos::ShaderType::kVertex:
+  if (shader_type != xenos::ShaderType::kVertex && shader_type != xenos::ShaderType::kPixel) {
+    assert_unhandled_case(shader_type);
+    return false;
+  }
+  const uint32_t guest_address = uint32_t(reader->read_ptr());
+  if (!record_split_) {
+    auto shader = LoadShader(shader_type, guest_address,
+                             reinterpret_cast<uint32_t*>(reader->read_ptr()), size_dwords);
+    if (shader_type == xenos::ShaderType::kVertex) {
       active_vertex_shader_ = shader;
-      break;
-    case xenos::ShaderType::kPixel:
+    } else {
       active_pixel_shader_ = shader;
-      break;
-    default:
-      assert_unhandled_case(shader_type);
-      return false;
+    }
+  } else {
+    // The microcode is in the ring, which the title may reuse once this
+    // thread moves on: the recorder gets a copy.
+    std::vector<uint32_t> ucode(size_dwords);
+    std::memcpy(ucode.data(), reinterpret_cast<const void*>(reader->read_ptr()),
+                size_dwords * sizeof(uint32_t));
+    RecordCall([this, shader_type, guest_address, ucode = std::move(ucode)]() mutable {
+      auto shader = LoadShader(shader_type, guest_address, ucode.data(), uint32_t(ucode.size()));
+      if (shader_type == xenos::ShaderType::kVertex) {
+        active_vertex_shader_ = shader;
+      } else {
+        active_pixel_shader_ = shader;
+      }
+    });
   }
   reader->AdvanceRead(size_dwords * sizeof(uint32_t));
   return true;
@@ -1814,17 +2078,16 @@ bool CommandProcessor::ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader, 
     // begin a new viz query @ id
     // On hardware this clears the internal state of the scan converter (which
     // is different to the register)
-    WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, VIZQUERY_START);
+    PacketWriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, VIZQUERY_START);
   } else {
     // end the viz query
-    WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, VIZQUERY_END);
+    PacketWriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, VIZQUERY_END);
     // The scan converter writes the internal result back to the register here.
     // We just fake it and say it was visible in case it is read back.
-    if (id < 32) {
-      register_file_->values[XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_0] |= uint32_t(1) << id;
-    } else {
-      register_file_->values[XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_1] |= uint32_t(1) << (id - 32);
-    }
+    const uint32_t status_register =
+        id < 32 ? XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_0 : XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_1;
+    PacketWriteRegister(status_register,
+                        decode_regs().values[status_register] | (uint32_t(1) << (id & 31)));
   }
 
   return true;
