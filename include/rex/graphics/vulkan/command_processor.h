@@ -909,6 +909,22 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Currently used samplers.
   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_vertex_;
   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_pixel_;
+  // Sampler parameters and the sampler last used for each binding slot, reused
+  // while the binding's fetch constant, filters and filtering overrides are
+  // unchanged (as on D3D12); the sampler only within the submission that last
+  // used it, since the texture cache frees samplers only after their last
+  // submission completes.
+  struct SamplerCacheEntry {
+    std::array<uint32_t, 6> fetch{};
+    uint32_t binding = UINT32_MAX;
+    int32_t anisotropic_override = 0;
+    bool force_trilinear = false;
+    VulkanTextureCache::SamplerParameters parameters;
+    VkSampler sampler = VK_NULL_HANDLE;
+    uint64_t submission = 0;
+  };
+  std::vector<SamplerCacheEntry> sampler_cache_vertex_;
+  std::vector<SamplerCacheEntry> sampler_cache_pixel_;
 
   // Cache render pass currently started in the command buffer with the
   // framebuffer. For dynamic rendering, current_render_pass_ is VK_NULL_HANDLE

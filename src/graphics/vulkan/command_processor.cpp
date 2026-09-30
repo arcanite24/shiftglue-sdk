@@ -1982,6 +1982,8 @@ void VulkanCommandProcessor::ShutdownContext() {
 
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyQueryPool, device,
                                          frame_timing_query_pool_);
+  sampler_cache_vertex_.clear();
+  sampler_cache_pixel_.clear();
   for (FrameTimingSlot& slot : frame_timing_slots_) {
     slot = {};
   }
@@ -4017,22 +4019,58 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       }
       const std::vector<VulkanShader::SamplerBinding>& shader_sampler_bindings =
           shader->GetSamplerBindingsAfterTranslation();
+      std::vector<SamplerCacheEntry>& sampler_cache =
+          j ? sampler_cache_pixel_ : sampler_cache_vertex_;
+      if (sampler_cache.size() < shader_sampler_bindings.size()) {
+        sampler_cache.resize(shader_sampler_bindings.size());
+      }
       if (!i) {
         shader_samplers.reserve(shader_sampler_bindings.size());
-        for (const VulkanShader::SamplerBinding& shader_sampler_binding : shader_sampler_bindings) {
-          shader_samplers.emplace_back(texture_cache_->GetSamplerParameters(shader_sampler_binding),
-                                       VK_NULL_HANDLE);
+        const int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
+        const bool force_trilinear = REXCVAR_GET(force_trilinear_filtering);
+        for (size_t k = 0; k < shader_sampler_bindings.size(); ++k) {
+          const VulkanShader::SamplerBinding& shader_sampler_binding = shader_sampler_bindings[k];
+          SamplerCacheEntry& cached = sampler_cache[k];
+          const uint32_t* fetch =
+              &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 +
+                           shader_sampler_binding.fetch_constant * uint32_t(cached.fetch.size())];
+          const uint32_t binding = shader_sampler_binding.fetch_constant |
+                                   (uint32_t(shader_sampler_binding.mag_filter) << 8) |
+                                   (uint32_t(shader_sampler_binding.min_filter) << 12) |
+                                   (uint32_t(shader_sampler_binding.mip_filter) << 16) |
+                                   (uint32_t(shader_sampler_binding.aniso_filter) << 20);
+          if (cached.binding != binding ||
+              std::memcmp(cached.fetch.data(), fetch, sizeof(cached.fetch)) ||
+              cached.anisotropic_override != anisotropic_override ||
+              cached.force_trilinear != force_trilinear) {
+            std::memcpy(cached.fetch.data(), fetch, sizeof(cached.fetch));
+            cached.binding = binding;
+            cached.anisotropic_override = anisotropic_override;
+            cached.force_trilinear = force_trilinear;
+            cached.parameters = texture_cache_->GetSamplerParameters(shader_sampler_binding);
+            cached.sampler = VK_NULL_HANDLE;
+          }
+          shader_samplers.emplace_back(cached.parameters, VK_NULL_HANDLE);
         }
       }
-      for (std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& shader_sampler_pair :
-           shader_samplers) {
+      for (size_t k = 0; k < shader_samplers.size(); ++k) {
+        std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& shader_sampler_pair =
+            shader_samplers[k];
+        SamplerCacheEntry& cached = sampler_cache[k];
         // UseSampler calls are needed even on the second iteration in case the
         // submission was broken (and thus the last usage submission indices for
         // the used samplers need to be updated) due to an overflow within one
         // submission. Though sampler overflow is a very rare situation overall.
-        bool sampler_overflowed;
-        VkSampler shader_sampler =
-            texture_cache_->UseSampler(shader_sampler_pair.first, sampler_overflowed);
+        bool sampler_overflowed = false;
+        VkSampler shader_sampler;
+        if (!i && cached.sampler != VK_NULL_HANDLE &&
+            cached.submission == GetCurrentSubmission()) {
+          shader_sampler = cached.sampler;
+        } else {
+          shader_sampler = texture_cache_->UseSampler(shader_sampler_pair.first, sampler_overflowed);
+          cached.sampler = shader_sampler;
+          cached.submission = GetCurrentSubmission();
+        }
         shader_sampler_pair.second = shader_sampler;
         if (shader_sampler == VK_NULL_HANDLE) {
           if (!sampler_overflowed || i) {
