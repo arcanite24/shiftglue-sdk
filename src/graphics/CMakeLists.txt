@@ -178,14 +178,21 @@ if(REXGLUE_USE_VULKAN)
     # Runtime shader translation (translator.cpp keeps it out of D3D12-only
     # runtimes, which load prebuilt packs).
     target_compile_definitions(rexgpu-fh1 PRIVATE REXGPU_SHADER_TRANSLATOR=1)
-    target_link_libraries(rexgpu-fh1 PRIVATE
-        Vulkan::Headers
-        glslang::SPIRV
-        GPUOpen::VulkanMemoryAllocator
-        glslang
-        MachineIndependent
-        GenericCodeGen
-        OSDependent
-        OGLCompiler
-    )
+    # The offline producer is built from the plugin's sources, which then
+    # include the Vulkan backend and the SPIR-V translator too.
+    foreach(rexgpu_fh1_target IN ITEMS rexgpu-fh1 rexgpu-fh1-producer)
+        if(NOT TARGET ${rexgpu_fh1_target})
+            continue()
+        endif()
+        target_link_libraries(${rexgpu_fh1_target} PRIVATE
+            Vulkan::Headers
+            glslang::SPIRV
+            GPUOpen::VulkanMemoryAllocator
+            glslang
+            MachineIndependent
+            GenericCodeGen
+            OSDependent
+            OGLCompiler
+        )
+    endforeach()
 endif()
