@@ -997,8 +997,8 @@ class VulkanCommandProcessor : public CommandProcessor {
     std::vector<VkDescriptorImageInfo> infos;
   };
   LastTextureDescriptorSet last_texture_descriptor_sets_[2];
-  // The last pipeline configured, reused while the register state epoch and
-  // the other inputs of the pipeline description are the same.
+  // A configured pipeline, reused while the memo state (StateMemoKey) and the
+  // other inputs of the pipeline description are the same.
   struct PipelineMemo {
     uint64_t state_epoch = 0;
     const void* vertex_translation = nullptr;
@@ -1013,8 +1013,19 @@ class VulkanCommandProcessor : public CommandProcessor {
     const VulkanPipelineCache::PipelineLayoutProvider* layout = nullptr;
     void* handle = nullptr;
   };
-  PipelineMemo pipeline_memo_;
-  // Shader modifications and translations by register state epoch.
+  // Direct-mapped by the memo state and the entry's main inputs: with
+  // gpu_state_hash_memos the state is the register content hash, so a draw
+  // finds the entry of any earlier draw in the same state (last frame's same
+  // draw, typically), otherwise the epoch and only the last draw's.
+  static constexpr size_t kStateMemoCount = 4096;
+  static size_t StateMemoSlot(uint64_t state, uint64_t a, uint64_t b) {
+    uint64_t x = (state ^ a * UINT64_C(0x9E3779B97F4A7C15) ^ b * UINT64_C(0xC2B2AE3D27D4EB4F)) *
+                 UINT64_C(0xBF58476D1CE4E5B9);
+    return size_t(x >> 52) & (kStateMemoCount - 1);
+  }
+  uint64_t StateMemoKey() const;
+  std::unique_ptr<PipelineMemo[]> pipeline_memos_{new PipelineMemo[kStateMemoCount]};
+  // Shader modifications and translations by memo state.
   struct TranslationMemo {
     uint64_t state_epoch = 0;
     const void* vertex_shader = nullptr;
@@ -1030,16 +1041,18 @@ class VulkanCommandProcessor : public CommandProcessor {
     VulkanShader::VulkanTranslation* vertex_translation = nullptr;
     VulkanShader::VulkanTranslation* pixel_translation = nullptr;
   };
-  TranslationMemo translation_memo_;
-  // Host viewport information by register state epoch.
+  std::unique_ptr<TranslationMemo[]> translation_memos_{new TranslationMemo[kStateMemoCount]};
+  // Host viewport information by memo state.
   struct ViewportMemo {
     uint64_t state_epoch = 0;
     const void* pixel_shader = nullptr;
     uint32_t depth_control = 0;
     uint32_t color_mask = 0;
+    uint32_t resolution_scale = 0;
+    double hud_squeeze = 0.0;
     draw_util::ViewportInfo info;
   };
-  ViewportMemo viewport_memo_;
+  std::unique_ptr<ViewportMemo[]> viewport_memos_{new ViewportMemo[kStateMemoCount]};
   // Pixel texture sets are pushed rather than allocated and written when the
   // device has VK_KHR_push_descriptor and the set has at most
   // kMaxPushedTextureBindings bindings (the minimum maxPushDescriptors).

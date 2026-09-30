@@ -610,6 +610,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   if (regs.values[index] != value && !IsPerDrawRegister(index) &&
       !(index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31)) {
     ++state_epoch_;
+    state_hash_ ^= StateHashTerm(index, regs.values[index]) ^ StateHashTerm(index, value);
   }
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
@@ -778,7 +779,11 @@ void CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* bas
     for (uint32_t i = 0; i < num_registers; ++i) {
       const uint32_t value = rex::byte_swap(base[i]);
       if (values[i] != value) {
-        changed |= !IsPerDrawRegister(start_index + i);
+        const uint32_t index = start_index + i;
+        if (!IsPerDrawRegister(index)) {
+          changed = true;
+          state_hash_ ^= StateHashTerm(index, values[i]) ^ StateHashTerm(index, value);
+        }
         values[i] = value;
       }
     }

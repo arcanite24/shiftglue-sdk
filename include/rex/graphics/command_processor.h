@@ -283,6 +283,16 @@ class CommandProcessor {
   // coherency, constant flushes) changes value: derivations from register
   // state can be reused while it holds.
   uint64_t state_epoch_ = 1;
+  // The same register set's content as a Zobrist-style hash, updated per
+  // changed register: equal hashes mean equal state, so derivations can be
+  // reused across draws and frames, not only while nothing changes.
+  uint64_t state_hash_ = 0;
+  static uint64_t StateHashTerm(uint32_t index, uint32_t value) {
+    uint64_t x = (uint64_t(index) << 32 | value) * UINT64_C(0x9E3779B97F4A7C15);
+    x ^= x >> 29;
+    x *= UINT64_C(0xBF58476D1CE4E5B9);
+    return x ^ (x >> 32);
+  }
   static bool IsPerDrawRegister(uint32_t index) {
     return (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) ||
            (index >= XE_GPU_REG_VGT_EVENT_INITIATOR && index <= XE_GPU_REG_VGT_DRAW_INITIATOR) ||

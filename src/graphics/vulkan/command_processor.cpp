@@ -54,6 +54,10 @@
 #include <rex/ui/vulkan/util.h>
 
 // Legacy backend compatibility aliases for shared readback controls.
+REXCVAR_DEFINE_BOOL(gpu_state_hash_memos, true, "GPU/Vulkan",
+                    "Key the per-draw shader, pipeline and viewport memos by the register "
+                    "state's content hash, so a draw reuses the derivations of any earlier "
+                    "draw in the same state rather than only the previous draw's");
 REXCVAR_DEFINE_BOOL(vulkan_push_texture_descriptors, true, "GPU/Vulkan",
                     "Push pixel shader texture descriptors (VK_KHR_push_descriptor) instead of "
                     "allocating and writing a descriptor set per change");
@@ -3884,6 +3888,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   return issued;
 }
 
+uint64_t VulkanCommandProcessor::StateMemoKey() const {
+  // Never 0, the memos' empty value, short of a hash collision.
+  return REXCVAR_GET(gpu_state_hash_memos) ? state_hash_ ^ UINT64_C(0x8000000000000001)
+                                           : state_epoch_;
+}
+
 bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
@@ -3892,6 +3902,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
   const RegisterFile& regs = *register_file_;
+  const uint64_t memo_state = StateMemoKey();
   (void)index_buffer_info;
   auto draw_fail = [&](const char* stage) {
     auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
@@ -4043,9 +4054,11 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
 
     // Shader modifications, and the translations, which with the same
     // register state and shaders are the last draw's.
-    TranslationMemo& translation_memo = translation_memo_;
     const uint32_t guest_prim_type = uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type);
-    if (translation_memo.state_epoch == state_epoch_ &&
+    TranslationMemo& translation_memo = translation_memos_[StateMemoSlot(
+        memo_state, uint64_t(uintptr_t(vertex_shader)),
+        uint64_t(uintptr_t(pixel_shader)) ^ uint64_t(interpolator_mask) << 1)];
+    if (translation_memo.state_epoch == memo_state &&
         translation_memo.guest_prim_type == guest_prim_type &&
         translation_memo.vertex_shader == vertex_shader &&
         translation_memo.pixel_shader == pixel_shader &&
@@ -4080,7 +4093,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         translation_memo.state_epoch = 0;
         return draw_fail("shader_translation");
       }
-      translation_memo.state_epoch = state_epoch_;
+      translation_memo.state_epoch = memo_state;
       translation_memo.vertex_shader = vertex_shader;
       translation_memo.pixel_shader = pixel_shader;
       translation_memo.host_vertex_shader_type =
@@ -4253,8 +4266,11 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   const VulkanRenderTargetCache::RenderPassKey pipeline_render_pass_key =
       fh1_native_executor_ ? fh1_render_pass_key
                            : render_target_cache_->last_update_render_pass_key();
-  PipelineMemo& memo = pipeline_memo_;
-  if (memo.handle && memo.state_epoch == state_epoch_ &&
+  PipelineMemo& memo = pipeline_memos_[StateMemoSlot(
+      memo_state, uint64_t(uintptr_t(vertex_shader_translation)),
+      uint64_t(uintptr_t(pixel_shader_translation)) ^
+          uint64_t(pipeline_render_pass_key.key) << 3 ^ uint64_t(normalized_color_mask) << 35)];
+  if (memo.handle && memo.state_epoch == memo_state &&
       memo.vertex_translation == vertex_shader_translation &&
       memo.pixel_translation == pixel_shader_translation &&
       memo.host_primitive_type == uint32_t(primitive_processing_result.host_primitive_type) &&
@@ -4278,7 +4294,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       memo.handle = nullptr;
       return draw_fail("configure_pipeline");
     }
-    memo.state_epoch = state_epoch_;
+    memo.state_epoch = memo_state;
     memo.vertex_translation = vertex_shader_translation;
     memo.pixel_translation = pixel_shader_translation;
     memo.host_primitive_type = uint32_t(primitive_processing_result.host_primitive_type);
@@ -4362,11 +4378,16 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   // life. Or even disregard the viewport bounds range in the fragment shader
   // interlocks case completely - apply the viewport and the scissor offset
   // directly to pixel address and to things like ps_param_gen.
-  ViewportMemo& viewport_memo = viewport_memo_;
-  if (viewport_memo.state_epoch == state_epoch_ &&
-      viewport_memo.pixel_shader == pixel_shader &&
+  const double hud_squeeze = REXCVAR_GET(fh1_hud_squeeze);
+  const uint32_t viewport_resolution_scale = draw_resolution_scale_x | draw_resolution_scale_y << 16;
+  ViewportMemo& viewport_memo = viewport_memos_[StateMemoSlot(
+      memo_state, uint64_t(uintptr_t(pixel_shader)),
+      uint64_t(normalized_depth_control.value) << 32 | normalized_color_mask)];
+  if (viewport_memo.state_epoch == memo_state && viewport_memo.pixel_shader == pixel_shader &&
       viewport_memo.depth_control == normalized_depth_control.value &&
-      viewport_memo.color_mask == normalized_color_mask) {
+      viewport_memo.color_mask == normalized_color_mask &&
+      viewport_memo.resolution_scale == viewport_resolution_scale &&
+      viewport_memo.hud_squeeze == hud_squeeze) {
     viewport_info = viewport_memo.info;
   } else {
     draw_util::GetHostViewportInfo(
@@ -4377,17 +4398,18 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         host_render_targets_used, pixel_shader && pixel_shader->writes_depth(), viewport_info);
     // FH1's HUD under Hor+, as on D3D12 (fh1_hud_squeeze): its draws into the
     // front buffer's 2_10_10_10_AS_10_10_10_10 view keep 16:9 proportions.
-    const double hud_squeeze = REXCVAR_GET(fh1_hud_squeeze);
     if (hud_squeeze > 1.0 && normalized_color_mask &&
         regs.Get<reg::RB_COLOR_INFO>(XE_GPU_REG_RB_COLOR_INFO).color_format ==
             xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10) {
       viewport_info.ndc_scale[0] = float(viewport_info.ndc_scale[0] / hud_squeeze);
       viewport_info.ndc_offset[0] = float(viewport_info.ndc_offset[0] / hud_squeeze);
     }
-    viewport_memo.state_epoch = state_epoch_;
+    viewport_memo.state_epoch = memo_state;
     viewport_memo.pixel_shader = pixel_shader;
     viewport_memo.depth_control = normalized_depth_control.value;
     viewport_memo.color_mask = normalized_color_mask;
+    viewport_memo.resolution_scale = viewport_resolution_scale;
+    viewport_memo.hud_squeeze = hud_squeeze;
     viewport_memo.info = viewport_info;
   }
 
