@@ -764,6 +764,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // Is currently writing the empty depth-only pixel shader, such as for depth
   // and stencil testing with fragment shader interlock.
   bool is_depth_only_fragment_shader_ = false;
+  // spirv_fast_pixel_math for the current (pixel) shader.
+  bool fast_pixel_math_ = false;
 
   std::unique_ptr<SpirvBuilder> builder_;
 

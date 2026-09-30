@@ -23,8 +23,17 @@
 #include <rex/assert.h>
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
+
+#include <rex/cvar.h>
 #include <rex/math.h>
 #include <rex/string/buffer.h>
+
+REXCVAR_DEFINE_BOOL(spirv_fast_pixel_math, false, "GPU",
+                    "Vulkan: translate pixel shaders without the Direct3D 9 multiply rule "
+                    "(0 * anything = 0) and let the driver fuse multiply-adds. Less pixel "
+                    "shader work at high scales; shaders that rely on 0 * Inf = 0 may show "
+                    "NaN pixels")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics {
 
@@ -180,6 +189,10 @@ void SpirvShaderTranslator::StartTranslation() {
   // TODO(Triang3l): Logger.
   builder_ = std::make_unique<SpirvBuilder>(features_.spirv_version, (kSpirvMagicToolId << 16) | 1,
                                             nullptr);
+  // Depth must match between passes, so shaders writing it stay exact.
+  fast_pixel_math_ = REXCVAR_GET(spirv_fast_pixel_math) && is_pixel_shader() &&
+                     !current_shader().writes_depth();
+  builder_->allow_contraction = fast_pixel_math_;
 
   builder_->addCapability(IsSpirvTessEvalShader() ? spv::CapabilityTessellation
                                                   : spv::CapabilityShader);

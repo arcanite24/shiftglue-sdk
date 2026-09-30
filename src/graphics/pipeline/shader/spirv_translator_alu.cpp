@@ -25,6 +25,10 @@ namespace rex::graphics {
 spv::Id SpirvShaderTranslator::ZeroIfAnyOperandIsZero(spv::Id value, spv::Id operand_0_abs,
                                                       spv::Id operand_1_abs) {
   EnsureBuildPointAvailable();
+  if (fast_pixel_math_) {
+    // IEEE multiplication: 0 * Inf and 0 * NaN are NaN instead of 0.
+    return value;
+  }
   int num_components = builder_->getNumComponents(value);
   assert_true(builder_->getNumComponents(operand_0_abs) == num_components);
   assert_true(builder_->getNumComponents(operand_1_abs) == num_components);
@@ -192,7 +196,7 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
       uint32_t multiplicands_different =
           used_result_components &
           ~instr.vector_operands[0].GetIdenticalComponents(instr.vector_operands[1]);
-      if (multiplicands_different) {
+      if (multiplicands_different && !fast_pixel_math_) {
         // Shader Model 3: +0 or denormal * anything = +-0.
         spv::Id different_operands[2] = {multiplicands[0], multiplicands[1]};
         spv::Id different_result = result;

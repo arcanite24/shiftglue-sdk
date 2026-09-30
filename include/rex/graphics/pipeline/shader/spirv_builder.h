@@ -34,6 +34,10 @@ class SpirvBuilder : public spv::Builder {
   spv::Id createQuadOp(spv::Op op_code, spv::Id type_id, spv::Id operand1, spv::Id operand2,
                        spv::Id operand3, spv::Id operand4);
 
+  // When set, the NoContraction helpers leave the result undecorated, so the
+  // driver may fuse and reorder (spirv_fast_pixel_math).
+  bool allow_contraction = false;
+
   spv::Id createNoContractionUnaryOp(spv::Op op_code, spv::Id type_id, spv::Id operand);
   spv::Id createNoContractionBinOp(spv::Op op_code, spv::Id type_id, spv::Id operand1,
                                    spv::Id operand2);
