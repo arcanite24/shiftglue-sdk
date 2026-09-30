@@ -139,6 +139,10 @@ foreach(rexgpu_fh1_target IN ITEMS rexgpu-fh1 rexgpu-fh1-producer)
         ${REXGLUE_ROOT}/thirdparty/renderdoc
         ${REXGLUE_ROOT})
     target_compile_options(${rexgpu_fh1_target} PRIVATE -Wno-unused-variable)
+    # presenter.h's class layout depends on REX_HAS_FIDELITYFX_SDK, which rexui
+    # gives its users; the plugin does not link rexui, so it must set it too
+    # to see the Presenter the runtime built.
+    target_compile_definitions(${rexgpu_fh1_target} PRIVATE REX_HAS_FIDELITYFX_SDK=1)
     rex_target_pch(${rexgpu_fh1_target}
         <mutex>
         <unordered_map>
