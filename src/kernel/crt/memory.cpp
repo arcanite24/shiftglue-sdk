@@ -16,17 +16,20 @@ namespace rex::kernel::crt {
 // ---------------------------------------------------------------------------
 // Standard memory operations
 // ---------------------------------------------------------------------------
+// These return their destination, which is the guest's first argument: void
+// leaves r3 as the guest passed it. Returning the host pointer would come
+// back wrong for the physical views with a host offset (0xE0000000 up).
 
-static void* native_memcpy(void* dst, const void* src, size_t n) {
-  return std::memcpy(dst, src, n);
+static void native_memcpy(void* dst, const void* src, size_t n) {
+  std::memcpy(dst, src, n);
 }
 
-static void* native_memmove(void* dst, const void* src, size_t n) {
-  return std::memmove(dst, src, n);
+static void native_memmove(void* dst, const void* src, size_t n) {
+  std::memmove(dst, src, n);
 }
 
-static void* native_memset(void* dst, int val, size_t n) {
-  return std::memset(dst, val, n);
+static void native_memset(void* dst, int val, size_t n) {
+  std::memset(dst, val, n);
 }
 
 static void* native_memchr(const void* ptr, int val, size_t n) {
@@ -37,20 +40,20 @@ static void* native_memchr(const void* ptr, int val, size_t n) {
 // Xbox/VMX-optimized variants (same semantics, native speed)
 // ---------------------------------------------------------------------------
 
-static void* native_XMemCpy(void* dst, const void* src, size_t n) {
-  return std::memcpy(dst, src, n);
+static void native_XMemCpy(void* dst, const void* src, size_t n) {
+  std::memcpy(dst, src, n);
 }
 
-static void* native_XMemSet(void* dst, int val, size_t n) {
-  return std::memset(dst, val, n);
+static void native_XMemSet(void* dst, int val, size_t n) {
+  std::memset(dst, val, n);
 }
 
-static void* native_XMemSet128(void* dst, int val, size_t n) {
-  return std::memset(dst, val, n);
+static void native_XMemSet128(void* dst, int val, size_t n) {
+  std::memset(dst, val, n);
 }
 
-static void* native_memset_vmx(void* dst, int val, size_t n) {
-  return std::memset(dst, val, n);
+static void native_memset_vmx(void* dst, int val, size_t n) {
+  std::memset(dst, val, n);
 }
 
 // ---------------------------------------------------------------------------
