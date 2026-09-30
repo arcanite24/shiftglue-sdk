@@ -14,13 +14,28 @@
 #include <rex/platform.h>
 #include <cstddef>
 
+// Linux and Android on x86-64 and AArch64 switch fibers with a few
+// instructions of their own (fiber_posix.cpp) instead of ucontext: Android's
+// libc has no makecontext or swapcontext, and glibc's swapcontext makes a
+// sigprocmask system call on every switch. Other POSIX targets (macOS) keep
+// ucontext. Defining REX_FIBER_STACK_SWITCH to 0 forces ucontext.
+#ifndef REX_FIBER_STACK_SWITCH
+#if REX_PLATFORM_LINUX && (REX_ARCH_AMD64 || REX_ARCH_ARM64)
+#define REX_FIBER_STACK_SWITCH 1
+#else
+#define REX_FIBER_STACK_SWITCH 0
+#endif
+#endif
+
 #if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+#if !REX_FIBER_STACK_SWITCH
 #if REX_PLATFORM_MAC && !defined(_XOPEN_SOURCE)
 // Darwin hides the deprecated ucontext APIs unless _XOPEN_SOURCE is defined
 // before including <ucontext.h>.
 #define _XOPEN_SOURCE 700
 #endif
 #include <ucontext.h>
+#endif
 #include <cstdint>
 #include <vector>
 #endif
@@ -57,13 +72,21 @@ struct Fiber {
   void* handle_ = nullptr;
   bool is_thread_fiber_ = false;
 #elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+#if REX_FIBER_STACK_SWITCH
+  // The suspended fiber's stack pointer, where the switch saved its
+  // callee-saved registers and floating-point control state.
+  void* stack_pointer_ = nullptr;
+#else
   ucontext_t context_{};
+#endif
   std::vector<uint8_t> stack_;
   void (*entry_)(void*) = nullptr;
   void* arg_ = nullptr;
   bool is_thread_fiber_ = false;
 
+#if !REX_FIBER_STACK_SWITCH
   static void Trampoline();
+#endif
 #endif
 };
 
