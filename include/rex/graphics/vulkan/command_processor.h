@@ -602,6 +602,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Returns how many VkWriteDescriptorSet structure instances have been
   // written, or 0 if there was a failure to allocate the descriptor set or no
   // bindings were requested.
+  // Whether the stage's last texture descriptor set (same frame, layout,
+  // views and samplers) can be bound again; if not, records the new contents
+  // for the set the caller is about to write.
+  bool ReuseTextureDescriptorSet(bool is_pixel, uint32_t texture_count, uint32_t sampler_count,
+                                 VkDescriptorSetLayout layout,
+                                 const VkDescriptorImageInfo* textures,
+                                 const VkDescriptorImageInfo* samplers);
   uint32_t WriteTransientTextureBindings(bool is_vertex, uint32_t texture_count,
                                          uint32_t sampler_count,
                                          VkDescriptorSetLayout descriptor_set_layout,
@@ -924,6 +931,17 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint64_t submission = 0;
   };
   std::vector<SamplerCacheEntry> sampler_cache_vertex_;
+  // The last texture descriptor set written per stage (vertex, pixel) and its
+  // contents; transient sets stay alive until their frame completes.
+  struct LastTextureDescriptorSet {
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    uint64_t frame = 0;
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    uint32_t texture_count = 0;
+    uint32_t sampler_count = 0;
+    std::vector<VkDescriptorImageInfo> infos;
+  };
+  LastTextureDescriptorSet last_texture_descriptor_sets_[2];
   std::vector<SamplerCacheEntry> sampler_cache_pixel_;
 
   // Cache render pass currently started in the command buffer with the
