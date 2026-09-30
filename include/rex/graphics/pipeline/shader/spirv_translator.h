@@ -399,6 +399,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
     bool demote_to_helper_invocation;
     bool sample_rate_shading;
+    // Quad operations in fragment shaders (SPIR-V 1.3).
+    bool quad_operations_fragment;
   };
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,
@@ -1068,6 +1070,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // If it's based on the predicate value: kCfExecBoolConstantPredicate.
   uint32_t cf_exec_bool_constant_or_predicate_;
   static constexpr uint32_t kCfExecBoolConstantPredicate = UINT32_MAX;
+  // A quad-uniform predicated jump, which can't be merged with anything.
+  static constexpr uint32_t kCfExecBoolConstantQuadJump = UINT32_MAX - 1;
   // When cf_exec_conditional_merge_ is not null, the expected bool constant or
   // predicate value for the current exec conditional.
   bool cf_exec_condition_;

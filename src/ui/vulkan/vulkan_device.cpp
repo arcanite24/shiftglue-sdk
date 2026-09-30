@@ -324,6 +324,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
   VkPhysicalDeviceFloatControlsProperties properties_1_2_KHR_shader_float_controls = {
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
+  VkPhysicalDeviceSubgroupProperties properties_1_1_subgroup = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
   VulkanFeatures<VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT>
       features_EXT_fragment_shader_interlock;
@@ -366,6 +368,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (ext_1_2_KHR_driver_properties) {
       properties_1_2_KHR_driver_properties.pNext = properties_2.pNext;
       properties_2.pNext = &properties_1_2_KHR_driver_properties;
+    }
+    if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
+      properties_1_1_subgroup.pNext = properties_2.pNext;
+      properties_2.pNext = &properties_1_1_subgroup;
     }
     if (ext_1_2_KHR_shader_float_controls) {
       properties_1_2_KHR_shader_float_controls.pNext = properties_2.pNext;
@@ -706,6 +712,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_FEATURE_IMPLIED(separateStencilMaskRef)
     XE_UI_VULKAN_FEATURE_IMPLIED(shaderSampleRateInterpolationFunctions)
   }
+
+  device->properties_.subgroupQuadFragment =
+      (properties_1_1_subgroup.supportedStages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
+      (properties_1_1_subgroup.supportedOperations & VK_SUBGROUP_FEATURE_QUAD_BIT);
+  REXLOG_INFO("* subgroupQuadFragment: {}", device->properties_.subgroupQuadFragment);
 
   if (ext_1_2_KHR_shader_float_controls) {
     XE_UI_VULKAN_PROPERTY_2(properties_1_2_KHR_shader_float_controls,

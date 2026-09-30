@@ -103,6 +103,10 @@ class VulkanDevice {
     bool geometryShader = false;
     bool tessellationShader = false;
     bool sampleRateShading = false;
+
+    // Vulkan 1.1 subgroups: quad operations in fragment shaders.
+
+    bool subgroupQuadFragment = false;
     bool depthClamp = false;
     bool fillModeNonSolid = false;
     bool samplerAnisotropy = false;

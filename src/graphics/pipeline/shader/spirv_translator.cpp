@@ -42,7 +42,8 @@ SpirvShaderTranslator::Features::Features(bool all)
       rounding_mode_rte_float32(all),
       fragment_shader_sample_interlock(all),
       demote_to_helper_invocation(all),
-      sample_rate_shading(all) {}
+      sample_rate_shading(all),
+      quad_operations_fragment(all) {}
 
 SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const vulkan_device)
     : max_storage_buffer_range(vulkan_device->properties().maxStorageBufferRange),
@@ -59,7 +60,8 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
       rounding_mode_rte_float32(vulkan_device->properties().shaderRoundingModeRTEFloat32),
       fragment_shader_sample_interlock(vulkan_device->properties().fragmentShaderSampleInterlock),
       demote_to_helper_invocation(vulkan_device->properties().shaderDemoteToHelperInvocation),
-      sample_rate_shading(vulkan_device->properties().sampleRateShading) {
+      sample_rate_shading(vulkan_device->properties().sampleRateShading),
+      quad_operations_fragment(vulkan_device->properties().subgroupQuadFragment) {
   const uint32_t vulkan_api_version = vulkan_device->properties().apiVersion;
   if (vulkan_api_version >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
     spirv_version = spv::Spv_1_5;
@@ -69,6 +71,9 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
     spirv_version = spv::Spv_1_3;
   } else {
     spirv_version = spv::Spv_1_0;
+  }
+  if (spirv_version < spv::Spv_1_3) {
+    quad_operations_fragment = false;
   }
 }
 
@@ -1542,6 +1547,49 @@ void SpirvShaderTranslator::ProcessLoopEndInstruction(const ParsedLoopEndInstruc
 }
 
 void SpirvShaderTranslator::ProcessJumpInstruction(const ParsedJumpInstruction& instr) {
+  // Xenos runs 64 invocations together, so a predicated jump is taken or not
+  // by all of them, and the compiler predicates the instructions it skips as
+  // well - jumping is only an optimization. Jumping per invocation instead
+  // splits a quad between iterations of the main loop, and a derivative after
+  // the jump in the lanes that didn't take it (the implicit gradients of a
+  // cube fetch in FH1's car shader) then hangs Nvidia GPUs. So a predicated
+  // forward jump in a pixel shader is only taken when the whole quad takes it.
+  if (instr.type == ParsedJumpInstruction::Type::kPredicated && is_pixel_shader() &&
+      features_.quad_operations_fragment && instr.target_address > instr.dword_index) {
+    CloseExecConditionals();
+    EnsureBuildPointAvailable();
+    spv::Id jump = builder_->createLoad(var_main_predicate_, spv::NoPrecision);
+    if (!instr.condition) {
+      jump = builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, jump);
+    }
+    builder_->addCapability(spv::CapabilityGroupNonUniformQuad);
+    spv::Id scope_subgroup = builder_->makeUintConstant(uint32_t(spv::ScopeSubgroup));
+    // Horizontal, then vertical: the AND of all four lanes.
+    for (uint32_t direction = 0; direction < 2; ++direction) {
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(scope_subgroup);
+      id_vector_temp_.push_back(jump);
+      id_vector_temp_.push_back(builder_->makeUintConstant(direction));
+      jump = builder_->createBinOp(
+          spv::OpLogicalAnd, type_bool_, jump,
+          builder_->createOp(spv::OpGroupNonUniformQuadSwap, type_bool_, id_vector_temp_));
+    }
+    cf_exec_bool_constant_or_predicate_ = kCfExecBoolConstantQuadJump;
+    cf_exec_condition_ = true;
+    cf_exec_conditional_merge_ =
+        new spv::Block(builder_->getUniqueId(), builder_->getBuildPoint()->getParent());
+    builder_->createSelectionMerge(cf_exec_conditional_merge_,
+                                   spv::SelectionControlDontFlattenMask);
+    spv::Block& inner_block = builder_->makeNewBlock();
+    builder_->createConditionalBranch(jump, &inner_block, cf_exec_conditional_merge_);
+    builder_->setBuildPoint(&inner_block);
+    main_switch_next_pc_phi_operands_.push_back(
+        builder_->makeIntConstant(int(instr.target_address)));
+    main_switch_next_pc_phi_operands_.push_back(builder_->getBuildPoint()->getId());
+    builder_->createBranch(main_loop_continue_);
+    return;
+  }
+
   // Treat like exec, merge with execs if possible, since it's an if too.
   ParsedExecInstruction::Type type;
   if (instr.type == ParsedJumpInstruction::Type::kConditional) {
