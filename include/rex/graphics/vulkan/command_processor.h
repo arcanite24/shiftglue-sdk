@@ -1055,20 +1055,6 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Float constant usage masks of the last draw call.
   uint64_t current_float_constant_map_vertex_[4];
   uint64_t current_float_constant_map_pixel_[4];
-  // The last float constants uploaded per stage (vertex, pixel) in this
-  // frame: a draw whose gathered constants are the same bytes reuses that
-  // range instead of writing the upload memory again
-  // (vulkan_dedupe_float_constants).
-  struct FloatConstantUpload {
-    uint64_t frame = 0;
-    VkDescriptorBufferInfo info = {};
-    std::vector<uint8_t> bytes;
-  };
-  FloatConstantUpload last_float_constant_uploads_[2];
-  std::vector<uint8_t> float_constant_scratch_;
-  bool dedupe_float_constants_ = false;
-  bool UploadFloatConstants(uint32_t stage, const uint64_t (&map)[4], uint32_t count,
-                            const uint32_t* first, size_t alignment);
 
   // System shader constants.
   SpirvShaderTranslator::SystemConstants system_constants_;
