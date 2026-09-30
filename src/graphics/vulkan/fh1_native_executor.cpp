@@ -1393,13 +1393,11 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1DrawInfo& draw) {
   if (!used_bits) return;
 
   const uint32_t msaa_y_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k2X));
-  const uint32_t height_used =
-      std::min(SurfaceHeight(pitch_tiles, msaa),
-               draw.vertex_shader ? draw_extent_estimator_.EstimateMaxY(true, *draw.vertex_shader)
-                                  : SurfaceHeight(pitch_tiles, msaa));
-  const uint32_t length_tiles_32bpp =
-      ((height_used << msaa_y_log2) + xenos::kEdramTileHeightSamples - 1) /
-      xenos::kEdramTileHeightSamples * pitch_tiles;
+  auto length_for_height = [&](uint32_t height) {
+    return ((height << msaa_y_log2) + xenos::kEdramTileHeightSamples - 1) /
+           xenos::kEdramTileHeightSamples * pitch_tiles;
+  };
+  const uint32_t surface_height = SurfaceHeight(pitch_tiles, msaa);
   const bool depth_stencil_written =
       (used_bits & 1) && DrawMayWriteNonzeroStencil(draw.normalized_depth_control);
   const bool may_overwrite_depth =
@@ -1409,12 +1407,31 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1DrawInfo& draw) {
   PrepareSignature signature;
   signature.generation = tiles_.generation();
   signature.used_bits = used_bits;
-  signature.length_tiles = length_tiles_32bpp;
   signature.stencil_written = depth_stencil_written;
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
     if (used_bits & (1u << i)) signature.keys[i] = keys[i].Pack();
   }
-  if (!may_overwrite_depth && signature == last_prepare_) return;
+  // With no tile changed since a recent preparation of the same targets, a
+  // claim no longer than that one is already in place; when that one covered
+  // the whole surface, the draw's extent need not even be estimated. Draws
+  // alternating between a few target sets all hit.
+  const PrepareSignature* same_targets = nullptr;
+  if (!may_overwrite_depth) {
+    for (const PrepareSignature& recent : recent_prepares_) {
+      if (recent.length_tiles && signature.SameTargets(recent)) {
+        same_targets = &recent;
+        break;
+      }
+    }
+  }
+  if (same_targets && same_targets->length_tiles >= length_for_height(surface_height)) return;
+  const uint32_t height_used =
+      std::min(surface_height, draw.vertex_shader
+                                   ? draw_extent_estimator_.EstimateMaxY(true, *draw.vertex_shader)
+                                   : surface_height);
+  const uint32_t length_tiles_32bpp = length_for_height(height_used);
+  signature.length_tiles = length_tiles_32bpp;
+  if (same_targets && length_tiles_32bpp <= same_targets->length_tiles) return;
 
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
     if ((used_bits & (1u << i)) && !GetOrCreateSurface(keys[i])) used_bits &= ~(1u << i);
@@ -1448,10 +1465,21 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1DrawInfo& draw) {
   }
   FlushTransfers();
   if (used_bits == signature.used_bits && !may_overwrite_depth) {
+    // Entries of an older generation never match, so no invalidation is
+    // needed; the same targets take their old entry's place.
     signature.generation = tiles_.generation();
-    last_prepare_ = signature;
-  } else {
-    last_prepare_ = {};
+    PrepareSignature* slot = nullptr;
+    for (PrepareSignature& recent : recent_prepares_) {
+      if (recent.used_bits == signature.used_bits &&
+          !std::memcmp(recent.keys, signature.keys, sizeof(signature.keys))) {
+        slot = &recent;
+        break;
+      }
+    }
+    if (!slot) {
+      slot = &recent_prepares_[recent_prepare_next_++ % std::size(recent_prepares_)];
+    }
+    *slot = signature;
   }
 }
 
@@ -1514,6 +1542,16 @@ uint64_t Fh1NativeExecutor::DrawRenderingId(uint32_t used_bits) const {
 }
 
 void Fh1NativeExecutor::BeginDrawRendering() {
+  if (command_processor_.IsFh1RenderingOpen(DrawRenderingId(bound_bits_))) {
+    // The draw continues the open rendering unless pending barriers end it;
+    // then it begins anew below as before.
+    command_processor_.SubmitBarriers(false);
+    if (command_processor_.IsFh1RenderingOpen(DrawRenderingId(bound_bits_))) {
+      attachment_barriers_skipped_ = false;
+      rendering_id_ = DrawRenderingId(bound_bits_);
+      return;
+    }
+  }
   VkRenderingAttachmentInfo colors[xenos::kMaxColorRenderTargets] = {};
   VkRenderingAttachmentInfo depth = {};
   uint32_t color_count = 0;

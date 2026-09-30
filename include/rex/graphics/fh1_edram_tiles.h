@@ -193,9 +193,12 @@ class Fh1EdramTiles {
 
   void MarkStencil(uint32_t base, uint32_t length, bool nonzero) {
     length = std::min(length, xenos::kEdramTileCount);
-    ++generation_;
     for (uint32_t i = 0; i < length; ++i) {
-      stencil_nonzero_[(base + i) & kTileMask] = nonzero;
+      auto& tile = stencil_nonzero_[(base + i) & kTileMask];
+      if (bool(tile) != nonzero) {
+        tile = nonzero;
+        ++generation_;
+      }
     }
   }
 

@@ -286,8 +286,14 @@ class Fh1NativeExecutor {
     bool stencil_written = false;
     uint32_t keys[5] = {};
     bool operator==(const PrepareSignature&) const = default;
+    bool SameTargets(const PrepareSignature& other) const {
+      return generation == other.generation && used_bits == other.used_bits &&
+             stencil_written == other.stencil_written &&
+             !std::memcmp(keys, other.keys, sizeof(keys));
+    }
   };
-  PrepareSignature last_prepare_;
+  PrepareSignature recent_prepares_[4];
+  uint32_t recent_prepare_next_ = 0;
 
   uint64_t frame_ = 0;
   // fh1_scaled_msaa_single_sample at a scale above 1x.
