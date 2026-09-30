@@ -141,6 +141,8 @@ enum class CounterId : uint16_t {
   kGpuSubmissionBusyNs,
   // Time the GPU recorder (gpu_record_thread) spent running recorded work.
   kGpuRecorderBusyNs,
+  // Time threads spent blocked on the global critical region.
+  kCriticalRegionBlockedNs,
 
   kCount  // sentinel -- must be last
 };

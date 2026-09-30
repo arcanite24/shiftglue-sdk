@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
+
 #include <rex/perf/counter.h>
 #include <rex/thread/mutex.h>
 
@@ -19,8 +21,14 @@ std::recursive_mutex& global_critical_region::mutex() {
   return global_mutex;
 }
 
-void global_critical_region::NoteContention() {
+void global_critical_region::LockContended() {
   PROFILE_CRITICAL_REGION_CONTENTION();
+  const auto start = std::chrono::steady_clock::now();
+  mutex().lock();
+  PERF_counter_add(kCriticalRegionBlockedNs,
+                   std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now() - start)
+                       .count());
 }
 
 }  // namespace rex::thread

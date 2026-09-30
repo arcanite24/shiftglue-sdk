@@ -61,8 +61,7 @@ class global_critical_region {
   // (the kCriticalRegionContentions performance counter).
   static void LockCounted() {
     if (!mutex().try_lock()) {
-      NoteContention();
-      mutex().lock();
+      LockContended();
     }
   }
 
@@ -90,7 +89,8 @@ class global_critical_region {
   }
 
  private:
-  static void NoteContention();
+  // Counts the contention and the time blocked (kCriticalRegionBlockedNs).
+  static void LockContended();
 };
 
 }  // namespace rex::thread
