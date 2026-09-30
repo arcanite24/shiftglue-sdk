@@ -278,6 +278,16 @@ class CommandProcessor {
   void RecordCall(std::function<void()> fn);
   // Hands the recorded work so far to the recorder.
   void PublishRecordBatch();
+  // Bumped whenever a register other than the shader constants and the
+  // per-draw ones (index buffer, draw initiator, event initiator, scratch,
+  // coherency, constant flushes) changes value: derivations from register
+  // state can be reused while it holds.
+  uint64_t state_epoch_ = 1;
+  static bool IsPerDrawRegister(uint32_t index) {
+    return (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) ||
+           (index >= XE_GPU_REG_VGT_EVENT_INITIATOR && index <= XE_GPU_REG_VGT_DRAW_INITIATOR) ||
+           index == XE_GPU_REG_COHER_STATUS_HOST || index >= 0x5000;
+  }
   // Returns once the recorder has run everything recorded so far; the
   // recorder is then idle until the next publish, so this thread may touch
   // backend state until it records again.
