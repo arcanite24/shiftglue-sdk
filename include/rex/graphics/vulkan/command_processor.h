@@ -511,6 +511,12 @@ class VulkanCommandProcessor : public CommandProcessor {
     CheckSubmissionFenceAndDeviceLoss(GetCurrentSubmission());
     return !submission_open_ && submissions_in_flight_fences_.empty();
   }
+  // Guest frame GPU timing for the performance CSV (guest_frame_gpu_time_ns):
+  // one timestamp at the frame's first submission and one at its swap, read
+  // once the frame's last submission has completed, as on D3D12.
+  void BeginFrameGpuTiming();
+  void EndFrameGpuTiming();
+  void ReadFrameGpuTiming();
   // Keep primary-buffer-end submit behavior aligned with D3D12: only submit
   // when immediate submission is safe.
   bool CanEndSubmissionImmediately() const;
@@ -836,6 +842,16 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint8_t* occlusion_query_readback_mapping_ = nullptr;
   uint32_t occlusion_query_cursor_ = 0;
   bool occlusion_query_resources_available_ = false;
+
+  static constexpr uint32_t kFrameTimingQueriesPerFrame = 2;
+  VkQueryPool frame_timing_query_pool_ = VK_NULL_HANDLE;
+  struct FrameTimingSlot {
+    bool started = false;
+    // The submission whose completion makes both timestamps readable; zero
+    // while the frame is still open.
+    uint64_t submission = 0;
+  };
+  FrameTimingSlot frame_timing_slots_[kMaxFramesInFlight] = {};
   struct ActiveOcclusionQuery {
     uint32_t sample_count_address = 0;
     uint32_t host_index = UINT32_MAX;

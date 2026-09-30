@@ -1948,6 +1948,20 @@ bool VulkanCommandProcessor::SetupContext() {
 
   occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
 
+  // Frame timestamps for the performance CSV; without them
+  // guest_frame_gpu_time_ns stays zero as before.
+  if (GetVulkanDevice()->properties().timestampPeriod > 0.0f) {
+    VkQueryPoolCreateInfo frame_timing_pool_info = {};
+    frame_timing_pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    frame_timing_pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    frame_timing_pool_info.queryCount = kMaxFramesInFlight * kFrameTimingQueriesPerFrame;
+    if (dfn.vkCreateQueryPool(device, &frame_timing_pool_info, nullptr,
+                              &frame_timing_query_pool_) != VK_SUCCESS) {
+      frame_timing_query_pool_ = VK_NULL_HANDLE;
+      REXGPU_WARN("VulkanCommandProcessor: no timestamp query pool, frame GPU time stays zero");
+    }
+  }
+
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
 
@@ -1965,6 +1979,12 @@ void VulkanCommandProcessor::ShutdownContext() {
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
+
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyQueryPool, device,
+                                         frame_timing_query_pool_);
+  for (FrameTimingSlot& slot : frame_timing_slots_) {
+    slot = {};
+  }
 
   DestroyScratchBuffer();
 
@@ -4363,6 +4383,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
       shader_32bit_index_dma) {
+    PROFILE_DRAW_CALL();
     deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
   } else {
     std::pair<VkBuffer, VkDeviceSize> index_buffer;
@@ -4394,6 +4415,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
             ? VK_INDEX_TYPE_UINT16
             : VK_INDEX_TYPE_UINT32);
+    PROFILE_DRAW_CALL();
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
   }
@@ -5229,9 +5251,14 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     // defined by vkQueueSubmit additionally include in the first
     // synchronization scope all commands that occur earlier in submission
     // order."
+    const auto wait_start = std::chrono::steady_clock::now();
     VkResult wait_result =
         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+    PERF_counter_add(kGpuThreadFenceWaitNs,
+                     std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now() - wait_start)
+                         .count());
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {
@@ -5424,6 +5451,10 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   }
 
   if (is_opening_frame) {
+    // Completed frames' timestamps first, so their slots are free for reuse.
+    ReadFrameGpuTiming();
+    BeginFrameGpuTiming();
+
     frame_open_ = true;
     frame_used_async_placeholder_pipeline_ = false;
 
@@ -5570,6 +5601,10 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     }
 
     EndRenderPass();
+
+    if (is_closing_frame) {
+      EndFrameGpuTiming();
+    }
 
     pipeline_cache_->EndSubmission();
 
@@ -5959,9 +5994,76 @@ void VulkanCommandProcessor::AwaitSubmissionWorker() {
   if (!async_submission_) {
     return;
   }
+  const auto wait_start = std::chrono::steady_clock::now();
   std::unique_lock<std::mutex> lock(submission_worker_mutex_);
   submission_worker_idle_.wait(
       lock, [this]() { return submission_jobs_.empty() && !submission_worker_busy_; });
+  PERF_counter_add(kGpuThreadFenceWaitNs,
+                   std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now() - wait_start)
+                       .count());
+}
+
+void VulkanCommandProcessor::BeginFrameGpuTiming() {
+  if (frame_timing_query_pool_ == VK_NULL_HANDLE) {
+    return;
+  }
+  FrameTimingSlot& slot = frame_timing_slots_[frame_current_ % kMaxFramesInFlight];
+  if (slot.submission) {
+    // The frame that last used this slot has not been read yet.
+    PROFILE_NATIVE_GPU_TIMING_DROP();
+    return;
+  }
+  const uint32_t query_base =
+      uint32_t(frame_current_ % kMaxFramesInFlight) * kFrameTimingQueriesPerFrame;
+  // Queries are reset outside a render pass.
+  EndRenderPass();
+  deferred_command_buffer_.CmdVkResetQueryPool(frame_timing_query_pool_, query_base,
+                                               kFrameTimingQueriesPerFrame);
+  deferred_command_buffer_.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                               frame_timing_query_pool_, query_base);
+  slot.started = true;
+}
+
+void VulkanCommandProcessor::EndFrameGpuTiming() {
+  if (frame_timing_query_pool_ == VK_NULL_HANDLE) {
+    return;
+  }
+  FrameTimingSlot& slot = frame_timing_slots_[frame_current_ % kMaxFramesInFlight];
+  if (!slot.started || slot.submission) {
+    return;
+  }
+  const uint32_t query_base =
+      uint32_t(frame_current_ % kMaxFramesInFlight) * kFrameTimingQueriesPerFrame;
+  deferred_command_buffer_.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                               frame_timing_query_pool_, query_base + 1);
+  slot.submission = GetCurrentSubmission();
+}
+
+void VulkanCommandProcessor::ReadFrameGpuTiming() {
+  if (frame_timing_query_pool_ == VK_NULL_HANDLE) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const double tick_ns = vulkan_device->properties().timestampPeriod;
+  for (uint32_t slot_index = 0; slot_index < kMaxFramesInFlight; ++slot_index) {
+    FrameTimingSlot& slot = frame_timing_slots_[slot_index];
+    if (!slot.submission || slot.submission > submission_completed_) {
+      continue;
+    }
+    uint64_t ticks[kFrameTimingQueriesPerFrame];
+    if (vulkan_device->functions().vkGetQueryPoolResults(
+            vulkan_device->device(), frame_timing_query_pool_,
+            slot_index * kFrameTimingQueriesPerFrame, kFrameTimingQueriesPerFrame, sizeof(ticks),
+            ticks, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+        ticks[1] >= ticks[0]) {
+      PROFILE_GUEST_FRAME_GPU_TIME_NS(int64_t(double(ticks[1] - ticks[0]) * tick_ns));
+      PROFILE_GUEST_FRAME_GPU_TIMING_SAMPLE();
+    } else {
+      PROFILE_NATIVE_GPU_TIMING_DROP();
+    }
+    slot = {};
+  }
 }
 
 void VulkanCommandProcessor::ClearTransientDescriptorPools() {
