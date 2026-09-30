@@ -27,11 +27,14 @@ namespace rex::ui {
 
 class WindowSDL final : public Window {
  public:
+  // The default size is the app's own, used where the cvars ask for none.
   WindowSDL(WindowedAppContext& app_context, const std::string_view title,
-            uint32_t desired_logical_width, uint32_t desired_logical_height);
+            uint32_t desired_logical_width, uint32_t desired_logical_height,
+            uint32_t default_logical_width, uint32_t default_logical_height);
   ~WindowSDL() override;
 
   void* GetNativeWindowHandle() const override;
+  void ApplyConfiguredSizeAndMonitor() override;
   bool SetRelativeMouseMode(bool enable) override;
   bool WarpMouseToCenter(int32_t& x_out, int32_t& y_out) override;
 
@@ -79,6 +82,11 @@ class WindowSDL final : public Window {
   // expect. Never zero.
   float GetPixelDensity() const;
 
+  // Centers the window on the display the monitor cvar names, if any.
+  void MoveToConfiguredMonitor();
+
+  uint32_t default_logical_width_;
+  uint32_t default_logical_height_;
   SDL_Window* sdl_window_ = nullptr;
   SDL_WindowID sdl_window_id_ = 0;
   std::atomic<bool> paint_pending_{false};

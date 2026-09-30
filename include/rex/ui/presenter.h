@@ -380,6 +380,9 @@ class Presenter {
   }
   // For simplicity, may be called repeatedly even if no changes have been made.
   void SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConfig& new_config);
+  // Rebuilds the paint configuration from the present_* cvars, for applying
+  // a changed setting without a restart.
+  void RefreshGuestOutputPaintConfigFromUIThread();
 
   void AddUIDrawerFromUIThread(UIDrawer* drawer, size_t z_order);
   void RemoveUIDrawerFromUIThread(UIDrawer* drawer);

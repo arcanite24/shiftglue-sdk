@@ -290,6 +290,11 @@ class Window {
   /// Valid after Open() returns successfully.
   virtual void* GetNativeWindowHandle() const { return nullptr; }
 
+  /// Applies the window_width, window_height and monitor cvars to the open
+  /// window: its windowed size, centered on the configured display (a
+  /// fullscreen window moves to cover that display). From the UI thread.
+  virtual void ApplyConfiguredSizeAndMonitor() {}
+
   // Desired state stored by the common Window, externally modifiable, read-only
   // in the implementation.
   void SetMainMenu(std::unique_ptr<MenuItem> new_main_menu);

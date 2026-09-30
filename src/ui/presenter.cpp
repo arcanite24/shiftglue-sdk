@@ -55,58 +55,51 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
                      "Vertical safe area percentage (0-100)")
     .range(0, 100);
 
+// The guest output paint settings apply live: GraphicsSystem passes each
+// change to Presenter::RefreshGuestOutputPaintConfigFromUIThread.
 #if defined(REX_HAS_FIDELITYFX_SDK)
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
                       "Guest output effect: bilinear, cas, fsr, fsr2, fsr3")
-    .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"})
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"});
 #else
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
                       "Guest output effect: bilinear, cas (sharpen, and resample when "
                       "downscaling), fsr (FSR 1 upscale with RCAS sharpening)")
-    .allowed({"bilinear", "cas", "fsr"})
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .allowed({"bilinear", "cas", "fsr"});
 #endif
 
 REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
                       rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessDefault,
                       "UI/Presenter", "Additional CAS sharpness in [0, 1]")
     .range(rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessMin,
-           rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessMax)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+           rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessMax);
 
 REXCVAR_DEFINE_INT32(present_fsr_max_upsampling_passes,
                      rex::ui::Presenter::GuestOutputPaintConfig::kFsrMaxUpscalingPassesMax,
                      "UI/Presenter", "Maximum chained FSR EASU passes")
-    .range(1, int32_t(rex::ui::Presenter::GuestOutputPaintConfig::kFsrMaxUpscalingPassesMax))
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .range(1, int32_t(rex::ui::Presenter::GuestOutputPaintConfig::kFsrMaxUpscalingPassesMax));
 
 REXCVAR_DEFINE_DOUBLE(present_fsr_sharpness_reduction,
                       rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionDefault,
                       "UI/Presenter", "FSR RCAS sharpness reduction in stops")
     .range(rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMin,
-           rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMax)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+           rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMax);
 
 REXCVAR_DEFINE_STRING(
     present_fsr_quality_mode, "auto", "UI/Presenter",
     "Temporal FSR quality mode: auto, nativeaa, quality, balanced, performance, ultra_performance")
-    .allowed({"auto", "nativeaa", "quality", "balanced", "performance", "ultra_performance"})
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .allowed({"auto", "nativeaa", "quality", "balanced", "performance", "ultra_performance"});
 #else
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter", "Guest output effect: bilinear")
-    .allowed({"bilinear"})
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .allowed({"bilinear"});
 #endif
 
 REXCVAR_DEFINE_BOOL(present_dither, false, "UI/Presenter",
-                    "Enable output dithering in the final present pass")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+                    "Enable output dithering in the final present pass");
 
 REXCVAR_DEFINE_BOOL(present_allow_overscan_cutoff, false, "UI/Presenter",
-                    "Allow overscan cutoff based on safe area settings")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+                    "Allow overscan cutoff based on safe area settings");
 
 namespace {
 using GuestOutputPaintConfig = rex::ui::Presenter::GuestOutputPaintConfig;
@@ -696,6 +689,10 @@ void Presenter::PublishGuestOutput() {
   }
 }
 
+void Presenter::RefreshGuestOutputPaintConfigFromUIThread() {
+  SetGuestOutputPaintConfigFromUIThread(BuildGuestOutputPaintConfigFromCVar());
+}
+
 void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConfig& new_config) {
   // For simplicity, this may be called externally repeatedly.
   // Lock the mutex only when something has been modified, and also don't
@@ -706,6 +703,10 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
     modified = true;
     request_repaint = true;
   }
+  if (guest_output_paint_config_.GetAllowOverscanCutoff() != new_config.GetAllowOverscanCutoff()) {
+    modified = true;
+    request_repaint = true;
+  }
 #if defined(REX_HAS_FIDELITYFX_SDK)
   if (guest_output_paint_config_.GetFsrSharpnessReduction() !=
       new_config.GetFsrSharpnessReduction()) {
@@ -713,6 +714,13 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
     if (new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr ||
         new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
         new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3) {
+      request_repaint = true;
+    }
+  }
+  if (guest_output_paint_config_.GetFsrMaxUpsamplingPasses() !=
+      new_config.GetFsrMaxUpsamplingPasses()) {
+    modified = true;
+    if (new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr) {
       request_repaint = true;
     }
   }

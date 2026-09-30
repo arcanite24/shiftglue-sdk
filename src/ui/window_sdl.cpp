@@ -119,15 +119,17 @@ MouseEvent::Button TranslateSDLMouseButton(Uint8 button) {
 std::unique_ptr<Window> Window::Create(WindowedAppContext& app_context,
                                        const std::string_view title, uint32_t desired_logical_width,
                                        uint32_t desired_logical_height) {
-  desired_logical_width = ResolveWindowWidth(desired_logical_width);
-  desired_logical_height = ResolveWindowHeight(desired_logical_height);
-  return std::make_unique<WindowSDL>(app_context, title, desired_logical_width,
-                                     desired_logical_height);
+  return std::make_unique<WindowSDL>(app_context, title, ResolveWindowWidth(desired_logical_width),
+                                     ResolveWindowHeight(desired_logical_height),
+                                     desired_logical_width, desired_logical_height);
 }
 
 WindowSDL::WindowSDL(WindowedAppContext& app_context, const std::string_view title,
-                     uint32_t desired_logical_width, uint32_t desired_logical_height)
-    : Window(app_context, title, desired_logical_width, desired_logical_height) {}
+                     uint32_t desired_logical_width, uint32_t desired_logical_height,
+                     uint32_t default_logical_width, uint32_t default_logical_height)
+    : Window(app_context, title, desired_logical_width, desired_logical_height),
+      default_logical_width_(default_logical_width),
+      default_logical_height_(default_logical_height) {}
 
 WindowSDL::~WindowSDL() {
   EnterDestructor();
@@ -154,22 +156,8 @@ bool WindowSDL::OpenImpl() {
   sdl_app_context().RegisterWindow(sdl_window_id_, this);
 
   // Center on the requested display before fullscreen so SDL resolves
-  // fullscreen against it. 1-based enumeration order; 0 = system default.
-  if (int32_t monitor_index = REXCVAR_GET(monitor); monitor_index > 0) {
-    int display_count = 0;
-    SDL_DisplayID* displays = SDL_GetDisplays(&display_count);
-    if (displays) {
-      if (monitor_index <= display_count) {
-        SDL_DisplayID display = displays[monitor_index - 1];
-        SDL_SetWindowPosition(sdl_window_, SDL_WINDOWPOS_CENTERED_DISPLAY(display),
-                              SDL_WINDOWPOS_CENTERED_DISPLAY(display));
-      } else {
-        REXLOG_WARN("monitor cvar is {} but only {} display(s) present; using default",
-                    monitor_index, display_count);
-      }
-      SDL_free(displays);
-    }
-  }
+  // fullscreen against it.
+  MoveToConfiguredMonitor();
 
   if (IsFullscreen()) {
     // Borderless desktop fullscreen (a NULL display mode is SDL3's default).
@@ -293,6 +281,49 @@ uint32_t WindowSDL::GetLatestDpiImpl() const {
     return GetMediumDpi();
   }
   return uint32_t(scale * float(GetMediumDpi()) + 0.5f);
+}
+
+void WindowSDL::MoveToConfiguredMonitor() {
+  // 1-based enumeration order; 0 = system default.
+  const int32_t monitor_index = REXCVAR_GET(monitor);
+  if (monitor_index <= 0) {
+    return;
+  }
+  int display_count = 0;
+  SDL_DisplayID* displays = SDL_GetDisplays(&display_count);
+  if (!displays) {
+    return;
+  }
+  if (monitor_index <= display_count) {
+    SDL_DisplayID display = displays[monitor_index - 1];
+    SDL_SetWindowPosition(sdl_window_, SDL_WINDOWPOS_CENTERED_DISPLAY(display),
+                          SDL_WINDOWPOS_CENTERED_DISPLAY(display));
+  } else {
+    REXLOG_WARN("monitor cvar is {} but only {} display(s) present; using default",
+                monitor_index, display_count);
+  }
+  SDL_free(displays);
+}
+
+void WindowSDL::ApplyConfiguredSizeAndMonitor() {
+  if (!sdl_window_) {
+    return;
+  }
+  // A fullscreen window keeps this as its windowed size.
+#if REX_PLATFORM_MAC
+  SDL_SetWindowSize(sdl_window_, int(ResolveWindowWidth(default_logical_width_)),
+                    int(ResolveWindowHeight(default_logical_height_)));
+#else
+  SDL_SetWindowSize(sdl_window_, int(SizeToPhysical(ResolveWindowWidth(default_logical_width_))),
+                    int(SizeToPhysical(ResolveWindowHeight(default_logical_height_))));
+#endif
+  if (REXCVAR_GET(monitor) > 0) {
+    MoveToConfiguredMonitor();
+  } else if (!IsFullscreen()) {
+    const SDL_DisplayID display = SDL_GetDisplayForWindow(sdl_window_);
+    SDL_SetWindowPosition(sdl_window_, SDL_WINDOWPOS_CENTERED_DISPLAY(display),
+                          SDL_WINDOWPOS_CENTERED_DISPLAY(display));
+  }
 }
 
 void WindowSDL::ApplyNewFullscreen() {

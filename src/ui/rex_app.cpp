@@ -360,6 +360,17 @@ bool ReXApp::SetupPresentation() {
       window_->SetFullscreen(rex::string::from_string<bool>(value, false));
     }
   });
+  for (const char* name : {"window_width", "window_height", "monitor"}) {
+    rex::cvar::RegisterChangeCallback(name, [this](std::string_view, std::string_view) {
+      // Deferred: the callback runs under the cvar registry lock, and a size
+      // change arrives as two writes.
+      app_context().CallInUIThreadDeferred([this] {
+        if (window_) {
+          window_->ApplyConfiguredSizeAndMonitor();
+        }
+      });
+    });
+  }
   window_->Open();
 
   auto* graphics_system = config_.graphics.get();

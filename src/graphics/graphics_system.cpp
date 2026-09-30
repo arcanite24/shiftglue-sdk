@@ -75,6 +75,17 @@ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
   }
   return rex::graphics::CommandProcessor::SwapPostEffect::kNone;
 }
+
+// The present_* cvars BuildGuestOutputPaintConfigFromCVar reads.
+constexpr const char* kPresenterPaintCvars[] = {
+    "present_effect",
+    "present_cas_additional_sharpness",
+    "present_fsr_max_upsampling_passes",
+    "present_fsr_sharpness_reduction",
+    "present_fsr_quality_mode",
+    "present_dither",
+    "present_allow_overscan_cutoff",
+};
 }  // namespace
 
 namespace rex::graphics {
@@ -130,6 +141,20 @@ X_STATUS GraphicsSystem::SetupPresentation(ui::WindowedAppContext* app_context) 
   if (!presenter_) {
     REXGPU_ERROR("Unable to create presenter");
     return X_STATUS_UNSUCCESSFUL;
+  }
+  // The output scaling, sharpening and overscan settings apply from the next
+  // paint (the letterbox is read by every paint already).
+  if (app_context_) {
+    for (const char* name : kPresenterPaintCvars) {
+      cvar::RegisterChangeCallback(name, [this](std::string_view, std::string_view) {
+        // Deferred: the callback runs under the cvar registry lock.
+        app_context_->CallInUIThreadDeferred([this] {
+          if (presenter_) {
+            presenter_->RefreshGuestOutputPaintConfigFromUIThread();
+          }
+        });
+      });
+    }
   }
   return X_STATUS_SUCCESS;
 }
@@ -251,6 +276,9 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
 
 void GraphicsSystem::Shutdown() {
   cvar::UnregisterChangeCallbacks("swap_post_effect");
+  for (const char* name : kPresenterPaintCvars) {
+    cvar::UnregisterChangeCallbacks(name);
+  }
   if (command_processor_) {
     command_processor_->Shutdown();
     command_processor_.reset();

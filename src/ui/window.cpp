@@ -22,25 +22,23 @@
 #include <imgui.h>
 
 REXCVAR_DEFINE_INT32(window_width, 0, "UI/Window",
-                     "Startup window width in logical pixels (0 = use app default)")
-    .range(0, 8192)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+                     "Window width in logical pixels (0 = use app default)")
+    .range(0, 8192);
 
 REXCVAR_DEFINE_INT32(window_height, 0, "UI/Window",
-                     "Startup window height in logical pixels (0 = use app default)")
-    .range(0, 8192)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+                     "Window height in logical pixels (0 = use app default)")
+    .range(0, 8192);
 
 // kHotReload (default): Window::SetFullscreen can be applied live, so the
 // change callback registered in ReXApp::SetupPresentation keeps the window
-// in sync whenever this cvar is changed at runtime.
+// in sync whenever this cvar is changed at runtime. The size and monitor
+// above apply live the same way, through ApplyConfiguredSizeAndMonitor.
 REXCVAR_DEFINE_BOOL(fullscreen, true, "UI/Window", "Start the window in fullscreen mode");
 
 REXCVAR_DEFINE_INT32(monitor, 0, "UI/Window",
                      "Monitor index to display on (0 = default, 1 = primary, 2 = "
                      "second monitor, etc.)")
-    .range(0, 16)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .range(0, 16);
 
 REXCVAR_DEFINE_STRING(video_driver, "", "UI/Window",
                       "SDL video driver to use, such as \"wayland\" or \"x11\". Empty picks "
