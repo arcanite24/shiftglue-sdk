@@ -1913,6 +1913,12 @@ void VirtualHeap::Initialize(memory::Memory* memory, uint8_t* membase, HeapType 
   BaseHeap::Initialize(memory, membase, heap_type, heap_base, heap_size, page_size);
 }
 
+}  // namespace rex::memory
+
+extern "C" uint32_t rex_physical_host_offset_e0 = 0;
+
+namespace rex::memory {
+
 PhysicalHeap::PhysicalHeap() : parent_heap_(nullptr) {}
 
 PhysicalHeap::~PhysicalHeap() = default;
@@ -1925,6 +1931,9 @@ void PhysicalHeap::Initialize(memory::Memory* memory, uint8_t* membase, HeapType
     host_address_offset = 0x1000;
   } else {
     host_address_offset = 0;
+  }
+  if (heap_base >= 0xE0000000) {
+    rex_physical_host_offset_e0 = host_address_offset;
   }
 
   BaseHeap::Initialize(memory, membase, heap_type, heap_base, heap_size, page_size,
