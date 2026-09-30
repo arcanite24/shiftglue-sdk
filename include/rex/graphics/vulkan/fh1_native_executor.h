@@ -238,6 +238,13 @@ class Fh1NativeExecutor {
   Fh1EdramTiles tiles_;
   Fh1ExecutorCounters counters_;
   std::map<uint32_t, Surface> surfaces_;
+  // Direct-mapped front for FindSurface: map nodes stay put until erased,
+  // and DestroySurface clears it.
+  struct SurfaceFront {
+    uint32_t packed_key = UINT32_MAX;
+    Surface* surface = nullptr;
+  };
+  SurfaceFront surface_front_[16];
   uint32_t scale_ = 1;
   bool initialized_ = false;
 

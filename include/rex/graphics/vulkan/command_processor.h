@@ -11,6 +11,7 @@
  */
 
 #include <array>
+#include <atomic>
 #include <climits>
 #include <cstdint>
 #include <condition_variable>
@@ -141,9 +142,16 @@ class VulkanCommandProcessor : public CommandProcessor {
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking) override;
 
+  // Fixed for the processor's lifetime; cached, since draws ask for it many
+  // times and provider() is virtual.
   ui::vulkan::VulkanDevice* GetVulkanDevice() const {
-    return static_cast<const ui::vulkan::VulkanProvider*>(graphics_system_->provider())
-        ->vulkan_device();
+    ui::vulkan::VulkanDevice* device = vulkan_device_cache_.load(std::memory_order_relaxed);
+    if (!device) {
+      device = static_cast<const ui::vulkan::VulkanProvider*>(graphics_system_->provider())
+                   ->vulkan_device();
+      vulkan_device_cache_.store(device, std::memory_order_relaxed);
+    }
+    return device;
   }
 
   bool CompileGlslToSpirv(VkShaderStageFlagBits stage, std::string_view source,
@@ -1025,6 +1033,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   }
   uint64_t StateMemoKey() const;
   std::unique_ptr<PipelineMemo[]> pipeline_memos_{new PipelineMemo[kStateMemoCount]};
+  mutable std::atomic<ui::vulkan::VulkanDevice*> vulkan_device_cache_{nullptr};
+  // Draws issued since the draw counter was last updated (at each swap): the
+  // counter is a thread-local lookup in another module.
+  uint32_t pending_draw_calls_ = 0;
   // Shader modifications and translations by memo state.
   struct TranslationMemo {
     uint64_t state_epoch = 0;

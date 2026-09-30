@@ -2406,6 +2406,8 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  PERF_counter_add(kDrawCalls, pending_draw_calls_);
+  pending_draw_calls_ = 0;
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
   if (frame_dump_) {
@@ -4609,7 +4611,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
       shader_32bit_index_dma) {
-    PROFILE_DRAW_CALL();
+    ++pending_draw_calls_;
     deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
   } else {
     std::pair<VkBuffer, VkDeviceSize> index_buffer;
@@ -4641,7 +4643,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
             ? VK_INDEX_TYPE_UINT16
             : VK_INDEX_TYPE_UINT32);
-    PROFILE_DRAW_CALL();
+    ++pending_draw_calls_;
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
   }

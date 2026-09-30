@@ -423,6 +423,9 @@ void Fh1NativeExecutor::Shutdown() {
 }
 
 void Fh1NativeExecutor::DestroySurface(Surface& surface) {
+  for (SurfaceFront& front : surface_front_) {
+    front = SurfaceFront();
+  }
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
   const auto& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -467,8 +470,18 @@ uint32_t Fh1NativeExecutor::TransferFlags() const {
 }
 
 Fh1NativeExecutor::Surface* Fh1NativeExecutor::FindSurface(uint32_t packed_key) {
+  SurfaceFront& front = surface_front_[(packed_key ^ (packed_key >> 7) ^ (packed_key >> 15)) &
+                                       (std::size(surface_front_) - 1)];
+  if (front.packed_key == packed_key) {
+    return front.surface;
+  }
   auto it = surfaces_.find(packed_key);
-  return it != surfaces_.end() ? &it->second : nullptr;
+  if (it == surfaces_.end()) {
+    return nullptr;
+  }
+  front.packed_key = packed_key;
+  front.surface = &it->second;
+  return front.surface;
 }
 
 VkImageAspectFlags Fh1NativeExecutor::AspectMask(const Surface& surface) const {
