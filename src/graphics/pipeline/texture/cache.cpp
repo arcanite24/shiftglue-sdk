@@ -33,12 +33,12 @@ REXCVAR_DEFINE_INT32(texture_cache_memory_limit_render_to_texture, 24, "GPU",
     .range(1, 256)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_INT32(texture_cache_memory_limit_soft, 384, "GPU",
+REXCVAR_DEFINE_INT32(texture_cache_memory_limit_soft, 1024, "GPU",
                      "Soft texture cache memory limit (MB)")
     .range(64, 4096)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_INT32(texture_cache_memory_limit_hard, 768, "GPU",
+REXCVAR_DEFINE_INT32(texture_cache_memory_limit_hard, 2048, "GPU",
                      "Hard texture cache memory limit (MB)")
     .range(128, 8192)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
