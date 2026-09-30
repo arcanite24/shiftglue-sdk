@@ -409,6 +409,9 @@ class VulkanPipelineCache {
 
   // Ucode hash -> shader.
   std::unordered_map<uint64_t, VulkanShader*, rex::IdentityHasher<uint64_t>> shaders_;
+  // A direct-mapped front for shaders_: the title reloads the same few
+  // shaders every draw.
+  std::array<std::pair<uint64_t, VulkanShader*>, 64> shader_lookup_memo_ = {};
 
   // Geometry shaders for Xenos primitive types not supported by Vulkan.
   // Stores VK_NULL_HANDLE if failed to create.
