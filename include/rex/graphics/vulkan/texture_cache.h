@@ -211,6 +211,7 @@ class VulkanTextureCache final : public TextureCache {
     }
 
     VkImageView GetView(bool is_signed, uint32_t host_swizzle, bool is_array = true);
+    VkImageView GetViewUncached(bool is_signed, uint32_t host_swizzle, bool is_array);
     VkImageView GetOrCreate3DAs2DImageView(bool is_signed, uint32_t host_swizzle);
 
    private:
@@ -267,6 +268,14 @@ class VulkanTextureCache final : public TextureCache {
     Usage usage_ = Usage::kUndefined;
 
     std::unordered_map<ViewKey, VkImageView, ViewKey::Hasher> views_;
+    // The last view returned per signedness, by its GetView arguments: a
+    // texture is nearly always bound with one swizzle, and views live as long
+    // as the texture.
+    struct LastView {
+      uint32_t arguments = UINT32_MAX;
+      VkImageView view = VK_NULL_HANDLE;
+    };
+    LastView last_views_[2];
     std::unique_ptr<VulkanTexture> texture_3d_as_2d_;
     VkImageView image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
     VkImageView image_view_3d_as_2d_signed_ = VK_NULL_HANDLE;

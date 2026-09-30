@@ -1921,6 +1921,22 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
 
 VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t host_swizzle,
                                                        bool is_array) {
+  LastView& last_view = last_views_[is_signed];
+  const uint32_t arguments = (host_swizzle << 1) | uint32_t(is_array);
+  if (last_view.arguments == arguments) {
+    return last_view.view;
+  }
+  const VkImageView view = GetViewUncached(is_signed, host_swizzle, is_array);
+  if (view != VK_NULL_HANDLE) {
+    last_view.arguments = arguments;
+    last_view.view = view;
+  }
+  return view;
+}
+
+VkImageView VulkanTextureCache::VulkanTexture::GetViewUncached(bool is_signed,
+                                                               uint32_t host_swizzle,
+                                                               bool is_array) {
   xenos::DataDimension dimension = key().dimension;
   if (dimension == xenos::DataDimension::k3D || dimension == xenos::DataDimension::kCube) {
     is_array = false;
