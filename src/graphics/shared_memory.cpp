@@ -488,7 +488,13 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     upload_ranges_.emplace_back(page_start, page_count);
   };
   {
-    auto global_lock = global_critical_region_.Acquire();
+    // No lock: invalidations clear valid bits from guest threads under the
+    // global critical region, and one landing after this read is the same as
+    // one landing right after a locked scan (the draw would use the data
+    // either way; the next request uploads it). Uploads mark pages valid
+    // under the lock, so no invalidation during an upload is lost. The lock
+    // is the process-wide one guest events take, so skipping it here takes
+    // the GPU commands thread out of their contention on every draw.
     for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
       uint32_t page_first = range.first >> page_size_log2_;
       uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
@@ -496,7 +502,8 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
       uint32_t block_last = page_last >> 6;
       uint32_t range_start = UINT32_MAX;
       for (uint32_t i = block_first; i <= block_last; ++i) {
-        uint64_t block_valid = system_page_flags_valid_[i];
+        uint64_t block_valid =
+            reinterpret_cast<const volatile uint64_t&>(system_page_flags_valid_[i]);
         // Consider pages in the block outside the requested range valid.
         if (i == block_first) {
           uint64_t block_before = (uint64_t(1) << (page_first & 63)) - 1;
