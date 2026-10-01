@@ -204,6 +204,50 @@ void LogCapabilityReport(const VulkanInstance* vulkan_instance, VkPhysicalDevice
                                uint32_t(format_properties.optimalTilingFeatures));
   }
   add("formats", format_list + "}");
+
+  // What this device lacks that the renderer would use, and what it does
+  // instead: the reference device's first log answers AP-2.3 and AP-2.4.
+  const auto format_features = [&](VkFormat format) {
+    VkFormatProperties format_properties = {};
+    ifn.vkGetPhysicalDeviceFormatProperties(physical_device, format, &format_properties);
+    return format_properties.optimalTilingFeatures;
+  };
+  constexpr VkFormatFeatureFlags kDepth =
+      VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+  constexpr VkFormatFeatureFlags kGuestOutput =
+      VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+      VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+  std::string missing_list = "[";
+  const auto missing = [&](const char* what, const char* instead) {
+    missing_list += fmt::format("{}{{\"what\":{},\"instead\":{}}}",
+                                missing_list.size() > 1 ? "," : "", quoted(what),
+                                quoted(instead));
+  };
+  const bool depth24 = (format_features(VK_FORMAT_D24_UNORM_S8_UINT) & kDepth) == kDepth;
+  const bool depth32 = (format_features(VK_FORMAT_D32_SFLOAT_S8_UINT) & kDepth) == kDepth;
+  if (!depth24 && !depth32) {
+    missing("D24_UNORM_S8_UINT and D32_SFLOAT_S8_UINT", "nothing: no depth buffer, unsupported");
+  } else if (!depth24) {
+    missing("D24_UNORM_S8_UINT", "24-bit depth kept in D32_SFLOAT_S8_UINT");
+  }
+  if ((format_features(VK_FORMAT_A2B10G10R10_UNORM_PACK32) & kGuestOutput) != kGuestOutput) {
+    missing("A2B10G10R10_UNORM sampled, color and storage",
+            "nothing: the guest output image cannot be created, unsupported");
+  }
+  if (!features.textureCompressionBC) {
+    missing("textureCompressionBC", "BC textures decoded to RGBA8 on the GPU, 4 to 8 times the memory");
+  }
+  if (!features.geometryShader) {
+    missing("geometryShader", "rectangle and point lists expanded in the vertex shader");
+  }
+  if (!features.sparseBinding) {
+    missing("sparseBinding", "shared memory as one 512 MB allocation; resolution scale 1x only");
+  }
+  if (!features.shaderStorageImageMultisample) {
+    missing("shaderStorageImageMultisample",
+            "nothing checks it yet: a candidate for wrong multisampled surfaces");
+  }
+  add("missing", missing_list + "]");
   REXLOG_INFO("VULKAN_CAPABILITY_REPORT {}}}", report);
 }
 
