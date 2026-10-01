@@ -61,6 +61,13 @@ REXCVAR_DEFINE_INT32(
     .range(-1, 32)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(vulkan_async_pipeline_no_placeholder, REX_PLATFORM_ANDROID, "GPU/Vulkan",
+                    "With async_shader_compilation, never build a pipeline on the GPU commands "
+                    "thread nor wait for one: a draw whose pipeline is not ready is skipped (the "
+                    "frame is not shown) until a worker has built it. On a phone a pipeline takes "
+                    "tens of milliseconds to compile, and building a placeholder and then waiting "
+                    "for the real one at every submission froze new scenes for seconds")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -900,6 +907,11 @@ void VulkanPipelineCache::EndSubmission() {
     }
     if (startup_loading) {
       creation_request_cond_.notify_one();
+    } else if (REXCVAR_GET(async_shader_compilation) &&
+               REXCVAR_GET(vulkan_async_pipeline_no_placeholder)) {
+      // Draws whose pipelines are not built yet were skipped, so nothing
+      // recorded waits on the workers.
+      creation_request_cond_.notify_all();
     } else {
       // Help worker threads on the processor thread to reduce warm-up latency.
       CreateQueuedPipelinesOnProcessorThread();
@@ -1250,8 +1262,11 @@ bool VulkanPipelineCache::ConfigurePipeline(
     }
   }
 
+  // Without placeholders, depth-only draws (no pixel shader) are built on the
+  // workers too.
   bool use_async = REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() &&
-                   pixel_shader && placeholder_pixel_shader_ != VK_NULL_HANDLE;
+                   (REXCVAR_GET(vulkan_async_pipeline_no_placeholder) ||
+                    (pixel_shader && placeholder_pixel_shader_ != VK_NULL_HANDLE));
   uint8_t async_priority = pipeline_util::kPriorityLowest;
   if (use_async) {
     uint32_t bound_rts =
@@ -1267,6 +1282,18 @@ bool VulkanPipelineCache::ConfigurePipeline(
   auto it = pipelines_.find(description);
   if (it != pipelines_.end()) {
     VkPipeline found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
+    if (found_pipeline == VK_NULL_HANDLE && use_async &&
+        REXCVAR_GET(vulkan_async_pipeline_no_placeholder) &&
+        it->second.is_placeholder.load(std::memory_order_acquire)) {
+      // A worker is still building it: the caller skips the draw.
+      last_pipeline_ = nullptr;
+      pipeline_out = VK_NULL_HANDLE;
+      pipeline_layout_out = nullptr;
+      if (pipeline_handle_out) {
+        *pipeline_handle_out = &it->second;
+      }
+      return pipeline_handle_out != nullptr;
+    }
     if (found_pipeline == VK_NULL_HANDLE) {
       PipelineCreationArguments creation_arguments;
       if (!TryGetPipelineCreationArgumentsForDescription(description, &*it, creation_arguments) ||
@@ -1296,6 +1323,33 @@ bool VulkanPipelineCache::ConfigurePipeline(
   }
 
   bool queued_async_creation = false;
+  if (use_async && REXCVAR_GET(vulkan_async_pipeline_no_placeholder) && pipeline_handle_out) {
+    creation_arguments_real.priority = async_priority;
+    pipeline.second.is_placeholder.store(true, std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> lock(creation_request_lock_);
+      creation_queue_.push(creation_arguments_real);
+    }
+    creation_request_cond_.notify_one();
+    if (pipeline_storage_file_) {
+      pipeline_storage_file_flush_needed_ = true;
+      {
+        std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+        storage_write_pipeline_queue_.emplace_back();
+        PipelineStoredDescription& stored_description = storage_write_pipeline_queue_.back();
+        stored_description.description_hash = description.GetHash();
+        std::memcpy(&stored_description.description, &description, sizeof(description));
+      }
+      storage_write_request_cond_.notify_all();
+    }
+    // Not last_pipeline_: the next draw with this description must see the
+    // handle again to know whether it is ready.
+    last_pipeline_ = nullptr;
+    pipeline_out = VK_NULL_HANDLE;
+    pipeline_layout_out = nullptr;
+    *pipeline_handle_out = &pipeline.second;
+    return true;
+  }
   if (use_async) {
     creation_arguments_real.priority = async_priority;
     PipelineCreationArguments creation_arguments_placeholder;
@@ -1347,6 +1401,10 @@ bool VulkanPipelineCache::ConfigurePipeline(
 bool VulkanPipelineCache::IsCreatingPipelines() const {
   std::lock_guard<std::mutex> lock(creation_request_lock_);
   if (creation_threads_.empty()) {
+    return startup_loading_;
+  }
+  if (REXCVAR_GET(async_shader_compilation) && REXCVAR_GET(vulkan_async_pipeline_no_placeholder)) {
+    // Nothing recorded uses a pipeline the workers are still building.
     return startup_loading_;
   }
   return startup_loading_ || !creation_queue_.empty() || creation_threads_busy_ != 0;
