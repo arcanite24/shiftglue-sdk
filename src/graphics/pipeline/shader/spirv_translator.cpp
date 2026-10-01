@@ -676,6 +676,16 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
     // Close flow control within the last switch case.
     CloseExecConditionals();
     bool has_main_switch = !current_shader().label_addresses().empty();
+    // The rectangle-list vertex loop (below, after the main loop) continues
+    // it for the next guest vertex, so its edge into the continuation must be
+    // an operand of the program counter OpPhi, which is built first. That
+    // edge leaves from a block made now, whose id the OpPhi can name.
+    spv::Block* rectangle_next_vertex_block = nullptr;
+    if (rectangle_vertex_loop && has_main_switch) {
+      rectangle_next_vertex_block = new spv::Block(builder_->getUniqueId(), *function_main_);
+      main_switch_next_pc_phi_operands_.push_back(const_int_0_);
+      main_switch_next_pc_phi_operands_.push_back(rectangle_next_vertex_block->getId());
+    }
     // After the final exec (if it happened to be not exece, which would already
     // have a break branch), break from the switch if it exists, or from the
     // loop it doesn't.
@@ -953,9 +963,10 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
                                                             var_main_registers_, id_vector_temp_));
         }
 
-        if (has_main_switch) {
-          main_switch_next_pc_phi_operands_.push_back(const_int_0_);
-          main_switch_next_pc_phi_operands_.push_back(builder_->getBuildPoint()->getId());
+        if (rectangle_next_vertex_block) {
+          builder_->createBranch(rectangle_next_vertex_block);
+          function_main_->addBlock(rectangle_next_vertex_block);
+          builder_->setBuildPoint(rectangle_next_vertex_block);
         }
         builder_->createBranch(main_loop_continue_);
       }

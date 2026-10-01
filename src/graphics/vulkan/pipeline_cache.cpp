@@ -1388,6 +1388,11 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
     }
     ObserveTranslation(shader, translation);
   }
+  // As the D3D12 backend does, so a driver's failure on one translation can
+  // be reproduced with spirv-val or replayed elsewhere.
+  if (!REXCVAR_GET(dump_shaders).empty()) {
+    translation.Dump(REXCVAR_GET(dump_shaders), "spirv");
+  }
   if (translation.GetOrCreateShaderModule() == VK_NULL_HANDLE) {
     return false;
   }
