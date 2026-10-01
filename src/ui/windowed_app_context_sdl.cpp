@@ -56,6 +56,13 @@ bool SDLWindowedAppContext::Initialize() {
   }
   const char* video_driver_in_use = SDL_GetCurrentVideoDriver();
   REXLOG_INFO("SDL video driver: {}", video_driver_in_use ? video_driver_in_use : "unknown");
+#if REX_PLATFORM_ANDROID
+  // SDL's Android SDL_WaitEvent pumps with a new poll sentinel on every pass,
+  // and adding it posts a wake to the very thread about to wait, so the UI
+  // thread spun at a full core with no events. Nothing here polls in cycles
+  // (the loop waits), so the sentinel is not needed.
+  SDL_SetEventEnabled(SDL_EVENT_POLL_SENTINEL, false);
+#endif
   uint32_t first = SDL_RegisterEvents(2);
   if (first == 0) {
     REXLOG_ERROR("SDL_RegisterEvents failed: {}", SDL_GetError());
