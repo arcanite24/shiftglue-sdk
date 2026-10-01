@@ -3874,8 +3874,12 @@ void VulkanPipelineCache::CreationThread(size_t thread_index) {
         // Keep the placeholder resident and stop waiting for a real pipeline.
         creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
       } else {
+        // Not pending any more either: without placeholders, draws skip a
+        // pending pipeline and the frame skips its present, so a failure
+        // left pending would stop presenting for good.
         creation_arguments.pipeline->second.pipeline.store(VK_NULL_HANDLE,
                                                            std::memory_order_release);
+        creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
       }
     }
 
@@ -3909,6 +3913,7 @@ void VulkanPipelineCache::CreateQueuedPipelinesOnProcessorThread() {
       } else {
         creation_arguments.pipeline->second.pipeline.store(VK_NULL_HANDLE,
                                                            std::memory_order_release);
+        creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
       }
     }
   }
