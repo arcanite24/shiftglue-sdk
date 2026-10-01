@@ -417,6 +417,29 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
       return;
     }
   }
+
+  // Not a fault any handler expects: give it to whatever was installed before
+  // (a crash reporter), or let the default action end the process when the
+  // instruction faults again. Returning alone would fault forever.
+  const struct sigaction* original = &original_sigsegv_handler_;
+  if (signal_number == SIGILL) {
+    original = &original_sigill_handler_;
+  }
+#if REX_PLATFORM_MAC
+  if (signal_number == SIGBUS) {
+    original = &original_sigbus_handler_;
+  }
+#endif
+  if ((original->sa_flags & SA_SIGINFO) && original->sa_sigaction) {
+    original->sa_sigaction(signal_number, signal_info, signal_context);
+    return;
+  }
+  if (!(original->sa_flags & SA_SIGINFO) && original->sa_handler != SIG_DFL &&
+      original->sa_handler != SIG_IGN && original->sa_handler) {
+    original->sa_handler(signal_number);
+    return;
+  }
+  signal(signal_number, SIG_DFL);
 }
 
 void ExceptionHandler::Install(Handler fn, void* data) {
