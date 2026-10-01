@@ -920,12 +920,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
 #else
     sigval value{};
     value.sival_ptr = this;
-#if REX_PLATFORM_ANDROID
-    int result = sigqueue(pthread_gettid_np(thread_),
-                          GetSystemSignal(SignalType::kThreadUserCallback), value);
-#else
+    // sigqueue takes a process id, so on Android it never reached the thread
+    // (ESRCH): every queued APC, the completion routine of an overlapped
+    // read among them, was dropped. Bionic has pthread_sigqueue from API 29.
     int result = pthread_sigqueue(thread_, GetSystemSignal(SignalType::kThreadUserCallback), value);
-#endif
 #endif
     if (result != 0) {
       REXSYS_WARN("QueueUserCallback: signal delivery failed ({})", result);
