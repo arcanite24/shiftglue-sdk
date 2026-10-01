@@ -1057,6 +1057,14 @@ class PosixCondition<Thread> : public PosixConditionBase {
   static void* ThreadStartRoutine(void* parameter);
   inline bool signaled() const override { return signaled_; }
   inline void post_execution() override {
+    // Every satisfied wait on an exited thread lands here (under mutex_);
+    // reap it once. Joining twice is undefined, and bionic aborts on it
+    // ("invalid pthread_t passed to pthread_join") when a guest waits on the
+    // same thread handle again.
+    if (reaped_) {
+      return;
+    }
+    reaped_ = true;
     if (thread_) {
       pthread_join(thread_, nullptr);
     }
@@ -1070,6 +1078,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
 #endif
   }
   pthread_t thread_;
+  bool reaped_ = false;
   bool signaled_;
   int exit_code_;
   State state_;             // Protected by state_mutex_
