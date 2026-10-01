@@ -406,6 +406,27 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     // clears the watch we just hit).
     // Do this under the lock so we don't introduce another race condition.
     auto lock = global_critical_region_.Acquire();
+#if REX_PLATFORM_LINUX
+    // QueryProtect parses /proc/self/maps as text on Linux and Android, and on
+    // a phone that took three quarters of the title's busiest thread at every
+    // write-watch fault. The callback settles a watch from the heaps' own
+    // records, including one another thread cleared meanwhile, so the maps
+    // are read only for a fault it does not handle.
+    if (access_violation_callback_) {
+      if (access_violation_callback_(std::move(lock), access_violation_callback_context_,
+                                     fault_host_address, is_write)) {
+        return true;
+      }
+      lock = global_critical_region_.Acquire();
+    }
+    {
+      memory::PageAccess unhandled_access;
+      size_t unhandled_length = memory::page_size();
+      memory::QueryProtect(fault_host_address, unhandled_length, unhandled_access);
+      return unhandled_access != memory::PageAccess::kNoAccess &&
+             (!is_write || unhandled_access != memory::PageAccess::kReadOnly);
+    }
+#endif
     memory::PageAccess cur_access;
     size_t page_length = memory::page_size();
     memory::QueryProtect(fault_host_address, page_length, cur_access);
