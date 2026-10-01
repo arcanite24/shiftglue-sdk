@@ -13,8 +13,9 @@
 #include <cstring>
 #include <utility>
 
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC || REX_PLATFORM_LINUX
 #include <sys/mman.h>
+#include <cerrno>
 #endif
 
 #include <fmt/format.h>
@@ -153,10 +154,12 @@ bool Memory::Initialize() {
     return false;
   }
 
-#if REX_PLATFORM_MAC
-  // On macOS, reserve a contiguous host range first, then carve guest views
-  // into it with MAP_SHARED|MAP_FIXED so all views share the same backing fd.
-  if (MapViewsMac()) {
+#if REX_PLATFORM_MAC || REX_PLATFORM_LINUX
+  // Reserve a contiguous host range first, then carve guest views into it with
+  // MAP_SHARED|MAP_FIXED so all views share the same backing fd. MAP_FIXED at a
+  // guessed address would silently replace whatever is mapped there (on
+  // Android, the linker's or the runtime's own mappings).
+  if (MapViewsReserved()) {
     REXSYS_ERROR("Unable to find a continuous block in the 64bit address space.");
     assert_always();
     return false;
@@ -317,20 +320,20 @@ static const struct {
         0x0000000100000000ull,
     },
 };
-#if REX_PLATFORM_MAC
-int Memory::MapViewsMac() {
+#if REX_PLATFORM_MAC || REX_PLATFORM_LINUX
+int Memory::MapViewsReserved() {
   assert_true(rex::countof(map_info) == rex::countof(views_.all_views));
 
-  // macOS does not guarantee that a non-MAP_FIXED mmap will honor a requested
-  // address. Reserve a contiguous range first, then MAP_FIXED each view within
-  // it so the guest layout is stable across runs.
+  // A non-MAP_FIXED mmap need not honor a requested address. Reserve a
+  // contiguous range first, then MAP_FIXED each view within it so the guest
+  // layout is stable across runs.
   const size_t total_size =
       static_cast<size_t>(map_info[rex::countof(map_info) - 1].virtual_address_end -
                           map_info[0].virtual_address_start + 1);
 
   void* reserved_base = mmap(nullptr, total_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (reserved_base == MAP_FAILED) {
-    REXSYS_ERROR("MapViewsMac: reserve failed: {}", std::strerror(errno));
+    REXSYS_ERROR("MapViewsReserved: reserve failed: {}", std::strerror(errno));
     return 1;
   }
 
@@ -347,7 +350,7 @@ int Memory::MapViewsMac() {
     if (result == MAP_FAILED || result != target_address) {
       int err = errno;
       REXSYS_ERROR(
-          "MapViewsMac: map failed view {} addr 0x{:016X} size 0x{:X} offset 0x{:X} err {} ({})", n,
+          "MapViewsReserved: map failed view {} addr 0x{:016X} size 0x{:X} offset 0x{:X} err {} ({})", n,
           reinterpret_cast<uintptr_t>(target_address), view_size, file_offset, err,
           std::strerror(err));
       munmap(reserved_base, total_size);
@@ -361,7 +364,7 @@ int Memory::MapViewsMac() {
 
   return 0;
 }
-#endif  // REX_PLATFORM_MAC
+#endif  // REX_PLATFORM_MAC || REX_PLATFORM_LINUX
 
 int Memory::MapViews(uint8_t* mapping_base) {
   assert_true(rex::countof(map_info) == rex::countof(views_.all_views));

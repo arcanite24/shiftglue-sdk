@@ -588,8 +588,8 @@ class Memory {
   bool HasAnyFunctionTable() const;
 
  private:
-#if REX_PLATFORM_MAC
-  int MapViewsMac();
+#if REX_PLATFORM_MAC || REX_PLATFORM_LINUX
+  int MapViewsReserved();
 #endif
   int MapViews(uint8_t* mapping_base);
   void UnmapViews();

@@ -34,9 +34,31 @@
 #include <shellapi.h>
 #endif
 
+#if REX_PLATFORM_ANDROID
+// SDL's activity loads the app as libmain.so and calls SDL_main, which this
+// header names main.
+#include <SDL3/SDL_main.h>
+
+#include <SDL3/SDL_system.h>
+
+#include <rex/platform/env.h>
+#include <rex/system.h>
+#endif
+
 namespace {
 
 int RunWindowedApp(int argc, char** argv) {
+#if REX_PLATFORM_ANDROID
+  // GetUserFolder and the logs need a home; an app has only its own storage.
+  if (!rex::platform::env::get("HOME")) {
+    if (const char* files = SDL_GetAndroidInternalStoragePath()) {
+      setenv("HOME", files, 0);
+    }
+  }
+  if (!rex::InitializeAndroidSystemForApplicationContext()) {
+    return EXIT_FAILURE;
+  }
+#endif
   auto remaining = rex::cvar::Init(argc, argv);
   rex::cvar::ApplyEnvironment();
   rex::InitLoggingEarly();
@@ -73,6 +95,9 @@ int RunWindowedApp(int argc, char** argv) {
 
 #if REX_PLATFORM_WIN32
   CoUninitialize();
+#endif
+#if REX_PLATFORM_ANDROID
+  rex::ShutdownAndroidSystem();
 #endif
 
   return result;

@@ -24,9 +24,11 @@
 #include <rex/platform.h>
 #include <rex/ui/windowed_app_context.h>
 
-#if REX_PLATFORM_ANDROID
-// Multiple apps in a single library instead of separate executables.
-#define XE_UI_WINDOWED_APPS_IN_LIBRARY 1
+// Xenia built several apps into one Android library and picked one by name;
+// a ReXGlue app is one game per package, so Android uses the same single
+// creator as every other platform (its SDL_main is in libmain.so).
+#ifndef XE_UI_WINDOWED_APPS_IN_LIBRARY
+#define XE_UI_WINDOWED_APPS_IN_LIBRARY 0
 #endif
 
 namespace rex {

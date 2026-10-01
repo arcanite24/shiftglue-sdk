@@ -26,6 +26,10 @@
 
 #include <rex/assert.h>
 #include <rex/filesystem.h>
+
+#if REX_PLATFORM_ANDROID
+#include <dlfcn.h>
+#endif
 #include <rex/logging.h>
 #include <rex/platform/env.h>
 #include <rex/string.h>
@@ -91,6 +95,15 @@ std::filesystem::path GetExecutablePath() {
   std::error_code ec;
   std::filesystem::path canonical_path = std::filesystem::weakly_canonical(executable_path, ec);
   return ec ? std::filesystem::path(executable_path) : canonical_path;
+#elif REX_PLATFORM_ANDROID
+  // The process is app_process64; the app's code is the shared libraries in
+  // its native library folder, which is where plugins and modules are found.
+  // This library is one of them.
+  Dl_info info{};
+  if (dladdr(reinterpret_cast<const void*>(&GetExecutablePath), &info) && info.dli_fname) {
+    return std::filesystem::path(info.dli_fname);
+  }
+  return {};
 #else
   char buff[FILENAME_MAX] = "";
   readlink("/proc/self/exe", buff, FILENAME_MAX);

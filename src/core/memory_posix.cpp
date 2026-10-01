@@ -45,21 +45,14 @@
 #define rex_ftruncate64 ftruncate64
 #endif
 
-#if REX_PLATFORM_ANDROID
-#include <string.h>
-
-#include <dlfcn.h>
-#include <sys/ioctl.h>
-
-#include <linux/ashmem.h>
-
-// TODO(tomc): Android or maybe na. idk
-// #include "xenia/base/main_android.h"
+#if REX_PLATFORM_LINUX
+#include <sys/mman.h>  // memfd_create
 #endif
 
 namespace rex {
 namespace memory {
 
+#if !REX_PLATFORM_LINUX
 // Convert a filesystem path to a valid shm_open name (must start with /, no other slashes).
 // macOS enforces a 31-character total limit, so long names are folded from the full path rather
 // than only the filename. This keeps equal filenames in different directories distinct.
@@ -83,32 +76,13 @@ static std::string MakeShmName(const std::filesystem::path& path) {
 #endif
   return name;
 }
+#endif  // !REX_PLATFORM_LINUX
 
 #if REX_PLATFORM_ANDROID
-// May be null if no dynamically loaded functions are required.
-static void* libandroid_;
-// API 26+.
-static int (*android_ASharedMemory_create_)(const char* name, size_t size);
-
-void AndroidInitialize() {
-  if (rex::GetAndroidApiLevel() >= 26) {
-    libandroid_ = dlopen("libandroid.so", RTLD_NOW);
-    assert_not_null(libandroid_);
-    if (libandroid_) {
-      android_ASharedMemory_create_ = reinterpret_cast<decltype(android_ASharedMemory_create_)>(
-          dlsym(libandroid_, "ASharedMemory_create"));
-      assert_not_null(android_ASharedMemory_create_);
-    }
-  }
-}
-
-void AndroidShutdown() {
-  android_ASharedMemory_create_ = nullptr;
-  if (libandroid_) {
-    dlclose(libandroid_);
-    libandroid_ = nullptr;
-  }
-}
+// Shared memory is a memfd (API 30+, below the supported minimum), so there
+// is nothing to load.
+void AndroidInitialize() {}
+void AndroidShutdown() {}
 #endif
 
 size_t page_size() {
@@ -431,29 +405,26 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
 
 FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, size_t length,
                                           PageAccess access, bool commit) {
-#if REX_PLATFORM_ANDROID
-  // TODO(Triang3l): Check if memfd can be used instead on API 30+.
-  if (android_ASharedMemory_create_) {
-    int sharedmem_fd = android_ASharedMemory_create_(path.c_str(), length);
-    return sharedmem_fd >= 0 ? static_cast<FileMappingHandle>(sharedmem_fd)
-                             : kFileMappingHandleInvalid;
-  }
-
-  // Use /dev/ashmem on API versions below 26, which added ASharedMemory.
-  // /dev/ashmem was disabled on API 29 for apps targeting it.
-  // https://chromium.googlesource.com/chromium/src/+/master/third_party/ashmem/ashmem-dev.c
-  int ashmem_fd = open("/" ASHMEM_NAME_DEF, O_RDWR);
-  if (ashmem_fd < 0) {
+  (void)commit;
+  if (access != PageAccess::kNoAccess && access != PageAccess::kReadOnly &&
+      access != PageAccess::kExecuteReadOnly && access != PageAccess::kReadWrite &&
+      access != PageAccess::kExecuteReadWrite) {
+    assert_always();
     return kFileMappingHandleInvalid;
   }
-  char ashmem_name[ASHMEM_NAME_LEN];
-  strlcpy(ashmem_name, path.c_str(), rex::countof(ashmem_name));
-  if (ioctl(ashmem_fd, ASHMEM_SET_NAME, ashmem_name) < 0 ||
-      ioctl(ashmem_fd, ASHMEM_SET_SIZE, length) < 0) {
-    close(ashmem_fd);
+#if REX_PLATFORM_LINUX
+  // An anonymous memfd: nothing named outlives a crash (shm_open names stay in
+  // /dev/shm), and Android apps have neither /dev/shm nor, since API 29,
+  // ashmem. The views decide their own protection.
+  int fd = memfd_create(path.filename().c_str(), MFD_CLOEXEC);
+  if (fd < 0) {
     return kFileMappingHandleInvalid;
   }
-  return static_cast<FileMappingHandle>(ashmem_fd);
+  if (rex_ftruncate64(fd, static_cast<off_t>(length)) != 0) {
+    close(fd);
+    return kFileMappingHandleInvalid;
+  }
+  return static_cast<FileMappingHandle>(fd);
 #else
   int oflag;
   switch (access) {
@@ -464,13 +435,9 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
     case PageAccess::kExecuteReadOnly:
       oflag = O_RDONLY;
       break;
-    case PageAccess::kReadWrite:
-    case PageAccess::kExecuteReadWrite:
+    default:
       oflag = O_RDWR;
       break;
-    default:
-      assert_always();
-      return kFileMappingHandleInvalid;
   }
   oflag |= O_CREAT;
   auto full_path = MakeShmName(path);
@@ -489,12 +456,13 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
 
 void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path) {
   close(static_cast<int>(handle));
-#if !REX_PLATFORM_ANDROID
+#if !REX_PLATFORM_LINUX
   auto full_path = MakeShmName(path);
   shm_unlink(full_path.c_str());
+#else
+  (void)path;
 #endif
 }
-
 void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, PageAccess access,
                   size_t file_offset) {
   // file_offset must be page-aligned

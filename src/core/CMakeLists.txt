@@ -74,6 +74,9 @@ elseif(UNIX)
         system_posix.cpp
         threading_posix.cpp
     )
+    if(ANDROID)
+        target_sources(rexcore PRIVATE system_android.cpp)
+    endif()
 endif()
 
 # Xenos data-format layer (stateless; headers under include/rex/graphics/).
@@ -102,6 +105,9 @@ if(WIN32)
     target_link_libraries(rexcore PUBLIC ws2_32 advapi32)
 elseif(APPLE)
     target_link_libraries(rexcore PRIVATE pthread)
+elseif(ANDROID)
+    # Bionic has pthreads and rt in libc.
+    target_link_libraries(rexcore PRIVATE dl log android)
 elseif(UNIX)
     target_link_libraries(rexcore PRIVATE pthread rt dl)
 endif()
