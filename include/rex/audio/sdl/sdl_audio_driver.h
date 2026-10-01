@@ -11,9 +11,11 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <queue>
 #include <stack>
+#include <thread>
 
 #include <rex/audio/audio_driver.h>
 #include <rex/thread.h>
@@ -34,6 +36,15 @@ class SDLAudioDriver : public AudioDriver {
  protected:
   static void SDLCallback(void* userdata, SDL_AudioStream* stream, int additional_amount,
                           int total_amount);
+  bool OpenDevice();
+  // Without a device (none present, or one that refuses to open, such as a
+  // display's speakers in standby) frames are consumed in silence at the
+  // device rate, so the title's audio clock keeps running.
+  void StartSilentOutput();
+  void SilentOutputThread();
+
+  std::thread silent_thread_;
+  std::atomic<bool> silent_running_{false};
 
   rex::thread::Semaphore* semaphore_ = nullptr;
 

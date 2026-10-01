@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 
 #include <rex/assert.h>
@@ -45,10 +46,21 @@ bool SDLAudioDriver::Initialize() {
 
   if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
     REXAPU_ERROR("SDL_InitSubSystem(SDL_INIT_AUDIO) failed: {}", SDL_GetError());
-    return false;
+    StartSilentOutput();
+    return true;
   }
   sdl_initialized_ = true;
+  if (!OpenDevice()) {
+    if (sdl_stream_) {
+      SDL_DestroyAudioStream(sdl_stream_);
+      sdl_stream_ = nullptr;
+    }
+    StartSilentOutput();
+  }
+  return true;
+}
 
+bool SDLAudioDriver::OpenDevice() {
   SDL_AudioSpec desired_spec = {};
   SDL_AudioSpec obtained_spec = {};
   desired_spec.freq = frame_frequency_;
@@ -138,7 +150,41 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
   }
 }
 
+void SDLAudioDriver::StartSilentOutput() {
+  REXAPU_WARN("No audio output device could be opened; the game runs without sound");
+  sdl_device_channels_ = 2;
+  silent_running_ = true;
+  silent_thread_ = std::thread(&SDLAudioDriver::SilentOutputThread, this);
+}
+
+void SDLAudioDriver::SilentOutputThread() {
+  // One frame is channel_samples_ samples at frame_frequency_ per channel.
+  const auto period = std::chrono::nanoseconds(uint64_t(channel_samples_) * 1000000000ull /
+                                               frame_frequency_);
+  auto next = std::chrono::steady_clock::now();
+  while (silent_running_.load(std::memory_order_acquire)) {
+    next += period;
+    std::this_thread::sleep_until(next);
+    float* buffer = nullptr;
+    {
+      std::unique_lock<std::mutex> guard(frames_mutex_);
+      if (!frames_queued_.empty()) {
+        buffer = frames_queued_.front();
+        frames_queued_.pop();
+        frames_unused_.push(buffer);
+      }
+    }
+    if (buffer) {
+      semaphore_->Release(1, nullptr);
+    }
+  }
+}
+
 void SDLAudioDriver::Shutdown() {
+  if (silent_thread_.joinable()) {
+    silent_running_ = false;
+    silent_thread_.join();
+  }
   if (sdl_stream_) {
     SDL_DestroyAudioStream(sdl_stream_);
     sdl_stream_ = nullptr;
