@@ -19,8 +19,11 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <cstddef>
 #include <ctime>
 #include <deque>
+#include <fstream>
 #include <limits>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include <pthread.h>
 #include <semaphore.h>
@@ -188,6 +191,49 @@ void EnableAffinityConfiguration() {}
 uint64_t GuestCpuAffinityMask(uint8_t) {
   return 0;
 }
+
+#if !defined(__APPLE__)
+namespace {
+// The cores whose capacity (the kernel's relative performance, 1024 for the
+// fastest) is at least half the largest: on a phone with prime, big and
+// little clusters (Snapdragon 8 Gen 2: 1 + 4 + 3), the prime and big cores.
+// Zero when every core is alike or the kernel does not say.
+uint64_t PerformanceCoreMask() {
+  static const uint64_t mask = [] {
+    std::vector<uint32_t> capacities;
+    for (uint32_t cpu = 0; cpu < 64; ++cpu) {
+      std::ifstream file("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/cpu_capacity");
+      uint32_t capacity = 0;
+      if (!(file >> capacity)) {
+        break;
+      }
+      capacities.push_back(capacity);
+    }
+    if (capacities.empty()) {
+      return uint64_t(0);
+    }
+    const auto [smallest, largest] = std::minmax_element(capacities.begin(), capacities.end());
+    std::string listing;
+    for (uint32_t capacity : capacities) {
+      listing += (listing.empty() ? "" : " ") + std::to_string(capacity);
+    }
+    if (*smallest == *largest) {
+      REXSYS_INFO("CPU capacities: {} (all alike, no core preference)", listing);
+      return uint64_t(0);
+    }
+    uint64_t result = 0;
+    for (size_t cpu = 0; cpu < capacities.size(); ++cpu) {
+      if (capacities[cpu] * 2 >= *largest) {
+        result |= uint64_t(1) << cpu;
+      }
+    }
+    REXSYS_INFO("CPU capacities: {}; latency-critical threads on cores {:#x}", listing, result);
+    return result;
+  }();
+  return mask;
+}
+}  // namespace
+#endif
 
 // uint64_t ticks() { return mach_absolute_time(); }
 
@@ -1427,6 +1473,19 @@ class PosixThread : public PosixConditionHandle<Thread> {
 
   uint64_t affinity_mask() override { return handle_.affinity_mask(); }
   void set_affinity_mask(uint64_t mask) override { handle_.set_affinity_mask(mask); }
+
+#if !defined(__APPLE__)
+  // A hard affinity, unlike Windows' CPU sets: the little cores of a phone
+  // run a recorder or a simulation step two to three times slower.
+  bool PreferPerformanceCores() override {
+    const uint64_t mask = PerformanceCoreMask();
+    if (!mask) {
+      return false;
+    }
+    handle_.set_affinity_mask(mask);
+    return true;
+  }
+#endif
 
   int priority() override { return handle_.priority(); }
   void set_priority(int new_priority) override { handle_.set_priority(new_priority); }
