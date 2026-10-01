@@ -27,6 +27,7 @@
 #include <cstring>
 #include <utility>
 #include <vector>
+#include <chrono>
 
 #include <rex/assert.h>
 #include <rex/graphics/fh1_frame_dump.h>
@@ -581,6 +582,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   void BeginFrameGpuTiming();
   void EndFrameGpuTiming();
   void ReadFrameGpuTiming();
+  // Every vulkan_memory_budget_log_seconds: each heap's usage against its
+  // budget (VK_EXT_memory_budget), the texture cache and the resident size.
+  void LogMemoryBudget();
+  std::chrono::steady_clock::time_point memory_budget_logged_{};
+  std::vector<uint64_t> memory_heap_peak_;
+  uint64_t memory_resident_peak_ = 0;
   // Keep primary-buffer-end submit behavior aligned with D3D12: only submit
   // when immediate submission is safe.
   bool CanEndSubmissionImmediately() const;

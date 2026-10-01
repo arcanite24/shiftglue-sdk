@@ -12,7 +12,9 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iterator>
 #include <mutex>
 #include <string>
@@ -110,6 +112,11 @@ REXCVAR_DEFINE_BOOL(vulkan_fh1_native_executor, true, "GPU/Vulkan",
                     "and resolves over native surfaces) instead of the generic render "
                     "target cache; needs dynamic rendering")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(vulkan_memory_budget_log_seconds, REX_PLATFORM_ANDROID ? 30 : 0, "GPU/Vulkan",
+                     "Log each memory heap's usage against its budget, the texture cache and "
+                     "the resident size, with their peaks, this often (0: never)")
+    .range(0, 3600)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                     "device (falls back to render passes otherwise)")
@@ -656,6 +663,59 @@ void VulkanCommandProcessor::ClearCaches() {
   CommandProcessor::ClearCaches();
   InvalidateAllVertexBufferResidency();
   cache_clear_requested_ = true;
+}
+
+void VulkanCommandProcessor::LogMemoryBudget() {
+  const int32_t interval = REXCVAR_GET(vulkan_memory_budget_log_seconds);
+  if (interval <= 0) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (now - memory_budget_logged_ < std::chrono::seconds(interval)) {
+    return;
+  }
+  memory_budget_logged_ = now;
+
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanInstance* const vulkan_instance = vulkan_device->vulkan_instance();
+  std::string heaps;
+  if (vulkan_device->extensions().ext_EXT_memory_budget &&
+      vulkan_instance->extensions().ext_1_1_KHR_get_physical_device_properties2) {
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 properties = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    properties.pNext = &budget;
+    vulkan_instance->functions().vkGetPhysicalDeviceMemoryProperties2(
+        vulkan_device->physical_device(), &properties);
+    const uint32_t heap_count = properties.memoryProperties.memoryHeapCount;
+    memory_heap_peak_.resize(heap_count);
+    for (uint32_t i = 0; i < heap_count; ++i) {
+      memory_heap_peak_[i] = std::max(memory_heap_peak_[i], uint64_t(budget.heapUsage[i]));
+      heaps += fmt::format(
+          "{}heap {}{}: {} of {} MB (peak {})", heaps.empty() ? "" : "; ", i,
+          (properties.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+              ? " device"
+              : "",
+          budget.heapUsage[i] >> 20, budget.heapBudget[i] >> 20, memory_heap_peak_[i] >> 20);
+    }
+  } else {
+    heaps = "no VK_EXT_memory_budget";
+  }
+  uint64_t resident = 0;
+#if REX_PLATFORM_LINUX
+  std::ifstream status("/proc/self/status");
+  for (std::string line; std::getline(status, line);) {
+    if (line.rfind("VmRSS:", 0) == 0) {
+      resident = std::strtoull(line.c_str() + 6, nullptr, 10) << 10;
+      break;
+    }
+  }
+#endif
+  memory_resident_peak_ = std::max(memory_resident_peak_, resident);
+  REXGPU_INFO("Memory: {}; textures {} MB; resident {} MB (peak {})", heaps,
+              texture_cache_ ? texture_cache_->total_host_memory_usage() >> 20 : 0,
+              resident >> 20, memory_resident_peak_ >> 20);
 }
 
 void VulkanCommandProcessor::OnReduceMemory() {
@@ -6209,6 +6269,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     frame_open_ = false;
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kMaxFramesInFlight] = GetCurrentSubmission() - 1;
+    LogMemoryBudget();
 
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
       cache_clear_requested_ = false;
