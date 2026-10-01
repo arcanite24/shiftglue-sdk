@@ -12,6 +12,7 @@
 #include <string_view>
 
 #include <rex/logging.h>
+#include <rex/graphics/null/graphics_system.h>
 #include <rex/system/gpu_plugin.h>
 
 #if REX_HAS_D3D12
@@ -38,6 +39,10 @@ extern "C" REX_GPU_PLUGIN_EXPORT rex::system::IGraphicsSystem* rex_gpu_create(
   }
 
   std::string_view backend = info->backend ? info->backend : "any";
+  // Only on request: "any" means a backend that draws.
+  if (backend == "null") {
+    return new rex::graphics::null::NullGraphicsSystem();
+  }
 #if REX_HAS_D3D12
   if (backend == "any" || backend == "d3d12") {
     return new rex::graphics::d3d12::D3D12GraphicsSystem();

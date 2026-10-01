@@ -28,6 +28,9 @@ set(REXGPU_XENOS_SOURCES
     shared_memory.cpp
     pipeline/texture/cache.cpp
     pipeline/shader/interpreter.cpp
+
+    # Null backend (gpu_backend=null): packets without a device
+    null/graphics_system.cpp
 )
 
 set(REXGPU_FH1_SHADER_ANALYSIS_SOURCES

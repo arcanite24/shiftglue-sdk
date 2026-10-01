@@ -40,6 +40,8 @@ enum class NativeGuestOutputBackend : uint32_t {
   kUnsupported = 0,
   kD3D12 = 1,
   kVulkan = 2,
+  // No device: the null backend's swaps (no image, device or context).
+  kNull = 3,
 };
 
 enum class NativeGuestOutputPhase : uint32_t {
@@ -49,8 +51,10 @@ enum class NativeGuestOutputPhase : uint32_t {
 
 // Which renderer produced the guest output of a kPresented notification.
 enum class NativeGuestOutputPresenter : uint32_t {
-  // The FH1 native executor, the only renderer.
+  // The FH1 native executor, the only drawing renderer.
   kNativeExecutor = 2,
+  // The null backend, which draws nothing.
+  kNull = 3,
 };
 
 struct NativeGuestOutputRenderContext {
