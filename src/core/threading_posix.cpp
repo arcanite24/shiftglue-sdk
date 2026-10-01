@@ -963,6 +963,14 @@ class PosixCondition<Thread> : public PosixConditionBase {
       return;
     }
 
+    // A thread that has finished cannot run the callback, and its pthread_t
+    // may already be gone: bionic aborts the process on a stale one (every
+    // route ended in a crash dump at shutdown). The thread marks itself
+    // finished under state_mutex_, so it stays alive while this is held.
+    std::unique_lock<std::mutex> state_lock(state_mutex_);
+    if (state_ == State::kFinished) {
+      return;
+    }
 #if defined(__APPLE__)
     // macOS has no sigqueue/pthread_sigqueue; pthread_kill delivers the signal
     // without the sigval payload.
