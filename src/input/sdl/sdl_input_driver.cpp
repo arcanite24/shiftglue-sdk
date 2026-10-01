@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
 #include <array>
 #include <filesystem>
 
@@ -669,10 +670,22 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
 }
 
 void SDLInputDriver::QueueControllerUpdate() {
-  // Pump SDL events to ensure controller state is up to date.
+  // Pump SDL events to ensure controller state is up to date, at most every
+  // 4 ms: the title polls from several threads many times a frame, and a pump
+  // queued again as soon as the last ended kept the UI thread busy for a whole
+  // core on Android, where every pump goes through the activity lifecycle
+  // semaphores. 250 pumps a second still outpace any display.
+  constexpr int64_t kMinimumPumpIntervalNs = 4000000;
+  const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+  if (now - sdl_pumpevents_last_ns_.load(std::memory_order_relaxed) < kMinimumPumpIntervalNs) {
+    return;
+  }
   bool is_queued = false;
   sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);
   if (!is_queued) {
+    sdl_pumpevents_last_ns_.store(now, std::memory_order_relaxed);
     attached_window_->app_context().CallInUIThread([this]() {
       SDL_PumpEvents();
       sdl_pumpevents_queued_ = false;
