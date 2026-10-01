@@ -39,6 +39,7 @@
 // header names main.
 #include <SDL3/SDL_main.h>
 
+#include <SDL3/SDL_hints.h>
 #include <SDL3/SDL_system.h>
 
 #include <rex/platform/env.h>
@@ -58,6 +59,9 @@ int RunWindowedApp(int argc, char** argv) {
   if (!rex::InitializeAndroidSystemForApplicationContext()) {
     return EXIT_FAILURE;
   }
+  // SDL otherwise picks the orientation from the window's shape and
+  // overrides the manifest; the title is 16:9 only.
+  SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
 #endif
   auto remaining = rex::cvar::Init(argc, argv);
   rex::cvar::ApplyEnvironment();

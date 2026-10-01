@@ -42,6 +42,9 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 #include <sched.h>
 
+#include <algorithm>
+#include <sys/resource.h>
+
 #if REX_PLATFORM_ANDROID
 #include <dlfcn.h>
 
@@ -684,6 +687,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
       pthread_attr_destroy(&attr);
       return false;
     }
+#if !REX_PLATFORM_ANDROID
+    // Android apps may not use SCHED_FIFO; set_priority maps to nice there.
     if (params.initial_priority != 0) {
       sched_param sched{};
       sched.sched_priority = params.initial_priority + 1;
@@ -696,6 +701,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
         return false;
       }
     }
+#endif
     if (pthread_create(&thread_, &attr, ThreadStartRoutine, start_data) != 0) {
       pthread_attr_destroy(&attr);
       return false;
@@ -862,6 +868,16 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
   void set_priority(int new_priority) {
     WaitStarted();
+#if REX_PLATFORM_ANDROID
+    // Real-time policies are refused to apps, but Android lets an app lower
+    // its threads' nice value; the guest's priorities (THREAD_PRIORITY_*,
+    // up to 15 for time critical) map to nice -10 (most urgent) .. +4.
+    const int nice = std::clamp(-2 * new_priority, -10, 4);
+    if (setpriority(PRIO_PROCESS, pthread_gettid_np(thread_), nice) != 0) {
+      REXSYS_WARN("set_priority: setpriority({}) failed ({})", nice, errno);
+    }
+    return;
+#endif
     sched_param param{};
     param.sched_priority = new_priority;
     int result = pthread_setschedparam(thread_, SCHED_FIFO, &param);
