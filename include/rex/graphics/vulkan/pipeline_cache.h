@@ -447,6 +447,15 @@ class VulkanPipelineCache {
   // Currently open shader storage path.
   std::filesystem::path shader_storage_cache_root_;
   uint32_t shader_storage_title_id_ = 0;
+  // The driver's own pipeline cache (AP-2.6): kept beside the shader
+  // storage, so a restart does not compile the title's pipelines again.
+  VkPipelineCache vk_pipeline_cache_ = VK_NULL_HANDLE;
+  std::filesystem::path vk_pipeline_cache_path_;
+  std::atomic<uint64_t> vk_pipeline_cache_creations_{0};
+  uint64_t vk_pipeline_cache_saved_creations_ = 0;
+  uint64_t vk_pipeline_cache_saved_time_ms_ = 0;
+  void LoadVkPipelineCache();
+  void SaveVkPipelineCache();
 
   // Shader storage output stream, for preload in the next emulator runs.
   FILE* shader_storage_file_ = nullptr;
