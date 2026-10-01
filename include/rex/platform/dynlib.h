@@ -31,6 +31,11 @@ class DynamicLibrary {
   DynamicLibrary& operator=(DynamicLibrary&& other) noexcept;
 
   bool Load(const std::filesystem::path& path, SymbolResolution mode = SymbolResolution::kLazy);
+  // Takes ownership of a handle opened elsewhere (such as by libadrenotools).
+  void Adopt(void* handle) {
+    Close();
+    handle_ = handle;
+  }
   void Close();
   explicit operator bool() const { return handle_ != nullptr; }
 

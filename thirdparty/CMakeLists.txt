@@ -304,6 +304,17 @@ endif()
 add_subdirectory(sdl3)
 
 #=============================================================================
+# libadrenotools (Android): custom Vulkan drivers such as Mesa Turnip, and the
+# Adreno GPU's clocks. Its hooks are shared libraries packaged beside the game.
+#=============================================================================
+if(ANDROID)
+    if(NOT CMAKE_ANDROID_ARCH_ABI)
+        set(CMAKE_ANDROID_ARCH_ABI ${ANDROID_ABI})
+    endif()
+    add_subdirectory(libadrenotools EXCLUDE_FROM_ALL)
+endif()
+
+#=============================================================================
 # DXC API headers (vendored from DirectXShaderCompiler, runtime-loaded)
 #=============================================================================
 if(REXGLUE_USE_D3D12)

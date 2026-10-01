@@ -41,6 +41,7 @@ set(REXUI_VULKAN_SOURCES
     vulkan/vulkan_device.cpp
     vulkan/vulkan_immediate_drawer.cpp
     vulkan/vulkan_instance.cpp
+    $<$<BOOL:${ANDROID}>:vulkan/android_gpu_driver.cpp>
     vulkan/vulkan_mem_alloc.cpp
     vulkan/vulkan_presenter.cpp
     vulkan/vulkan_provider.cpp
@@ -157,6 +158,9 @@ endif()
 # Platform-specific dependencies
 if(ANDROID)
     target_link_libraries(rexui PUBLIC android)
+    target_link_libraries(rexui PRIVATE adrenotools)
+    # Loaded from the native library folder at run time, not linked.
+    add_dependencies(rexui main_hook file_redirect_hook gsl_alloc_hook hook_impl)
 elseif(UNIX AND NOT APPLE)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(X11_XCB REQUIRED x11-xcb)

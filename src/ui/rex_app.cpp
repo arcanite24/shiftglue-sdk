@@ -42,6 +42,9 @@
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/keybinds.h>
 #include <rex/version.h>
+#if REX_PLATFORM_ANDROID
+#include <rex/ui/vulkan/android_gpu_driver.h>
+#endif
 
 #include <fmt/format.h>
 #include <imgui.h>
@@ -325,10 +328,16 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
         if (audio) audio->Pause();
         if (graphics) graphics->Pause();
         rex::chrono::Clock::set_guest_time_paused(true);
+#if REX_PLATFORM_ANDROID
+        rex::ui::vulkan::SetAndroidGpuTurbo(false);
+#endif
         break;
       case rex::ui::WindowedAppContext::LifecycleEvent::kDidEnterForeground:
         REXLOG_INFO("App back in the foreground: resuming guest time, GPU and audio");
         rex::chrono::Clock::set_guest_time_paused(false);
+#if REX_PLATFORM_ANDROID
+        rex::ui::vulkan::SetAndroidGpuTurbo(true);
+#endif
         if (graphics) graphics->Resume();
         if (audio) audio->Resume();
         break;

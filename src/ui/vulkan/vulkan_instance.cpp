@@ -20,6 +20,10 @@
 #include <rex/platform.h>
 #include <rex/ui/vulkan/instance.h>
 #include <rex/ui/vulkan/presenter.h>
+#if REX_PLATFORM_ANDROID
+#include <rex/platform/env.h>
+#include <rex/ui/vulkan/android_gpu_driver.h>
+#endif
 
 #if REX_PLATFORM_MAC
 #include "vulkan_moltenvk.h"
@@ -75,6 +79,16 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     return nullptr;
   }
 #else
+#if REX_PLATFORM_ANDROID
+  // A custom driver (Mesa Turnip) through libadrenotools, when one is set.
+  if (const auto drivers = rex::platform::env::get("REX_ANDROID_DRIVERS_DIR")) {
+    if (void* driver = OpenAndroidCustomVulkanDriver(*drivers)) {
+      vulkan_instance->loader_.Adopt(driver);
+      loader_loaded = true;
+    }
+  }
+  if (!loader_loaded)
+#endif
   loader_loaded = vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader);
   if (!loader_loaded) {
     REXLOG_ERROR("Failed to load {}", platform::lib_names::kVulkanLoader);
