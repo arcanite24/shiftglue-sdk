@@ -1,6 +1,8 @@
 #include <rex/graphics/vulkan/fh1_native_executor.h>
 
 #include <algorithm>
+#include <unordered_set>
+#include <mutex>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -1938,6 +1940,20 @@ void Fh1NativeExecutor::FlushResolveReadbacks() {
   Count("resolve_readback_flush");
 }
 
+namespace {
+// Once per kind: which guest copy (source and destination formats, samples)
+// the backend lacks, so a device report names it.
+void LogSkippedResolve(const Fh1ResolvePlan& plan) {
+  static std::mutex logged_mutex;
+  static std::unordered_set<std::string> logged;
+  std::lock_guard lock(logged_mutex);
+  if (logged.insert(std::string(plan.skip) + ":" + plan.kind).second) {
+    REXGPU_WARN("FH1 native executor (Vulkan) skipped a resolve: {} {} dest_info=0x{:08X}",
+                plan.skip, plan.kind, plan.info.copy_dest_info.value);
+  }
+}
+}  // namespace
+
 bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_length) {
   const RegisterFile& regs = register_file_;
   CopyPlan plan;
@@ -1946,6 +1962,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
       Count("resolve_empty");
       return true;
     }
+    LogSkippedResolve(plan);
     Skip(plan.skip);
     return false;
   }
@@ -1959,6 +1976,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
   const auto& depth_info = plan.depth_info;
 
   if (plan.skip) {
+    LogSkippedResolve(plan);
     Skip(plan.skip);
     succeeded = false;
   } else if (plan.copy) {
