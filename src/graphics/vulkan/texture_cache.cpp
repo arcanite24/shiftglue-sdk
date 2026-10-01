@@ -35,6 +35,10 @@
 #include <rex/ui/vulkan/util.h>
 
 REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
+REXCVAR_DEFINE_BOOL(vulkan_force_bc_decode, false, "GPU/Vulkan",
+                    "Decode BC (DXT, DXN) textures to uncompressed formats on the GPU as on a "
+                    "device without them, to measure that path where BC is supported")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::vulkan {
 
@@ -2544,11 +2548,15 @@ bool VulkanTextureCache::Initialize() {
   // decompressed.
   // TODO(Triang3l): S3TC -> 5551 or 4444 as an option.
   // TODO(Triang3l): S3TC -> ETC2 / EAC (a huge research topic).
+  // As a device without BC formats would: to measure the decode fallback's
+  // memory and check its output where BC is available (AP-2.4).
+  const bool force_bc_decode = REXCVAR_GET(vulkan_force_bc_decode);
   HostFormatPair& host_format_dxt1 = host_formats_[uint32_t(xenos::TextureFormat::k_DXT1)];
   assert_true(host_format_dxt1.format_unsigned.format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK);
   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
                                           &format_properties);
-  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+  if (force_bc_decode ||
+      (format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
     host_format_dxt1.format_unsigned.load_shader = kLoadShaderIndexDXT1ToRGBA8;
     host_format_dxt1.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
     host_format_dxt1.format_unsigned.block_compressed = false;
@@ -2558,7 +2566,8 @@ bool VulkanTextureCache::Initialize() {
   assert_true(host_format_dxt2_3.format_unsigned.format == VK_FORMAT_BC2_UNORM_BLOCK);
   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC2_UNORM_BLOCK,
                                           &format_properties);
-  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+  if (force_bc_decode ||
+      (format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
     host_format_dxt2_3.format_unsigned.load_shader = kLoadShaderIndexDXT3ToRGBA8;
     host_format_dxt2_3.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
     host_format_dxt2_3.format_unsigned.block_compressed = false;
@@ -2568,7 +2577,8 @@ bool VulkanTextureCache::Initialize() {
   assert_true(host_format_dxt4_5.format_unsigned.format == VK_FORMAT_BC3_UNORM_BLOCK);
   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC3_UNORM_BLOCK,
                                           &format_properties);
-  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+  if (force_bc_decode ||
+      (format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
     host_format_dxt4_5.format_unsigned.load_shader = kLoadShaderIndexDXT5ToRGBA8;
     host_format_dxt4_5.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
     host_format_dxt4_5.format_unsigned.block_compressed = false;
@@ -2578,7 +2588,8 @@ bool VulkanTextureCache::Initialize() {
   assert_true(host_format_dxn.format_unsigned.format == VK_FORMAT_BC5_UNORM_BLOCK);
   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC5_UNORM_BLOCK,
                                           &format_properties);
-  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+  if (force_bc_decode ||
+      (format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
     host_format_dxn.format_unsigned.load_shader = kLoadShaderIndexDXNToRG8;
     host_format_dxn.format_unsigned.format = VK_FORMAT_R8G8_UNORM;
     host_format_dxn.format_unsigned.block_compressed = false;
@@ -2587,7 +2598,8 @@ bool VulkanTextureCache::Initialize() {
   assert_true(host_format_dxt5a.format_unsigned.format == VK_FORMAT_BC4_UNORM_BLOCK);
   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC4_UNORM_BLOCK,
                                           &format_properties);
-  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+  if (force_bc_decode ||
+      (format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
     host_format_dxt5a.format_unsigned.load_shader = kLoadShaderIndexDXT5AToR8;
     host_format_dxt5a.format_unsigned.format = VK_FORMAT_R8_UNORM;
     host_format_dxt5a.format_unsigned.block_compressed = false;
