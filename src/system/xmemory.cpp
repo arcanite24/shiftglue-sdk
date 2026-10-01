@@ -1937,6 +1937,10 @@ void PhysicalHeap::Initialize(memory::Memory* memory, uint8_t* membase, HeapType
   }
   if (heap_base >= 0xE0000000) {
     rex_physical_host_offset_e0 = host_address_offset;
+    REXSYS_INFO("Host page size {:#x}, allocation granularity {:#x}: physical heap at "
+                "{:08X} offset {:#x} in host memory",
+                rex::memory::page_size(), rex::memory::allocation_granularity(), heap_base,
+                host_address_offset);
   }
 
   BaseHeap::Initialize(memory, membase, heap_type, heap_base, heap_size, page_size,
