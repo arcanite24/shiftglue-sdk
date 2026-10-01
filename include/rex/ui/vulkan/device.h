@@ -240,10 +240,13 @@ class VulkanDevice {
 
   const Functions& functions() const { return functions_; }
 
+  // Debug names for objects (VK_EXT_debug_utils), for capture tools.
+  bool object_names_enabled() const { return object_names_enabled_; }
+
   template <typename Object>
   void SetObjectName(const VkObjectType object_type, const Object object_handle,
                      const char* const object_name) const {
-    if (!vulkan_instance()->extensions().ext_EXT_debug_utils) {
+    if (!object_names_enabled_) {
       return;
     }
     VkDebugUtilsObjectNameInfoEXT object_name_info;
@@ -314,6 +317,8 @@ class VulkanDevice {
   VkDevice device_ = nullptr;
 
   Functions functions_;
+
+  bool object_names_enabled_ = false;
 
   std::vector<QueueFamily> queue_families_;
   uint32_t queue_family_graphics_compute_ = UINT32_MAX;

@@ -53,6 +53,11 @@ REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid,
                     "allow fallback to solid fill for line/point polygon modes)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_BOOL(vulkan_debug_object_names, !REX_PLATFORM_ANDROID, "UI/Vulkan",
+                    "Name Vulkan objects for capture tools (VK_EXT_debug_utils). Off on "
+                    "Android: the emulator's Mesa-based driver crashes naming objects its "
+                    "gfxstream layer does not back with Mesa objects")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(vulkan_capability_report, REX_PLATFORM_ANDROID, "UI/Vulkan",
                     "Log one VULKAN_CAPABILITY_REPORT line per device: the features, "
                     "extensions, limits, memory heaps and render-target formats the renderer "
@@ -305,6 +310,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   // Enable needed extensions.
 
   std::unique_ptr<VulkanDevice> device(new VulkanDevice(vulkan_instance, physical_device));
+  device->object_names_enabled_ = vulkan_instance->extensions().ext_EXT_debug_utils &&
+                                  REXCVAR_GET(vulkan_debug_object_names);
 
   const bool get_physical_device_properties2_supported =
       vulkan_instance->extensions().ext_1_1_KHR_get_physical_device_properties2;
