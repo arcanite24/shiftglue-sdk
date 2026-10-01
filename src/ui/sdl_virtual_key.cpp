@@ -42,6 +42,8 @@ VirtualKey TranslateSDLScancode(SDL_Scancode scancode) {
     case SDL_SCANCODE_KP_ENTER:
       return VirtualKey::kReturn;
     case SDL_SCANCODE_ESCAPE:
+    // Android's Back button and gesture (trapped for the app by SDL).
+    case SDL_SCANCODE_AC_BACK:
       return VirtualKey::kEscape;
     case SDL_SCANCODE_BACKSPACE:
       return VirtualKey::kBack;

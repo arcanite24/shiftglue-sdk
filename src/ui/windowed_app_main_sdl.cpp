@@ -64,6 +64,9 @@ int RunWindowedApp(int argc, char** argv) {
   SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
   // Game audio, for the system's routing and focus (AP-5.1).
   SDL_SetHint(SDL_HINT_AUDIO_DEVICE_STREAM_ROLE, "Game");
+  // Back goes to the app as a key (Escape: back out of the host menus)
+  // instead of finishing the activity.
+  SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
 #endif
   auto remaining = rex::cvar::Init(argc, argv);
   rex::cvar::ApplyEnvironment();
