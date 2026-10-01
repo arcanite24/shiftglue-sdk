@@ -269,6 +269,13 @@ class Window {
   uint32_t GetActualLogicalWidth() const { return SizeToLogical(GetActualPhysicalWidth()); }
   uint32_t GetActualLogicalHeight() const { return SizeToLogical(GetActualPhysicalHeight()); }
 
+  // The margins, in physical pixels, that a display cutout or rounded
+  // corners cover; zero where the platform reports none.
+  struct SafeAreaInsets {
+    uint32_t left = 0, top = 0, right = 0, bottom = 0;
+  };
+  virtual SafeAreaInsets GetSafeAreaInsets() const { return {}; }
+
   // Desired state stored by the common Window, modifiable both externally and
   // by the implementation (including from SetFullscreen itself).
   bool IsFullscreen() const { return fullscreen_; }

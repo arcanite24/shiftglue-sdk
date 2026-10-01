@@ -222,6 +222,27 @@ void WindowSDL::DestroySDLWindow() {
   }
 }
 
+Window::SafeAreaInsets WindowSDL::GetSafeAreaInsets() const {
+  SafeAreaInsets insets;
+  SDL_Rect safe;
+  int width = 0, height = 0, pixel_width = 0, pixel_height = 0;
+  if (!sdl_window_ || !SDL_GetWindowSafeArea(sdl_window_, &safe) ||
+      !SDL_GetWindowSize(sdl_window_, &width, &height) ||
+      !SDL_GetWindowSizeInPixels(sdl_window_, &pixel_width, &pixel_height) || width <= 0 ||
+      height <= 0) {
+    return insets;
+  }
+  // The safe area is in window coordinates; the insets are pixels.
+  const auto scale = [](int value, int pixels, int points) {
+    return uint32_t(std::max(0, value) * int64_t(pixels) / points);
+  };
+  insets.left = scale(safe.x, pixel_width, width);
+  insets.top = scale(safe.y, pixel_height, height);
+  insets.right = scale(width - safe.x - safe.w, pixel_width, width);
+  insets.bottom = scale(height - safe.y - safe.h, pixel_height, height);
+  return insets;
+}
+
 void* WindowSDL::GetNativeWindowHandle() const {
 #if REX_PLATFORM_WIN32
   if (!sdl_window_) {

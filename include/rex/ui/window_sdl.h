@@ -34,6 +34,7 @@ class WindowSDL final : public Window {
   ~WindowSDL() override;
 
   void* GetNativeWindowHandle() const override;
+  SafeAreaInsets GetSafeAreaInsets() const override;
   void ApplyConfiguredSizeAndMonitor() override;
   bool SetRelativeMouseMode(bool enable) override;
   bool WarpMouseToCenter(int32_t& x_out, int32_t& y_out) override;
