@@ -141,6 +141,11 @@ class MouseEvent : public UIEvent {
   void set_handled(bool value) { handled_ = value; }
 
   Button button() const { return button_; }
+  // Made by the platform from a touch screen finger (SDL's touch mouse), for
+  // listeners that must not treat a tap as a mouse (the on-screen controls
+  // read the fingers themselves).
+  bool from_touch() const { return from_touch_; }
+  void set_from_touch(bool value) { from_touch_ = value; }
   int32_t x() const { return x_; }
   int32_t y() const { return y_; }
   int32_t scroll_x() const { return scroll_x_; }
@@ -154,6 +159,7 @@ class MouseEvent : public UIEvent {
  private:
   bool handled_ = false;
   Button button_;
+  bool from_touch_ = false;
   int32_t x_ = 0;
   int32_t y_ = 0;
   int32_t scroll_x_ = 0;

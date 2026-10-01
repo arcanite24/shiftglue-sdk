@@ -44,6 +44,9 @@ class WindowSDL final : public Window {
   void HandleTextInputEvent(SDL_Event& event);
   void HandleMouseEvent(SDL_Event& event);
   void HandleDropEvent(SDL_Event& event);
+  // Touch screen fingers, in physical pixels (AP-4.2); SDL also turns them
+  // into mouse events, which the menus use.
+  void HandleFingerEvent(SDL_Event& event);
   void HandlePaintEvent();
   // The platform destroys the native window behind the surface when the
   // app goes to the background and makes a new one on its return.

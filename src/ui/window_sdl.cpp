@@ -603,6 +603,32 @@ void WindowSDL::HandleTextInputEvent(SDL_Event& event) {
   }
 }
 
+void WindowSDL::HandleFingerEvent(SDL_Event& event) {
+  int width = 0, height = 0;
+  if (!SDL_GetWindowSizeInPixels(sdl_window_, &width, &height) || width <= 0 || height <= 0) {
+    return;
+  }
+  TouchEvent::Action action;
+  switch (event.type) {
+    case SDL_EVENT_FINGER_DOWN:
+      action = TouchEvent::Action::kDown;
+      break;
+    case SDL_EVENT_FINGER_UP:
+      action = TouchEvent::Action::kUp;
+      break;
+    case SDL_EVENT_FINGER_CANCELED:
+      action = TouchEvent::Action::kCancel;
+      break;
+    default:
+      action = TouchEvent::Action::kMove;
+      break;
+  }
+  WindowDestructionReceiver destruction_receiver(this);
+  TouchEvent e(this, uint32_t(event.tfinger.fingerID), action, event.tfinger.x * float(width),
+               event.tfinger.y * float(height));
+  OnTouchEvent(e, destruction_receiver);
+}
+
 void WindowSDL::HandleMouseEvent(SDL_Event& event) {
   // SDL3 reports float window coordinates; listeners expect physical pixels.
   float density = GetPixelDensity();
@@ -616,6 +642,7 @@ void WindowSDL::HandleMouseEvent(SDL_Event& event) {
       MouseEvent e(this, MouseEvent::Button::kNone, int32_t(event.motion.x * density),
                    int32_t(event.motion.y * density), 0, 0, event.motion.xrel * density,
                    event.motion.yrel * density);
+      e.set_from_touch(event.motion.which == SDL_TOUCH_MOUSEID);
       OnMouseMove(e, destruction_receiver);
       break;
     }
@@ -623,6 +650,7 @@ void WindowSDL::HandleMouseEvent(SDL_Event& event) {
     case SDL_EVENT_MOUSE_BUTTON_UP: {
       MouseEvent e(this, TranslateSDLMouseButton(event.button.button),
                    int32_t(event.button.x * density), int32_t(event.button.y * density));
+      e.set_from_touch(event.button.which == SDL_TOUCH_MOUSEID);
       if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
         OnMouseDown(e, destruction_receiver);
       } else {

@@ -169,6 +169,15 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
       }
       break;
     }
+    case SDL_EVENT_FINGER_DOWN:
+    case SDL_EVENT_FINGER_UP:
+    case SDL_EVENT_FINGER_MOTION:
+    case SDL_EVENT_FINGER_CANCELED: {
+      if (WindowSDL* window = GetWindow(event.tfinger.windowID)) {
+        window->HandleFingerEvent(event);
+      }
+      break;
+    }
     case SDL_EVENT_DROP_FILE: {
       if (WindowSDL* window = GetWindow(event.drop.windowID)) {
         window->HandleDropEvent(event);

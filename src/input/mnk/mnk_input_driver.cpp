@@ -616,7 +616,8 @@ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
 }
 
 void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
-  if (!IsEnabled() || !has_focus_)
+  // A tap is not a mouse: the on-screen controls read touches themselves.
+  if (!IsEnabled() || !has_focus_ || e.from_touch())
     return;
   std::lock_guard lock(state_mutex_);
   switch (e.button()) {
@@ -635,7 +636,7 @@ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
 }
 
 void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
-  if (!IsEnabled())
+  if (!IsEnabled() || e.from_touch())
     return;
   std::lock_guard lock(state_mutex_);
   switch (e.button()) {
@@ -654,7 +655,8 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
 }
 
 void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
-  if (!IsEnabled() || !has_focus_)
+  // A tap is not a mouse: the on-screen controls read touches themselves.
+  if (!IsEnabled() || !has_focus_ || e.from_touch())
     return;
   int32_t x = e.x();
   int32_t y = e.y();
