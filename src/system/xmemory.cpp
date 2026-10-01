@@ -560,6 +560,22 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
         "0x{:X}, guest lr 0x{:08X}",
         is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
         rex::thread::current_thread_id(), context ? uint32_t(context->lr) : 0u);
+    if (context) {
+      // As last stored: generated code may hold a register in a host one.
+      const PPCRegister* gprs[] = {
+          &context->r0,  &context->r1,  &context->r2,  &context->r3,  &context->r4,
+          &context->r5,  &context->r6,  &context->r7,  &context->r8,  &context->r9,
+          &context->r10, &context->r11, &context->r12, &context->r13, &context->r14,
+          &context->r15, &context->r16, &context->r17, &context->r18, &context->r19,
+          &context->r20, &context->r21, &context->r22, &context->r23, &context->r24,
+          &context->r25, &context->r26, &context->r27, &context->r28, &context->r29,
+          &context->r30, &context->r31};
+      std::string registers;
+      for (size_t i = 0; i < std::size(gprs); ++i) {
+        registers += fmt::format("{}r{}={:08X}", i ? " " : "", i, gprs[i]->u32);
+      }
+      REXSYS_ERROR("  guest registers: {} ctr={:08X}", registers, uint32_t(context->ctr.u32));
+    }
     return false;
   }
 
