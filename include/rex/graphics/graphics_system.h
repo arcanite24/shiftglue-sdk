@@ -103,8 +103,8 @@ class GraphicsSystem : public system::IGraphicsSystem {
                                bool blocking) override;
 
   bool is_paused() const { return paused_; }
-  void Pause();
-  void Resume();
+  void Pause() override;
+  void Resume() override;
 
   bool Save(::rex::stream::ByteStream* stream);
   bool Restore(::rex::stream::ByteStream* stream);

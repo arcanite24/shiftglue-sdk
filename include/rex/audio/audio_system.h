@@ -52,8 +52,8 @@ class AudioSystem : public system::IAudioSystem {
   bool Restore(stream::ByteStream* stream);
 
   bool is_paused() const { return paused_; }
-  void Pause();
-  void Resume();
+  void Pause() override;
+  void Resume() override;
 
  protected:
   explicit AudioSystem(runtime::FunctionDispatcher* function_dispatcher);

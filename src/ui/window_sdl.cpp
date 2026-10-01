@@ -409,6 +409,15 @@ void WindowSDL::FocusImpl() {
   SDL_RaiseWindow(sdl_window_);
 }
 
+void WindowSDL::HandleAppBackground(bool background) {
+  if (!sdl_window_) {
+    return;
+  }
+  // Disconnect the presenter before the native window goes away; attach to
+  // the new one (CreateSurfaceImpl reads it from SDL) on the way back.
+  OnSurfaceChanged(!background);
+}
+
 std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed_types) {
   if (!sdl_window_) {
     return nullptr;

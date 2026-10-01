@@ -45,6 +45,9 @@ class WindowSDL final : public Window {
   void HandleMouseEvent(SDL_Event& event);
   void HandleDropEvent(SDL_Event& event);
   void HandlePaintEvent();
+  // The platform destroys the native window behind the surface when the
+  // app goes to the background and makes a new one on its return.
+  void HandleAppBackground(bool background);
 
  protected:
   uint32_t GetLatestDpiImpl() const override;

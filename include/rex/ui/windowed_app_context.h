@@ -15,6 +15,7 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #include <rex/assert.h>
 
@@ -118,6 +119,21 @@ class WindowedAppContext {
     CallInUIThreadDeferred([this] { QuitFromUIThread(); });
   }
 
+  // The platform's application lifecycle (AP-3.1): on Android the activity
+  // goes to the background (its window is destroyed) and returns, and the
+  // system asks for memory back. Delivered in the UI thread, in order, before
+  // the platform blocks the UI loop while in the background.
+  enum class LifecycleEvent {
+    kWillEnterBackground,
+    kDidEnterForeground,
+    kLowMemory,
+    kTerminating,
+  };
+  using LifecycleListener = std::function<void(LifecycleEvent)>;
+  void AddLifecycleListener(LifecycleListener listener) {
+    lifecycle_listeners_.push_back(std::move(listener));
+  }
+
  protected:
   WindowedAppContext() : ui_thread_id_(std::this_thread::get_id()) {}
 
@@ -147,6 +163,12 @@ class WindowedAppContext {
   // platform implementation itself should be resolving this case).
   virtual void PlatformQuitFromUIThread() = 0;
 
+  void NotifyLifecycleEvent(LifecycleEvent event) {
+    for (const LifecycleListener& listener : lifecycle_listeners_) {
+      listener(event);
+    }
+  }
+
   std::thread::id ui_thread_id_;
 
  private:
@@ -156,6 +178,7 @@ class WindowedAppContext {
 
   // Accessible by the UI thread.
   bool has_quit_ = false;
+  std::vector<LifecycleListener> lifecycle_listeners_;
   bool is_in_destructor_ = false;
 
   // Synchronizes producers with each other and with the consumer, as well as

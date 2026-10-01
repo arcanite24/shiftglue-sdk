@@ -233,6 +233,11 @@ class IGraphicsSystem {
     return SetupGuestGpu(function_dispatcher, kernel_state);
   }
 
+  // Stop and restart consuming the guest's command buffers (the app in the
+  // background); guest threads then wait on the GPU as on a stalled frame.
+  virtual void Pause() {}
+  virtual void Resume() {}
+
   virtual void Shutdown() = 0;
 };
 

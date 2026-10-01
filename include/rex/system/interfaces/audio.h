@@ -24,6 +24,10 @@ class IAudioSystem {
   virtual ~IAudioSystem() = default;
   virtual X_STATUS Setup(KernelState* kernel_state) = 0;
   virtual void Shutdown() = 0;
+
+  // Silence and resume output (the app in the background).
+  virtual void Pause() {}
+  virtual void Resume() {}
 };
 
 }  // namespace rex::system

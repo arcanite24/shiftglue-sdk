@@ -25,6 +25,9 @@
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
+#include <fstream>
+#include <string>
+
 #include <rex/audio/audio_system.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
 #include <rex/input/input_system.h>
@@ -304,6 +307,47 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
       return false;
     }
   }
+
+  // In the background the activity's window is gone and the player is not
+  // there: stop the GPU commands (guest threads then wait as on a stalled
+  // frame) and the audio, and restart both on return.
+  app_context().AddLifecycleListener([this](rex::ui::WindowedAppContext::LifecycleEvent event) {
+    if (!runtime_) {
+      return;
+    }
+    auto* graphics = runtime_->graphics_system();
+    auto* audio = runtime_->audio_system();
+    switch (event) {
+      case rex::ui::WindowedAppContext::LifecycleEvent::kWillEnterBackground:
+        REXLOG_INFO("App entering the background: pausing GPU and audio");
+        if (audio) audio->Pause();
+        if (graphics) graphics->Pause();
+        break;
+      case rex::ui::WindowedAppContext::LifecycleEvent::kDidEnterForeground:
+        REXLOG_INFO("App back in the foreground: resuming GPU and audio");
+        if (graphics) graphics->Resume();
+        if (audio) audio->Resume();
+        break;
+      case rex::ui::WindowedAppContext::LifecycleEvent::kLowMemory: {
+        // The system is about to kill background apps, or this one: record
+        // what the process holds so a kill is diagnosable afterwards.
+        std::string resident = "unknown";
+#if REX_PLATFORM_LINUX
+        std::ifstream status("/proc/self/status");
+        for (std::string line; std::getline(status, line);) {
+          if (line.rfind("VmRSS:", 0) == 0) {
+            resident = line.substr(6);
+            break;
+          }
+        }
+#endif
+        REXLOG_WARN("Low memory reported by the system; resident:{}", resident);
+        break;
+      }
+      default:
+        break;
+    }
+  });
 
   OnPostSetup();
 

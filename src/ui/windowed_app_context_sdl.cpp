@@ -182,6 +182,33 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
 
 bool SDLCALL SDLWindowedAppContext::WatchEvent(void* userdata, SDL_Event* event) {
   auto* context = static_cast<SDLWindowedAppContext*>(userdata);
+  // Application events are sent while SDL pumps in this thread; on Android
+  // it then blocks the loop until the activity returns, so they are handled
+  // here, before the window behind the surface is destroyed.
+  if (SDL_IsMainThread() && context->IsInUIThread()) {
+    switch (event->type) {
+      case SDL_EVENT_WILL_ENTER_BACKGROUND:
+        for (const auto& [id, window] : context->windows_) {
+          window->HandleAppBackground(true);
+        }
+        context->NotifyLifecycleEvent(LifecycleEvent::kWillEnterBackground);
+        break;
+      case SDL_EVENT_DID_ENTER_FOREGROUND:
+        context->NotifyLifecycleEvent(LifecycleEvent::kDidEnterForeground);
+        for (const auto& [id, window] : context->windows_) {
+          window->HandleAppBackground(false);
+        }
+        break;
+      case SDL_EVENT_LOW_MEMORY:
+        context->NotifyLifecycleEvent(LifecycleEvent::kLowMemory);
+        break;
+      case SDL_EVENT_TERMINATING:
+        context->NotifyLifecycleEvent(LifecycleEvent::kTerminating);
+        break;
+      default:
+        break;
+    }
+  }
   if (event->type == SDL_EVENT_QUIT && SDL_IsMainThread() && context->IsInUIThread()) {
     // Cocoa stops making Metal drawables available as part of its termination
     // request. Handle the request synchronously while SDL is queueing it,
