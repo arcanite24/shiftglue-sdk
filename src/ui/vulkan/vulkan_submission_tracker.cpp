@@ -119,8 +119,7 @@ bool VulkanSubmissionTracker::AwaitSubmissionCompletion(uint64_t submission_inde
       assert_true(pending_pair.first > submission_completed_on_gpu_);
       if (pending_pair.first <= submission_index) {
         // Wait if requested.
-        if (dfn.vkWaitForFences(device, 1, &pending_pair.second, VK_TRUE, UINT64_MAX) ==
-            VK_SUCCESS) {
+        if (vulkan_device_->WaitForFences(1, &pending_pair.second, VK_TRUE) == VK_SUCCESS) {
           break;
         }
       }

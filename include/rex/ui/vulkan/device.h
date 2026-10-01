@@ -240,6 +240,20 @@ class VulkanDevice {
 
   const Functions& functions() const { return functions_; }
 
+  // vkWaitForFences until the fences signal or the device fails. Waits a
+  // second at a time: an Adreno 830 driver (Snapdragon 8 Elite) returns
+  // VK_TIMEOUT at once for a UINT64_MAX timeout, which callers took for a
+  // failure and treated unfinished submissions as done.
+  VkResult WaitForFences(uint32_t fence_count, const VkFence* fences, VkBool32 wait_all) const {
+    for (;;) {
+      const VkResult result = functions_.vkWaitForFences(device_, fence_count, fences, wait_all,
+                                                         UINT64_C(1000000000));
+      if (result != VK_TIMEOUT) {
+        return result;
+      }
+    }
+  }
+
   // Debug names for objects (VK_EXT_debug_utils), for capture tools.
   bool object_names_enabled() const { return object_names_enabled_; }
 

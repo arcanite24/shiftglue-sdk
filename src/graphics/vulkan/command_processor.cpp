@@ -5792,8 +5792,8 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     // order."
     const auto wait_start = std::chrono::steady_clock::now();
     VkResult wait_result =
-        dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
-                            submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+        vulkan_device->WaitForFences(uint32_t(await_submission - submission_completed_),
+                                     submissions_in_flight_fences_.data(), VK_TRUE);
     PERF_counter_add(kGpuThreadFenceWaitNs,
                      std::chrono::duration_cast<std::chrono::nanoseconds>(
                          std::chrono::steady_clock::now() - wait_start)
@@ -5801,7 +5801,8 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {
-      REXGPU_ERROR("Failed to await submission completion Vulkan fences");
+      REXGPU_ERROR("Failed to await submission completion Vulkan fences: VkResult {}",
+                   int32_t(wait_result));
       if (wait_result == VK_ERROR_DEVICE_LOST) {
         device_lost_ = true;
         LogCheckpoints();
