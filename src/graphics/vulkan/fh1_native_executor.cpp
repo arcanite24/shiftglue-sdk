@@ -2177,11 +2177,31 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
     transfer_volume_.clear();
   }
   const uint64_t window_frames = frame >= 600 ? 600 : std::max<uint64_t>(frame, 1);
+  const auto causes = command_processor_.TakeFh1RenderingCauses();
+  const double per_frame = 1.0 / double(window_frames);
   REXGPU_INFO(
       "FH1 native executor (Vulkan) per frame over {} frames: renderings {:.1f} barrier "
-      "batches {:.1f}",
-      window_frames, double(command_processor_.TakeRenderingBeginCount()) / double(window_frames),
-      double(command_processor_.TakeBarrierBatchCount()) / double(window_frames));
+      "batches {:.1f}; renderings begun after barriers on the same surfaces {:.1f}, barriers "
+      "and new surfaces {:.1f}, new surfaces {:.1f}, other work {:.1f}",
+      window_frames, double(command_processor_.TakeRenderingBeginCount()) * per_frame,
+      double(command_processor_.TakeBarrierBatchCount()) * per_frame,
+      double(causes[VulkanCommandProcessor::kFh1RenderingBarriersSameSurfaces]) * per_frame,
+      double(causes[VulkanCommandProcessor::kFh1RenderingBarriersNewSurfaces]) * per_frame,
+      double(causes[VulkanCommandProcessor::kFh1RenderingNewSurfaces]) * per_frame,
+      double(causes[VulkanCommandProcessor::kFh1RenderingEndedElsewhere]) * per_frame);
+  std::vector<std::pair<uint64_t, std::string>> enders;
+  for (auto& [name, count] : command_processor_.TakeFh1RenderingEnders()) {
+    enders.emplace_back(count, name);
+  }
+  std::sort(enders.begin(), enders.end(), std::greater<>());
+  std::string top;
+  for (size_t i = 0; i < enders.size() && i < 6; ++i) {
+    top += fmt::format("{}{:.1f} {}", i ? "; " : "", double(enders[i].first) * per_frame,
+                       enders[i].second);
+  }
+  if (!top.empty()) {
+    REXGPU_INFO("FH1 native executor (Vulkan) renderings ended by other work, per frame: {}", top);
+  }
 }
 
 uint32_t Fh1NativeExecutor::GpuBegin() {

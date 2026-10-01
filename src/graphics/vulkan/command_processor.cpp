@@ -3531,16 +3531,17 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
   return true;
 }
 
-bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
+bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass,
+                                            std::source_location caller) {
   assert_true(submission_open_);
   SplitPendingBarrier();
   if (pending_barriers_.empty()) {
     if (force_end_render_pass) {
-      EndRenderPass();
+      EndRenderPass(caller);
     }
     return false;
   }
-  EndRenderPass();
+  EndRenderPass(caller);
   barrier_batch_count_ += pending_barriers_.size();
   for (auto it = pending_barriers_.cbegin(); it != pending_barriers_.cend(); ++it) {
     auto it_next = std::next(it);
@@ -3736,6 +3737,10 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
 
 void VulkanCommandProcessor::SubmitBarriersAndBeginFh1Rendering(
     const VkRenderingInfo& rendering_info, uint64_t id) {
+  const bool was_rendering = in_render_pass_;
+  const bool same_surfaces = was_rendering && current_fh1_rendering_id_ == id;
+  SplitPendingBarrier();
+  const bool barriers = !pending_barriers_.empty();
   SubmitBarriers(false);
   if (in_render_pass_ && current_fh1_rendering_id_ == id) {
     return;
@@ -3743,6 +3748,13 @@ void VulkanCommandProcessor::SubmitBarriersAndBeginFh1Rendering(
   EndRenderPass();
   deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
   ++rendering_begin_count_;
+  if (!was_rendering) {
+    ++fh1_rendering_enders_[last_rendering_ender_];
+  }
+  ++fh1_rendering_causes_[!was_rendering ? kFh1RenderingEndedElsewhere
+                          : barriers     ? (same_surfaces ? kFh1RenderingBarriersSameSurfaces
+                                                          : kFh1RenderingBarriersNewSurfaces)
+                                         : kFh1RenderingNewSurfaces];
   current_render_pass_ = VK_NULL_HANDLE;
   current_framebuffer_ = nullptr;
   current_fh1_rendering_id_ = id;
@@ -3818,12 +3830,13 @@ void VulkanCommandProcessor::FlushCpuVisibleResults() {
   }
 }
 
-void VulkanCommandProcessor::EndRenderPass() {
+void VulkanCommandProcessor::EndRenderPass(std::source_location caller) {
   assert_true(submission_open_);
   current_fh1_rendering_id_ = 0;
   if (!in_render_pass_) {
     return;
   }
+  last_rendering_ender_ = caller.function_name();
   if (current_render_pass_ == VK_NULL_HANDLE) {
     deferred_command_buffer_.CmdVkEndRendering();
   } else {

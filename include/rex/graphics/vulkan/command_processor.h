@@ -25,6 +25,8 @@
 #include <string_view>
 #include <unordered_map>
 #include <cstring>
+#include <map>
+#include <source_location>
 #include <utility>
 #include <vector>
 #include <chrono>
@@ -206,7 +208,8 @@ class VulkanCommandProcessor : public CommandProcessor {
                               bool skip_if_equal = true);
   // Returns whether any barriers have been submitted - if true is returned, the
   // render pass will also be closed.
-  bool SubmitBarriers(bool force_end_render_pass);
+  bool SubmitBarriers(bool force_end_render_pass,
+                      std::source_location caller = std::source_location::current());
 
   // If not started yet, begins a render pass from the render target cache.
   // Submission must be open.
@@ -223,6 +226,26 @@ class VulkanCommandProcessor : public CommandProcessor {
   Fh1NativeExecutor* GetFh1NativeExecutor() const { return fh1_native_executor_.get(); }
   uint64_t TakeBarrierBatchCount() { return std::exchange(barrier_batch_count_, 0); }
   uint64_t TakeRenderingBeginCount() { return std::exchange(rendering_begin_count_, 0); }
+  // Why each FH1 rendering began (AP-7.4: a tiler stores and reloads the
+  // attachments at every rendering boundary): barriers between draws to the
+  // same surfaces, barriers with a change of surfaces, a change of surfaces
+  // alone, or a rendering already ended by other work (transfers, clears,
+  // resolves, uploads).
+  enum Fh1RenderingCause : uint32_t {
+    kFh1RenderingBarriersSameSurfaces,
+    kFh1RenderingBarriersNewSurfaces,
+    kFh1RenderingNewSurfaces,
+    kFh1RenderingEndedElsewhere,
+    kFh1RenderingCauseCount,
+  };
+  std::array<uint64_t, kFh1RenderingCauseCount> TakeFh1RenderingCauses() {
+    return std::exchange(fh1_rendering_causes_, {});
+  }
+  // For kFh1RenderingEndedElsewhere: the functions that ended the previous
+  // rendering, with counts.
+  std::map<std::string, uint64_t> TakeFh1RenderingEnders() {
+    return std::exchange(fh1_rendering_enders_, {});
+  }
   // vulkan_diagnostic_checkpoints: marks the command stream so a device loss
   // reports the last draws, copies, texture loads and executor passes the GPU
   // reached. Each marker is a serial number; a ring keeps what each recent
@@ -257,7 +280,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Must be called before doing anything outside the render pass scope,
   // including adding pipeline barriers that are not a part of the render pass
   // scope. Submission must be open.
-  void EndRenderPass();
+  void EndRenderPass(std::source_location caller = std::source_location::current());
 
   VkDescriptorSetLayout GetSingleTransientDescriptorLayout(
       SingleTransientDescriptorLayout transient_descriptor_layout) const {
@@ -971,6 +994,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   FrameTimingSlot frame_timing_slots_[kMaxFramesInFlight] = {};
   uint64_t barrier_batch_count_ = 0;
   uint64_t rendering_begin_count_ = 0;
+  std::array<uint64_t, kFh1RenderingCauseCount> fh1_rendering_causes_{};
+  std::map<std::string, uint64_t> fh1_rendering_enders_;
+  const char* last_rendering_ender_ = "";
   struct ActiveOcclusionQuery {
     uint32_t sample_count_address = 0;
     uint32_t host_index = UINT32_MAX;
