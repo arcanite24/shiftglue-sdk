@@ -30,21 +30,26 @@ bool build_attn(BuilderContext& ctx) {
   return true;
 }
 
+// The barriers lower to macros from the generated header: nothing on x86-64,
+// whose ordering the title already relies on, and fences on AArch64.
+
 bool build_sync(BuilderContext& ctx) {
-  // Memory barrier, x86 has strong ordering so this is a no-op
-  (void)ctx;
+  ctx.println("\tREX_PPC_SYNC();");
   return true;
 }
 
 bool build_lwsync(BuilderContext& ctx) {
-  // Lightweight memory barrier, x86 has strong ordering so this is a no-op
-  (void)ctx;
+  ctx.println("\tREX_PPC_LWSYNC();");
   return true;
 }
 
 bool build_eieio(BuilderContext& ctx) {
-  // Enforce in-order execution of I/O, x86 has strong ordering so this is a no-op
-  (void)ctx;
+  ctx.println("\tREX_PPC_EIEIO();");
+  return true;
+}
+
+bool build_isync(BuilderContext& ctx) {
+  ctx.println("\tREX_PPC_ISYNC();");
   return true;
 }
 

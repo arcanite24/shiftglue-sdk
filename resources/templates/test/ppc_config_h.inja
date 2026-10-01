@@ -96,6 +96,29 @@
 #define REX_MEMORY_SIZE 0x100000000ull
 
 //=============================================================================
+// Memory Barriers
+//=============================================================================
+
+// The guest's barriers, for host CPUs that reorder more than the guest code
+// assumes. x86-64 keeps every load and store in order except a store followed
+// by a load, which the title tolerates as it always has, so they cost nothing
+// there and the x86-64 code is unchanged. AArch64 reorders freely: sync is a
+// full barrier, lwsync orders everything but a store before a later load,
+// eieio orders stores (device and memory), and isync after a reservation
+// loop makes it an acquire.
+#if REX_ARCH_ARM64
+#define REX_PPC_SYNC() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#define REX_PPC_LWSYNC() __atomic_thread_fence(__ATOMIC_ACQ_REL)
+#define REX_PPC_EIEIO() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#define REX_PPC_ISYNC() __atomic_thread_fence(__ATOMIC_ACQUIRE)
+#else
+#define REX_PPC_SYNC() ((void)0)
+#define REX_PPC_LWSYNC() ((void)0)
+#define REX_PPC_EIEIO() ((void)0)
+#define REX_PPC_ISYNC() ((void)0)
+#endif
+
+//=============================================================================
 // Function Dispatch
 //=============================================================================
 
