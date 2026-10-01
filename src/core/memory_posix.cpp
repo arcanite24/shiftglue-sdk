@@ -27,6 +27,7 @@
 
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <rex/logging.h>
@@ -345,6 +346,22 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
                  strerror(errno), errno);
   }
   return ret == 0;
+}
+
+bool IsHostReadable(const void* address) {
+#if REX_PLATFORM_LINUX
+  // The kernel copies one byte and reports EFAULT for a page that cannot be
+  // read, instead of the signal a direct read would raise.
+  char byte = 0;
+  iovec local{&byte, 1};
+  iovec remote{const_cast<void*>(address), 1};
+  return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == 1;
+#else
+  size_t length = page_size();
+  PageAccess access = PageAccess::kNoAccess;
+  return QueryProtect(const_cast<void*>(address), length, access) &&
+         access != PageAccess::kNoAccess;
+#endif
 }
 
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {

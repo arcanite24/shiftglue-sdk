@@ -113,6 +113,10 @@ bool Protect(void* base_address, size_t length, PageAccess access,
 // rights. The length will start from the first byte of the first page of
 // the region.
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out);
+// Whether the host page holding address can be read without a fault. Cheap
+// enough for every page of a range each frame: QueryProtect parses
+// /proc/self/maps on Linux and Android.
+bool IsHostReadable(const void* address);
 
 // Allocates a block of memory for a type with the given alignment.
 // The memory must be freed with AlignedFree.

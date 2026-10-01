@@ -154,6 +154,13 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
   return true;
 }
 
+bool IsHostReadable(const void* address) {
+  size_t length = page_size();
+  PageAccess access = PageAccess::kNoAccess;
+  return QueryProtect(const_cast<void*>(address), length, access) &&
+         access != PageAccess::kNoAccess;
+}
+
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
   access_out = PageAccess::kNoAccess;
 
