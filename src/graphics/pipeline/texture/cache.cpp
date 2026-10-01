@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <utility>
@@ -292,6 +293,20 @@ void TextureCache::ClearCache() {
   DestroyAllTextures();
 }
 
+namespace {
+// Host uptime in milliseconds until which memory reduction applies.
+std::atomic<uint64_t> memory_reduction_until_ms{0};
+constexpr uint64_t kMemoryReductionDurationMs = 10000;
+constexpr uint32_t kMemoryReductionFloorMb = 256;
+constexpr uint32_t kMemoryReductionLifetimeMs = 1000;
+}  // namespace
+
+void TextureCache::RequestMemoryReduction() {
+  memory_reduction_until_ms.store(
+      rex::chrono::Clock::QueryHostUptimeMillis() + kMemoryReductionDurationMs,
+      std::memory_order_relaxed);
+}
+
 void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_index) {
   // If memory usage is too high, destroy unused textures.
   uint64_t current_time = rex::chrono::Clock::QueryHostUptimeMillis();
@@ -306,6 +321,12 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
   uint32_t limit_hard_mb =
       REXCVAR_GET(texture_cache_memory_limit_hard) + limit_scaled_resolve_add_mb;
   uint32_t limit_soft_lifetime = REXCVAR_GET(texture_cache_memory_limit_soft_lifetime) * 1000;
+  const bool reducing = current_time < memory_reduction_until_ms.load(std::memory_order_relaxed);
+  if (reducing) {
+    limit_soft_mb = std::min(limit_soft_mb, kMemoryReductionFloorMb);
+    limit_soft_lifetime = std::min(limit_soft_lifetime, kMemoryReductionLifetimeMs);
+  }
+  const uint64_t usage_before = textures_total_host_memory_usage_;
   bool destroyed_any = false;
   while (texture_used_first_ != nullptr) {
     uint64_t total_host_memory_usage_mb =
@@ -340,6 +361,10 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
     }
   }
   if (destroyed_any) {
+    if (reducing) {
+      REXGPU_INFO("Texture cache reduced for low memory: {} MB to {} MB",
+                  usage_before >> 20, textures_total_host_memory_usage_ >> 20);
+    }
     COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   }
 }

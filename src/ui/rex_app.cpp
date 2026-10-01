@@ -30,6 +30,7 @@
 
 #include <rex/audio/audio_system.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
+#include <rex/chrono/clock.h>
 #include <rex/input/input_system.h>
 #include <rex/kernel/init.h>
 #include <rex/string/numeric.h>
@@ -310,7 +311,8 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
 
   // In the background the activity's window is gone and the player is not
   // there: stop the GPU commands (guest threads then wait as on a stalled
-  // frame) and the audio, and restart both on return.
+  // frame) and the audio, and restart both on return. Guest time stops too,
+  // so the title does not integrate the pause as one long step.
   app_context().AddLifecycleListener([this](rex::ui::WindowedAppContext::LifecycleEvent event) {
     if (!runtime_) {
       return;
@@ -319,18 +321,21 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     auto* audio = runtime_->audio_system();
     switch (event) {
       case rex::ui::WindowedAppContext::LifecycleEvent::kWillEnterBackground:
-        REXLOG_INFO("App entering the background: pausing GPU and audio");
+        REXLOG_INFO("App entering the background: pausing GPU, audio and guest time");
         if (audio) audio->Pause();
         if (graphics) graphics->Pause();
+        rex::chrono::Clock::set_guest_time_paused(true);
         break;
       case rex::ui::WindowedAppContext::LifecycleEvent::kDidEnterForeground:
-        REXLOG_INFO("App back in the foreground: resuming GPU and audio");
+        REXLOG_INFO("App back in the foreground: resuming guest time, GPU and audio");
+        rex::chrono::Clock::set_guest_time_paused(false);
         if (graphics) graphics->Resume();
         if (audio) audio->Resume();
         break;
       case rex::ui::WindowedAppContext::LifecycleEvent::kLowMemory: {
         // The system is about to kill background apps, or this one: record
-        // what the process holds so a kill is diagnosable afterwards.
+        // what the process holds so a kill is diagnosable afterwards, and
+        // give back the textures the renderer can reload.
         std::string resident = "unknown";
 #if REX_PLATFORM_LINUX
         std::ifstream status("/proc/self/status");
@@ -342,6 +347,7 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
         }
 #endif
         REXLOG_WARN("Low memory reported by the system; resident:{}", resident);
+        if (graphics) graphics->ReduceMemory();
         break;
       }
       default:

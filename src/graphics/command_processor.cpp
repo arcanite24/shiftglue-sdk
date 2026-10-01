@@ -189,6 +189,12 @@ bool CommandProcessor::Initialize() {
 
 void CommandProcessor::Shutdown() {
   worker_running_ = false;
+  {
+    // A paused worker (the app closed from the background) must wake to exit.
+    std::lock_guard<std::mutex> lock(pause_mutex_);
+    worker_paused_ = false;
+  }
+  pause_signal_.notify_all();
   write_ptr_index_event_->Set();
   worker_thread_->Wait(0, 0, 0, nullptr);
   worker_thread_.reset();
@@ -198,11 +204,19 @@ void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cach
                                                uint32_t title_id, bool blocking) {}
 
 void CommandProcessor::CallInThread(std::function<void()> fn) {
-  if (pending_fns_.empty() && system::XThread::IsInThread(worker_thread_.get())) {
+  if (!pending_any_ && system::XThread::IsInThread(worker_thread_.get())) {
     fn();
   } else {
-    pending_fns_.push(std::move(fn));
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    pending_fns_.push({std::move(fn), false});
+    pending_any_ = true;
   }
+}
+
+void CommandProcessor::CallInWorkerThread(std::function<void()> fn) {
+  std::lock_guard<std::mutex> lock(pending_mutex_);
+  pending_fns_.push({std::move(fn), true});
+  pending_any_ = true;
 }
 
 void CommandProcessor::ClearCaches() {}
@@ -249,14 +263,23 @@ void CommandProcessor::WorkerThreadMain() {
   }
 
   while (worker_running_) {
-    while (!pending_fns_.empty()) {
-      auto fn = std::move(pending_fns_.front());
-      pending_fns_.pop();
-      if (record_split_) {
-        RecordCall(std::move(fn));
+    while (pending_any_) {
+      PendingCall call;
+      {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        if (pending_fns_.empty()) {
+          pending_any_ = false;
+          break;
+        }
+        call = std::move(pending_fns_.front());
+        pending_fns_.pop();
+        pending_any_ = !pending_fns_.empty();
+      }
+      if (record_split_ && !call.on_worker) {
+        RecordCall(std::move(call.fn));
         PublishRecordBatch();
       } else {
-        fn();
+        call.fn();
       }
     }
 
@@ -283,7 +306,7 @@ void CommandProcessor::WorkerThreadMain() {
         rex::thread::MaybeYield();
         loop_count++;
         write_ptr_index = write_ptr_index_.load();
-      } while (worker_running_ && pending_fns_.empty() &&
+      } while (worker_running_ && !pending_any_ &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
       PERF_counter_add(kGpuThreadIdleNs,
                        std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -292,7 +315,7 @@ void CommandProcessor::WorkerThreadMain() {
       if (!record_split_) {
         ReturnFromWait();
       }
-      if (!worker_running_ || !pending_fns_.empty()) {
+      if (!worker_running_ || pending_any_) {
         continue;
       }
     }
@@ -565,13 +588,53 @@ void CommandProcessor::Pause() {
   }
   paused_ = true;
 
+  // The decoding thread parks itself between guest commands until Resume.
+  // With a recorder thread, it first lets the recorder finish what is
+  // queued; the recorder then waits for batches that do not come.
+  {
+    std::lock_guard<std::mutex> lock(pause_mutex_);
+    worker_paused_ = true;
+  }
   thread::Fence fence;
-  CallInThread([&fence]() {
+  CallInWorkerThread([this, &fence]() {
+    RecordSync();
     fence.Signal();
-    thread::Thread::GetCurrentThread()->Suspend();
+    WorkerWaitWhilePaused();
   });
 
   fence.Wait();
+}
+
+void CommandProcessor::WorkerWaitWhilePaused() {
+  std::unique_lock<std::mutex> lock(pause_mutex_);
+  for (;;) {
+    pause_signal_.wait(lock, [this]() { return !worker_paused_ || reduce_memory_requested_; });
+    if (!reduce_memory_requested_) {
+      return;
+    }
+    reduce_memory_requested_ = false;
+    lock.unlock();
+    if (record_split_) {
+      RecordCall([this]() { OnReduceMemory(); });
+      RecordSync();
+    } else {
+      OnReduceMemory();
+    }
+    lock.lock();
+  }
+}
+
+void CommandProcessor::ReduceMemoryWhilePaused() {
+  // Does not wait: the caller is the UI thread, which must stay free to
+  // deliver the return to the foreground.
+  {
+    std::lock_guard<std::mutex> lock(pause_mutex_);
+    if (!worker_paused_) {
+      return;
+    }
+    reduce_memory_requested_ = true;
+  }
+  pause_signal_.notify_all();
 }
 
 void CommandProcessor::Resume() {
@@ -579,8 +642,11 @@ void CommandProcessor::Resume() {
     return;
   }
   paused_ = false;
-
-  worker_thread_->thread()->Resume();
+  {
+    std::lock_guard<std::mutex> lock(pause_mutex_);
+    worker_paused_ = false;
+  }
+  pause_signal_.notify_all();
 }
 
 bool CommandProcessor::Save(::rex::stream::ByteStream* stream) {

@@ -658,6 +658,20 @@ void VulkanCommandProcessor::ClearCaches() {
   cache_clear_requested_ = true;
 }
 
+void VulkanCommandProcessor::OnReduceMemory() {
+  if (!texture_cache_) {
+    return;
+  }
+  // Paused between guest commands: reclaim what the GPU has finished
+  // (without waiting; textures still in flight stay), then trim down to the
+  // reduction floor.
+  CheckSubmissionFenceAndDeviceLoss(0);
+  const uint64_t before = texture_cache_->total_host_memory_usage();
+  texture_cache_->CompletedSubmissionUpdated(GetCompletedSubmission());
+  REXGPU_INFO("Low memory while paused: texture cache {} MB, now {} MB", before >> 20,
+              texture_cache_->total_host_memory_usage() >> 20);
+}
+
 void VulkanCommandProcessor::InvalidateGpuMemory() {
   if (shared_memory_) {
     shared_memory_->InvalidateAllPages();

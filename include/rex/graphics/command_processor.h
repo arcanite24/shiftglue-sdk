@@ -145,6 +145,9 @@ class CommandProcessor {
   bool is_paused() const { return paused_; }
   void Pause();
   void Resume();
+  // While paused, wakes the commands thread once to release the caches it
+  // can rebuild (OnReduceMemory), then pauses it again.
+  void ReduceMemoryWhilePaused();
 
   bool Save(::rex::stream::ByteStream* stream);
   bool Restore(::rex::stream::ByteStream* stream);
@@ -322,7 +325,28 @@ class CommandProcessor {
   std::atomic<bool> worker_running_;
   system::object_ref<system::XHostThread> worker_thread_;
 
-  std::queue<std::function<void()>> pending_fns_;
+  struct PendingCall {
+    std::function<void()> fn;
+    // Runs on the decoding thread even when a recorder thread is split off.
+    bool on_worker = false;
+  };
+  void CallInWorkerThread(std::function<void()> fn);
+  // On the worker thread, between guest commands: parks it until Resume,
+  // doing any memory reduction requested meanwhile.
+  void WorkerWaitWhilePaused();
+  // Called on the thread that records host GPU work, with the GPU idle.
+  virtual void OnReduceMemory() {}
+
+  // Pushed from other threads (the UI's lifecycle events), popped by the
+  // worker.
+  std::mutex pending_mutex_;
+  std::queue<PendingCall> pending_fns_;
+  std::atomic<bool> pending_any_{false};
+
+  std::mutex pause_mutex_;
+  std::condition_variable pause_signal_;
+  bool worker_paused_ = false;            // Protected by pause_mutex_.
+  bool reduce_memory_requested_ = false;  // Protected by pause_mutex_.
 
   // MicroEngine binary from PM4_ME_INIT
   std::vector<uint32_t> me_bin_;

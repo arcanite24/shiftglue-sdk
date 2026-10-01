@@ -57,6 +57,10 @@ class Clock {
   // Sets the guest time scalar, adjusting tick and wall clock speed.
   // Ex: 1x=normal, 2x=double speed, 1/2x=half speed.
   static void set_guest_time_scalar(double scalar);
+  // Stops guest time where it is (a mobile app in the background), so the
+  // title sees no gap when it resumes; resuming continues from that value.
+  static void set_guest_time_paused(bool paused);
+  static bool guest_time_paused();
   // Get the tick ration between host and guest including time scaling if set.
   static std::pair<uint64_t, uint64_t> guest_tick_ratio();
   // Guest ticks-per-second.

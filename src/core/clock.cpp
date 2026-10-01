@@ -58,6 +58,8 @@ std::atomic<const ClockSegment*> clock_segment_{
     new ClockSegment{Clock::QueryHostTickCount(), 0, 1, 1}};
 // Serializes segment changes and guest_tick_ratio_.
 std::mutex tick_mutex_;
+// While set, segments advance no guest ticks (set_guest_time_paused).
+std::atomic<bool> guest_time_paused_{false};
 // Largest guest tick count returned so far, so guest time never runs
 // backwards between threads that sampled the host clock in either order.
 std::atomic<uint64_t> last_guest_tick_count_{0};
@@ -93,8 +95,9 @@ void RecomputeGuestTickScalar() {
   guest_tick_ratio_ = frac;
   const uint64_t host_now = Clock::QueryHostTickCount();
   const uint64_t guest_now = UpdateGuestClock();
-  clock_segment_.store(new ClockSegment{host_now, guest_now, frac.first, frac.second},
-                       std::memory_order_release);
+  clock_segment_.store(
+      new ClockSegment{host_now, guest_now, guest_time_paused_ ? 0 : frac.first, frac.second},
+      std::memory_order_release);
 }
 
 // Update the guest timer for all threads.
@@ -160,6 +163,26 @@ void Clock::set_guest_time_scalar(double scalar) {
 
   guest_time_scalar_ = scalar;
   RecomputeGuestTickScalar();
+}
+
+void Clock::set_guest_time_paused(bool paused) {
+  if (REXCVAR_GET(clock_no_scaling)) {
+    return;
+  }
+  std::lock_guard lock(tick_mutex_);
+  if (guest_time_paused_ == paused) {
+    return;
+  }
+  const uint64_t host_now = Clock::QueryHostTickCount();
+  const uint64_t guest_now = UpdateGuestClock();
+  guest_time_paused_ = paused;
+  clock_segment_.store(new ClockSegment{host_now, guest_now, paused ? 0 : guest_tick_ratio_.first,
+                                        guest_tick_ratio_.second},
+                       std::memory_order_release);
+}
+
+bool Clock::guest_time_paused() {
+  return guest_time_paused_.load(std::memory_order_relaxed);
 }
 
 std::pair<uint64_t, uint64_t> Clock::guest_tick_ratio() {

@@ -105,6 +105,7 @@ class GraphicsSystem : public system::IGraphicsSystem {
   bool is_paused() const { return paused_; }
   void Pause() override;
   void Resume() override;
+  void ReduceMemory() override;
 
   bool Save(::rex::stream::ByteStream* stream);
   bool Restore(::rex::stream::ByteStream* stream);

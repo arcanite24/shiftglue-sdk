@@ -237,6 +237,9 @@ class IGraphicsSystem {
   // background); guest threads then wait on the GPU as on a stalled frame.
   virtual void Pause() {}
   virtual void Resume() {}
+  // The system is short of memory (Android's onTrimMemory): release caches
+  // the renderer can rebuild.
+  virtual void ReduceMemory() {}
 
   virtual void Shutdown() = 0;
 };

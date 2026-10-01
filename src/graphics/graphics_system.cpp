@@ -24,6 +24,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
@@ -215,6 +216,11 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         uint64_t interval_ticks = 1;
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
         while (vsync_worker_running_) {
+          if (chrono::Clock::guest_time_paused()) {
+            // Guest time stands still in the background: no vblank is due.
+            rex::thread::Sleep(std::chrono::milliseconds(20));
+            continue;
+          }
           const uint32_t current_render_fps_limit =
               REXCVAR_GET(pinyon_shift_fh1_render_fps_limit);
           if (current_render_fps_limit != render_fps_limit) {
@@ -258,7 +264,7 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
           } else if (remaining_time > kVblankSpinTime) {
             std::this_thread::sleep_for(remaining_time - kVblankSpinTime);
           }
-          while (vsync_worker_running_ &&
+          while (vsync_worker_running_ && !chrono::Clock::guest_time_paused() &&
                  chrono::Clock::QueryGuestTickCount() < deadline_ticks) {
             std::this_thread::yield();
           }
@@ -506,6 +512,16 @@ void GraphicsSystem::Pause() {
 void GraphicsSystem::Resume() {
   paused_ = false;
   command_processor_->Resume();
+}
+
+void GraphicsSystem::ReduceMemory() {
+  // The texture cache runs on the GPU commands thread: it reads the request
+  // there at the next completed submission, or at once if the app is in the
+  // background with the thread paused.
+  TextureCache::RequestMemoryReduction();
+  if (paused_) {
+    command_processor_->ReduceMemoryWhilePaused();
+  }
 }
 
 bool GraphicsSystem::Save(::rex::stream::ByteStream* stream) {

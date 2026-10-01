@@ -77,6 +77,9 @@ class TextureCache {
   virtual void ClearCache();
 
   virtual void CompletedSubmissionUpdated(uint64_t completed_submission_index);
+  // For a while after this call (from any thread), textures unused for a
+  // second are destroyed down to a small floor instead of the usual limits.
+  static void RequestMemoryReduction();
   virtual void BeginSubmission(uint64_t new_submission_index);
   virtual void BeginFrame();
 
