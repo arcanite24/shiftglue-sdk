@@ -45,9 +45,10 @@ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
 REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
                     "Ignores game-specified thread affinities");
 
-// On by default on Android: a phone's little cores run these threads two to
-// three times slower, and the scheduler does not know which ones gate a frame.
-REXCVAR_DEFINE_BOOL(latency_critical_thread_placement, REX_PLATFORM_ANDROID, "Kernel",
+// Off on Android too until a device measures it (AP-7.0): on the 8-core
+// emulator the raised priority alone (its cores are alike, so nothing is
+// pinned) stalled or derailed fh1-opening-sync in two runs of two.
+REXCVAR_DEFINE_BOOL(latency_critical_thread_placement, false, "Kernel",
                     "Run the main guest thread and the GPU command and vblank threads at "
                     "above-normal priority, on performance cores of hybrid CPUs");
 
