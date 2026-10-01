@@ -62,6 +62,8 @@ int RunWindowedApp(int argc, char** argv) {
   // SDL otherwise picks the orientation from the window's shape and
   // overrides the manifest; the title is 16:9 only.
   SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+  // Game audio, for the system's routing and focus (AP-5.1).
+  SDL_SetHint(SDL_HINT_AUDIO_DEVICE_STREAM_ROLE, "Game");
 #endif
   auto remaining = rex::cvar::Init(argc, argv);
   rex::cvar::ApplyEnvironment();

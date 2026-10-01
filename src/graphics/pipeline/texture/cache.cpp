@@ -28,6 +28,10 @@
 #include <rex/math.h>
 #include <rex/perf/counter.h>
 
+REXCVAR_DEFINE_BOOL(android_allow_resolution_scale, false, "GPU",
+                    "Android: allow internal resolution scales above 1x (each needs a "
+                    "dedicated 512 MB x scale^2 resolve buffer)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(texture_cache_memory_limit_render_to_texture, 24, "GPU",
                      "Texture cache memory limit for render-to-texture (MB)")
     .range(1, 256)
@@ -268,8 +272,17 @@ bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out
   uint32_t config_y = use_shared_scale && !rex::cvar::HasNonDefaultValue("draw_resolution_scale_y")
                           ? shared_scale
                           : uint32_t(std::max(INT32_C(1), REXCVAR_GET(draw_resolution_scale_y)));
-  uint32_t clamped_x = std::min(kMaxDrawResolutionScaleAlongAxis, config_x);
-  uint32_t clamped_y = std::min(kMaxDrawResolutionScaleAlongAxis, config_y);
+  uint32_t max_scale = kMaxDrawResolutionScaleAlongAxis;
+#if REX_PLATFORM_ANDROID
+  // Mobile drivers have no sparse buffers, so the scaled resolve buffer is a
+  // dedicated 512 MB x scale^2 allocation in the memory the whole device
+  // shares; 1x is what a phone or handheld can hold (AP-2.5).
+  if (!REXCVAR_GET(android_allow_resolution_scale)) {
+    max_scale = 1;
+  }
+#endif
+  uint32_t clamped_x = std::min(max_scale, config_x);
+  uint32_t clamped_y = std::min(max_scale, config_y);
   x_out = clamped_x;
   y_out = clamped_y;
   return clamped_x == config_x && clamped_y == config_y;
