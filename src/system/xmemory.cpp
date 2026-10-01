@@ -551,10 +551,15 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
   uint32_t virtual_address = HostToGuestVirtual(host_address);
   BaseHeap* heap = LookupHeap(virtual_address);
   if (!heap || heap->heap_type() != memory::HeapType::kGuestPhysical) {
+    // Generated code keeps no guest program counter, but every call sets the
+    // link register: it names the function the faulting code was called from.
+    const auto* thread_state = runtime::ThreadState::Get();
+    const PPCContext* context = thread_state ? thread_state->context() : nullptr;
     REXSYS_ERROR(
-        "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
+        "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread "
+        "0x{:X}, guest lr 0x{:08X}",
         is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
-        rex::thread::current_thread_id());
+        rex::thread::current_thread_id(), context ? uint32_t(context->lr) : 0u);
     return false;
   }
 
