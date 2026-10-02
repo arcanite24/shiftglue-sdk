@@ -74,6 +74,16 @@ for dest_kind in depth stencil; do
   done
   kind=2
 done
+# Depth and stencil in one pass, for Vulkan devices with shader stencil export:
+# GLSL, as glslang's HLSL front end has no SV_StencilRef (nor has Direct3D 12's
+# shader model 5.1).
+if [[ -n $GLSLANG ]]; then
+  for dest_msaa in "" _dms; do
+    msaa_define=()
+    [[ -n $dest_msaa ]] && msaa_define+=(-DFH1_DEST_MSAA=1)
+    "$GLSLANG" -V "${msaa_define[@]}"       --vn "fh1_native_transfer_depth_stencil${dest_msaa}_from_words_ps"       -o "vulkan_spirv/fh1_native_transfer_depth_stencil${dest_msaa}_from_words_ps.h"       fh1_native_transfer_depth_stencil_from_words.frag > /dev/null
+  done
+fi
 # Texture cache: the scaled 32-bpp resolve buffer and reflection cube imports.
 # Their DXBC headers were built with other fxc flags and are kept as they are.
 compile_spirv cs_5_1 fh1_scaled_32bpp_2x.cs.hlsl fh1_scaled_32bpp_2x_cs

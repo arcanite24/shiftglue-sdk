@@ -124,6 +124,8 @@ class Fh1NativeExecutor {
   using TileRun = Fh1EdramTiles::Run;
   static constexpr uint32_t kNoOwner = Fh1EdramTiles::kNoOwner;
   static constexpr uint32_t kTransferDestUint = 16;
+  // Depth and stencil from EDRAM words in one pass (shader stencil export).
+  static constexpr uint32_t kTransferDestDepthStencil = 17;
   static constexpr uint32_t kTransferSourceWords = 3;
   struct TransferPipelineKey {
     uint32_t dest_kind;  // 0 color, 1 depth, 2 + bit: stencil bit, kTransferDestUint
@@ -319,6 +321,8 @@ class Fh1NativeExecutor {
   uint64_t frame_ = 0;
   // fh1_scaled_msaa_single_sample at a scale above 1x.
   bool single_sample_msaa_ = false;
+  // The device exports stencil from shaders: depth transfers take one pass.
+  bool stencil_export_ = false;
   // The layout constant's host sample mode: 0 native, 1 native 2x, 2 2x
   // stored as 4x, 3 every guest sample in one host sample.
   static uint32_t HostSampleMode(const Surface& surface);
