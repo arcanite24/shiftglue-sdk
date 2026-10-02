@@ -336,8 +336,10 @@ void VulkanSharedMemory::GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_
                                        VkAccessFlags& access_mask) const {
   switch (usage) {
     case Usage::kComputeWrite:
+      // Resolves write the buffer: the write must be made available to the
+      // next usage (tiled GPUs do not tolerate a read-only source mask).
       stage_mask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-      access_mask = VK_ACCESS_SHADER_READ_BIT;
+      access_mask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
       return;
     case Usage::kTransferDestination:
       stage_mask = VK_PIPELINE_STAGE_TRANSFER_BIT;
