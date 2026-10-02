@@ -184,6 +184,8 @@ constexpr const char* kCounterNames[] = {
     "gpu_submission_busy_ns",
     "gpu_recorder_busy_ns",
     "critical_region_blocked_ns",
+    "gpu_decoder_cpu_ns",
+    "gpu_recorder_cpu_ns",
 };
 static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
 
@@ -268,6 +270,8 @@ constexpr bool kIsGauge[] = {
     false,  // kGpuSubmissionBusyNs
     false,  // kGpuRecorderBusyNs
     false,  // kCriticalRegionBlockedNs
+    false,  // kGpuDecoderCpuNs
+    false,  // kGpuRecorderCpuNs
 };
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 
@@ -341,7 +345,9 @@ int64_t CurrentThreadCpuTimeNs() {
   user_time.HighPart = user.dwHighDateTime;
   return int64_t(kernel_time.QuadPart + user_time.QuadPart) * 100;
 #else
-  return 0;
+  timespec time = {};
+  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time)) return 0;
+  return int64_t(time.tv_sec) * 1000000000 + time.tv_nsec;
 #endif
 }
 

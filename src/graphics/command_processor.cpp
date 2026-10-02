@@ -60,6 +60,19 @@ REXCVAR_DEFINE_INT32(wait_reg_mem_yield_us, 2000, "GPU",
                      "once")
     .range(0, 16000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(gpu_idle_spin_count, 500, "GPU",
+                     "How many times the GPU commands thread yields, when the ring is empty, "
+                     "before it waits for the guest to write more (each yield is a busy spin "
+                     "when no other thread wants the core)")
+    .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(wait_reg_mem_sleep_us, 0, "GPU",
+                     "With vsync, how long each WAIT_REG_MEM sleep after the yield period lasts; "
+                     "0 sleeps the packet's own interval (at least a millisecond). Short sleeps "
+                     "stop the commands thread spinning for power without the millisecond's "
+                     "latency")
+    .range(0, 16000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_STRING(fh1_debug_skip_draws, "", "GPU",
                       "Diagnostics: skip the draws with these indices in every frame, as "
@@ -262,6 +275,7 @@ void CommandProcessor::WorkerThreadMain() {
     StartRecordThread();
   }
 
+  int64_t decoder_cpu_ns = 0;
   while (worker_running_) {
     while (pending_any_) {
       PendingCall call;
@@ -283,6 +297,13 @@ void CommandProcessor::WorkerThreadMain() {
       }
     }
 
+    {
+      const int64_t cpu_ns = perf::CurrentThreadCpuTimeNs();
+      if (decoder_cpu_ns && cpu_ns >= decoder_cpu_ns) {
+        PERF_counter_add(kGpuDecoderCpuNs, cpu_ns - decoder_cpu_ns);
+      }
+      decoder_cpu_ns = cpu_ns;
+    }
     uint32_t write_ptr_index = write_ptr_index_.load();
     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
@@ -297,7 +318,7 @@ void CommandProcessor::WorkerThreadMain() {
       uint32_t loop_count = 0;
       do {
         // If we spin around too much, revert to a "low-power" state.
-        if (loop_count > 500) {
+        if (loop_count > uint32_t(REXCVAR_GET(gpu_idle_spin_count))) {
           const int wait_time_ms = 5;
           rex::thread::Wait(write_ptr_index_event_.get(), true,
                             std::chrono::milliseconds(wait_time_ms));
@@ -389,7 +410,9 @@ void CommandProcessor::RecordThreadMain() {
       record_queue_.pop_front();
     }
     const auto busy_start = std::chrono::steady_clock::now();
+    const int64_t cpu_start = perf::CurrentThreadCpuTimeNs();
     ExecuteRecordBatch(*batch);
+    PERF_counter_add(kGpuRecorderCpuNs, perf::CurrentThreadCpuTimeNs() - cpu_start);
     PERF_counter_add(kGpuRecorderBusyNs,
                      std::chrono::duration_cast<std::chrono::nanoseconds>(
                          std::chrono::steady_clock::now() - busy_start)
@@ -1551,6 +1574,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         } else if (std::chrono::steady_clock::now() - wait_start <
                    std::chrono::microseconds(REXCVAR_GET(wait_reg_mem_yield_us))) {
           rex::thread::MaybeYield();
+        } else if (const int32_t sleep_us = REXCVAR_GET(wait_reg_mem_sleep_us)) {
+          rex::thread::Sleep(std::chrono::microseconds(sleep_us));
         } else {
           rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
         }
