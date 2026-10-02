@@ -29,6 +29,11 @@ REXCVAR_DEFINE_BOOL(fh1_scaled_msaa_single_sample, false, "GPU",
                     "host sample. Much less GPU work at 3x and 4x; edges lose their MSAA")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(fh1_msaa_single_sample, false, "GPU",
+                    "Keep the guest's 2x and 4x MSAA surfaces as single-sampled images at any "
+                    "resolution scale (Vulkan): at 1x the game renders without MSAA - harder "
+                    "edges - for much less GPU work, the cheaper choice for phones")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_native_stencil_export, true, "GPU",
                     "Transfer depth and stencil into a depth surface in one pass where the "
                     "device exports stencil from shaders (FH1 native executor, Vulkan), "
@@ -321,7 +326,8 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   config_ = config;
   if (!config_.memory || !config_.textures || !config_.render_targets) return false;
   scale_ = config_.textures->draw_resolution_scale_x();
-  single_sample_msaa_ = scale_ >= 2 && REXCVAR_GET(fh1_scaled_msaa_single_sample);
+  single_sample_msaa_ = (scale_ >= 2 && REXCVAR_GET(fh1_scaled_msaa_single_sample)) ||
+                        REXCVAR_GET(fh1_msaa_single_sample);
   stencil_export_ = REXCVAR_GET(fh1_native_stencil_export) &&
                     command_processor_.GetVulkanDevice()->extensions().ext_EXT_shader_stencil_export;
   if (single_sample_msaa_) {
