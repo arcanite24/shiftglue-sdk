@@ -19,6 +19,7 @@
 #include <rex/bit.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/platform.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
@@ -35,7 +36,9 @@
 #include <rex/ui/vulkan/util.h>
 
 REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
-REXCVAR_DEFINE_BOOL(vulkan_texture_load_compute_copy, true, "GPU/Vulkan",
+// Off on Android: storage-capable images may lose the tiled GPUs' framebuffer
+// compression (UBWC on Adreno), and those GPUs have no copy engine to avoid.
+REXCVAR_DEFINE_BOOL(vulkan_texture_load_compute_copy, !REX_PLATFORM_ANDROID, "GPU/Vulkan",
                     "Write loaded texture data into large single-level 2D textures with a compute "
                     "shader instead of a buffer-to-image copy, which NVIDIA runs on the copy "
                     "engine serialized with the frame")
