@@ -23,6 +23,7 @@
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
+#include <rex/platform.h>
 #include <SDL3/SDL.h>
 
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
@@ -40,6 +41,15 @@ SDLAudioDriver::~SDLAudioDriver() {
 bool SDLAudioDriver::Initialize() {
   // Set audio category for proper OS audio handling
   SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
+#if REX_PLATFORM_ANDROID
+  // 10 ms callbacks (SDL's AAudio default is 20 ms, with twice that
+  // buffered): with the stereo stream below the low latency path keeps the
+  // output close to the game.
+  SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "480");
+  // Opens the device itself in stereo: SDL otherwise takes the 6 channels
+  // Android reports and expands the stereo fold below back to them.
+  SDL_SetHint(SDL_HINT_AUDIO_CHANNELS, "2");
+#endif
 
   // Set app name for audio device identification
   SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING, "rexglue");
@@ -86,8 +96,11 @@ bool SDLAudioDriver::OpenDevice() {
   }
 
   // A 1-channel device gets the stereo fold too, then SDL collapses to mono.
-  // Handing it a 6ch stream instead would use SDL's own downmix.
-  if (obtained_spec.channels <= 2) {
+  // Handing it a 6ch stream instead would use SDL's own downmix. Android
+  // reports 6 channels for a phone's stereo speakers, and a 6-channel stream
+  // misses its low latency mixer (about 130 ms behind on a Snapdragon 8
+  // Elite), so it always gets the stereo fold.
+  if (obtained_spec.channels <= 2 || REX_PLATFORM_ANDROID) {
     SDL_DestroyAudioStream(sdl_stream_);
     sdl_stream_ = nullptr;
     desired_spec.channels = 2;
