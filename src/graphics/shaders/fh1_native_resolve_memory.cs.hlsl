@@ -13,7 +13,8 @@
 // stencil sources instead of a color source), FH1_DEST_IMAGE (32bpp only: each
 // resolved word is also written into a texture of the destination's layout,
 // through its raw-bits view, as the texture's load would leave it: swapped by
-// the texture's endianness, from the texture row fh1_image_row).
+// the texture's endianness and, for depth textures, converted to float as
+// their load does, from the texture row fh1_image_row).
 
 #include "fh1_push_constants.hlsli"
 
@@ -39,7 +40,9 @@ FH1_PUSH_CONSTANTS cbuffer Fh1NativeResolveMemoryConstants FH1_CONSTANTS_REGISTE
   uint fh1_dest_pitch;      // texels
 #ifdef FH1_DEST_IMAGE
   uint fh1_image_row;       // texture row of the destination's first row, host rows
-  uint fh1_image_endian;    // the texture's xenos::Endian
+  // The texture's xenos::Endian 0:2; its load's conversion 3:4 (0: none, 1:
+  // 24-bit unorm depth to float, 2: 20e4 depth to float).
+  uint fh1_image_endian;
 #endif
 };
 
@@ -93,7 +96,16 @@ uint EndianSwap32(uint value, uint endian) {
 void StoreWord(uint address, uint2 host_pixel, uint word) {
   fh1_memory.Store(address, word);
 #ifdef FH1_DEST_IMAGE
-  fh1_image[host_pixel + uint2(0u, fh1_image_row)] = EndianSwap32(word, fh1_image_endian);
+  uint texel = EndianSwap32(word, fh1_image_endian & 7u);
+  uint conversion = (fh1_image_endian >> 3u) & 3u;
+  if (conversion == 1u) {
+    // As texture_load_depth_unorm: (d + (d >> 23)) * 2^-24.
+    uint depth = texel >> 8u;
+    texel = asuint(float(depth + (depth >> 23u)) * asfloat(0x33800000u));
+  } else if (conversion == 2u) {
+    texel = asuint(Float20e4To32(texel >> 8u));
+  }
+  fh1_image[host_pixel + uint2(0u, fh1_image_row)] = texel;
 #endif
 }
 

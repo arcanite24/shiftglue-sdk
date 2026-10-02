@@ -289,7 +289,7 @@ class Fh1NativeExecutor {
   // image (binding 33), with two more constants.
   VkDescriptorSetLayout image_set_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout image_pipeline_layout_ = VK_NULL_HANDLE;
-  // [source kind][msaa]; no depth sources.
+  // [source kind][msaa]
   VkPipeline image_pipelines_[3][2] = {};
   std::vector<TextureCache::DirectResolveTarget> direct_resolve_targets_;
   // A descriptor pool per frame in flight, reset when the frame reopens.

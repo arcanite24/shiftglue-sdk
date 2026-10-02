@@ -94,6 +94,8 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/fh1_native_resolve_memory_uint_ms_cs.h"
 #include "../shaders/vulkan_spirv/fh1_native_resolve_image_color_cs.h"
 #include "../shaders/vulkan_spirv/fh1_native_resolve_image_color_ms_cs.h"
+#include "../shaders/vulkan_spirv/fh1_native_resolve_image_depth_cs.h"
+#include "../shaders/vulkan_spirv/fh1_native_resolve_image_depth_ms_cs.h"
 #include "../shaders/vulkan_spirv/fh1_native_resolve_image_uint_cs.h"
 #include "../shaders/vulkan_spirv/fh1_native_resolve_image_uint_ms_cs.h"
 #include "../shaders/vulkan_spirv/fh1_native_transfer_color_from_color_ps.h"
@@ -278,11 +280,12 @@ const SpirvShader kComputeShaders[2][3][2] = {
      {FH1_SPIRV(fh1_native_transfer_words_uint_cs),
       FH1_SPIRV(fh1_native_transfer_words_uint_ms_cs)}},
 };
-// [source kind][msaa]: resolves straight into a texture (no depth sources).
+// [source kind][msaa]: resolves also written into a texture.
 const SpirvShader kImageShaders[3][2] = {
     {FH1_SPIRV(fh1_native_resolve_image_color_cs),
      FH1_SPIRV(fh1_native_resolve_image_color_ms_cs)},
-    {{nullptr, 0}, {nullptr, 0}},
+    {FH1_SPIRV(fh1_native_resolve_image_depth_cs),
+     FH1_SPIRV(fh1_native_resolve_image_depth_ms_cs)},
     {FH1_SPIRV(fh1_native_resolve_image_uint_cs),
      FH1_SPIRV(fh1_native_resolve_image_uint_ms_cs)},
 };
@@ -2377,17 +2380,24 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
                           std::make_pair(extent_start, extent_length));
     }
     // Current textures of the destination's format and layout over it are
-    // written directly as well, and stay current.
+    // written directly as well, and stay current. Depth (the 24_8 word) goes
+    // to 24_8 or 24_8_FLOAT textures, converted as their loads do.
     direct_resolve_targets_.clear();
     const uint32_t pack = plan.dest_info & 7u;
-    if (REXCVAR_GET(fh1_resolve_to_textures) && !plan.copying_depth && pack <= 2) {
-      config_.textures->FindDirectResolveTargets(
-          plan.dest_base, extent_start, extent_length,
+    uint32_t direct_resolve_conversion = 0;
+    if (REXCVAR_GET(fh1_resolve_to_textures) && (pack <= 2 || pack == 4)) {
+      const xenos::TextureFormat formats[2] = {
           pack == 0   ? xenos::TextureFormat::k_8_8_8_8
           : pack == 1 ? xenos::TextureFormat::k_2_10_10_10
-                      : xenos::TextureFormat::k_32_FLOAT,
-          plan.dest_pitch, uint32_t(plan.x1), uint32_t(plan.y1), scale_ > 1,
-          direct_resolve_targets_);
+          : pack == 2 ? xenos::TextureFormat::k_32_FLOAT
+                      : xenos::TextureFormat::k_24_8,
+          xenos::TextureFormat::k_24_8_FLOAT};
+      for (uint32_t i = 0; i < (pack == 4 ? 2u : 1u) && direct_resolve_targets_.empty(); ++i) {
+        config_.textures->FindDirectResolveTargets(
+            plan.dest_base, extent_start, extent_length, formats[i], plan.dest_pitch,
+            uint32_t(plan.x1), uint32_t(plan.y1), scale_ > 1, direct_resolve_targets_);
+        if (pack == 4) direct_resolve_conversion = i + 1;
+      }
     }
     // One texture, written by the resolve's own dispatch; any others reload.
     VkImageView direct_resolve_view = VK_NULL_HANDLE;
@@ -2427,7 +2437,8 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
               direct_resolve_targets_.empty() ? 0 : direct_resolve_targets_[0].row_offset,
               direct_resolve_targets_.empty()
                   ? 0
-                  : uint32_t(direct_resolve_targets_[0].texture->key().endianness))) {
+                  : uint32_t(direct_resolve_targets_[0].texture->key().endianness) |
+                        (direct_resolve_conversion << 3))) {
         complete = false;
       }
     }
