@@ -20,6 +20,8 @@
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
+#include <rex/thread.h>
+#include <rex/system/thread_state.h>
 #include <rex/ui/vulkan/util.h>
 
 
@@ -38,6 +40,11 @@ REXCVAR_DEFINE_BOOL(fh1_native_stencil_export, true, "GPU",
                     "Transfer depth and stencil into a depth surface in one pass where the "
                     "device exports stencil from shaders (FH1 native executor, Vulkan), "
                     "instead of a pass per stencil bit")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_trace_resolve_cpu_accesses, false, "GPU",
+                    "Diagnostics: after each resolve, watch the resolved range and log guest CPU "
+                    "reads and writes of it (thread and link register), to find the resolves "
+                    "the CPU reads (FH1 native executor, Vulkan)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_fold_clears, true, "GPU",
                     "Record EDRAM clears inside the next draw rendering on the surface (or as "
@@ -2211,6 +2218,24 @@ void LogSkippedResolve(const Fh1ResolvePlan& plan) {
 }
 }  // namespace
 
+namespace {
+// fh1_trace_resolve_cpu_accesses: guest CPU accesses of armed resolved ranges.
+void LogResolvedRangeAccess(void*, uint32_t physical_address, uint32_t length, bool is_write) {
+  static std::atomic<uint32_t> logs{0};
+  static std::atomic<uint32_t> repeats[256];
+  const uint32_t address = memory::CurrentAccessFaultVirtualAddress();
+  if (repeats[((address >> 12) ^ uint32_t(is_write)) & 255].fetch_add(1) % 64 ||
+      logs.fetch_add(1) >= 1000) {
+    return;
+  }
+  const auto* thread_state = runtime::ThreadState::Get();
+  const PPCContext* context = thread_state ? thread_state->context() : nullptr;
+  REXGPU_INFO("Resolved range page {:08X}+{:X}: guest CPU {} at {:08X}, thread 0x{:X}, lr {:08X}",
+              physical_address, length, is_write ? "write" : "read", address,
+              rex::thread::current_thread_id(), context ? uint32_t(context->lr) : 0u);
+}
+}  // namespace
+
 bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_length) {
   const RegisterFile& regs = register_file_;
   CopyPlan plan;
@@ -2329,6 +2354,20 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     }
     // Invalidates textures over the range (and marks it scaled at scale).
     config_.textures->MarkRangeAsResolved(extent_start, extent_length);
+    if (REXCVAR_GET(fh1_trace_resolve_cpu_accesses)) {
+      static void* const callback =
+          memory_.RegisterPhysicalMemoryAccessCallback(LogResolvedRangeAccess, nullptr);
+      (void)callback;
+      memory_.EnablePhysicalMemoryAccessCallbacks(extent_start, extent_length, false, false,
+                                                  true);
+      static std::unordered_set<uint64_t> logged_ranges;
+      if (logged_ranges.size() < 300 &&
+          logged_ranges.insert((uint64_t(extent_start) << 32) | extent_length).second) {
+        REXGPU_INFO("Resolve range {:08X}+{:X} (format {}, {}x{})", extent_start, extent_length,
+                    uint32_t(plan.info.copy_dest_info.copy_dest_format), plan.x1 - plan.x0,
+                    plan.y1 - plan.y0);
+      }
+    }
     if (written_address) *written_address = extent_start;
     if (written_length) *written_length = extent_length;
     if (complete) {
