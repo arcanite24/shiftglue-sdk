@@ -190,6 +190,7 @@ constexpr const char* kCounterNames[] = {
     "gpu_reg_mem_slept_count",
     "title_gpu_fence_wait_count",
     "title_gpu_fence_wait_ns",
+    "texture_band_reloads",
 };
 static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
 
@@ -280,6 +281,7 @@ constexpr bool kIsGauge[] = {
     false,  // kGpuRegMemSleptCount
     false,  // kTitleGpuFenceWaitCount
     false,  // kTitleGpuFenceWaitNs
+    false,  // kTextureBandReloads
 };
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 

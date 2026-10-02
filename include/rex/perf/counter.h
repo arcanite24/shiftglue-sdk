@@ -155,6 +155,9 @@ enum class CounterId : uint16_t {
   kTitleGpuFenceWaitCount,
   kTitleGpuFenceWaitNs,
 
+  // Texture reloads limited to the rows GPU writes changed (DR-2.2).
+  kTextureBandReloads,
+
   kCount  // sentinel -- must be last
 };
 

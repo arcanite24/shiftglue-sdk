@@ -251,6 +251,10 @@ class TextureCache {
     uint32_t gpu_outdated_mask(const std::unique_lock<std::recursive_mutex>& global_lock) const {
       return gpu_outdated_mask_;
     }
+    // The texture cache's write log count when the data last loaded was read
+    // (0: never loaded), for band reloads.
+    uint64_t loaded_write_log_count() const { return loaded_write_log_count_; }
+    void set_loaded_write_log_count(uint64_t count) { loaded_write_log_count_ = count; }
 
     // For LRU caching - updates the last usage frame and moves the texture to
     // the end of the usage queue. Must be called any time the texture is
@@ -275,6 +279,7 @@ class TextureCache {
     TextureKey key_;
     uint64_t allocation_id_;
     std::atomic<uint64_t> payload_generation_{0};
+    uint64_t loaded_write_log_count_ = 0;
 
     texture_util::TextureGuestLayout guest_layout_;
 
@@ -572,6 +577,13 @@ class TextureCache {
   // Whether the load in LoadTextureDataFromResidentMemoryImpl reloads data a
   // GPU write (a resolve) invalidated, for profiling.
   bool loading_resolve_sourced() const { return loading_resolve_sourced_; }
+  // For a base-only load of a single-level tiled 2D texture: the guest texel
+  // rows [first, end) that changed since its last load, all by GPU writes, a
+  // whole number of 32-row macro tile rows from the top (the tiled layout
+  // keeps each such row contiguous). The implementation may load only those
+  // rows; end 0 means the whole texture.
+  uint32_t loading_rows_first() const { return loading_rows_first_; }
+  uint32_t loading_rows_end() const { return loading_rows_end_; }
 
   // Converts a texture fetch constant to a texture key, normalizing and
   // validating the values, or creating an invalid key, and also gets the
@@ -629,6 +641,13 @@ class TextureCache {
   void ScaledResolveGlobalWatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
                                         uint32_t address_first, uint32_t address_last,
                                         bool invalidated_by_gpu);
+  // Appends every watched write to the write log.
+  static void WriteLogGlobalWatchCallback(
+      const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
+      uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu);
+  // Sets loading_rows_first_ and loading_rows_end_ for a base-only reload.
+  void FindReloadRowBand(const std::unique_lock<std::recursive_mutex>& global_lock,
+                         const Texture& texture);
 
   const RegisterFile& register_file_;
   SharedMemory& shared_memory_;
@@ -651,6 +670,18 @@ class TextureCache {
   SharedMemory::GlobalWatchHandle scaled_resolve_global_watch_handle_ = nullptr;
   SharedMemory::GlobalWatchHandle reload_probe_global_watch_handle_ = nullptr;
 
+  // Every watched write in order (its pages, and whether the GPU wrote it), so
+  // a reload knows what changed since a texture's last load.
+  struct WriteLogEntry {
+    uint32_t address_first;
+    uint32_t address_last;
+    bool by_gpu;
+  };
+  static constexpr uint32_t kWriteLogSize = 4096;
+  std::array<WriteLogEntry, kWriteLogSize> write_log_{};
+  uint64_t write_log_count_ = 0;
+  SharedMemory::GlobalWatchHandle write_log_global_watch_handle_ = nullptr;
+
   uint64_t current_submission_index_ = 0;
   uint64_t current_submission_time_ = 0;
 
@@ -672,6 +703,8 @@ class TextureCache {
   // constants have been changed.
   std::atomic<bool> texture_became_outdated_{false};
   bool loading_resolve_sourced_ = false;
+  uint32_t loading_rows_first_ = 0;
+  uint32_t loading_rows_end_ = 0;
 
   std::array<TextureBinding, xenos::kTextureFetchConstantCount> texture_bindings_;
   // Recent derivations per fetch constant: while no binding has been reset

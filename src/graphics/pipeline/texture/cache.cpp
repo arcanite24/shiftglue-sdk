@@ -29,6 +29,12 @@
 #include <rex/math.h>
 #include <rex/perf/counter.h>
 
+REXCVAR_DEFINE_BOOL(texture_band_reloads, true, "GPU",
+                    "Reload only the macro tile rows of a single-level tiled 2D texture that "
+                    "GPU writes (resolves) changed since its last load, when the backend can "
+                    "(Vulkan with vulkan_texture_load_compute_copy), instead of the whole "
+                    "texture")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(android_allow_resolution_scale, false, "GPU",
                     "Android: allow internal resolution scales above 1x (each needs a "
                     "dedicated 512 MB x scale^2 resolve buffer)")
@@ -251,6 +257,8 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
     reload_probe_global_watch_handle_ =
         shared_memory.RegisterGlobalWatch(ReloadProbeGlobalWatchCallback, this);
   }
+  write_log_global_watch_handle_ =
+      shared_memory.RegisterGlobalWatch(WriteLogGlobalWatchCallback, this);
 }
 
 TextureCache::~TextureCache() {
@@ -261,6 +269,9 @@ TextureCache::~TextureCache() {
   }
   if (reload_probe_global_watch_handle_) {
     shared_memory().UnregisterGlobalWatch(reload_probe_global_watch_handle_);
+  }
+  if (write_log_global_watch_handle_) {
+    shared_memory().UnregisterGlobalWatch(write_log_global_watch_handle_);
   }
 }
 
@@ -531,9 +542,22 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   }
 
   loading_resolve_sourced_ = pending_load.resolve_sourced;
+  uint64_t write_log_count;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    write_log_count = write_log_count_;
+    loading_rows_first_ = loading_rows_end_ = 0;
+    if (pending_load.load_base && !pending_load.load_mips) {
+      FindReloadRowBand(global_lock, texture);
+    }
+  }
   const auto load_start = std::chrono::steady_clock::now();
   const bool loaded = LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
                                                             pending_load.load_mips);
+  loading_rows_first_ = loading_rows_end_ = 0;
+  if (loaded) {
+    texture.set_loaded_write_log_count(write_log_count);
+  }
   if (pending_load.resolve_sourced) {
     PERF_counter_add(kTextureResolveReloadCpuTimeNs,
                      std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1315,6 +1339,67 @@ void TextureCache::ScaledResolveGlobalWatchCallbackThunk(
   TextureCache* texture_cache = reinterpret_cast<TextureCache*>(context);
   texture_cache->ScaledResolveGlobalWatchCallback(global_lock, address_first, address_last,
                                                   invalidated_by_gpu);
+}
+
+void TextureCache::WriteLogGlobalWatchCallback(
+    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
+    uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu) {
+  TextureCache& texture_cache = *static_cast<TextureCache*>(context);
+  texture_cache.write_log_[texture_cache.write_log_count_ % kWriteLogSize] = {
+      address_first, address_last, invalidated_by_gpu};
+  ++texture_cache.write_log_count_;
+}
+
+void TextureCache::FindReloadRowBand(
+    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock,
+    const Texture& texture) {
+  loading_rows_first_ = 0;
+  loading_rows_end_ = 0;
+  const TextureKey& key = texture.key();
+  const texture_util::TextureGuestLayout& layout = texture.guest_layout();
+  const FormatInfo* format_info = FormatInfo::Get(key.format);
+  if (!REXCVAR_GET(texture_band_reloads) || !key.tiled ||
+      key.dimension != xenos::DataDimension::k2DOrStacked || key.GetDepthOrArraySize() != 1 ||
+      key.mip_max_level != 0 || layout.packed_level == 0 || format_info->block_width != 1 ||
+      format_info->block_height != 1) {
+    return;
+  }
+  const uint64_t since = texture.loaded_write_log_count();
+  if (!since || write_log_count_ - since > kWriteLogSize) {
+    return;
+  }
+  const uint32_t base = key.base_page << 12;
+  const uint32_t size = texture.GetGuestBaseSize();
+  const uint32_t macro_row_bytes = layout.base.row_pitch_bytes * 32;
+  if (!size || !macro_row_bytes) {
+    return;
+  }
+  uint32_t row_first = UINT32_MAX, row_last = 0;
+  for (uint64_t i = since; i < write_log_count_; ++i) {
+    const WriteLogEntry& entry = write_log_[i % kWriteLogSize];
+    if (entry.address_last < base || entry.address_first >= base + size) {
+      continue;
+    }
+    if (!entry.by_gpu) {
+      // A CPU write: anything may have changed.
+      return;
+    }
+    const uint32_t first = std::max(entry.address_first, base) - base;
+    const uint32_t last = std::min(entry.address_last - base, size - 1);
+    row_first = std::min(row_first, first / macro_row_bytes);
+    row_last = std::max(row_last, last / macro_row_bytes);
+  }
+  if (row_first == UINT32_MAX) {
+    return;
+  }
+  const uint32_t height = key.GetHeight();
+  const uint32_t first = row_first * 32;
+  const uint32_t end = std::min((row_last + 1) * 32, height);
+  if (first >= end || (first == 0 && end == height)) {
+    return;
+  }
+  loading_rows_first_ = first;
+  loading_rows_end_ = end;
 }
 
 void TextureCache::ReloadProbeGlobalWatchCallback(

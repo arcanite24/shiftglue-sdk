@@ -14,6 +14,7 @@ layout(push_constant) uniform Constants {
   uint width;
   uint height;
   uint slice_words;
+  uint dest_y;  // First image row written (a band reload).
 } c;
 
 layout(set = 0, binding = 0, std430) readonly buffer Source { uint words[]; };
@@ -38,5 +39,5 @@ void main() {
   texel.z = words[i + 2u];
   texel.w = words[i + 3u];
 #endif
-  imageStore(dest, ivec3(id), texel);
+  imageStore(dest, ivec3(id.x, id.y + c.dest_y, id.z), texel);
 }

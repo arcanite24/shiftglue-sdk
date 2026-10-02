@@ -22,6 +22,7 @@
 #include <rex/platform.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
+#include <rex/perf/counter.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -1423,6 +1424,18 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
   uint32_t level_stored_last = std::min(level_last, level_packed);
   uint32_t texture_resolution_scale_x = texture_key.scaled_resolve ? draw_resolution_scale_x() : 1;
   uint32_t texture_resolution_scale_y = texture_key.scaled_resolve ? draw_resolution_scale_y() : 1;
+  // Only the rows GPU writes changed since the last load (texture_band_reloads),
+  // when the compute copy writes the image: the untile starts at the band's
+  // first macro tile row and the copy at its first host row, and the rest of
+  // the image keeps its contents.
+  uint32_t band_first = 0, band_end = 0;
+  if (loading_rows_end() && load_base && !load_mips && vulkan_texture.copy_words() &&
+      !host_format.block_compressed && guest_layout.packed_level != 0 &&
+      texture_key.mip_max_level == 0 && !is_3d_tiling) {
+    band_first = loading_rows_first();
+    band_end = loading_rows_end();
+  }
+  const bool band = band_end != 0;
 
   // The loop counter can mean two things depending on whether the packed mip
   // tail is stored as mip 0, because in this case, it would be ambiguous since
@@ -1482,7 +1495,8 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
       level_guest_z_extent_texels = guest_layout_packed.z_extent;
     } else {
       level_guest_x_extent_texels_unscaled = std::max(width >> level, UINT32_C(1));
-      level_guest_y_extent_texels_unscaled = std::max(height >> level, UINT32_C(1));
+      level_guest_y_extent_texels_unscaled =
+          band && is_base ? band_end - band_first : std::max(height >> level, UINT32_C(1));
       level_guest_z_extent_texels = std::max(depth >> level, UINT32_C(1));
     }
     level_host_layout.x_pitch_blocks =
@@ -1689,6 +1703,11 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
     }
     const texture_util::TextureGuestLayout::Level& level_guest_layout =
         is_base ? guest_layout.base : guest_layout.mips[level];
+    if (band && is_base) {
+      // A 32-row macro tile row is contiguous in the tiled layout.
+      load_constants.guest_offset += (band_first / 32) * level_guest_layout.row_pitch_bytes * 32 *
+                                     (texture_resolution_scale_x * texture_resolution_scale_y);
+    }
     uint32_t level_guest_pitch = level_guest_layout.row_pitch_bytes;
     if (texture_key.tiled) {
       // Shaders expect pitch in blocks for tiled textures.
@@ -1710,7 +1729,8 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
       level_depth = level_guest_layout.z_extent;
     } else {
       level_width = std::max(width >> level, UINT32_C(1));
-      level_height = std::max(height >> level, UINT32_C(1));
+      level_height =
+          band && is_base ? band_end - band_first : std::max(height >> level, UINT32_C(1));
       level_depth = std::max(depth >> level, UINT32_C(1));
     }
     load_constants.size_blocks[0] =
@@ -1896,11 +1916,13 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
         GetTextureUsageMasks(copy_old_usage, src_stage_mask, src_access_mask, old_layout);
         GetTextureUsageMasks(VulkanTexture::Usage::kComputeWrite, dst_stage_mask,
                              dst_access_mask, new_layout);
-        // Every texel of the level is written: the old contents need not stay.
+        // Every texel of the level is written, so the old contents need not
+        // stay, unless only a band of rows is.
         command_processor_.PushImageMemoryBarrier(
             vulkan_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
             src_stage_mask ? src_stage_mask : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, dst_stage_mask,
-            src_access_mask, dst_access_mask, VK_IMAGE_LAYOUT_UNDEFINED, new_layout);
+            src_access_mask, dst_access_mask, band ? old_layout : VK_IMAGE_LAYOUT_UNDEFINED,
+            new_layout);
       }
       command_processor_.SubmitBarriers(true);
       const uint32_t words = vulkan_texture.copy_words();
@@ -1910,11 +1932,18 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
       command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, copy_pipeline_layout_,
                                              0, 2, copy_sets, 0, nullptr);
       const uint32_t copy_width = width * texture_resolution_scale_x;
-      const uint32_t copy_height = height * texture_resolution_scale_y;
-      const uint32_t copy_constants[5] = {
+      const uint32_t copy_height =
+          (band ? band_end - band_first : height) * texture_resolution_scale_y;
+      const uint32_t copy_constants[6] = {
           uint32_t(host_layout_base.offset_bytes / 4),
-          host_layout_base.x_pitch_blocks * host_block_width, copy_width, copy_height,
-          uint32_t(host_layout_base.slice_size_bytes / 4)};
+          host_layout_base.x_pitch_blocks * host_block_width,
+          copy_width,
+          copy_height,
+          uint32_t(host_layout_base.slice_size_bytes / 4),
+          band_first * texture_resolution_scale_y};
+      if (band) {
+        PERF_counter_inc(kTextureBandReloads);
+      }
       command_buffer.CmdVkPushConstants(copy_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                         sizeof(copy_constants), copy_constants);
       command_buffer.CmdVkDispatch((copy_width + 7) / 8, (copy_height + 7) / 8, array_size);
@@ -3217,7 +3246,7 @@ bool VulkanTextureCache::Initialize() {
         command_processor_.GetSingleTransientDescriptorLayout(
             VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageImageCompute)};
     VkPushConstantRange copy_push_constants = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                               5 * sizeof(uint32_t)};
+                                               6 * sizeof(uint32_t)};
     VkPipelineLayoutCreateInfo copy_layout_info = {};
     copy_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     copy_layout_info.setLayoutCount = 2;
