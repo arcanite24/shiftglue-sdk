@@ -62,6 +62,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   enum class SingleTransientDescriptorLayout {
     kStorageBufferCompute,
     kStorageBufferPairCompute,
+    // One storage image for compute shaders.
+    kStorageImageCompute,
     kCount,
   };
 
@@ -267,6 +269,15 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool checkpoints_enabled() const { return checkpoints_enabled_; }
   // A CPU-side record in the checkpoint ring (resource lifetimes, bindings).
   void NoteCheckpoint(std::string detail);
+  // vulkan_debug_labels: names GPU work for capture tools (Nsight Graphics
+  // GPU Trace, RenderDoc). Labels must not straddle a rendering's begin or
+  // end; FH1 renderings label themselves.
+  void BeginDebugLabel(const char* name) {
+    if (debug_labels_) deferred_command_buffer_.CmdVkBeginDebugLabel(name);
+  }
+  void EndDebugLabel() {
+    if (debug_labels_) deferred_command_buffer_.CmdVkEndDebugLabel();
+  }
   bool IsFh1RenderingOpen(uint64_t id) const {
     return in_render_pass_ && id && current_fh1_rendering_id_ == id;
   }
@@ -790,6 +801,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBuffer;
   static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBufferDynamic;
   static const VkDescriptorPoolSize kDescriptorPoolSizeStorageBuffer;
+  static const VkDescriptorPoolSize kDescriptorPoolSizeStorageImage;
   static const VkDescriptorPoolSize kDescriptorPoolSizeTextures[2];
   ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_uniform_buffer_;
   ui::vulkan::LinkedTypeDescriptorSetAllocator
@@ -822,6 +834,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkDescriptorBufferInfo
       constants_descriptor_write_infos_[SpirvShaderTranslator::kConstantBufferCount] = {};
   ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_storage_buffer_;
+  ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_storage_image_;
   std::deque<UsedSingleTransientDescriptor> single_transient_descriptors_used_;
   std::array<std::vector<VkDescriptorSet>, size_t(SingleTransientDescriptorLayout::kCount)>
       single_transient_descriptors_free_;
@@ -847,6 +860,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::unique_ptr<Fh1FrameDump> frame_dump_;
   // Identifies the open dynamic rendering scope of the executor (0: none).
   uint64_t current_fh1_rendering_id_ = 0;
+  bool debug_labels_ = false;
+  // An FH1 rendering opened a label its end closes.
+  bool rendering_label_open_ = false;
 
   std::unique_ptr<VulkanPipelineCache> pipeline_cache_;
 

@@ -101,6 +101,10 @@ REXCVAR_DEFINE_BOOL(vulkan_async_submission, true, "GPU/Vulkan",
                     "Replay and submit each ended submission's command stream on a worker "
                     "thread, overlapping the driver's recording with the next submission")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(vulkan_debug_labels, false, "GPU/Vulkan",
+                    "Label GPU work for capture tools (VK_EXT_debug_utils): FH1 draw, transfer "
+                    "and clear renderings, resolves, texture loads and uploads")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(vulkan_async_submission_split_draws, 1024, "GPU/Vulkan",
                      "With vulkan_async_submission, end a submission after this many draws "
                      "when no occlusion query is open, so frames overlap with the worker; 0 "
@@ -626,6 +630,8 @@ const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeUniformBuf
 
 const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeStorageBuffer = {
     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * kLinkedTypeDescriptorPoolSetCount};
+const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeStorageImage = {
+    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * kLinkedTypeDescriptorPoolSetCount};
 
 // 2x descriptors for texture images because of unsigned and signed bindings.
 const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeTextures[2] = {
@@ -649,6 +655,10 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
               ->vulkan_device(),
           &kDescriptorPoolSizeStorageBuffer, 1, kLinkedTypeDescriptorPoolSetCount),
+      transient_descriptor_allocator_storage_image_(
+          static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
+              ->vulkan_device(),
+          &kDescriptorPoolSizeStorageImage, 1, kLinkedTypeDescriptorPoolSetCount),
       transient_descriptor_allocator_textures_(
           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
               ->vulkan_device(),
@@ -1021,6 +1031,19 @@ bool VulkanCommandProcessor::SetupContext() {
     REXGPU_ERROR(
         "Failed to create a Vulkan descriptor set layout for two storage "
         "buffers bound to the compute shader");
+    return false;
+  }
+  // Transient: storage image for compute shaders.
+  descriptor_set_layout_binding_transient.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  descriptor_set_layout_create_info.bindingCount = 1;
+  descriptor_set_layout_create_info.pBindings = &descriptor_set_layout_binding_transient;
+  if (dfn.vkCreateDescriptorSetLayout(
+          device, &descriptor_set_layout_create_info, nullptr,
+          &descriptor_set_layouts_single_transient_[size_t(
+              SingleTransientDescriptorLayout::kStorageImageCompute)]) != VK_SUCCESS) {
+    REXGPU_ERROR(
+        "Failed to create a Vulkan descriptor set layout for a storage image "
+        "bound to the compute shader");
     return false;
   }
 
@@ -2020,6 +2043,8 @@ bool VulkanCommandProcessor::CreateScaledComponents(uint32_t draw_resolution_sca
 
   if (REXCVAR_GET(vulkan_fh1_native_executor) && REXCVAR_GET(vulkan_dynamic_rendering) &&
       render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
+    debug_labels_ = REXCVAR_GET(vulkan_debug_labels) &&
+                    GetVulkanDevice()->vulkan_instance()->functions().vkCmdBeginDebugUtilsLabelEXT;
     fh1_native_executor_ = std::make_unique<Fh1NativeExecutor>(*this, *register_file_, *memory_);
     Fh1VulkanExecutorConfig native_config;
     native_config.msaa_2x_supported = render_target_cache_->msaa_2x_attachments_supported();
@@ -3748,6 +3773,13 @@ void VulkanCommandProcessor::SubmitBarriersAndBeginFh1Rendering(
   }
   EndRenderPass();
   deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
+  if (debug_labels_) {
+    deferred_command_buffer_.CmdVkBeginDebugLabel(
+        (id >> 62) == 3   ? "fh1 resolve fill"
+        : (id >> 63) != 0 ? "fh1 transfer or clear"
+                          : "fh1 draws");
+    rendering_label_open_ = true;
+  }
   ++rendering_begin_count_;
   if (!was_rendering) {
     ++fh1_rendering_enders_[last_rendering_ender_];
@@ -3838,6 +3870,10 @@ void VulkanCommandProcessor::EndRenderPass(std::source_location caller) {
     return;
   }
   last_rendering_ender_ = caller.function_name();
+  if (rendering_label_open_) {
+    deferred_command_buffer_.CmdVkEndDebugLabel();
+    rendering_label_open_ = false;
+  }
   if (current_render_pass_ == VK_NULL_HANDLE) {
     deferred_command_buffer_.CmdVkEndRendering();
   } else {
@@ -3864,12 +3900,16 @@ VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
     bool is_storage_buffer =
         transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageBufferCompute ||
         transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageBufferPairCompute;
+    const bool is_storage_image =
+        transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageImageCompute;
     ui::vulkan::LinkedTypeDescriptorSetAllocator& transient_descriptor_allocator =
-        is_storage_buffer ? transient_descriptor_allocator_storage_buffer_
-                          : transient_descriptor_allocator_uniform_buffer_;
+        is_storage_image    ? transient_descriptor_allocator_storage_image_
+        : is_storage_buffer ? transient_descriptor_allocator_storage_buffer_
+                            : transient_descriptor_allocator_uniform_buffer_;
     VkDescriptorPoolSize descriptor_count;
-    descriptor_count.type =
-        is_storage_buffer ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    descriptor_count.type = is_storage_image    ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                            : is_storage_buffer ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                                                : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     descriptor_count.descriptorCount =
         transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageBufferPairCompute
             ? 2
@@ -6660,6 +6700,7 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
   }
   single_transient_descriptors_used_.clear();
   transient_descriptor_allocator_storage_buffer_.Reset();
+  transient_descriptor_allocator_storage_image_.Reset();
   transient_descriptor_allocator_uniform_buffer_.Reset();
   transient_descriptor_allocator_uniform_buffer_dynamic_.Reset();
   constants_descriptor_sets_frame_.clear();

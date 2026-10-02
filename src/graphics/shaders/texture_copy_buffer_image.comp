@@ -1,0 +1,42 @@
+// Copies texture data the load shaders untiled into a buffer to the texture's
+// image, through a raw-bits storage view of WORDS 32-bit words per texel:
+// vkCmdCopyBufferToImage runs on NVIDIA's copy engine, serialized with the
+// frame, which made frame-sized texture loads at 3x most of the GPU frame.
+// Compiled to vulkan_spirv/texture_copy_buffer_image_{1,2,4}w_cs.h by
+// compile-fh1-native.sh.
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform Constants {
+  uint offset_words;
+  uint pitch_texels;
+  uint width;
+  uint height;
+  uint slice_words;
+} c;
+
+layout(set = 0, binding = 0, std430) readonly buffer Source { uint words[]; };
+
+#if WORDS == 1
+layout(set = 1, binding = 0, r32ui) writeonly uniform uimage2DArray dest;
+#elif WORDS == 2
+layout(set = 1, binding = 0, rg32ui) writeonly uniform uimage2DArray dest;
+#else
+layout(set = 1, binding = 0, rgba32ui) writeonly uniform uimage2DArray dest;
+#endif
+
+void main() {
+  uvec3 id = gl_GlobalInvocationID;
+  if (id.x >= c.width || id.y >= c.height) return;
+  uint i = c.offset_words + id.z * c.slice_words + (id.y * c.pitch_texels + id.x) * WORDS;
+  uvec4 texel = uvec4(words[i], 0u, 0u, 0u);
+#if WORDS >= 2
+  texel.y = words[i + 1u];
+#endif
+#if WORDS == 4
+  texel.z = words[i + 2u];
+  texel.w = words[i + 3u];
+#endif
+  imageStore(dest, ivec3(id), texel);
+}

@@ -197,6 +197,8 @@ class VulkanTextureCache final : public TextureCache {
       kTransferDestination,
       kGuestShaderSampled,
       kSwapSampled,
+      // Written by the buffer-to-image copy compute shader.
+      kComputeWrite,
     };
 
     // Takes ownership of the image and its memory.
@@ -216,6 +218,14 @@ class VulkanTextureCache final : public TextureCache {
     VkImageView GetView(bool is_signed, uint32_t host_swizzle, bool is_array = true);
     VkImageView GetViewUncached(bool is_signed, uint32_t host_swizzle, bool is_array);
     VkImageView GetOrCreate3DAs2DImageView(bool is_signed, uint32_t host_swizzle);
+
+    // Loads by compute (vulkan_texture_load_compute_copy): the image was
+    // created storage-capable with a raw-bits view format of copy_words()
+    // 32-bit words per texel (0: it was not), and the 2D array view of level 0
+    // in that format.
+    uint32_t copy_words() const { return copy_words_; }
+    void set_copy_words(uint32_t words) { copy_words_ = words; }
+    VkImageView GetCopyView();
 
    private:
     union ViewKey {
@@ -267,6 +277,8 @@ class VulkanTextureCache final : public TextureCache {
 
     VkImage image_;
     VmaAllocation allocation_;
+    uint32_t copy_words_ = 0;
+    VkImageView copy_view_ = VK_NULL_HANDLE;
 
     Usage usage_ = Usage::kUndefined;
 
@@ -360,6 +372,11 @@ class VulkanTextureCache final : public TextureCache {
   HostFormatPair host_formats_[64];
 
   VkPipelineLayout load_pipeline_layout_ = VK_NULL_HANDLE;
+  // Buffer-to-image copies by compute (vulkan_texture_load_compute_copy):
+  // set 0 the scratch storage buffer, set 1 the texture's raw-bits storage
+  // view; pipelines by 32-bit words per texel (1, 2, 4).
+  VkPipelineLayout copy_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline copy_pipelines_[3] = {};
   std::array<VkPipeline, kLoadShaderCount> load_pipelines_{};
   std::array<VkPipeline, kLoadShaderCount> load_pipelines_scaled_{};
 

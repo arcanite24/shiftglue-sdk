@@ -104,4 +104,11 @@ fi
 # Their DXBC headers were built with other fxc flags and are kept as they are.
 compile_spirv cs_5_1 fh1_scaled_32bpp_2x.cs.hlsl fh1_scaled_32bpp_2x_cs
 compile_spirv cs_5_1 fh1_reflection_cube_import.cs.hlsl fh1_reflection_cube_import_cs
+# Texture cache: buffer-to-image copies by compute (GLSL), one per texel size
+# in 32-bit words.
+if [[ -n $GLSLANG ]]; then
+  for words in 1 2 4; do
+    "$GLSLANG" -V -S comp -DWORDS=$words --vn "texture_copy_buffer_image_${words}w_cs"       -o "vulkan_spirv/texture_copy_buffer_image_${words}w_cs.h" texture_copy_buffer_image.comp       > /dev/null
+  done
+fi
 echo compiled

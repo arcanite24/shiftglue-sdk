@@ -1308,6 +1308,11 @@ void Fh1NativeExecutor::FlushDepthTransfers(Surface& dest, size_t first, size_t 
     command_processor_.BindExternalComputePipeline(pipeline);
     command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
                                            compute_pipeline_layout_, 0, 1, &set, 0, nullptr);
+    command_processor_.BeginDebugLabel("fh1 transfer words");
+    struct EndLabel {
+      VulkanCommandProcessor& processor;
+      ~EndLabel() { processor.EndDebugLabel(); }
+    } end_label{command_processor_};
     for (; i < source_end; ++i) {
       const Rect& rect = pending_transfers_[i].rect;
       const uint32_t constants[kComputeConstantCount] = {
@@ -2058,8 +2063,10 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
                                          0, 1, &set, 0, nullptr);
   command_buffer.CmdVkPushConstants(compute_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                     sizeof(constants), constants);
+  command_processor_.BeginDebugLabel("fh1 resolve");
   command_buffer.CmdVkDispatch((uint32_t(rect.right - rect.left) + 7) / 8,
                                (uint32_t(rect.bottom - rect.top) + 7) / 8, 1);
+  command_processor_.EndDebugLabel();
   return true;
 }
 

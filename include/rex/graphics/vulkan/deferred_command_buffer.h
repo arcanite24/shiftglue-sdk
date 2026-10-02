@@ -268,6 +268,15 @@ class DeferredCommandBuffer {
   void CmdVkBeginRendering(const VkRenderingInfo* rendering_info);
   void CmdVkEndRendering() { WriteCommand(Command::kVkEndRendering, 0); }
 
+  // Debug utils labels for capture tools; `name` must outlive the stream
+  // (a string literal).
+  void CmdVkBeginDebugLabel(const char* name) {
+    auto& args = *reinterpret_cast<ArgsVkBeginDebugLabel*>(
+        WriteCommand(Command::kVkBeginDebugLabel, sizeof(ArgsVkBeginDebugLabel)));
+    args.name = name;
+  }
+  void CmdVkEndDebugLabel() { WriteCommand(Command::kVkEndDebugLabel, 0); }
+
   void CmdVkSetCheckpointNV(uint64_t marker) {
     auto& args = *reinterpret_cast<ArgsVkSetCheckpointNV*>(
         WriteCommand(Command::kVkSetCheckpointNV, sizeof(ArgsVkSetCheckpointNV)));
@@ -416,6 +425,8 @@ class DeferredCommandBuffer {
     kVkResetQueryPool,
     kVkWriteTimestamp,
     kVkSetCheckpointNV,
+    kVkBeginDebugLabel,
+    kVkEndDebugLabel,
     kVkSetBlendConstants,
     kVkSetDepthBias,
     kVkSetScissor,
@@ -570,6 +581,10 @@ class DeferredCommandBuffer {
 
   struct ArgsVkSetCheckpointNV {
     uint64_t marker;
+  };
+
+  struct ArgsVkBeginDebugLabel {
+    const char* name;
   };
 
   struct ArgsVkWriteTimestamp {

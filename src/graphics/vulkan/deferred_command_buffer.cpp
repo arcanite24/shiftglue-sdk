@@ -300,6 +300,22 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                                 args.query_count);
       } break;
 
+      case Command::kVkBeginDebugLabel: {
+        auto& args = *reinterpret_cast<const ArgsVkBeginDebugLabel*>(stream);
+        const auto& ifn = command_processor_.GetVulkanDevice()->vulkan_instance()->functions();
+        if (ifn.vkCmdBeginDebugUtilsLabelEXT) {
+          VkDebugUtilsLabelEXT label = {};
+          label.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+          label.pLabelName = args.name;
+          ifn.vkCmdBeginDebugUtilsLabelEXT(command_buffer, &label);
+        }
+      } break;
+
+      case Command::kVkEndDebugLabel: {
+        const auto& ifn = command_processor_.GetVulkanDevice()->vulkan_instance()->functions();
+        if (ifn.vkCmdEndDebugUtilsLabelEXT) ifn.vkCmdEndDebugUtilsLabelEXT(command_buffer);
+      } break;
+
       case Command::kVkSetCheckpointNV: {
         auto& args = *reinterpret_cast<const ArgsVkSetCheckpointNV*>(stream);
         dfn.vkCmdSetCheckpointNV(command_buffer,

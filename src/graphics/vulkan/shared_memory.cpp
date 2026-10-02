@@ -281,6 +281,11 @@ bool VulkanSharedMemory::UploadRanges(
                       upload_page_ranges.front().first)
                          << page_size_log2()));
   command_processor_.SubmitBarriers(true);
+  command_processor_.BeginDebugLabel("shared memory upload");
+  struct EndLabel {
+    VulkanCommandProcessor& processor;
+    ~EndLabel() { processor.EndDebugLabel(); }
+  } end_label{command_processor_};
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
   uint64_t submission_current = command_processor_.GetCurrentSubmission();
   bool successful = true;
