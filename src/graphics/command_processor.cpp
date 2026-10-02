@@ -1519,15 +1519,29 @@ bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* re
 }
 
 namespace {
-// gpu_trace_wait_reg_mem_writers: the guest accesses to the armed pages.
+// gpu_trace_wait_reg_mem_writers: the guest writes to the armed pages; the
+// waiting loop re-arms the page after each.
 std::atomic<uint32_t> wait_writer_logs{0};
+std::atomic<bool> wait_word_armed{false};
 void LogWaitWordAccess(void*, uint32_t physical_address, uint32_t length, bool is_write) {
-  if (!is_write || wait_writer_logs.fetch_add(1, std::memory_order_relaxed) >= 400) return;
+  wait_word_armed.store(false, std::memory_order_relaxed);
+  // Each address once per 256 writes: frequent writers (the vblank callback)
+  // would use up the log otherwise.
+  static std::atomic<uint32_t> repeats[64];
+  const uint32_t address = memory::CurrentAccessFaultVirtualAddress();
+  if (!is_write || repeats[(address >> 2) & 63].fetch_add(1, std::memory_order_relaxed) % 256 ||
+      wait_writer_logs.fetch_add(1, std::memory_order_relaxed) >= 2000) {
+    return;
+  }
   const auto* thread_state = runtime::ThreadState::Get();
   const PPCContext* context = thread_state ? thread_state->context() : nullptr;
-  REXGPU_INFO("WAIT_REG_MEM word page {:08X}+{:X} written by thread 0x{:X}, guest lr {:08X}",
-              physical_address, length, rex::thread::current_thread_id(),
-              context ? uint32_t(context->lr) : 0u);
+  REXGPU_INFO(
+      "WAIT_REG_MEM word page {:08X}+{:X} written at {:08X} by thread 0x{:X}, guest lr {:08X} "
+      "r3 {:08X} r31 {:08X}",
+      physical_address, length, memory::CurrentAccessFaultVirtualAddress(),
+      rex::thread::current_thread_id(),
+      context ? uint32_t(context->lr) : 0u, context ? context->r3.u32 : 0u,
+      context ? context->r31.u32 : 0u);
 }
 }  // namespace
 
@@ -1591,6 +1605,12 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       if (wait_start == std::chrono::steady_clock::time_point{}) {
         wait_start = std::chrono::steady_clock::now();
         if (is_memory && REXCVAR_GET(gpu_trace_wait_reg_mem_writers)) {
+          static std::atomic<uint32_t> wait_logs{0};
+          if (wait_logs.fetch_add(1, std::memory_order_relaxed) < 200) {
+            REXGPU_INFO("WAIT_REG_MEM waits on {:08X} (function {}, ref {:08X}, mask {:08X}): "
+                        "now {:08X}",
+                        poll_reg_addr, wait_info & 7, ref, mask, value);
+          }
           static void* const callback =
               memory_->RegisterPhysicalMemoryAccessCallback(LogWaitWordAccess, nullptr);
           (void)callback;
@@ -1599,6 +1619,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         }
         // Let the recorder work through what was decoded while this waits.
         PublishRecordBatch();
+      }
+      if (is_memory && REXCVAR_GET(gpu_trace_wait_reg_mem_writers) &&
+          !wait_word_armed.exchange(true, std::memory_order_relaxed)) {
+        memory_->EnablePhysicalMemoryAccessCallbacks(poll_reg_addr & 0x1FFFFFFC, 4, false, false,
+                                                     true);
       }
       // Wait.
       if (wait >= 0x100) {

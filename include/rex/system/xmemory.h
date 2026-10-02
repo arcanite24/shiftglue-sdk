@@ -379,6 +379,10 @@ class PhysicalHeap : public BaseHeap {
 // overlap with other ranges. Each range is represented by a BaseHeap of either
 // VirtualHeap or PhysicalHeap depending on type. Heaps model the page tables
 // and can handle reservation and committing of requested pages.
+// Within a physical memory access callback: the guest virtual address whose
+// access triggered it (the callback itself gets whole pages).
+uint32_t CurrentAccessFaultVirtualAddress();
+
 class Memory {
  public:
   Memory();

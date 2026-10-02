@@ -2269,6 +2269,12 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
   }
 }
 
+namespace {
+thread_local uint32_t access_fault_virtual_address = 0;
+}  // namespace
+
+uint32_t CurrentAccessFaultVirtualAddress() { return access_fault_virtual_address; }
+
 bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                                     uint32_t virtual_address, uint32_t length, bool is_write,
                                     bool unwatch_exact_range, bool unprotect,
@@ -2350,6 +2356,8 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
   uint32_t unwatch_first = 0;
   uint32_t unwatch_last = UINT32_MAX;
   if (any_access_watched) {
+    // The exact guest address, for observers that care below page level.
+    access_fault_virtual_address = virtual_address;
     for (auto access_callback : memory_->physical_memory_access_callbacks_) {
       access_callback->first(access_callback->second, physical_address_start, physical_length,
                              is_write);
