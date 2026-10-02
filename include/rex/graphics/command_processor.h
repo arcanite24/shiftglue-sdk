@@ -426,6 +426,11 @@ class CommandProcessor {
   std::unique_ptr<RegisterFile> decode_register_file_;
   std::unordered_map<uint32_t, uint32_t> decode_extended_register_values_;
   std::unique_ptr<RecordBatch> record_batch_;
+  // The last float constant run recorded, while it is still the batch's last
+  // record: a following run a short gap after it extends it instead.
+  const RecordBatch* last_constant_run_batch_ = nullptr;
+  size_t last_constant_run_offset_ = 0;
+  size_t last_constant_run_end_ = 0;
   std::mutex record_mutex_;
   std::condition_variable record_ready_;
   std::condition_variable record_done_;

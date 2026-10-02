@@ -74,6 +74,11 @@ REXCVAR_DEFINE_INT32(wait_reg_mem_yield_us, kWaitRegMemYieldUsDefault, "GPU",
                      "once")
     .range(0, 16000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_record_merge_constant_runs, true, "GPU",
+                    "With gpu_record_thread, the decoder extends the last recorded float "
+                    "constant run over a gap of up to 16 registers (their current values) "
+                    "instead of recording another run, so the recorder handles fewer runs")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(gpu_ib_identity_stats, false, "GPU",
                     "Diagnostics: hash every indirect buffer the commands thread executes and log "
                     "every 600 frames how many buffers, dwords and draws repeat byte for byte "
@@ -575,12 +580,48 @@ void CommandProcessor::PacketWriteRegistersFromMem(uint32_t start_index, const u
 void CommandProcessor::RecordRegisterRun(uint32_t start_index, const uint32_t* base,
                                          uint32_t num_registers) {
   std::vector<uint32_t>& words = record_batch_->words;
+  // Float constants arrive in many small runs (about 12 a draw of 3 to 4
+  // registers), and each run costs the recorder a dispatch and its checks:
+  // one following the last recorded run within a short gap extends it, the
+  // gap holding the registers' current values (rewriting a float constant
+  // with its own value only stores it again).
+  constexpr uint32_t kConstantRunMergeGap = 16;
+  if (REXCVAR_GET(gpu_record_merge_constant_runs) &&
+      start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+      start_index + num_registers - 1 <= XE_GPU_REG_SHADER_CONSTANT_511_W &&
+      last_constant_run_batch_ == record_batch_.get() &&
+      last_constant_run_end_ == words.size()) {
+    const uint32_t previous_start = words[last_constant_run_offset_ + 1];
+    const uint32_t previous_count = words[last_constant_run_offset_ + 2];
+    const uint32_t previous_end = previous_start + previous_count;
+    if (start_index >= previous_end && start_index - previous_end <= kConstantRunMergeGap) {
+      const uint32_t gap = start_index - previous_end;
+      const size_t offset = words.size();
+      words.resize(offset + gap + num_registers);
+      for (uint32_t i = 0; i < gap; ++i) {
+        words[offset + i] = rex::byte_swap(decode_register_file_->values[previous_end + i]);
+      }
+      std::memcpy(words.data() + offset + gap, base, sizeof(uint32_t) * num_registers);
+      words[last_constant_run_offset_ + 2] = previous_count + gap + num_registers;
+      last_constant_run_end_ = words.size();
+      if (words.size() >= 65536) {
+        PublishRecordBatch();
+      }
+      return;
+    }
+  }
   const size_t offset = words.size();
   words.resize(offset + 3 + num_registers);
   words[offset] = kRecordRun;
   words[offset + 1] = start_index;
   words[offset + 2] = num_registers;
   std::memcpy(words.data() + offset + 3, base, sizeof(uint32_t) * num_registers);
+  if (start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+      start_index + num_registers - 1 <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+    last_constant_run_batch_ = record_batch_.get();
+    last_constant_run_offset_ = offset;
+    last_constant_run_end_ = words.size();
+  }
   if (words.size() >= 65536) {
     PublishRecordBatch();
   }
@@ -605,6 +646,7 @@ void CommandProcessor::PublishRecordBatch() {
   if (!record_split_ || record_batch_->words.empty()) {
     return;
   }
+  last_constant_run_batch_ = nullptr;
   std::unique_ptr<RecordBatch> next;
   {
     std::lock_guard<std::mutex> lock(record_mutex_);
