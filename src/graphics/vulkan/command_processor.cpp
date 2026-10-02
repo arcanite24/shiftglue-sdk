@@ -836,6 +836,7 @@ bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuff
     return write_fallback_result();
   }
 
+  if (fh1_native_executor_) fh1_native_executor_->CountEvent("occlusion_query_end");
   if (!EndGuestOcclusionQuery(sample_count_addr)) {
     return write_fallback_result();
   }

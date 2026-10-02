@@ -61,6 +61,8 @@ class Fh1NativeExecutor {
 
   bool Initialize(const Fh1VulkanExecutorConfig& config);
   void Shutdown();
+  // Counts an event in the rendering stats (such as occlusion query ends).
+  void CountEvent(const char* stat) { Count(stat); }
 
   // Before the targets are bound for a draw: derives the surfaces the draw
   // writes and takes their EDRAM tiles, transferring the previous owners'
@@ -112,6 +114,14 @@ class Fh1NativeExecutor {
     uint32_t samples = 1;
     uint32_t width = 0;
     uint32_t height = 0;
+    // Clears not recorded yet (fh1_fold_clears), in order: folded into the
+    // next draw rendering on this surface, or recorded in a rendering of
+    // their own before anything else uses the image.
+    struct PendingClear {
+      VkClearAttachment clear;
+      VkClearRect rect;
+    };
+    std::vector<PendingClear> pending_clears;
   };
   struct SourceRect {
     Surface* surface = nullptr;
@@ -217,6 +227,18 @@ class Fh1NativeExecutor {
                        VkDeviceSize memory_range, bool unscaled_dest = false);
   void ClearSurfaceRect(Surface& surface, const Rect& guest_rect, uint32_t clear_value,
                         uint32_t clear_value_lo);
+  // Records the surface's pending clears in a rendering of their own.
+  void FlushPendingClears(Surface& surface);
+  // Folds the pending clears of the draw's surfaces into its rendering of
+  // width x height: those that do not fit are flushed before it begins
+  // (before_begin), the rest recorded inside it (after the rendering began).
+  // A full-area clear of a new rendering becomes its load op (colors and
+  // depth are the rendering's attachment infos, null for an open rendering).
+  void FoldPendingClears(Surface* const* bound, uint32_t width, uint32_t height,
+                         VkRenderingAttachmentInfo* colors, VkRenderingAttachmentInfo* depth,
+                         bool before_begin);
+  // Surfaces with pending clears.
+  uint32_t pending_clear_surfaces_ = 0;
   bool IsOneOffResolve(uint32_t address, uint32_t length);
   void QueueResolveReadback(uint32_t address, uint32_t length);
   void DumpResolveOutput(uint32_t address, uint32_t length);
@@ -288,6 +310,8 @@ class Fh1NativeExecutor {
   // Identifies the attachments of the current dynamic rendering scope for the
   // command processor (0: none).
   uint64_t rendering_id_ = 0;
+  // Draws in the open draw rendering (fh1_debug_rendering_split_draws).
+  uint32_t rendering_draws_ = 0;
   uint64_t next_rendering_id_ = 1;
   struct PrepareSignature {
     uint64_t generation = 0;

@@ -39,6 +39,19 @@ REXCVAR_DEFINE_BOOL(fh1_native_stencil_export, true, "GPU",
                     "device exports stencil from shaders (FH1 native executor, Vulkan), "
                     "instead of a pass per stencil bit")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_fold_clears, true, "GPU",
+                    "Record EDRAM clears inside the next draw rendering on the surface (or as "
+                    "its load op) instead of in a rendering of their own: on tiled GPUs each "
+                    "rendering costs a pass over the tiles (FH1 native executor, Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(fh1_debug_rendering_split_draws, 0, "GPU",
+                     "Diagnostics: end the draw rendering every N draws (0: never), to measure "
+                     "the cost of a rendering on the GPU. Same image, more renderings")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_debug_skip_clears, false, "GPU",
+                    "Diagnostics: skip every EDRAM clear (wrong image), to bound what clears "
+                    "cost")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 #if REX_HAS_D3D12
 REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
 REXCVAR_DECLARE(int32_t, fh1_resolve_dump_frame);
@@ -484,6 +497,7 @@ void Fh1NativeExecutor::DestroySurface(Surface& surface) {
   if (surface.uint_view) dfn.vkDestroyImageView(device, surface.uint_view, nullptr);
   if (surface.image) dfn.vkDestroyImage(device, surface.image, nullptr);
   if (surface.memory) dfn.vkFreeMemory(device, surface.memory, nullptr);
+  if (!surface.pending_clears.empty()) --pending_clear_surfaces_;
   surface = Surface();
 }
 
@@ -536,6 +550,12 @@ VkImageAspectFlags Fh1NativeExecutor::AspectMask(const Surface& surface) const {
 
 void Fh1NativeExecutor::Transition(Surface& surface, VkImageLayout layout,
                                    VkPipelineStageFlags stage, VkAccessFlags access) {
+  if (!surface.pending_clears.empty() &&
+      layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL &&
+      layout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
+    // Anything but drawing sees the cleared contents.
+    FlushPendingClears(surface);
+  }
   constexpr VkAccessFlags kReadOnly = VK_ACCESS_SHADER_READ_BIT;
   if (surface.layout == layout && !(surface.access & ~kReadOnly) && !(access & ~kReadOnly)) {
     // Reads after reads in the same layout need no barrier.
@@ -575,6 +595,8 @@ void Fh1NativeExecutor::TransitionForAttachment(Surface& surface, uint64_t open_
 }
 
 void Fh1NativeExecutor::BeginSurfaceRendering(Surface& surface, bool uint_view) {
+  // Transfers and clears into the surface come after its pending clears.
+  FlushPendingClears(surface);
   VkRenderingAttachmentInfo attachment = {};
   attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
   attachment.imageView = uint_view && surface.uint_view ? surface.uint_view : surface.view;
@@ -1729,16 +1751,42 @@ uint64_t Fh1NativeExecutor::DrawRenderingId(uint32_t used_bits) const {
 }
 
 void Fh1NativeExecutor::BeginDrawRendering() {
+  // Pending clears of the draw's surfaces are folded into its rendering.
+  Surface* bound[1 + xenos::kMaxColorRenderTargets] = {};
+  uint32_t clear_width = UINT32_MAX, clear_height = UINT32_MAX;
+  bool clears = false;
+  if (pending_clear_surfaces_) {
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (!(bound_bits_ & (1u << i))) continue;
+      bound[i] = FindSurface(pending_keys_[i].Pack());
+      if (!bound[i]) continue;
+      clears |= !bound[i]->pending_clears.empty();
+      clear_width = std::min(clear_width, bound[i]->width * scale_);
+      clear_height = std::min(clear_height, bound[i]->height * scale_);
+    }
+    if (clears) {
+      FoldPendingClears(bound, clear_width, clear_height, nullptr, nullptr, true);
+    }
+  }
   if (command_processor_.IsFh1RenderingOpen(DrawRenderingId(bound_bits_))) {
     // The draw continues the open rendering unless pending barriers end it;
     // then it begins anew below as before.
     command_processor_.SubmitBarriers(false);
     if (command_processor_.IsFh1RenderingOpen(DrawRenderingId(bound_bits_))) {
-      attachment_barriers_skipped_ = false;
-      rendering_id_ = DrawRenderingId(bound_bits_);
-      return;
+      const int32_t split = REXCVAR_GET(fh1_debug_rendering_split_draws);
+      if (split <= 0 || ++rendering_draws_ < uint32_t(split)) {
+        attachment_barriers_skipped_ = false;
+        rendering_id_ = DrawRenderingId(bound_bits_);
+        if (clears) FoldPendingClears(bound, clear_width, clear_height, nullptr, nullptr, false);
+        return;
+      }
+      command_processor_.EndRenderPass();
+      Count("debug_rendering_split");
+      // Ordered after the previous instance like any rendering break.
+      attachment_barriers_skipped_ = true;
     }
   }
+  rendering_draws_ = 0;
   VkRenderingAttachmentInfo colors[xenos::kMaxColorRenderTargets] = {};
   VkRenderingAttachmentInfo depth = {};
   uint32_t color_count = 0;
@@ -1793,8 +1841,10 @@ void Fh1NativeExecutor::BeginDrawRendering() {
     info.pDepthAttachment = &depth;
     info.pStencilAttachment = &depth;
   }
+  if (clears) FoldPendingClears(bound, clear_width, clear_height, colors, &depth, true);
   rendering_id_ = id;
   command_processor_.SubmitBarriersAndBeginFh1Rendering(info, id);
+  if (clears) FoldPendingClears(bound, clear_width, clear_height, nullptr, nullptr, false);
 }
 
 void Fh1NativeExecutor::NativeDrawIssued(const Fh1DrawInfo& draw) {
@@ -1806,8 +1856,7 @@ void Fh1NativeExecutor::NativeDrawIssued(const Fh1DrawInfo& draw) {
 
 void Fh1NativeExecutor::ClearSurfaceRect(Surface& surface, const Rect& guest_rect,
                                          uint32_t clear_value, uint32_t clear_value_lo) {
-  GpuTimer gpu_timer(*this, kGpuClears);
-  command_processor_.Checkpoint(VulkanCommandProcessor::CheckpointKind::kClear);
+  if (REXCVAR_GET(fh1_debug_skip_clears)) return;
   const Rect rect = HostRect(guest_rect);
   VkClearAttachment clear = {};
   if (surface.key.is_depth) {
@@ -1870,13 +1919,77 @@ void Fh1NativeExecutor::ClearSurfaceRect(Surface& surface, const Rect& guest_rec
         break;
     }
   }
-  TransitionForAttachment(surface);
-  BeginSurfaceRendering(surface, false);
   VkClearRect vk_rect = {};
   vk_rect.rect = {{rect.left, rect.top},
                   {uint32_t(rect.right - rect.left), uint32_t(rect.bottom - rect.top)}};
   vk_rect.layerCount = 1;
-  command_processor_.deferred_command_buffer().CmdVkClearAttachments(1, &clear, 1, &vk_rect);
+  if (surface.pending_clears.empty()) ++pending_clear_surfaces_;
+  surface.pending_clears.push_back({clear, vk_rect});
+  if (!REXCVAR_GET(fh1_fold_clears)) FlushPendingClears(surface);
+}
+
+void Fh1NativeExecutor::FlushPendingClears(Surface& surface) {
+  if (surface.pending_clears.empty()) return;
+  const std::vector<Surface::PendingClear> clears = std::move(surface.pending_clears);
+  surface.pending_clears.clear();
+  --pending_clear_surfaces_;
+  GpuTimer gpu_timer(*this, kGpuClears);
+  command_processor_.Checkpoint(VulkanCommandProcessor::CheckpointKind::kClear);
+  TransitionForAttachment(surface);
+  BeginSurfaceRendering(surface, false);
+  for (const Surface::PendingClear& pending : clears) {
+    command_processor_.deferred_command_buffer().CmdVkClearAttachments(1, &pending.clear, 1,
+                                                                       &pending.rect);
+  }
+  // Whatever renders into the surface next is ordered after the clears.
+  TransitionForAttachment(surface);
+  Count("clear_flushed");
+}
+
+void Fh1NativeExecutor::FoldPendingClears(Surface* const* bound, uint32_t width, uint32_t height,
+                                          VkRenderingAttachmentInfo* colors,
+                                          VkRenderingAttachmentInfo* depth, bool before_begin) {
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    Surface* surface = bound[i];
+    if (!surface || surface->pending_clears.empty()) continue;
+    auto& pending = surface->pending_clears;
+    if (before_begin) {
+      bool fits = true;
+      for (const Surface::PendingClear& clear : pending) {
+        const VkRect2D& r = clear.rect.rect;
+        fits = fits && r.offset.x >= 0 && r.offset.y >= 0 &&
+               uint32_t(r.offset.x) + r.extent.width <= width &&
+               uint32_t(r.offset.y) + r.extent.height <= height;
+      }
+      if (!fits) {
+        // Clears beyond the rendering's area keep a rendering of their own.
+        FlushPendingClears(*surface);
+        TransitionForAttachment(*surface);
+        continue;
+      }
+      VkRenderingAttachmentInfo* attachment = i ? (colors ? &colors[i - 1] : nullptr) : depth;
+      const VkRect2D& last = pending.back().rect.rect;
+      if (attachment && !last.offset.x && !last.offset.y && last.extent.width == width &&
+          last.extent.height == height) {
+        // The last clear covers the whole rendering: it replaces the load.
+        attachment->loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        attachment->clearValue = pending.back().clear.clearValue;
+        pending.clear();
+        --pending_clear_surfaces_;
+        Count("clear_load_op");
+      }
+      continue;
+    }
+    for (const Surface::PendingClear& clear : pending) {
+      VkClearAttachment attachment_clear = clear.clear;
+      attachment_clear.colorAttachment = i ? i - 1 : 0;
+      command_processor_.deferred_command_buffer().CmdVkClearAttachments(1, &attachment_clear, 1,
+                                                                         &clear.rect);
+      Count("clear_folded");
+    }
+    pending.clear();
+    --pending_clear_surfaces_;
+  }
 }
 
 bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceKey& resolve_key,
