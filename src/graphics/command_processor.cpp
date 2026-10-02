@@ -23,6 +23,7 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
+#include <rex/platform.h>
 #include <rex/chrono/clock.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
@@ -54,7 +55,17 @@ REXCVAR_DEFINE_BOOL(gpu_record_elide_unchanged_registers, true, "GPU",
                     "plain state register or shader constant unchanged, so the recorder neither "
                     "applies them nor invalidates what depends on them")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_INT32(wait_reg_mem_yield_us, 2000, "GPU",
+#if REX_PLATFORM_ANDROID
+// Phones: short sleeps instead of a busy yield, for power (measured on the
+// Snapdragon 8 Elite: a third less CPU on the commands thread, same frames).
+constexpr int32_t kWaitRegMemYieldUsDefault = 100;
+constexpr int32_t kWaitRegMemSleepUsDefault = 100;
+#else
+// Windows sleeps in timer ticks (about a millisecond), so desktops spin.
+constexpr int32_t kWaitRegMemYieldUsDefault = 2000;
+constexpr int32_t kWaitRegMemSleepUsDefault = 0;
+#endif
+REXCVAR_DEFINE_INT32(wait_reg_mem_yield_us, kWaitRegMemYieldUsDefault, "GPU",
                      "With vsync, how long a WAIT_REG_MEM poll yields before it sleeps (the "
                      "sleep is at least a millisecond, which can outlast the wait); 0 sleeps at "
                      "once")
@@ -66,7 +77,7 @@ REXCVAR_DEFINE_INT32(gpu_idle_spin_count, 500, "GPU",
                      "when no other thread wants the core)")
     .range(0, 100000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_INT32(wait_reg_mem_sleep_us, 0, "GPU",
+REXCVAR_DEFINE_INT32(wait_reg_mem_sleep_us, kWaitRegMemSleepUsDefault, "GPU",
                      "With vsync, how long each WAIT_REG_MEM sleep after the yield period lasts; "
                      "0 sleeps the packet's own interval (at least a millisecond). Short sleeps "
                      "stop the commands thread spinning for power without the millisecond's "
