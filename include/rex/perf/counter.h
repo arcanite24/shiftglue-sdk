@@ -147,6 +147,13 @@ enum class CounterId : uint16_t {
   // GPU recorder: what they cost in power, spinning included.
   kGpuDecoderCpuNs,
   kGpuRecorderCpuNs,
+  // The wait chain between the title and the GPU threads (DR-0.2):
+  // WAIT_REG_MEM packets that had to wait, and those of them that slept;
+  // the title's GPU fence waits that blocked, and their time.
+  kGpuRegMemWaitCount,
+  kGpuRegMemSleptCount,
+  kTitleGpuFenceWaitCount,
+  kTitleGpuFenceWaitNs,
 
   kCount  // sentinel -- must be last
 };

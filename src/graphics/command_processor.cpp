@@ -38,6 +38,7 @@
 #include <rex/stream.h>
 #include <rex/system/gpu_write_signal.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/thread_state.h>
 #include <rex/system/user_module.h>
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
@@ -71,6 +72,10 @@ REXCVAR_DEFINE_INT32(wait_reg_mem_yield_us, kWaitRegMemYieldUsDefault, "GPU",
                      "once")
     .range(0, 16000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_trace_wait_reg_mem_writers, false, "GPU",
+                    "Diagnostics: while WAIT_REG_MEM waits on a guest memory word, watch its "
+                    "page and log the guest threads (and their link register) that write it")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(gpu_idle_spin_count, 500, "GPU",
                      "How many times the GPU commands thread yields, when the ring is empty, "
                      "before it waits for the guest to write more (each yield is a busy spin "
@@ -1513,6 +1518,19 @@ bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* re
   return true;
 }
 
+namespace {
+// gpu_trace_wait_reg_mem_writers: the guest accesses to the armed pages.
+std::atomic<uint32_t> wait_writer_logs{0};
+void LogWaitWordAccess(void*, uint32_t physical_address, uint32_t length, bool is_write) {
+  if (!is_write || wait_writer_logs.fetch_add(1, std::memory_order_relaxed) >= 400) return;
+  const auto* thread_state = runtime::ThreadState::Get();
+  const PPCContext* context = thread_state ? thread_state->context() : nullptr;
+  REXGPU_INFO("WAIT_REG_MEM word page {:08X}+{:X} written by thread 0x{:X}, guest lr {:08X}",
+              physical_address, length, rex::thread::current_thread_id(),
+              context ? uint32_t(context->lr) : 0u);
+}
+}  // namespace
+
 bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reader, uint32_t packet,
                                                        uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
@@ -1528,6 +1546,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   bool is_memory = (wait_info & 0x10) != 0;
 
   bool matched = false;
+  bool slept = false;
   std::chrono::steady_clock::time_point wait_start{};
   do {
     uint32_t value = 0;
@@ -1571,6 +1590,13 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
     if (!matched) {
       if (wait_start == std::chrono::steady_clock::time_point{}) {
         wait_start = std::chrono::steady_clock::now();
+        if (is_memory && REXCVAR_GET(gpu_trace_wait_reg_mem_writers)) {
+          static void* const callback =
+              memory_->RegisterPhysicalMemoryAccessCallback(LogWaitWordAccess, nullptr);
+          (void)callback;
+          memory_->EnablePhysicalMemoryAccessCallbacks(poll_reg_addr & 0x1FFFFFFC, 4, false,
+                                                       false, true);
+        }
         // Let the recorder work through what was decoded while this waits.
         PublishRecordBatch();
       }
@@ -1587,8 +1613,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           rex::thread::MaybeYield();
         } else if (const int32_t sleep_us = REXCVAR_GET(wait_reg_mem_sleep_us)) {
           rex::thread::Sleep(std::chrono::microseconds(sleep_us));
+          slept = true;
         } else {
           rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          slept = true;
         }
         rex::thread::SyncMemory();
         if (!record_split_) {
@@ -1605,6 +1633,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
     }
   } while (!matched);
   if (wait_start != std::chrono::steady_clock::time_point{}) {
+    PERF_counter_inc(kGpuRegMemWaitCount);
+    if (slept) PERF_counter_inc(kGpuRegMemSleptCount);
     PERF_counter_add(kGpuThreadRegMemWaitNs,
                      std::chrono::duration_cast<std::chrono::nanoseconds>(
                          std::chrono::steady_clock::now() - wait_start)
