@@ -18,6 +18,9 @@
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/platform.h>
+#if REX_PLATFORM_LINUX
+#include <dlfcn.h>
+#endif
 #include <rex/system/mmio_handler.h>
 #include <rex/types.h>
 
@@ -423,8 +426,24 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
       memory::PageAccess unhandled_access;
       size_t unhandled_length = memory::page_size();
       memory::QueryProtect(fault_host_address, unhandled_length, unhandled_access);
-      return unhandled_access != memory::PageAccess::kNoAccess &&
-             (!is_write || unhandled_access != memory::PageAccess::kReadOnly);
+      const bool handled = unhandled_access != memory::PageAccess::kNoAccess &&
+                           (!is_write || unhandled_access != memory::PageAccess::kReadOnly);
+      if (!handled) {
+        // Where the faulting access was, as a library and offset to
+        // symbolize: the guest link register only names the last guest
+        // call, and host code reading guest memory reports the same way.
+        Dl_info info = {};
+        const auto pc = reinterpret_cast<uintptr_t>(ex->pc());
+        if (dladdr(reinterpret_cast<const void*>(pc), &info) && info.dli_fname) {
+          REXSYS_ERROR("Unhandled fault at host {} +0x{:X} ({} +0x{:X})", info.dli_fname,
+                       pc - reinterpret_cast<uintptr_t>(info.dli_fbase),
+                       info.dli_sname ? info.dli_sname : "?",
+                       info.dli_saddr ? pc - reinterpret_cast<uintptr_t>(info.dli_saddr) : 0);
+        } else {
+          REXSYS_ERROR("Unhandled fault at host 0x{:X}", pc);
+        }
+      }
+      return handled;
     }
 #endif
     memory::PageAccess cur_access;
