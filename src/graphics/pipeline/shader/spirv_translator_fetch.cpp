@@ -19,8 +19,11 @@
 #include <fmt/format.h>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/math.h>
+
+REXCVAR_DECLARE(bool, spirv_implicit_lod_2d);
 
 namespace rex::graphics {
 
@@ -1455,9 +1458,14 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         // driver picks other levels of a cube than Direct3D 12 does for the
         // same gradients: FH1's car paint got different reflection colors,
         // which its HDR math turned into a green glow around traffic cars.
-        bool cube_implicit_lod = use_computed_lod &&
-                                 instr.dimension == xenos::FetchOpDimension::kCube &&
-                                 !instr.attributes.use_register_gradients;
+        // spirv_implicit_lod_2d does the same for 2D fetches in pixel
+        // shaders: explicit gradients are slower than implicit LOD on tiled
+        // mobile GPUs (Adreno, Mali), and differ only at level transitions.
+        bool cube_implicit_lod =
+            use_computed_lod && !instr.attributes.use_register_gradients &&
+            (instr.dimension == xenos::FetchOpDimension::kCube ||
+             (instr.dimension == xenos::FetchOpDimension::k2D && is_pixel_shader() &&
+              REXCVAR_GET(spirv_implicit_lod_2d)));
 
         // Calculate the gradients for sampling the texture if needed.
         // 2D vectors for k1D (because 1D images are emulated as 2D arrays),

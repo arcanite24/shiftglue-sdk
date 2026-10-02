@@ -35,6 +35,12 @@ REXCVAR_DEFINE_BOOL(spirv_fast_pixel_math, false, "GPU",
                     "NaN pixels")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(spirv_implicit_lod_2d, false, "GPU",
+                    "Vulkan: sample 2D textures whose level the pixel shader computes with "
+                    "implicit level of detail plus the bias, as cube maps already are, "
+                    "instead of explicit gradients - cheaper on tiled mobile GPUs")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::graphics {
 
 SpirvShaderTranslator::Features::Features(bool all)
