@@ -58,6 +58,12 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
                     "Allow FIFO relaxed present mode");
 
+REXCVAR_DEFINE_BOOL(vulkan_present_wait, false, "UI/Vulkan",
+                    "Pace presentation: after each present, wait (up to 50 ms) until the "
+                    "previous one has reached the display (VK_KHR_present_wait), so at most "
+                    "one present is in flight, as UnleashedRecomp paces at 120 Hz")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex {
 namespace ui {
 namespace vulkan {
@@ -766,6 +772,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   if (paint_context_.vulkan_surface != VK_NULL_HANDLE) {
     VkSwapchainKHR old_swapchain = paint_context_.PrepareForSwapchainRetirement();
     bool surface_unusable;
+    paint_context_.swapchain_last_present_id = 0;
     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
         old_swapchain, paint_context_.present_queue_family, new_swapchain_format,
@@ -870,6 +877,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
       return SurfacePaintConnectResult::kFailure;
     }
     bool surface_unusable;
+    paint_context_.swapchain_last_present_id = 0;
     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
         VK_NULL_HANDLE, paint_context_.present_queue_family, new_swapchain_format,
@@ -2251,11 +2259,28 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   present_info.pSwapchains = &paint_context_.swapchain;
   present_info.pImageIndices = &swapchain_image_index;
   present_info.pResults = nullptr;
+  // IDs grow on each swapchain (a new swapchain starts again from 1).
+  VkPresentIdKHR present_id_info = {VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
+  uint64_t present_id = 0;
+  const VulkanDevice::Properties& device_properties = vulkan_device_->properties();
+  if (device_properties.presentId && device_properties.presentWait &&
+      REXCVAR_GET(vulkan_present_wait)) {
+    present_id = ++paint_context_.swapchain_last_present_id;
+    present_id_info.swapchainCount = 1;
+    present_id_info.pPresentIds = &present_id;
+    present_info.pNext = &present_id_info;
+  }
   VkResult present_result;
   {
     const VulkanDevice::Queue::Acquisition queue_acquisition =
         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
+  }
+  if (present_id > 1 && (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR)) {
+    // At most one present in flight: the previous one must have reached the
+    // display before the next frame is painted.
+    dfn.vkWaitForPresentKHR(vulkan_device_->device(), paint_context_.swapchain, present_id - 1,
+                            UINT64_C(50000000));
   }
   switch (present_result) {
     case VK_SUCCESS:

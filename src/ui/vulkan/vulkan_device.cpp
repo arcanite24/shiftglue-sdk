@@ -415,6 +415,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (with_swapchain) {
     // #2.
     XE_UI_VULKAN_STRUCT_EXTENSION(KHR_swapchain)
+    if (get_physical_device_properties2_supported) {
+      // #295 and #249, for presentation pacing (vulkan_present_wait).
+      XE_UI_VULKAN_STRUCT_EXTENSION(KHR_present_id)
+      XE_UI_VULKAN_STRUCT_EXTENSION(KHR_present_wait)
+    }
   }
 
   bool ext_1_2_KHR_sampler_mirror_clamp_to_edge = false;
@@ -554,6 +559,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceRobustness2FeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT>
       features_EXT_robustness2;
+  VulkanFeatures<VkPhysicalDevicePresentIdFeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR>
+      features_KHR_present_id;
+  VulkanFeatures<VkPhysicalDevicePresentWaitFeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR>
+      features_KHR_present_wait;
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -601,6 +612,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (device->extensions_.ext_EXT_robustness2) {
       features_EXT_robustness2.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_KHR_present_id) {
+      features_KHR_present_id.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_KHR_present_wait) {
+      features_KHR_present_wait.Link(supported_features_2, device_create_info);
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
@@ -964,6 +981,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
   }
 
+  if (device->extensions_.ext_KHR_present_id) {
+    XE_UI_VULKAN_FEATURE_2(features_KHR_present_id, presentId)
+  }
+  if (device->extensions_.ext_KHR_present_wait) {
+    XE_UI_VULKAN_FEATURE_2(features_KHR_present_wait, presentWait)
+  }
+
 #undef XE_UI_VULKAN_LIMIT
 #undef XE_UI_VULKAN_ENUM_LIMIT
 #undef XE_UI_VULKAN_FEATURE
@@ -1040,6 +1064,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
   if (device->extensions_.ext_KHR_push_descriptor) {
 #include <rex/ui/vulkan/functions/device_khr_push_descriptor.inc>
+  }
+  if (device->extensions_.ext_KHR_present_wait) {
+#include <rex/ui/vulkan/functions/device_khr_present_wait.inc>
   }
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 

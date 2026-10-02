@@ -175,6 +175,11 @@ class VulkanDevice {
     // VK_EXT_robustness2
 
     bool nullDescriptor = false;
+
+    // VK_KHR_present_id (#295) and VK_KHR_present_wait (#249)
+
+    bool presentId = false;
+    bool presentWait = false;
   };
 
   // Properties of the core API and enabled extensions, and enabled features.
@@ -209,6 +214,9 @@ class VulkanDevice {
     bool ext_1_3_KHR_dynamic_rendering = false;  // #55
     // Only with vulkan_diagnostic_checkpoints.
     bool ext_NV_device_diagnostic_checkpoints = false;  // #207
+    // Have optional features not implied by these being true.
+    bool ext_KHR_present_id = false;    // #295
+    bool ext_KHR_present_wait = false;  // #249
   };
 
   const Extensions& extensions() const { return extensions_; }
@@ -234,6 +242,8 @@ class VulkanDevice {
 #include <rex/ui/vulkan/functions/device_nv_device_diagnostic_checkpoints.inc>
     // VK_KHR_push_descriptor (#81)
 #include <rex/ui/vulkan/functions/device_khr_push_descriptor.inc>
+    // VK_KHR_present_wait (#249)
+#include <rex/ui/vulkan/functions/device_khr_present_wait.inc>
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 #undef XE_UI_VULKAN_FUNCTION
   };
