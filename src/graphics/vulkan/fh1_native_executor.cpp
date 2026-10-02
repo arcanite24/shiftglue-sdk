@@ -55,6 +55,10 @@ REXCVAR_DEFINE_INT32(fh1_debug_rendering_split_draws, 0, "GPU",
                      "Diagnostics: end the draw rendering every N draws (0: never), to measure "
                      "the cost of a rendering on the GPU. Same image, more renderings")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_debug_skip_stencil_transfers, false, "GPU",
+                    "Diagnostics: transfer depth without its stencil bit passes on devices "
+                    "without stencil export (wrong stencil), to bound what they cost")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_debug_skip_clears, false, "GPU",
                     "Diagnostics: skip every EDRAM clear (wrong image), to bound what clears "
                     "cost")
@@ -622,6 +626,8 @@ void Fh1NativeExecutor::BeginSurfaceRendering(Surface& surface, bool uint_view) 
     info.colorAttachmentCount = 1;
     info.pColorAttachments = &attachment;
   }
+  command_processor_.SetNextRenderingLabel(
+      surface.key.is_depth ? "fh1 depth transfer or clear" : "fh1 color transfer or clear");
   // Transfer and clear scopes are keyed apart from draw scopes.
   const uint64_t id =
       (uint64_t(1) << 63) | (uint64_t(surface.key.Pack()) << 1) | uint64_t(uint_view);
@@ -1360,7 +1366,8 @@ void Fh1NativeExecutor::FlushDepthTransfers(Surface& dest, size_t first, size_t 
       dest.key.msaa == uint32_t(xenos::MsaaSamples::k2X) && dest.samples == 4 ? 0b1001u
                                                                              : UINT32_MAX;
   bool set_bound = false;
-  for (uint32_t pass = 0; pass < (any_stencil ? 9u : 1u); ++pass) {
+  const bool stencil_passes = any_stencil && !REXCVAR_GET(fh1_debug_skip_stencil_transfers);
+  for (uint32_t pass = 0; pass < (stencil_passes ? 9u : 1u); ++pass) {
     TransferPipelineKey key;
     key.dest_kind = pass ? 1 + pass : 1;
     key.dest_format = dest.format;

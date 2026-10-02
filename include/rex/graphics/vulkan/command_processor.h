@@ -278,6 +278,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   void EndDebugLabel() {
     if (debug_labels_) deferred_command_buffer_.CmdVkEndDebugLabel();
   }
+  // The label of the next FH1 rendering begun (a string literal), instead of
+  // the one its id implies.
+  void SetNextRenderingLabel(const char* label) { next_rendering_label_ = label; }
   bool IsFh1RenderingOpen(uint64_t id) const {
     return in_render_pass_ && id && current_fh1_rendering_id_ == id;
   }
@@ -863,6 +866,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool debug_labels_ = false;
   // An FH1 rendering opened a label its end closes.
   bool rendering_label_open_ = false;
+  const char* next_rendering_label_ = nullptr;
 
   std::unique_ptr<VulkanPipelineCache> pipeline_cache_;
 

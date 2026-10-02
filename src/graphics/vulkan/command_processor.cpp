@@ -3769,15 +3769,18 @@ void VulkanCommandProcessor::SubmitBarriersAndBeginFh1Rendering(
   const bool barriers = !pending_barriers_.empty();
   SubmitBarriers(false);
   if (in_render_pass_ && current_fh1_rendering_id_ == id) {
+    next_rendering_label_ = nullptr;
     return;
   }
   EndRenderPass();
   deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
+  const char* const next_rendering_label = next_rendering_label_;
+  next_rendering_label_ = nullptr;
   if (debug_labels_) {
-    deferred_command_buffer_.CmdVkBeginDebugLabel(
-        (id >> 62) == 3   ? "fh1 resolve fill"
-        : (id >> 63) != 0 ? "fh1 transfer or clear"
-                          : "fh1 draws");
+    deferred_command_buffer_.CmdVkBeginDebugLabel(next_rendering_label ? next_rendering_label
+                                                  : (id >> 62) == 3        ? "fh1 resolve fill"
+                                                  : (id >> 63) != 0 ? "fh1 transfer or clear"
+                                                                    : "fh1 draws");
     rendering_label_open_ = true;
   }
   ++rendering_begin_count_;
