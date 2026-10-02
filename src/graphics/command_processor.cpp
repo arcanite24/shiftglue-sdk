@@ -17,8 +17,10 @@
 #include <cstdio>
 #include <cstring>
 #include <string_view>
+#include <unordered_map>
 
 #include <fmt/format.h>
+#include <xxhash.h>
 
 #include <rex/cvar.h>
 #include <rex/dbg.h>
@@ -72,6 +74,12 @@ REXCVAR_DEFINE_INT32(wait_reg_mem_yield_us, kWaitRegMemYieldUsDefault, "GPU",
                      "once")
     .range(0, 16000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_ib_identity_stats, false, "GPU",
+                    "Diagnostics: hash every indirect buffer the commands thread executes and log "
+                    "every 600 frames how many buffers, dwords and draws repeat byte for byte "
+                    "from the previous execution at the same address (the display-list "
+                    "compiler's potential hit rate)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(gpu_trace_wait_reg_mem_writers, false, "GPU",
                     "Diagnostics: while WAIT_REG_MEM waits on a guest memory word, watch its "
                     "page and log the guest threads (and their link register) that write it")
@@ -1099,8 +1107,36 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   return write_index;
 }
 
+namespace {
+// gpu_ib_identity_stats (decoder thread only).
+struct IbIdentityStats {
+  std::unordered_map<uint64_t, uint64_t> last_hash;
+  uint64_t decoded_draws = 0;
+  uint64_t frames = 0, ibs = 0, repeats = 0, dwords = 0, repeat_dwords = 0, draws = 0,
+           repeat_draws = 0;
+};
+IbIdentityStats ib_stats;
+}  // namespace
+
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
+
+  const bool ib_stats_enabled = REXCVAR_GET(gpu_ib_identity_stats);
+  bool ib_repeat = false;
+  const uint64_t draws_before = ib_stats.decoded_draws;
+  if (ib_stats_enabled) {
+    const uint64_t hash =
+        XXH3_64bits(memory_->TranslatePhysical(ptr), size_t(count) * sizeof(uint32_t));
+    uint64_t& last = ib_stats.last_hash[(uint64_t(ptr) << 32) | count];
+    ib_repeat = last == hash;
+    last = hash;
+    ++ib_stats.ibs;
+    ib_stats.dwords += count;
+    if (ib_repeat) {
+      ++ib_stats.repeats;
+      ib_stats.repeat_dwords += count;
+    }
+  }
 
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
@@ -1114,6 +1150,12 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
     }
   } while (reader.read_count());
 
+  if (ib_stats_enabled) {
+    // Nested buffers count in both.
+    const uint64_t draws = ib_stats.decoded_draws - draws_before;
+    ib_stats.draws += draws;
+    if (ib_repeat) ib_stats.repeat_draws += draws;
+  }
 }
 
 void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
@@ -1464,6 +1506,21 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
 bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet,
                                                   uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
+
+  if (REXCVAR_GET(gpu_ib_identity_stats) && ++ib_stats.frames == 600) {
+    const double f = double(ib_stats.frames);
+    REXGPU_INFO(
+        "Indirect buffers per frame over 600 frames: {:.1f} executed, {:.1f} repeated byte for "
+        "byte ({:.1f} %); dwords {:.0f}, repeated {:.0f} ({:.1f} %); draws inside {:.0f}, in "
+        "repeated buffers {:.0f} ({:.1f} %); {} distinct buffers seen",
+        ib_stats.ibs / f, ib_stats.repeats / f, 100.0 * ib_stats.repeats / std::max<uint64_t>(ib_stats.ibs, 1),
+        ib_stats.dwords / f, ib_stats.repeat_dwords / f,
+        100.0 * ib_stats.repeat_dwords / std::max<uint64_t>(ib_stats.dwords, 1), ib_stats.draws / f,
+        ib_stats.repeat_draws / f, 100.0 * ib_stats.repeat_draws / std::max<uint64_t>(ib_stats.draws, 1),
+        ib_stats.last_hash.size());
+    ib_stats.frames = ib_stats.ibs = ib_stats.repeats = ib_stats.dwords = ib_stats.repeat_dwords =
+        ib_stats.draws = ib_stats.repeat_draws = 0;
+  }
 
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
   {
@@ -2145,6 +2202,7 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
 
 bool CommandProcessor::ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, uint32_t packet,
                                                     uint32_t count) {
+  ++ib_stats.decoded_draws;
   // "initiate fetch of index buffer and draw"
   // Generally used by Xbox 360 Direct3D 9 for kDMA and kAutoIndex sources.
   // With a viz query token as the first one.
@@ -2162,6 +2220,7 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, 
 
 bool CommandProcessor::ExecutePacketType3_DRAW_INDX_2(memory::RingBuffer* reader, uint32_t packet,
                                                       uint32_t count) {
+  ++ib_stats.decoded_draws;
   // "draw using supplied indices in packet"
   // Generally used by Xbox 360 Direct3D 9 for kAutoIndex source.
   // No viz query token.
