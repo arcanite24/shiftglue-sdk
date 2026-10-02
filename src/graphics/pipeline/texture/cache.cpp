@@ -362,7 +362,14 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
       // any texture has been destroyed.
       ResetTextureBindings();
     }
-    // Remove the texture from the map and destroy it via its unique_ptr.
+    // Remove the texture from the maps and destroy it via its unique_ptr.
+    for (auto [it, end] = textures_by_base_.equal_range(texture->key().base_page << 12);
+         it != end; ++it) {
+      if (it->second == texture) {
+        textures_by_base_.erase(it);
+        break;
+      }
+    }
     auto found_texture_it = textures_.find(texture->key());
     assert_true(found_texture_it != textures_.end());
     if (found_texture_it != textures_.end()) {
@@ -1012,6 +1019,7 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
 
 void TextureCache::DestroyAllTextures(bool from_destructor) {
   ResetTextureBindings(from_destructor);
+  textures_by_base_.clear();
   textures_.clear();
   COUNT_profile_set("gpu/texture_cache/textures", 0);
 }
@@ -1129,6 +1137,7 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     }
     assert_true(new_texture->key() == key);
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
+    textures_by_base_.emplace(key.base_page << 12, texture);
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");
@@ -1400,6 +1409,61 @@ void TextureCache::FindReloadRowBand(
   }
   loading_rows_first_ = first;
   loading_rows_end_ = end;
+}
+
+void TextureCache::FindDirectResolveTargets(uint32_t dest_base, uint32_t extent_start,
+                                            uint32_t extent_length, xenos::TextureFormat format,
+                                            uint32_t pitch_texels, uint32_t dest_width,
+                                            uint32_t dest_height, bool scaled,
+                                            std::vector<DirectResolveTarget>& targets_out) {
+  targets_out.clear();
+  const FormatInfo* format_info = FormatInfo::Get(format);
+  const uint32_t bytes_per_block = format_info->bytes_per_block();
+  if (format_info->block_width != 1 || format_info->block_height != 1 || !bytes_per_block) {
+    return;
+  }
+  const uint32_t pitch_aligned = (pitch_texels + 31) & ~UINT32_C(31);
+  auto global_lock = global_critical_region_.Acquire();
+  // Textures starting at most 32 MB before the destination.
+  for (auto it = textures_by_base_.upper_bound(dest_base); it != textures_by_base_.begin();) {
+    --it;
+    const uint32_t base = it->first;
+    if (dest_base - base > (UINT32_C(32) << 20)) {
+      break;
+    }
+    Texture& texture = *it->second;
+    const TextureKey& key = texture.key();
+    const texture_util::TextureGuestLayout& layout = texture.guest_layout();
+    if (key.format != format || !key.tiled || key.dimension != xenos::DataDimension::k2DOrStacked ||
+        key.GetDepthOrArraySize() != 1 || key.mip_max_level != 0 || layout.packed_level == 0 ||
+        bool(key.scaled_resolve) != scaled || texture.outdated_mask() ||
+        layout.base.row_pitch_bytes != pitch_aligned * bytes_per_block) {
+      continue;
+    }
+    const uint32_t macro_row_bytes = layout.base.row_pitch_bytes * 32;
+    const uint32_t offset = dest_base - base;
+    if (offset % macro_row_bytes || extent_start < base ||
+        uint64_t(extent_start) + extent_length > uint64_t(base) + texture.GetGuestBaseSize()) {
+      continue;
+    }
+    // The texels the resolve writes (its source pixels from the destination's
+    // first row) must lie inside the texture.
+    const uint32_t row_offset = offset / macro_row_bytes * 32;
+    if (dest_width > key.GetWidth() || row_offset + dest_height > key.GetHeight()) {
+      continue;
+    }
+    targets_out.push_back({&texture, row_offset});
+  }
+}
+
+void TextureCache::CompleteDirectResolve(const std::vector<DirectResolveTarget>& targets) {
+  auto global_lock = global_critical_region_.Acquire();
+  for (const DirectResolveTarget& target : targets) {
+    Texture& texture = *target.texture;
+    texture.WatchPendingLoad(global_lock, true, false);
+    texture.CompleteLoad(global_lock, true, false);
+    texture.set_loaded_write_log_count(write_log_count_);
+  }
 }
 
 void TextureCache::ReloadProbeGlobalWatchCallback(

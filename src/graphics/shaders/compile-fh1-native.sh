@@ -48,6 +48,9 @@ for source_kind in color depth uint; do
     [[ -n $source_msaa ]] && msaa_defines+=(FH1_SOURCE_MSAA=1)
     compile cs_5_1 fh1_native_resolve_memory.cs.hlsl \
       "fh1_native_resolve_memory_${source_kind}${source_msaa}_cs" "${msaa_defines[@]}"
+    if [[ $source_kind != depth ]]; then
+      compile cs_5_1 fh1_native_resolve_memory.cs.hlsl         "fh1_native_resolve_image_${source_kind}${source_msaa}_cs" "${msaa_defines[@]}"         FH1_DEST_IMAGE=1
+    fi
     compile cs_5_1 fh1_native_transfer_words.cs.hlsl \
       "fh1_native_transfer_words_${source_kind}${source_msaa}_cs" "${msaa_defines[@]}"
     dest_index=0

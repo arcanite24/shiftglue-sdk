@@ -344,6 +344,13 @@ class VulkanTextureCache final : public TextureCache {
 
   const HostFormatPair& GetHostFormatPair(TextureKey key) const;
 
+  // For a resolve writing straight into the texture (DR-2.2): its raw-bits
+  // view of single 32-bit words, with the image ready for compute writes and
+  // its contents kept, or VK_NULL_HANDLE.
+ public:
+  VkImageView PrepareDirectResolveWrite(Texture& texture);
+
+ private:
   void GetTextureUsageMasks(VulkanTexture::Usage usage, VkPipelineStageFlags& stage_mask,
                             VkAccessFlags& access_mask, VkImageLayout& layout);
   bool EnsureScaledResolveBufferAllocated(uint64_t start_scaled, uint64_t length_scaled);

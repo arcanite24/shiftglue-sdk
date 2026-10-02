@@ -55,6 +55,12 @@ REXCVAR_DEFINE_INT32(fh1_debug_rendering_split_draws, 0, "GPU",
                      "Diagnostics: end the draw rendering every N draws (0: never), to measure "
                      "the cost of a rendering on the GPU. Same image, more renderings")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_resolve_to_textures, true, "GPU",
+                    "Write a 32bpp color resolve also straight into each current texture of "
+                    "its format and layout over the destination, through the texture's "
+                    "raw-bits view, so the texture stays current instead of reloading the "
+                    "whole range (FH1 native executor, Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_debug_skip_stencil_transfers, false, "GPU",
                     "Diagnostics: transfer depth without its stencil bit passes on devices "
                     "without stencil export (wrong stencil), to bound what they cost")
@@ -86,6 +92,10 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/fh1_native_resolve_memory_depth_ms_cs.h"
 #include "../shaders/vulkan_spirv/fh1_native_resolve_memory_uint_cs.h"
 #include "../shaders/vulkan_spirv/fh1_native_resolve_memory_uint_ms_cs.h"
+#include "../shaders/vulkan_spirv/fh1_native_resolve_image_color_cs.h"
+#include "../shaders/vulkan_spirv/fh1_native_resolve_image_color_ms_cs.h"
+#include "../shaders/vulkan_spirv/fh1_native_resolve_image_uint_cs.h"
+#include "../shaders/vulkan_spirv/fh1_native_resolve_image_uint_ms_cs.h"
 #include "../shaders/vulkan_spirv/fh1_native_transfer_color_from_color_ps.h"
 #include "../shaders/vulkan_spirv/fh1_native_transfer_color_from_color_ms_ps.h"
 #include "../shaders/vulkan_spirv/fh1_native_transfer_color_from_depth_ps.h"
@@ -166,6 +176,7 @@ namespace {
 constexpr uint32_t kBindingSource = 16;
 constexpr uint32_t kBindingStencil = 17;
 constexpr uint32_t kBindingMemory = 32;
+constexpr uint32_t kBindingImage = 33;
 constexpr uint32_t kComputeConstantCount = 8;
 constexpr uint32_t kTransferConstantCount = 3;
 
@@ -266,6 +277,14 @@ const SpirvShader kComputeShaders[2][3][2] = {
       FH1_SPIRV(fh1_native_transfer_words_depth_ms_cs)},
      {FH1_SPIRV(fh1_native_transfer_words_uint_cs),
       FH1_SPIRV(fh1_native_transfer_words_uint_ms_cs)}},
+};
+// [source kind][msaa]: resolves straight into a texture (no depth sources).
+const SpirvShader kImageShaders[3][2] = {
+    {FH1_SPIRV(fh1_native_resolve_image_color_cs),
+     FH1_SPIRV(fh1_native_resolve_image_color_ms_cs)},
+    {{nullptr, 0}, {nullptr, 0}},
+    {FH1_SPIRV(fh1_native_resolve_image_uint_cs),
+     FH1_SPIRV(fh1_native_resolve_image_uint_ms_cs)},
 };
 #undef FH1_SPIRV
 
@@ -405,6 +424,19 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   bindings[0] = {kBindingSource, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
                  VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
   if (!create_set_layout(bindings, 1, words_set_layout_)) return false;
+  bindings[0] = {kBindingSource, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                 VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+  bindings[1] = {kBindingStencil, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                 VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+  const VkDescriptorSetLayoutBinding image_bindings[4] = {
+      {kBindingSource, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {kBindingStencil, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT,
+       nullptr},
+      {kBindingMemory, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT,
+       nullptr},
+      {kBindingImage, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT,
+       nullptr}};
+  if (!create_set_layout(image_bindings, 4, image_set_layout_)) return false;
 
   auto create_pipeline_layout = [&](VkDescriptorSetLayout set_layout, VkShaderStageFlags stage,
                                     uint32_t constant_count, VkPipelineLayout& layout_out) {
@@ -422,7 +454,9 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
       !create_pipeline_layout(transfer_set_layout_, VK_SHADER_STAGE_FRAGMENT_BIT,
                               kTransferConstantCount, transfer_pipeline_layout_) ||
       !create_pipeline_layout(words_set_layout_, VK_SHADER_STAGE_FRAGMENT_BIT,
-                              kTransferConstantCount, words_pipeline_layout_)) {
+                              kTransferConstantCount, words_pipeline_layout_) ||
+      !create_pipeline_layout(image_set_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                              kComputeConstantCount + 2, image_pipeline_layout_)) {
     return false;
   }
   tiles_.Reset();
@@ -479,13 +513,19 @@ void Fh1NativeExecutor::Shutdown() {
     destroy_buffer(readback.buffer, readback.memory);
   }
   pending_readbacks_.clear();
-  for (VkPipelineLayout* layout :
-       {&compute_pipeline_layout_, &transfer_pipeline_layout_, &words_pipeline_layout_}) {
+  for (auto& by_kind : image_pipelines_) {
+    for (VkPipeline& pipeline : by_kind) {
+      if (pipeline) dfn.vkDestroyPipeline(device, pipeline, nullptr);
+      pipeline = VK_NULL_HANDLE;
+    }
+  }
+  for (VkPipelineLayout* layout : {&compute_pipeline_layout_, &transfer_pipeline_layout_,
+                                   &words_pipeline_layout_, &image_pipeline_layout_}) {
     if (*layout) dfn.vkDestroyPipelineLayout(device, *layout, nullptr);
     *layout = VK_NULL_HANDLE;
   }
   for (VkDescriptorSetLayout* layout :
-       {&compute_set_layout_, &transfer_set_layout_, &words_set_layout_}) {
+       {&compute_set_layout_, &transfer_set_layout_, &words_set_layout_, &image_set_layout_}) {
     if (*layout) dfn.vkDestroyDescriptorSetLayout(device, *layout, nullptr);
     *layout = VK_NULL_HANDLE;
   }
@@ -908,7 +948,8 @@ VkDescriptorSet Fh1NativeExecutor::AllocateDescriptorSet(VkDescriptorSetLayout l
     uint32_t& current = descriptor_pool_current_[slot];
     if (current >= pools.size()) {
       const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024},
-                                            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 512}};
+                                            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 512},
+                                            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256}};
       VkDescriptorPoolCreateInfo info = {};
       info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
       info.maxSets = 512;
@@ -2015,18 +2056,36 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
                                         uint32_t sample_select, uint32_t dest_info,
                                         uint32_t dest_base, uint32_t dest_pitch,
                                         VkBuffer buffer, VkDeviceSize memory_offset,
-                                        VkDeviceSize memory_range, bool unscaled_dest) {
+                                        VkDeviceSize memory_range, bool unscaled_dest,
+                                        VkImageView image_view, uint32_t image_row,
+                                        uint32_t image_endian) {
   GpuTimer gpu_timer(*this, kGpuResolves);
   command_processor_.Checkpoint(VulkanCommandProcessor::CheckpointKind::kResolve);
   Surface& surface = *source.surface;
   const bool depth = surface.key.is_depth;
   const bool msaa = surface.samples > 1;
-  VkPipeline pipeline = GetComputePipeline(false, SourceKind(depth, surface.key.format), msaa);
+  const uint32_t kind = SourceKind(depth, surface.key.format);
+  // With a texture image, the variant that also writes it.
+  if (image_view != VK_NULL_HANDLE && !image_pipelines_[kind][msaa] &&
+      kImageShaders[kind][msaa].code) {
+    image_pipelines_[kind][msaa] = ui::vulkan::util::CreateComputePipeline(
+        command_processor_.GetVulkanDevice(), image_pipeline_layout_,
+        kImageShaders[kind][msaa].code, kImageShaders[kind][msaa].size);
+  }
+  if (image_view != VK_NULL_HANDLE && !image_pipelines_[kind][msaa]) {
+    Skip("resolve_image_pipeline");
+    return false;
+  }
+  VkPipeline pipeline = image_view != VK_NULL_HANDLE ? image_pipelines_[kind][msaa]
+                                                     : GetComputePipeline(false, kind, msaa);
+  const VkPipelineLayout pipeline_layout =
+      image_view != VK_NULL_HANDLE ? image_pipeline_layout_ : compute_pipeline_layout_;
   if (!pipeline) {
     Skip("resolve_pipeline_create");
     return false;
   }
-  VkDescriptorSet set = AllocateDescriptorSet(compute_set_layout_);
+  VkDescriptorSet set = AllocateDescriptorSet(
+      image_view != VK_NULL_HANDLE ? image_set_layout_ : compute_set_layout_);
   if (!set) {
     Skip("resolve_descriptor");
     return false;
@@ -2039,8 +2098,9 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
       {VK_NULL_HANDLE, surface.stencil_view ? surface.stencil_view : surface.sampled_view,
        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
   VkDescriptorBufferInfo buffer_info = {buffer, memory_offset, memory_range};
-  VkWriteDescriptorSet writes[3] = {};
-  for (uint32_t w = 0; w < 3; ++w) {
+  const VkDescriptorImageInfo image_info = {VK_NULL_HANDLE, image_view, VK_IMAGE_LAYOUT_GENERAL};
+  VkWriteDescriptorSet writes[4] = {};
+  for (uint32_t w = 0; w < 4; ++w) {
     writes[w].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[w].dstSet = set;
     writes[w].descriptorCount = 1;
@@ -2054,12 +2114,15 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   writes[2].dstBinding = kBindingMemory;
   writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   writes[2].pBufferInfo = &buffer_info;
-  vulkan_device->functions().vkUpdateDescriptorSets(vulkan_device->device(), 3, writes, 0,
-                                                    nullptr);
+  writes[3].dstBinding = kBindingImage;
+  writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  writes[3].pImageInfo = &image_info;
+  vulkan_device->functions().vkUpdateDescriptorSets(
+      vulkan_device->device(), image_view != VK_NULL_HANDLE ? 4 : 3, writes, 0, nullptr);
   const SurfaceKey& owner = surface.key;
   const uint32_t host_sample_mode = HostSampleMode(surface);
   const Rect rect = unscaled_dest ? source.rect : HostRect(source.rect);
-  uint32_t constants[kComputeConstantCount];
+  uint32_t constants[kComputeConstantCount + 2];
   constants[0] = uint32_t(rect.left) | (uint32_t(rect.top) << 16);
   constants[1] = uint32_t(rect.right - rect.left) | (uint32_t(rect.bottom - rect.top) << 16);
   constants[2] = PackLayout(resolve_key.base_tiles, resolve_key.pitch_tiles, resolve_key.msaa,
@@ -2071,13 +2134,19 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   constants[5] = dest_info | ((scale_ - 1) << 20) | (unscaled_dest ? 1u << 22 : 0u);
   constants[6] = dest_base;
   constants[7] = dest_pitch;
+  constants[8] = image_row * scale_;
+  constants[9] = image_endian;
   auto& command_buffer = command_processor_.deferred_command_buffer();
   command_processor_.BindExternalComputePipeline(pipeline);
-  command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, compute_pipeline_layout_,
-                                         0, 1, &set, 0, nullptr);
-  command_buffer.CmdVkPushConstants(compute_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                    sizeof(constants), constants);
-  command_processor_.BeginDebugLabel("fh1 resolve");
+  command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1,
+                                         &set, 0, nullptr);
+  command_buffer.CmdVkPushConstants(
+      pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+      uint32_t(sizeof(uint32_t)) * (image_view != VK_NULL_HANDLE ? kComputeConstantCount + 2
+                                                                 : kComputeConstantCount),
+      constants);
+  command_processor_.BeginDebugLabel(image_view != VK_NULL_HANDLE ? "fh1 resolve and texture"
+                                                                  : "fh1 resolve");
   command_buffer.CmdVkDispatch((uint32_t(rect.right - rect.left) + 7) / 8,
                                (uint32_t(rect.bottom - rect.top) + 7) / 8, 1);
   command_processor_.EndDebugLabel();
@@ -2307,6 +2376,27 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
       config_.memory->Use(VulkanSharedMemory::Usage::kComputeWrite,
                           std::make_pair(extent_start, extent_length));
     }
+    // Current textures of the destination's format and layout over it are
+    // written directly as well, and stay current.
+    direct_resolve_targets_.clear();
+    const uint32_t pack = plan.dest_info & 7u;
+    if (REXCVAR_GET(fh1_resolve_to_textures) && !plan.copying_depth && pack <= 2) {
+      config_.textures->FindDirectResolveTargets(
+          plan.dest_base, extent_start, extent_length,
+          pack == 0   ? xenos::TextureFormat::k_8_8_8_8
+          : pack == 1 ? xenos::TextureFormat::k_2_10_10_10
+                      : xenos::TextureFormat::k_32_FLOAT,
+          plan.dest_pitch, uint32_t(plan.x1), uint32_t(plan.y1), scale_ > 1,
+          direct_resolve_targets_);
+    }
+    // One texture, written by the resolve's own dispatch; any others reload.
+    VkImageView direct_resolve_view = VK_NULL_HANDLE;
+    if (!direct_resolve_targets_.empty()) {
+      direct_resolve_targets_.resize(1);
+      direct_resolve_view =
+          config_.textures->PrepareDirectResolveWrite(*direct_resolve_targets_[0].texture);
+      if (direct_resolve_view == VK_NULL_HANDLE) direct_resolve_targets_.clear();
+    }
     bool complete = true;
     for (const SourceRect& source : plan.sources) {
       if (source.rect.left >= source.rect.right || source.rect.top >= source.rect.bottom) {
@@ -2331,8 +2421,13 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
                                      .Pack())) {
         Count("resolve_through_alias");
       }
-      if (!ResolveToMemory(source, plan.resolve_key, plan.sample_select, plan.dest_info,
-                           dest_base, plan.dest_pitch, target, target_offset, target_range)) {
+      if (!ResolveToMemory(
+              source, plan.resolve_key, plan.sample_select, plan.dest_info, dest_base,
+              plan.dest_pitch, target, target_offset, target_range, false, direct_resolve_view,
+              direct_resolve_targets_.empty() ? 0 : direct_resolve_targets_[0].row_offset,
+              direct_resolve_targets_.empty()
+                  ? 0
+                  : uint32_t(direct_resolve_targets_[0].texture->key().endianness))) {
         complete = false;
       }
     }
@@ -2361,6 +2456,10 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     }
     // Invalidates textures over the range (and marks it scaled at scale).
     config_.textures->MarkRangeAsResolved(extent_start, extent_length);
+    if (complete && !direct_resolve_targets_.empty()) {
+      config_.textures->CompleteDirectResolve(direct_resolve_targets_);
+      counters_.Count("resolve_to_texture", direct_resolve_targets_.size());
+    }
     if (REXCVAR_GET(fh1_trace_resolve_cpu_accesses)) {
       static void* const callback =
           memory_.RegisterPhysicalMemoryAccessCallback(LogResolvedRangeAccess, nullptr);

@@ -10,7 +10,10 @@
 // they may on the guest.
 //
 // Variants: FH1_SOURCE_MSAA (Texture2DMS sources), FH1_SOURCE_DEPTH (depth and
-// stencil sources instead of a color source).
+// stencil sources instead of a color source), FH1_DEST_IMAGE (32bpp only: each
+// resolved word is also written into a texture of the destination's layout,
+// through its raw-bits view, as the texture's load would leave it: swapped by
+// the texture's endianness, from the texture row fh1_image_row).
 
 #include "fh1_push_constants.hlsli"
 
@@ -34,11 +37,22 @@ FH1_PUSH_CONSTANTS cbuffer Fh1NativeResolveMemoryConstants FH1_CONSTANTS_REGISTE
   uint fh1_dest_info;
   uint fh1_dest_base;       // bytes (scaled: from the scaled range's base, unscaled)
   uint fh1_dest_pitch;      // texels
+#ifdef FH1_DEST_IMAGE
+  uint fh1_image_row;       // texture row of the destination's first row, host rows
+  uint fh1_image_endian;    // the texture's xenos::Endian
+#endif
 };
 
 #include "fh1_native_edram.hlsli"
 
 RWByteAddressBuffer fh1_memory : register(u0);
+#ifdef FH1_DEST_IMAGE
+#ifdef FH1_SPIRV
+[[vk::image_format("r32ui")]]
+#endif
+RWTexture2D<uint> fh1_image : register(u1);
+#endif
+
 
 // texture_util::GetTiledOffset2D.
 int TiledOffset2D(int x, int y, uint pitch, uint bpb_log2) {
@@ -75,6 +89,14 @@ uint EndianSwap32(uint value, uint endian) {
   return value;
 }
 
+// Stores a 32-bit destination word (already in the guest memory's byte order).
+void StoreWord(uint address, uint2 host_pixel, uint word) {
+  fh1_memory.Store(address, word);
+#ifdef FH1_DEST_IMAGE
+  fh1_image[host_pixel + uint2(0u, fh1_image_row)] = EndianSwap32(word, fh1_image_endian);
+#endif
+}
+
 uint LoadOwnerWord(uint2 pixel, uint sample, uint half) {
   uint flags = (((fh1_dest_info >> 7u) & 1u) ? FH1_FLAG_FLOAT24_ROUND : 0u) |
                (((fh1_dest_info >> 18u) & 1u) ? FH1_FLAG_GAMMA_UNORM16 : 0u);
@@ -99,6 +121,7 @@ void main(uint3 thread : SV_DispatchThreadID) {
     return;
   }
   uint2 pixel = uint2(fh1_rect_origin & 0xFFFFu, fh1_rect_origin >> 16u) + thread.xy;
+  uint2 host_pixel = pixel;
   fh1_fixed16_scale = ((fh1_dest_info >> 19u) & 1u) != 0u ? 32.0f : 1.0f;
   uint scale = ((fh1_dest_info >> 20u) & 3u) + 1u;
   bool unscaled_dest = ((fh1_dest_info >> 22u) & 1u) != 0u;
@@ -130,7 +153,7 @@ void main(uint3 thread : SV_DispatchThreadID) {
 
   if (pack == 4u) {
     // Depth: the EDRAM word itself.
-    fh1_memory.Store(address, EndianSwap32(LoadOwnerWord(pixel, first_sample, 0u), endian));
+    StoreWord(address, host_pixel, EndianSwap32(LoadOwnerWord(pixel, first_sample, 0u), endian));
     return;
   }
 
@@ -147,11 +170,11 @@ void main(uint3 thread : SV_DispatchThreadID) {
   }
 
   if (pack == 0u) {
-    fh1_memory.Store(address, EndianSwap32(EncodeColor(color, FORMAT_8_8_8_8), endian));
+    StoreWord(address, host_pixel, EndianSwap32(EncodeColor(color, FORMAT_8_8_8_8), endian));
   } else if (pack == 1u) {
-    fh1_memory.Store(address, EndianSwap32(EncodeColor(color, FORMAT_2_10_10_10), endian));
+    StoreWord(address, host_pixel, EndianSwap32(EncodeColor(color, FORMAT_2_10_10_10), endian));
   } else if (pack == 2u) {
-    fh1_memory.Store(address, EndianSwap32(asuint(color.r), endian));
+    StoreWord(address, host_pixel, EndianSwap32(asuint(color.r), endian));
   } else {
     uint2 words = uint2(f32tof16(color.r) | (f32tof16(color.g) << 16u),
                         f32tof16(color.b) | (f32tof16(color.a) << 16u));

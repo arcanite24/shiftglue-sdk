@@ -12,6 +12,7 @@
 #include <rex/graphics/fh1_edram_surfaces.h>
 #include <rex/graphics/fh1_edram_tiles.h>
 #include <rex/graphics/fh1_executor_counters.h>
+#include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw_extent_estimator.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
@@ -224,7 +225,9 @@ class Fh1NativeExecutor {
   bool ResolveToMemory(const SourceRect& source, const SurfaceKey& resolve_key,
                        uint32_t sample_select, uint32_t dest_info, uint32_t dest_base,
                        uint32_t dest_pitch, VkBuffer buffer, VkDeviceSize memory_offset,
-                       VkDeviceSize memory_range, bool unscaled_dest = false);
+                       VkDeviceSize memory_range, bool unscaled_dest = false,
+                       VkImageView image_view = VK_NULL_HANDLE, uint32_t image_row = 0,
+                       uint32_t image_endian = 0);
   void ClearSurfaceRect(Surface& surface, const Rect& guest_rect, uint32_t clear_value,
                         uint32_t clear_value_lo);
   // Records the surface's pending clears in a rendering of their own.
@@ -282,6 +285,13 @@ class Fh1NativeExecutor {
   VkPipelineLayout compute_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout transfer_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout words_pipeline_layout_ = VK_NULL_HANDLE;
+  // Resolves also written into a texture: the compute bindings and a storage
+  // image (binding 33), with two more constants.
+  VkDescriptorSetLayout image_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout image_pipeline_layout_ = VK_NULL_HANDLE;
+  // [source kind][msaa]; no depth sources.
+  VkPipeline image_pipelines_[3][2] = {};
+  std::vector<TextureCache::DirectResolveTarget> direct_resolve_targets_;
   // A descriptor pool per frame in flight, reset when the frame reopens.
   static constexpr uint32_t kDescriptorPoolFrames = 3;
   std::array<std::vector<VkDescriptorPool>, kDescriptorPoolFrames> descriptor_pools_;

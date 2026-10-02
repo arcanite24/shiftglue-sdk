@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -585,6 +586,25 @@ class TextureCache {
   uint32_t loading_rows_first() const { return loading_rows_first_; }
   uint32_t loading_rows_end() const { return loading_rows_end_; }
 
+ public:
+  // A texture a resolve may write straight into instead of leaving it to
+  // reload (DR-2.2): current (not outdated), a single-level tiled 2D texture
+  // of the resolve's format, pitch and scaling, whose base level holds the
+  // resolve's written range, with the destination's first row a whole number
+  // of 32-row macro tile rows (row_offset) below its top.
+  struct DirectResolveTarget {
+    Texture* texture;
+    uint32_t row_offset;
+  };
+  void FindDirectResolveTargets(uint32_t dest_base, uint32_t extent_start, uint32_t extent_length,
+                                xenos::TextureFormat format, uint32_t pitch_texels,
+                                uint32_t dest_width, uint32_t dest_height, bool scaled,
+                                std::vector<DirectResolveTarget>& targets_out);
+  // After MarkRangeAsResolved invalidated the targets: their data was written
+  // directly, so they are current again.
+  void CompleteDirectResolve(const std::vector<DirectResolveTarget>& targets);
+
+ protected:
   // Converts a texture fetch constant to a texture key, normalizing and
   // validating the values, or creating an invalid key, and also gets the
   // post-guest-swizzle signedness.
@@ -686,6 +706,8 @@ class TextureCache {
   uint64_t current_submission_time_ = 0;
 
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
+  // The same textures by base address.
+  std::multimap<uint32_t, Texture*> textures_by_base_;
 
   uint64_t textures_total_host_memory_usage_ = 0;
 

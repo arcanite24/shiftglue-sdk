@@ -1286,6 +1286,32 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
   return texture;
 }
 
+VkImageView VulkanTextureCache::PrepareDirectResolveWrite(Texture& texture) {
+  VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
+  if (vulkan_texture.copy_words() != 1) {
+    return VK_NULL_HANDLE;
+  }
+  const VkImageView view = vulkan_texture.GetCopyView();
+  if (view == VK_NULL_HANDLE) {
+    return VK_NULL_HANDLE;
+  }
+  vulkan_texture.MarkAsUsed();
+  const VulkanTexture::Usage old_usage =
+      vulkan_texture.SetUsage(VulkanTexture::Usage::kComputeWrite);
+  VkPipelineStageFlags src_stage_mask, dst_stage_mask;
+  VkAccessFlags src_access_mask, dst_access_mask;
+  VkImageLayout old_layout, new_layout;
+  GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask, old_layout);
+  GetTextureUsageMasks(VulkanTexture::Usage::kComputeWrite, dst_stage_mask, dst_access_mask,
+                       new_layout);
+  // Earlier writes of the same texels (a load) come first.
+  command_processor_.PushImageMemoryBarrier(
+      vulkan_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+      src_stage_mask ? src_stage_mask : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, dst_stage_mask,
+      src_access_mask, dst_access_mask, old_layout, new_layout);
+  return view;
+}
+
 VkImageView VulkanTextureCache::VulkanTexture::GetCopyView() {
   if (copy_view_ != VK_NULL_HANDLE || !copy_words_) {
     return copy_view_;
