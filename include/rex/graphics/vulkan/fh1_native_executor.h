@@ -124,7 +124,7 @@ class Fh1NativeExecutor {
   using TileRun = Fh1EdramTiles::Run;
   static constexpr uint32_t kNoOwner = Fh1EdramTiles::kNoOwner;
   static constexpr uint32_t kTransferDestUint = 16;
-  // Depth and stencil from EDRAM words in one pass (shader stencil export).
+  // Depth and stencil in one pass from the source (shader stencil export).
   static constexpr uint32_t kTransferDestDepthStencil = 17;
   static constexpr uint32_t kTransferSourceWords = 3;
   struct TransferPipelineKey {
@@ -197,6 +197,7 @@ class Fh1NativeExecutor {
   void FlushTransfers();
   void FlushColorTransfers(Surface& dest, size_t first, size_t end);
   void FlushDepthTransfers(Surface& dest, size_t first, size_t end);
+  void FlushDepthTransfersExported(Surface& dest, size_t first, size_t end);
   bool EnsureTransferWords(const Surface& dest);
   uint32_t LayoutConstant(const Surface& surface) const;
   uint32_t TransferFlags() const;

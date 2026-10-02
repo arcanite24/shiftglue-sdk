@@ -115,8 +115,18 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/fh1_native_transfer_depth_dms_from_words_ps.h"
 #include "../shaders/vulkan_spirv/fh1_native_transfer_stencil_from_words_ps.h"
 #include "../shaders/vulkan_spirv/fh1_native_transfer_stencil_dms_from_words_ps.h"
-#include "../shaders/vulkan_spirv/fh1_native_transfer_depth_stencil_from_words_ps.h"
-#include "../shaders/vulkan_spirv/fh1_native_transfer_depth_stencil_dms_from_words_ps.h"
+#include "../shaders/vulkan_spirv/fh1_native_transfer_depth_stencil_from_color_ps.h"
+#include "../shaders/vulkan_spirv/fh1_native_transfer_depth_stencil_from_color_ms_ps.h"
+#include "../shaders/vulkan_spirv/fh1_native_transfer_depth_stencil_from_depth_ps.h"
+#include "../shaders/vulkan_spirv/fh1_native_transfer_depth_stencil_from_depth_ms_ps.h"
+#include "../shaders/vulkan_spirv/fh1_native_transfer_depth_stencil_from_uint_ps.h"
+#include "../shaders/vulkan_spirv/fh1_native_transfer_depth_stencil_from_uint_ms_ps.h"
+#include "../shaders/vulkan_spirv/fh1_native_transfer_depth_stencil_dms_from_color_ps.h"
+#include "../shaders/vulkan_spirv/fh1_native_transfer_depth_stencil_dms_from_color_ms_ps.h"
+#include "../shaders/vulkan_spirv/fh1_native_transfer_depth_stencil_dms_from_depth_ps.h"
+#include "../shaders/vulkan_spirv/fh1_native_transfer_depth_stencil_dms_from_depth_ms_ps.h"
+#include "../shaders/vulkan_spirv/fh1_native_transfer_depth_stencil_dms_from_uint_ps.h"
+#include "../shaders/vulkan_spirv/fh1_native_transfer_depth_stencil_dms_from_uint_ms_ps.h"
 #include "../shaders/vulkan_spirv/fullscreen_cw_vs.h"
 }  // namespace shaders
 
@@ -195,10 +205,23 @@ const SpirvShader kFromWordsShaders[2][2] = {
     {FH1_SPIRV(fh1_native_transfer_stencil_from_words_ps),
      FH1_SPIRV(fh1_native_transfer_stencil_dms_from_words_ps)},
 };
-// Depth and stencil at once, [dest msaa].
-const SpirvShader kFromWordsDepthStencilShaders[2] = {
-    FH1_SPIRV(fh1_native_transfer_depth_stencil_from_words_ps),
-    FH1_SPIRV(fh1_native_transfer_depth_stencil_dms_from_words_ps),
+// Depth and stencil at once with stencil export, straight from the source:
+// [dest msaa][source kind][source msaa].
+const SpirvShader kTransferDepthStencilShaders[2][3][2] = {
+    {
+     {FH1_SPIRV(fh1_native_transfer_depth_stencil_from_color_ps),
+      FH1_SPIRV(fh1_native_transfer_depth_stencil_from_color_ms_ps)},
+     {FH1_SPIRV(fh1_native_transfer_depth_stencil_from_depth_ps),
+      FH1_SPIRV(fh1_native_transfer_depth_stencil_from_depth_ms_ps)},
+     {FH1_SPIRV(fh1_native_transfer_depth_stencil_from_uint_ps),
+      FH1_SPIRV(fh1_native_transfer_depth_stencil_from_uint_ms_ps)}},
+    {
+     {FH1_SPIRV(fh1_native_transfer_depth_stencil_dms_from_color_ps),
+      FH1_SPIRV(fh1_native_transfer_depth_stencil_dms_from_color_ms_ps)},
+     {FH1_SPIRV(fh1_native_transfer_depth_stencil_dms_from_depth_ps),
+      FH1_SPIRV(fh1_native_transfer_depth_stencil_dms_from_depth_ms_ps)},
+     {FH1_SPIRV(fh1_native_transfer_depth_stencil_dms_from_uint_ps),
+      FH1_SPIRV(fh1_native_transfer_depth_stencil_dms_from_uint_ms_ps)}},
 };
 // [resolve, words][source kind][msaa]
 const SpirvShader kComputeShaders[2][3][2] = {
@@ -712,7 +735,8 @@ VkPipeline Fh1NativeExecutor::GetTransferPipeline(const TransferPipelineKey& key
                         : key.dest_kind == kTransferDestUint ? 3
                                                              : std::min(key.dest_kind, 2u);
   const SpirvShader& fragment =
-      exports_stencil ? kFromWordsDepthStencilShaders[key.dest_samples > 1]
+      exports_stencil
+          ? kTransferDepthStencilShaders[key.dest_samples > 1][key.source_kind][key.source_msaa]
       : key.source_kind == kTransferSourceWords
           ? kFromWordsShaders[kind == 1 ? 0 : 1][key.dest_samples > 1]
           : kTransferShaders[kind][key.dest_samples > 1][key.source_kind][key.source_msaa];
@@ -1083,6 +1107,89 @@ void Fh1NativeExecutor::FlushColorTransfers(Surface& dest, size_t first, size_t 
   Count("transfer_batch");
 }
 
+// With stencil export, depth and stencil in one pass per source, read
+// straight from it as color transfers are: no EDRAM words buffer, no compute
+// pass, no pass per stencil bit.
+void Fh1NativeExecutor::FlushDepthTransfersExported(Surface& dest, size_t first, size_t end) {
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  for (size_t i = first; i < end; ++i) {
+    if (Surface* source = FindSurface(pending_transfers_[i].source)) {
+      TransitionForSampling(*source, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    }
+  }
+  TransitionForAttachment(dest);
+  BeginSurfaceRendering(dest, false);
+  auto& command_buffer = command_processor_.deferred_command_buffer();
+  const uint32_t flags = TransferFlags();
+  const uint32_t sample_mask =
+      dest.key.msaa == uint32_t(xenos::MsaaSamples::k2X) && dest.samples == 4 ? 0b1001u
+                                                                             : UINT32_MAX;
+  // The exported value replaces the reference, which still has to be set.
+  command_buffer.CmdVkSetStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+  for (size_t i = first; i < end;) {
+    size_t source_end = i;
+    while (source_end < end &&
+           pending_transfers_[source_end].source == pending_transfers_[i].source) {
+      ++source_end;
+    }
+    Surface* source = FindSurface(pending_transfers_[i].source);
+    VkDescriptorSet set = source ? AllocateDescriptorSet(transfer_set_layout_) : VK_NULL_HANDLE;
+    if (!set) {
+      Skip("transfer_descriptor");
+      i = source_end;
+      continue;
+    }
+    VkDescriptorImageInfo images[2] = {
+        {VK_NULL_HANDLE, source->sampled_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {VK_NULL_HANDLE, source->stencil_view ? source->stencil_view : source->sampled_view,
+         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+    VkWriteDescriptorSet writes[2] = {};
+    for (uint32_t w = 0; w < 2; ++w) {
+      writes[w].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      writes[w].dstSet = set;
+      writes[w].dstBinding = w ? kBindingStencil : kBindingSource;
+      writes[w].descriptorCount = 1;
+      writes[w].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+      writes[w].pImageInfo = &images[w];
+    }
+    dfn.vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+    TransferPipelineKey key;
+    key.dest_kind = kTransferDestDepthStencil;
+    key.dest_format = dest.format;
+    key.dest_samples = dest.samples;
+    key.sample_mask = sample_mask;
+    key.source_kind = SourceKind(source->key.is_depth, source->key.format);
+    key.source_msaa = source->samples > 1;
+    VkPipeline pipeline = GetTransferPipeline(key);
+    if (!pipeline) {
+      Skip("transfer_pipeline");
+      i = source_end;
+      continue;
+    }
+    command_processor_.BindExternalGraphicsPipeline(pipeline);
+    command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           transfer_pipeline_layout_, 0, 1, &set, 0, nullptr);
+    const uint32_t constants[kTransferConstantCount] = {LayoutConstant(dest),
+                                                        LayoutConstant(*source), flags};
+    command_buffer.CmdVkPushConstants(transfer_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                      sizeof(constants), constants);
+    for (; i < source_end; ++i) {
+      const Rect& rect = pending_transfers_[i].rect;
+      command_processor_.SetViewport({float(rect.left), float(rect.top),
+                                      float(rect.right - rect.left),
+                                      float(rect.bottom - rect.top), 0.0f, 1.0f});
+      command_processor_.SetScissor(
+          {{rect.left, rect.top},
+           {uint32_t(rect.right - rect.left), uint32_t(rect.bottom - rect.top)}});
+      command_buffer.CmdVkDraw(3, 1, 0, 0);
+    }
+  }
+  Count("transfer_batch");
+  Count("transfer_stencil_exported");
+}
+
 bool Fh1NativeExecutor::EnsureTransferWords(const Surface& dest) {
   const VkDeviceSize size = VkDeviceSize(dest.width) * dest.height * scale_ * scale_ *
                             dest.samples * sizeof(uint32_t);
@@ -1104,6 +1211,10 @@ bool Fh1NativeExecutor::EnsureTransferWords(const Surface& dest) {
 }
 
 void Fh1NativeExecutor::FlushDepthTransfers(Surface& dest, size_t first, size_t end) {
+  if (stencil_export_) {
+    FlushDepthTransfersExported(dest, first, end);
+    return;
+  }
   if (!EnsureTransferWords(dest)) {
     Skip("transfer_words_buffer");
     return;
@@ -1188,8 +1299,7 @@ void Fh1NativeExecutor::FlushDepthTransfers(Surface& dest, size_t first, size_t 
       VK_ACCESS_SHADER_READ_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
 
   // The depth pass (which resets stencil to 0), then one pass per stencil bit
-  // over the rectangles whose source may have nonzero stencil; with stencil
-  // export, one pass writing both.
+  // over the rectangles whose source may have nonzero stencil.
   TransitionForAttachment(dest);
   VkDescriptorSet words_set = AllocateDescriptorSet(words_set_layout_);
   if (!words_set) {
@@ -1210,11 +1320,9 @@ void Fh1NativeExecutor::FlushDepthTransfers(Surface& dest, size_t first, size_t 
       dest.key.msaa == uint32_t(xenos::MsaaSamples::k2X) && dest.samples == 4 ? 0b1001u
                                                                              : UINT32_MAX;
   bool set_bound = false;
-  const bool one_pass = any_stencil && stencil_export_;
-  if (one_pass) Count("transfer_stencil_exported");
-  for (uint32_t pass = 0; pass < (any_stencil && !one_pass ? 9u : 1u); ++pass) {
+  for (uint32_t pass = 0; pass < (any_stencil ? 9u : 1u); ++pass) {
     TransferPipelineKey key;
-    key.dest_kind = one_pass ? kTransferDestDepthStencil : pass ? 1 + pass : 1;
+    key.dest_kind = pass ? 1 + pass : 1;
     key.dest_format = dest.format;
     key.dest_samples = dest.samples;
     key.sample_mask = sample_mask;

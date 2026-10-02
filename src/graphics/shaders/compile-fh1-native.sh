@@ -74,15 +74,31 @@ for dest_kind in depth stencil; do
   done
   kind=2
 done
-# Depth and stencil in one pass, for Vulkan devices with shader stencil export:
-# GLSL, as glslang's HLSL front end has no SV_StencilRef (nor has Direct3D 12's
-# shader model 5.1).
+# Depth and stencil in one pass straight from the source, for Vulkan devices
+# with shader stencil export (FH1_DEST_KIND 4). glslang's HLSL front end has no
+# SV_StencilRef (nor has Direct3D 12's shader model 5.1): the shader writes the
+# value to an int target at location 7, which spirv_stencil_export.py turns
+# into the FragStencilRefEXT built-in.
 if [[ -n $GLSLANG ]]; then
-  for dest_msaa in "" _dms; do
-    msaa_define=()
-    [[ -n $dest_msaa ]] && msaa_define+=(-DFH1_DEST_MSAA=1)
-    "$GLSLANG" -V "${msaa_define[@]}"       --vn "fh1_native_transfer_depth_stencil${dest_msaa}_from_words_ps"       -o "vulkan_spirv/fh1_native_transfer_depth_stencil${dest_msaa}_from_words_ps.h"       fh1_native_transfer_depth_stencil_from_words.frag > /dev/null
+  PYTHON="${PYTHON:-python3}"
+  spirv_temp="$(mktemp -d)"
+  for source_kind in color depth uint; do
+    for source_msaa in "" _ms; do
+      for dest_msaa in "" _dms; do
+        defines=(-DFH1_SPIRV=1 -DFH1_DEST_KIND=4)
+        [[ $source_kind == depth ]] && defines+=(-DFH1_SOURCE_DEPTH=1)
+        [[ $source_kind == uint ]] && defines+=(-DFH1_SOURCE_UINT=1)
+        [[ -n $source_msaa ]] && defines+=(-DFH1_SOURCE_MSAA=1)
+        [[ -n $dest_msaa ]] && defines+=(-DFH1_DEST_MSAA=1)
+        name="fh1_native_transfer_depth_stencil${dest_msaa}_from_${source_kind}${source_msaa}_ps"
+        "$GLSLANG" -D -V -S frag -e main "${defines[@]}" --hlsl-iomap \
+          --shift-texture-binding 16 --shift-UAV-binding 32 \
+          -o "$spirv_temp/$name.spv" fh1_native_transfer.ps.hlsl > /dev/null
+        "$PYTHON" spirv_stencil_export.py "$spirv_temp/$name.spv" "vulkan_spirv/$name.h" "$name"
+      done
+    done
   done
+  rm -r "$spirv_temp"
 fi
 # Texture cache: the scaled 32-bpp resolve buffer and reflection cube imports.
 # Their DXBC headers were built with other fxc flags and are kept as they are.

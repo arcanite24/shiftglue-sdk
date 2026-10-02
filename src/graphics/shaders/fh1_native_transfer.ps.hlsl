@@ -9,7 +9,10 @@
 // 0 (color), 1 (depth; the pipeline also resets stencil to 0), 2 (one stencil
 // bit: discards where the bit is clear, the pipeline replaces that bit
 // elsewhere), 3 (color written as raw channel bits through a UINT view, for
-// formats with 16-bit or 32-bit float channels).
+// formats with 16-bit or 32-bit float channels), 4 (depth and the whole stencil
+// value at once; SPIR-V only, the stencil output turned into the stencil
+// export built-in by spirv_stencil_export.py, for devices with
+// VK_EXT_shader_stencil_export).
 
 #include "fh1_native_edram.hlsli"
 
@@ -50,18 +53,41 @@ float4 main(float4 position : SV_Position FH1_SAMPLE_INPUT) : SV_Target {
   }
   return color;
 }
-#elif FH1_DEST_KIND == 1
-float main(float4 position : SV_Position FH1_SAMPLE_INPUT) : SV_Depth {
-#ifndef FH1_DEST_MSAA
-  uint host_sample = 0u;
-#endif
-  uint depth24 = LoadWord(position, host_sample, 0u) >> 8u;
+#elif FH1_DEST_KIND == 1 || FH1_DEST_KIND == 4
+float WordDepth(uint word) {
+  uint depth24 = word >> 8u;
   if (LayoutFormat(fh1_dest_layout) == DEPTH_D24FS8) {
     // The host keeps float24 depth halved.
     return Float20e4To32(depth24) * 0.5f;
   }
   return float(depth24) * (1.0f / 16777215.0f);
 }
+
+#if FH1_DEST_KIND == 1
+float main(float4 position : SV_Position FH1_SAMPLE_INPUT) : SV_Depth {
+#ifndef FH1_DEST_MSAA
+  uint host_sample = 0u;
+#endif
+  return WordDepth(LoadWord(position, host_sample, 0u));
+}
+#else
+struct DepthStencilOutput {
+  float depth : SV_Depth;
+  // Becomes FragStencilRefEXT after compilation.
+  int stencil : SV_Target7;
+};
+
+DepthStencilOutput main(float4 position : SV_Position FH1_SAMPLE_INPUT) {
+#ifndef FH1_DEST_MSAA
+  uint host_sample = 0u;
+#endif
+  uint word = LoadWord(position, host_sample, 0u);
+  DepthStencilOutput output;
+  output.depth = WordDepth(word);
+  output.stencil = int(word & 0xFFu);
+  return output;
+}
+#endif
 #elif FH1_DEST_KIND == 2
 void main(float4 position : SV_Position FH1_SAMPLE_INPUT) {
 #ifndef FH1_DEST_MSAA
