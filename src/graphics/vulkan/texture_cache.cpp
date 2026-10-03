@@ -1291,7 +1291,7 @@ VkImageView VulkanTextureCache::PrepareDirectResolveWrite(Texture& texture) {
   if (vulkan_texture.copy_words() != 1) {
     return VK_NULL_HANDLE;
   }
-  const VkImageView view = vulkan_texture.GetCopyView();
+  const VkImageView view = vulkan_texture.GetCopyView2D();
   if (view == VK_NULL_HANDLE) {
     return VK_NULL_HANDLE;
   }
@@ -1335,6 +1335,29 @@ VkImageView VulkanTextureCache::VulkanTexture::GetCopyView() {
     copy_words_ = 0;
   }
   return copy_view_;
+}
+
+VkImageView VulkanTextureCache::VulkanTexture::GetCopyView2D() {
+  if (copy_view_2d_ != VK_NULL_HANDLE || !copy_words_) {
+    return copy_view_2d_;
+  }
+  const VulkanTextureCache& vulkan_texture_cache =
+      static_cast<const VulkanTextureCache&>(texture_cache());
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      vulkan_texture_cache.command_processor_.GetVulkanDevice();
+  VkImageViewCreateInfo view_create_info = {};
+  view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  view_create_info.image = image_;
+  view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view_create_info.format = copy_words_ == 1   ? VK_FORMAT_R32_UINT
+                            : copy_words_ == 2 ? VK_FORMAT_R32G32_UINT
+                                               : VK_FORMAT_R32G32B32A32_UINT;
+  view_create_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  if (vulkan_device->functions().vkCreateImageView(vulkan_device->device(), &view_create_info,
+                                                   nullptr, &copy_view_2d_) != VK_SUCCESS) {
+    copy_view_2d_ = VK_NULL_HANDLE;
+  }
+  return copy_view_2d_;
 }
 
 bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled,
@@ -2135,6 +2158,9 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
   }
   if (copy_view_ != VK_NULL_HANDLE) {
     dfn.vkDestroyImageView(device, copy_view_, nullptr);
+  }
+  if (copy_view_2d_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyImageView(device, copy_view_2d_, nullptr);
   }
   if (image_view_3d_as_2d_unsigned_ != VK_NULL_HANDLE) {
     dfn.vkDestroyImageView(device, image_view_3d_as_2d_unsigned_, nullptr);

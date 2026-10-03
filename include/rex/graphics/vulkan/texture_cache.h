@@ -226,6 +226,10 @@ class VulkanTextureCache final : public TextureCache {
     uint32_t copy_words() const { return copy_words_; }
     void set_copy_words(uint32_t words) { copy_words_ = words; }
     VkImageView GetCopyView();
+    // The same format's 2D view of level 0 and layer 0, for the FH1 resolve
+    // writing the texture directly (a storage image declared 2D, which a 2D
+    // array view does not match).
+    VkImageView GetCopyView2D();
 
    private:
     union ViewKey {
@@ -279,6 +283,7 @@ class VulkanTextureCache final : public TextureCache {
     VmaAllocation allocation_;
     uint32_t copy_words_ = 0;
     VkImageView copy_view_ = VK_NULL_HANDLE;
+    VkImageView copy_view_2d_ = VK_NULL_HANDLE;
 
     Usage usage_ = Usage::kUndefined;
 
