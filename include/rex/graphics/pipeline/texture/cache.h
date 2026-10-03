@@ -614,7 +614,7 @@ class TextureCache {
   // Makes all texture bindings invalid. Also requesting textures after calling
   // this will cause another attempt to create a texture or to untile it if
   // there was an error.
-  void ResetTextureBindings(bool from_destructor = false);
+  void ResetTextureBindings(bool from_destructor = false, bool keep_memo = false);
   // Resets only the bindings of outdated textures, keeping the binding memo.
   void ResetOutdatedTextureBindings();
 
@@ -748,10 +748,18 @@ class TextureCache {
     Texture* texture = nullptr;
     Texture* texture_signed = nullptr;
   };
-  static constexpr uint32_t kBindingMemoWays = 4;
-  std::array<std::array<BindingMemo, kBindingMemoWays>, xenos::kTextureFetchConstantCount>
-      binding_memos_;
-  std::array<uint8_t, xenos::kTextureFetchConstantCount> binding_memo_next_ = {};
+  // One table for every fetch constant, by the words' hash: the derivation
+  // depends only on the words, and a slot cycling through more textures than
+  // a few ways per slot held (heavy race frames) missed and looked them up.
+  static constexpr size_t kBindingMemoCount = 4096;
+  static size_t BindingMemoSlot(const uint32_t* fetch_words) {
+    uint64_t hash = 0;
+    for (uint32_t i = 0; i < 6; ++i) {
+      hash = (hash ^ fetch_words[i]) * UINT64_C(0x9E3779B97F4A7C15);
+    }
+    return size_t(hash >> 52) & (kBindingMemoCount - 1);
+  }
+  std::unique_ptr<BindingMemo[]> binding_memos_{new BindingMemo[kBindingMemoCount]};
   uint64_t binding_memo_epoch_ = 1;
   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch
   // constants again and again.

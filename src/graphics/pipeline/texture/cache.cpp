@@ -401,8 +401,9 @@ void TextureCache::BeginSubmission(uint64_t new_submission_index) {
 void TextureCache::BeginFrame() {
   // In case there was a failure to create something in the previous frame, make
   // sure bindings are reset so a new attempt will surely be made if the texture
-  // is requested again.
-  ResetTextureBindings();
+  // is requested again. The memo holds only successful derivations of
+  // textures that still exist (destroying one resets it), so it is kept.
+  ResetTextureBindings(false, true);
 }
 
 void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
@@ -651,12 +652,10 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     std::memcpy(binding.fetch_words, fetch_words, sizeof(binding.fetch_words));
     binding.fetch_words_valid = true;
     const BindingMemo* memo = nullptr;
-    for (const BindingMemo& entry : binding_memos_[index]) {
-      if (entry.epoch == binding_memo_epoch_ &&
-          !std::memcmp(entry.fetch_words, fetch_words, sizeof(entry.fetch_words))) {
-        memo = &entry;
-        break;
-      }
+    const BindingMemo& memo_slot = binding_memos_[BindingMemoSlot(fetch_words)];
+    if (memo_slot.epoch == binding_memo_epoch_ &&
+        !std::memcmp(memo_slot.fetch_words, fetch_words, sizeof(memo_slot.fetch_words))) {
+      memo = &memo_slot;
     }
     if (memo) {
       // As the derivation below would do for these words.
@@ -777,7 +776,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       queue_pending_texture_load(binding.texture_signed);
     }
     if (binding.texture || binding.texture_signed) {
-      BindingMemo& entry = binding_memos_[index][binding_memo_next_[index]++ % kBindingMemoWays];
+      BindingMemo& entry = binding_memos_[BindingMemoSlot(fetch_words)];
       entry.epoch = binding_memo_epoch_;
       std::memcpy(entry.fetch_words, fetch_words, sizeof(entry.fetch_words));
       entry.key = binding.key;
@@ -1291,9 +1290,11 @@ void TextureCache::ResetOutdatedTextureBindings() {
   }
 }
 
-void TextureCache::ResetTextureBindings(bool from_destructor) {
-  // Remembered derivations may name destroyed or outdated textures.
-  ++binding_memo_epoch_;
+void TextureCache::ResetTextureBindings(bool from_destructor, bool keep_memo) {
+  // Remembered derivations may name destroyed textures.
+  if (!keep_memo) {
+    ++binding_memo_epoch_;
+  }
   uint32_t bindings_reset = 0;
   for (size_t i = 0; i < texture_bindings_.size(); ++i) {
     TextureBinding& binding = texture_bindings_[i];
