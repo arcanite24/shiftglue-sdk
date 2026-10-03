@@ -180,7 +180,7 @@ class CommandProcessor {
   // compiled replay of repeated buffers could skip.
   void TemplateStatsIbBegin(uint64_t ib_key, bool repeat);
   void TemplateStatsIbEnd();
-  static constexpr size_t kTemplateParts = 5;
+  static constexpr size_t kTemplateParts = 6;
   void TemplateStatsDraw(const uint64_t (&parts)[kTemplateParts]);
   void TemplateStatsFrame();
   struct TemplateStatsIb {
@@ -198,6 +198,7 @@ class CommandProcessor {
              ibs = 0, matching_ibs = 0;
     // Draws at a matching position whose part n matches.
     uint64_t parts_matching[kTemplateParts] = {};
+    uint64_t draws_matching_with_constants = 0;
   } template_stats_;
   // A sample of buffers: the register file at their first draw, to count
   // which registers differ from the previous execution's.

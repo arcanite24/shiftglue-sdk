@@ -4444,7 +4444,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       hash = (hash ^ value) * UINT64_C(0xBF58476D1CE4E5B9);
       hash ^= hash >> 31;
     };
-    uint64_t parts[5] = {state_hash_, 0, 0, 0, 0};
+    uint64_t parts[6] = {state_hash_, 0, 0, 0, 0, 0};
     mix(parts[1], uint64_t(uintptr_t(vertex_shader)));
     mix(parts[1], uint64_t(uintptr_t(pixel_shader)));
     mix(parts[1], uint64_t(prim_type) << 32 | index_count);
@@ -4474,6 +4474,27 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
             &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + (i * 32 + bit) * 2];
         mix(parts[4], uint64_t(words[0]) << 32 | words[1]);
       }
+    }
+    // Part 5: the float, bool and loop constants the shaders read.
+    for (const VulkanShader* shader : {vertex_shader, pixel_shader}) {
+      if (!shader) continue;
+      const Shader::ConstantRegisterMap& map = shader->constant_register_map();
+      const uint32_t* base = &regs.values[shader == vertex_shader
+                                              ? XE_GPU_REG_SHADER_CONSTANT_000_X
+                                              : XE_GPU_REG_SHADER_CONSTANT_256_X];
+      for (uint32_t word = 0; word < 4; ++word) {
+        uint64_t bits = map.float_bitmap[word];
+        while (bits) {
+          const uint32_t bit = uint32_t(std::countr_zero(bits));
+          bits &= bits - 1;
+          const uint32_t* c = base + (word * 64 + bit) * 4;
+          mix(parts[5], uint64_t(c[0]) << 32 | c[1]);
+          mix(parts[5], uint64_t(c[2]) << 32 | c[3]);
+        }
+      }
+    }
+    for (uint32_t i = 0; i < 8 + 32; ++i) {
+      mix(parts[5], regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + i]);
     }
     TemplateStatsDraw(parts);
   }

@@ -1304,6 +1304,10 @@ void CommandProcessor::TemplateStatsIbEnd() {
       }
     }
     if (i < last.size() && last[i] == ib.signatures[i]) {
+      ++counts.draws_matching_with_constants;
+    }
+    if (i < last.size() && std::equal(last[i].begin(), last[i].begin() + 5,
+                                      ib.signatures[i].begin())) {
       ++matching;
       ++run;
     } else {
@@ -1361,9 +1365,11 @@ void CommandProcessor::TemplateStatsFrame() {
       c.ibs / f);
   REXGPU_INFO(
       "Draw templates: parts matching at the same position: state {:.1f} %, shaders and packet "
-      "{:.1f} %, index buffer {:.1f} %, texture fetch {:.1f} %, vertex fetch {:.1f} %",
+      "{:.1f} %, index buffer {:.1f} %, texture fetch {:.1f} %, vertex fetch {:.1f} %, "
+      "constants {:.1f} %; whole signature with constants {:.1f} %",
       percent(c.parts_matching[0]), percent(c.parts_matching[1]), percent(c.parts_matching[2]),
-      percent(c.parts_matching[3]), percent(c.parts_matching[4]));
+      percent(c.parts_matching[3]), percent(c.parts_matching[4]), percent(c.parts_matching[5]),
+      percent(c.draws_matching_with_constants));
   std::vector<std::pair<uint64_t, uint32_t>> diffs;
   for (const auto& [index, count] : template_stats_register_diffs_) diffs.emplace_back(count, index);
   std::sort(diffs.rbegin(), diffs.rend());
