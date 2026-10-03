@@ -195,6 +195,14 @@ class Fh1NativeExecutor {
   void TransitionForAttachment(Surface& surface, uint64_t open_rendering_id = 0);
   // The dynamic rendering scope of a draw to the prepared targets.
   uint64_t DrawRenderingId(uint32_t used_bits) const;
+
+ public:
+  // gpu_buffer_replay: after PrepareTargets, whether the draw's targets are
+  // those of the open rendering `rendering_id` with no clear pending, so its
+  // recorded commands can follow without binding or beginning anything.
+  bool PreparedTargetsContinueRendering(uint64_t rendering_id);
+
+ private:
   // BindTargets relied on the open rendering; if it ends before the draw
   // begins its rendering, the barriers are made there.
   bool attachment_barriers_skipped_ = false;

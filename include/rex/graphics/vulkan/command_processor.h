@@ -766,6 +766,123 @@ class VulkanCommandProcessor : public CommandProcessor {
       const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask);
   bool UpdateBindings(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader);
+  // UpdateBindings' constants half: uploads the dirty constant buffers and
+  // picks the frame's constants set for them (dynamic offsets in
+  // current_constant_dynamic_offsets_).
+  bool PrepareConstantBindings(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader,
+                               VkDescriptorSet& set_out);
+  // Requests the vertex buffers the vertex shader fetches from the shared
+  // memory (false on an invalid fetch constant or a failed request).
+  bool RequestVertexBuffers(const VulkanShader& vertex_shader);
+  // Binds the guest pipeline and keeps the descriptor sets its layout is
+  // compatible with.
+  void BindGuestGraphicsPipeline(
+      VkPipeline pipeline, const VulkanPipelineCache::PipelineLayoutProvider* layout_provider);
+
+  // gpu_buffer_replay (DR-4.2's third stage). The first execution of an
+  // indirect buffer records, per draw, the commands the draw added (its
+  // first draw recording the whole state); a later execution whose draws
+  // have the same signatures (register state, shaders, used fetch constants,
+  // draw packet) appends those commands again, uploading only the draws'
+  // constants and keeping texture, buffer and target state current. A draw
+  // that does not match, or anything recorded between draws, ends the replay
+  // for the rest of the execution.
+  static constexpr size_t kDrawSignatureParts = 5;
+  void ComputeDrawSignature(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader,
+                            xenos::PrimitiveType prim_type, uint32_t index_count,
+                            const IndexBufferInfo* index_buffer_info, xenos::EdramMode edram_mode,
+                            bool major_mode_explicit,
+                            uint64_t (&parts)[kDrawSignatureParts]) const;
+  // What the command processor knows the command buffer holds after a draw,
+  // restored after replayed commands instead of recording everything again.
+  struct ReplayState {
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const void* pipeline_layout = nullptr;
+    VkViewport viewport = {};
+    VkRect2D scissor = {};
+    float depth_bias_constant_factor = 0.0f;
+    float depth_bias_slope_factor = 0.0f;
+    float blend_constants[4] = {};
+    uint32_t stencil[6] = {};
+    uint32_t update_needed = 0;
+    uint32_t sets_bound = 0;
+  };
+  struct ReplayDraw {
+    uint64_t signature = 0;
+    ReplayState state;
+    std::vector<uintmax_t> commands;
+    ptrdiff_t constants_bind = -1;
+    uint32_t constants_bind_set_index = 0;
+    ptrdiff_t texture_push = -1;
+    std::vector<VulkanTextureCache::SamplerParameters> pixel_samplers;
+    uint64_t rendering_id = 0;
+    uint32_t used_texture_mask = 0;
+    bool rasterization_done = false;
+    reg::RB_DEPTHCONTROL depth_control;
+    uint32_t color_mask = 0;
+    PrimitiveProcessor::ProcessedIndexBufferType index_type =
+        PrimitiveProcessor::ProcessedIndexBufferType::kNone;
+    uint32_t index_base = 0;
+    uint32_t index_bytes = 0;
+    bool system_constants_changed = false;
+    SpirvShaderTranslator::SystemConstants system_constants;
+  };
+  struct ReplayIb {
+    std::vector<ReplayDraw> draws;
+    bool valid = false;
+    // Executions that could not be recorded or replayed: from 3 on the
+    // buffer is left to the full path.
+    uint32_t rejects = 0;
+  };
+  enum class ReplayMode { kNone, kReplaying, kCapturing };
+  struct ReplayCursor {
+    uint64_t key = 0;
+    ReplayMode mode = ReplayMode::kNone;
+    size_t index = 0;
+    ReplayIb* ib = nullptr;
+    ReplayIb capture;
+    // Where the last draw's commands ended: anything recorded after it ends
+    // the chain of state the next draw's commands assume.
+    bool position_valid = false;
+    uint64_t position_submission = 0;
+    size_t position_elements = 0;
+    // The last replayed draw's state, to restore when the replay ends.
+    const ReplayState* replayed_state = nullptr;
+    bool capture_failed = false;
+    // Capture: the current draw's commands start here.
+    bool draw_open = false;
+    uint64_t draw_submission = 0;
+    size_t draw_elements = 0;
+  };
+  enum class ReplayResult { kIssued, kFallBack, kFailed };
+  void OnReplayIbBegin(uint64_t ib_key) override;
+  void OnReplayIbEnd() override;
+  bool ReplayChained(const ReplayCursor& cursor) const;
+  void SetReplayPosition(ReplayCursor& cursor);
+  // Forgets what the command buffer is known to hold, so the next draw records
+  // its whole state.
+  void ForceFullDrawState();
+  void SaveReplayState(ReplayState& state) const;
+  void RestoreReplayState(const ReplayState& state);
+  // Ends a cursor's replay: the command processor takes up the state its
+  // last replayed draw left.
+  void EndReplay(ReplayCursor& cursor);
+  ReplayResult IssueReplayedDraw(const ReplayDraw& draw, VulkanShader* vertex_shader,
+                                 VulkanShader* pixel_shader, bool first);
+  void CaptureReplayDraw(ReplayCursor& cursor, uint64_t signature, uint32_t used_texture_mask,
+                         bool rasterization_done, reg::RB_DEPTHCONTROL depth_control,
+                         uint32_t color_mask,
+                         const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+                         bool index_scratch);
+  void EndReplayFrame();
+  std::unordered_map<uint64_t, ReplayIb> replay_ibs_;
+  std::unordered_map<uint64_t, uint32_t> replay_occurrences_;
+  std::vector<ReplayCursor> replay_stack_;
+  bool replay_capture_system_dirty_ = false;
+  struct ReplayCounts {
+    uint64_t frames = 0, replayed = 0, fallbacks = 0, captured = 0, uncapturable = 0;
+    uint64_t reasons[12] = {};
+  } replay_counts_;
   // Allocates a descriptor set and fills one or two VkWriteDescriptorSet
   // structure instances (for images and samplers).
   // The descriptor set layout must be the one for the given is_vertex,

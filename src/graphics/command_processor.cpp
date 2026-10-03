@@ -74,6 +74,12 @@ REXCVAR_DEFINE_BOOL(gpu_template_stats, false, "GPU",
                     "with the same position in the same indirect buffer's previous execution "
                     "and log every 600 frames how many draws a compiled replay could reuse")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_buffer_replay, false, "GPU",
+                    "With gpu_record_thread on Vulkan, replay an indirect buffer's draws from "
+                    "the commands recorded at its previous execution while each draw's "
+                    "signature matches, refreshing only constants, residency and target "
+                    "tracking (DR-4.2)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(gpu_ib_identity_stats, false, "GPU",
                     "Diagnostics: hash every indirect buffer the commands thread executes and log "
                     "every 600 frames how many buffers, dwords and draws repeat byte for byte "
@@ -1305,6 +1311,11 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
 
   const bool ib_stats_enabled = REXCVAR_GET(gpu_ib_identity_stats);
   const bool template_stats = record_split_ && REXCVAR_GET(gpu_template_stats);
+  const bool buffer_replay = record_split_ && REXCVAR_GET(gpu_buffer_replay);
+  if (buffer_replay) {
+    const uint64_t key = (uint64_t(ptr) << 32) | count;
+    RecordCall([this, key]() { OnReplayIbBegin(key); });
+  }
   bool ib_repeat = false;
   const uint64_t draws_before = ib_stats.decoded_draws;
   if (ib_stats_enabled || template_stats) {
@@ -1341,6 +1352,9 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
 
   if (template_stats) {
     RecordCall([this]() { TemplateStatsIbEnd(); });
+  }
+  if (buffer_replay) {
+    RecordCall([this]() { OnReplayIbEnd(); });
   }
   if (ib_stats_enabled) {
     // Nested buffers count in both.

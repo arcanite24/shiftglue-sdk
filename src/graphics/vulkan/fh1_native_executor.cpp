@@ -1808,6 +1808,26 @@ bool Fh1NativeExecutor::BindTargets(VulkanRenderTargetCache::RenderPassKey& key_
   return true;
 }
 
+bool Fh1NativeExecutor::PreparedTargetsContinueRendering(uint64_t rendering_id) {
+  if (!initialized_ || !pending_targets_valid_ ||
+      DrawRenderingId(pending_used_bits_) != rendering_id ||
+      !command_processor_.IsFh1RenderingOpen(rendering_id) ||
+      REXCVAR_GET(fh1_debug_rendering_split_draws) > 0) {
+    return false;
+  }
+  // Clears pending on the draw's surfaces fold into its rendering.
+  if (pending_clear_surfaces_) {
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (!(pending_used_bits_ & (1u << i))) continue;
+      const Surface* surface = FindSurface(pending_keys_[i].Pack());
+      if (!surface || !surface->pending_clears.empty()) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 uint64_t Fh1NativeExecutor::DrawRenderingId(uint32_t used_bits) const {
   // The scope is identified by the bound surfaces.
   uint64_t id = 0x9E3779B97F4A7C15ull;
