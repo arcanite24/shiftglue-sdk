@@ -169,6 +169,15 @@ foreach(rexgpu_fh1_target IN ITEMS rexgpu-fh1 rexgpu-fh1-producer)
 endforeach()
 set_target_properties(rexgpu-fh1 PROPERTIES EXPORT_NAME gpu-fh1)
 
+# Symbols for profiling the optimized plugin: a RelWithDebInfo plugin links
+# its own runtime and does not load into a Release executable, so this keeps
+# the Release build and only adds CodeView debug info and a PDB.
+option(REXGPU_FH1_DEBUG_INFO "Build rexgpu-fh1 with a PDB in every configuration" OFF)
+if(REXGPU_FH1_DEBUG_INFO)
+    target_compile_options(rexgpu-fh1 PRIVATE -g -gcodeview)
+    target_link_options(rexgpu-fh1 PRIVATE -g)
+endif()
+
 if(REXGPU_XENOS_DXBC_THIRDPARTY_SOURCES)
     set_source_files_properties(${REXGPU_XENOS_DXBC_THIRDPARTY_SOURCES}
         PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
