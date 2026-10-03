@@ -56,6 +56,13 @@
 #include <rex/ui/vulkan/util.h>
 
 // Legacy backend compatibility aliases for shared readback controls.
+REXCVAR_DEFINE_INT32(vulkan_async_pipeline_wait_ms, REX_PLATFORM_ANDROID ? 0 : 250, "GPU/Vulkan",
+                     "With async_shader_compilation, how long a draw whose pipeline a worker is "
+                     "still building waits for it before it is skipped (0: skipped at once). A "
+                     "skipped draw can leave corruption in textures the title renders once, such "
+                     "as menu backgrounds")
+    .range(0, 5000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(vulkan_cached_uniform_memory, true, "GPU/Vulkan",
                     "Put the per-draw uniform (constant) upload pages in host-cached memory "
                     "rather than write-combined memory")
@@ -4878,8 +4885,26 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline, pipeline_layout_provider,
                                                 &pipeline_is_placeholder);
   if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
-    frame_used_async_placeholder_pipeline_ = true;
-    return true;
+    // A skipped draw is missing from its render targets, and a resolve of
+    // them keeps the gap in a texture until the title draws that texture
+    // again: menu and event backgrounds stayed corrupted (issue #328). Give
+    // the worker building the pipeline a moment first; the submission waits
+    // for the workers at its end anyway.
+    const int32_t wait_ms = REXCVAR_GET(vulkan_async_pipeline_wait_ms);
+    if (wait_ms > 0) {
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+      while (pipeline_is_placeholder && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+        pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline,
+                                                      pipeline_layout_provider,
+                                                      &pipeline_is_placeholder);
+      }
+    }
+    if (pipeline_is_placeholder) {
+      frame_used_async_placeholder_pipeline_ = true;
+      return true;
+    }
   }
   if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
     return draw_fail("pipeline_lookup");
