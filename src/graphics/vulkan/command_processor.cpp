@@ -2545,6 +2545,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   }
   current_submission_wait_semaphores_.clear();
   submission_completed_ = 0;
+  submission_worker_submitted_.store(0, std::memory_order_release);
   submission_open_ = false;
 
   for (VkSemaphore semaphore : semaphores_free_) {
@@ -6056,8 +6057,20 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   const VkDevice device = vulkan_device->device();
 
   size_t fences_total = submissions_in_flight_fences_.size();
+  if (async_submission_) {
+    // Fences the worker has not submitted yet are not checked.
+    const uint64_t submitted = submission_worker_submitted_.load(std::memory_order_acquire);
+    fences_total = std::min(
+        fences_total, size_t(submitted > submission_completed_ ? submitted - submission_completed_
+                                                               : 0));
+  }
   size_t fences_awaited = 0;
   if (await_submission > submission_completed_) {
+    if (async_submission_) {
+      AwaitSubmissionWorkerSubmitted(await_submission);
+      fences_total = size_t(submission_worker_submitted_.load(std::memory_order_acquire) -
+                            submission_completed_);
+    }
     // Await in a blocking way if requested.
     // TODO(Triang3l): Await only one fence. "Fence signal operations that are
     // defined by vkQueueSubmit additionally include in the first
@@ -6506,9 +6519,10 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       tape->Swap(deferred_command_buffer_);
       {
         std::lock_guard<std::mutex> lock(submission_worker_mutex_);
-        submission_jobs_.push_back(SubmissionJob{std::move(tape), command_buffer,
-                                                 current_submission_wait_semaphores_,
-                                                 current_submission_wait_stage_masks_, fence});
+        SubmissionJob job{std::move(tape), command_buffer, current_submission_wait_semaphores_,
+                          current_submission_wait_stage_masks_, fence};
+        job.submission = GetCurrentSubmission();
+        submission_jobs_.push_back(std::move(job));
       }
       submission_worker_wake_.notify_one();
     } else if (!ExecuteSubmission(deferred_command_buffer_, command_buffer,
@@ -6805,6 +6819,8 @@ void VulkanCommandProcessor::SubmissionWorkerMain() {
     lock.lock();
     if (job.tape) {
       submission_free_tapes_.push_back(std::move(job.tape));
+      submission_worker_submitted_.store(job.submission, std::memory_order_release);
+      submission_worker_progress_.notify_all();
     }
     submission_worker_busy_ = false;
     if (submission_jobs_.empty()) {
@@ -6830,6 +6846,21 @@ void VulkanCommandProcessor::DeferPresentStep(std::function<void()> step) {
     submission_jobs_.push_back(std::move(job));
   }
   submission_worker_wake_.notify_one();
+}
+
+void VulkanCommandProcessor::AwaitSubmissionWorkerSubmitted(uint64_t submission) {
+  if (submission_worker_submitted_.load(std::memory_order_acquire) >= submission) {
+    return;
+  }
+  const auto wait_start = std::chrono::steady_clock::now();
+  std::unique_lock<std::mutex> lock(submission_worker_mutex_);
+  submission_worker_progress_.wait(lock, [this, submission]() {
+    return submission_worker_submitted_.load(std::memory_order_relaxed) >= submission;
+  });
+  PERF_counter_add(kGpuThreadFenceWaitNs,
+                   std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now() - wait_start)
+                       .count());
 }
 
 void VulkanCommandProcessor::AwaitSubmissionWorker() {

@@ -417,6 +417,8 @@ class VulkanCommandProcessor : public CommandProcessor {
     // Without a tape: work to run on the worker after the jobs before it (the
     // presenter's publish and paint).
     std::function<void()> callback;
+    // With a tape: the submission's number.
+    uint64_t submission = 0;
   };
   // Replays `tape` into `command_buffer` and submits it signaling `fence`;
   // on failure still signals the fence (an empty submission) unless the
@@ -429,6 +431,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   void StopSubmissionWorker();
   void SubmissionWorkerMain();
   void AwaitSubmissionWorker();
+  // Waits until the worker has passed `submission` to vkQueueSubmit: its fence
+  // must not be waited for before (the fence is externally synchronized, and
+  // an AMD driver fails a wait for a fence that was never submitted).
+  void AwaitSubmissionWorkerSubmitted(uint64_t submission);
   void LogCheckpoints();
   bool checkpoints_enabled_ = false;
   // What each recent checkpoint serial was, for the device-loss report.
@@ -453,6 +459,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::vector<std::unique_ptr<DeferredCommandBuffer>> submission_free_tapes_;
   bool submission_worker_busy_ = false;
   bool submission_worker_stop_ = false;
+  // The last submission the worker has submitted, and its signal.
+  std::atomic<uint64_t> submission_worker_submitted_{0};
+  std::condition_variable submission_worker_progress_;
   // The presenter's publish-and-paint step runs on the submission worker after
   // the swap's submission instead of the swap waiting for the worker
   // (vulkan_present_on_submission_worker).
