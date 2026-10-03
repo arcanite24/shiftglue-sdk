@@ -98,6 +98,11 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
 // Defined by the backend-independent command processor.
 REXCVAR_DECLARE(bool, gpu_template_stats);
 REXCVAR_DECLARE(bool, gpu_buffer_replay);
+REXCVAR_DEFINE_BOOL(gpu_buffer_replay_persistent_constants, true, "GPU/Vulkan",
+                    "With gpu_buffer_replay, a replayed draw gathers its constants into its own "
+                    "persistent block (one per frame in flight) instead of the upload pool, and "
+                    "binds it without looking up a constants set (DR-4.2)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 #if REX_HAS_D3D12
 REXCVAR_DECLARE(double, fh1_hud_squeeze);
 #else
@@ -2546,6 +2551,7 @@ void VulkanCommandProcessor::ShutdownContext() {
     dfn.vkDestroySemaphore(device, semaphore, nullptr);
   }
   current_submission_wait_semaphores_.clear();
+  DestroyReplayConstants();
   submission_completed_ = 0;
   submission_worker_submitted_.store(0, std::memory_order_release);
   submission_open_ = false;
@@ -4542,6 +4548,8 @@ void VulkanCommandProcessor::OnReplayIbEnd() {
              !cursor.capture.draws.empty()) {
     if (replay_ibs_.size() >= 16384 && replay_stack_.empty()) {
       replay_ibs_.clear();
+      // Their blocks are reused from the next frame on.
+      replay_constants_full_ = true;
     }
     ReplayIb& ib = replay_ibs_[cursor.key];
     const uint32_t rejects = ib.rejects;
@@ -4637,6 +4645,13 @@ void VulkanCommandProcessor::EndReplay(ReplayCursor& cursor) {
     RestoreReplayState(*cursor.replayed_state);
   }
   cursor.replayed_state = nullptr;
+  if (replay_persistent_constants_bound_) {
+    // The bound constants set is a persistent block's: the next full draw
+    // binds the command processor's own again.
+    current_graphics_descriptor_sets_bound_up_to_date_ &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants);
+    replay_persistent_constants_bound_ = false;
+  }
 }
 
 void VulkanCommandProcessor::ForceFullDrawState() {
@@ -4719,6 +4734,172 @@ void VulkanCommandProcessor::CaptureReplayDraw(
   SetReplayPosition(cursor);
 }
 
+namespace {
+void GatherFloatConstants(uint8_t* out, const uint64_t (&bitmap)[4], const uint32_t* first);
+}  // namespace
+
+bool VulkanCommandProcessor::CreateReplayConstants() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  uint32_t memory_type = UINT32_MAX;
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, kReplayConstantsSlice * kMaxFramesInFlight,
+          VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, ui::vulkan::util::MemoryPurpose::kUpload,
+          replay_constants_buffer_, replay_constants_memory_, &memory_type)) {
+    return false;
+  }
+  void* mapping = nullptr;
+  // Written without flushes, so only host-coherent memory serves.
+  if (!(vulkan_device->memory_types().host_coherent & (UINT32_C(1) << memory_type)) ||
+      dfn.vkMapMemory(device, replay_constants_memory_, 0, VK_WHOLE_SIZE, 0, &mapping) !=
+          VK_SUCCESS) {
+    DestroyReplayConstants();
+    return false;
+  }
+  replay_constants_mapping_ = static_cast<uint8_t*>(mapping);
+  constexpr uint32_t kSets = 512;
+  VkDescriptorPoolSize pool_size = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+                                    kSets * SpirvShaderTranslator::kConstantBufferCount};
+  VkDescriptorPoolCreateInfo pool_info = {};
+  pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  pool_info.maxSets = kSets;
+  pool_info.poolSizeCount = 1;
+  pool_info.pPoolSizes = &pool_size;
+  if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &replay_constants_pool_) !=
+      VK_SUCCESS) {
+    DestroyReplayConstants();
+    return false;
+  }
+  replay_constants_pool_sets_ = kSets;
+  REXGPU_INFO("Buffer replay: persistent constants in {} MB of host memory",
+              (kReplayConstantsSlice * kMaxFramesInFlight) >> 20);
+  return true;
+}
+
+void VulkanCommandProcessor::DestroyReplayConstants() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (replay_constants_pool_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyDescriptorPool(device, replay_constants_pool_, nullptr);
+    replay_constants_pool_ = VK_NULL_HANDLE;
+  }
+  replay_constants_sets_.clear();
+  replay_constants_pool_sets_ = 0;
+  if (replay_constants_mapping_) {
+    dfn.vkUnmapMemory(device, replay_constants_memory_);
+    replay_constants_mapping_ = nullptr;
+  }
+  if (replay_constants_buffer_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyBuffer(device, replay_constants_buffer_, nullptr);
+    replay_constants_buffer_ = VK_NULL_HANDLE;
+  }
+  if (replay_constants_memory_ != VK_NULL_HANDLE) {
+    dfn.vkFreeMemory(device, replay_constants_memory_, nullptr);
+    replay_constants_memory_ = VK_NULL_HANDLE;
+  }
+  replay_constants_used_ = 0;
+}
+
+bool VulkanCommandProcessor::WriteReplayConstantsBlock(
+    const ReplayDraw& draw, const VulkanShader* vertex_shader, const VulkanShader* pixel_shader,
+    uint32_t (&offsets_out)[SpirvShaderTranslator::kConstantBufferCount]) {
+  if (replay_constants_failed_) {
+    return false;
+  }
+  if (!replay_constants_mapping_ && !CreateReplayConstants()) {
+    replay_constants_failed_ = true;
+    REXGPU_WARN("Buffer replay: no host-coherent memory for persistent constants");
+    return false;
+  }
+  const Shader::ConstantRegisterMap& vertex_map = vertex_shader->constant_register_map();
+  if (draw.constants_block < 0) {
+    const uint32_t vertex_count = std::max(vertex_map.float_count, UINT32_C(1));
+    const uint32_t pixel_count =
+        pixel_shader ? std::max(pixel_shader->constant_register_map().float_count, UINT32_C(1))
+                     : UINT32_C(1);
+    const uint32_t sizes[SpirvShaderTranslator::kConstantBufferCount] = {
+        uint32_t(sizeof(SpirvShaderTranslator::SystemConstants)),
+        uint32_t(sizeof(float) * 4 * vertex_count), uint32_t(sizeof(float) * 4 * pixel_count),
+        uint32_t(sizeof(uint32_t) * (8 + 32)), uint32_t(sizeof(uint32_t) * 6 * 32)};
+    const uint32_t alignment =
+        uint32_t(GetVulkanDevice()->properties().minUniformBufferOffsetAlignment);
+    uint32_t parts[SpirvShaderTranslator::kConstantBufferCount];
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
+      parts[i] = total;
+      total += rex::align(sizes[i], alignment);
+    }
+    if (replay_constants_used_ + total > kReplayConstantsSlice) {
+      replay_constants_full_ = true;
+      return false;
+    }
+    const uint64_t key = uint64_t(vertex_count) | (uint64_t(pixel_count) << 32);
+    VkDescriptorSet& set = replay_constants_sets_[key];
+    if (set == VK_NULL_HANDLE) {
+      if (!replay_constants_pool_sets_) {
+        replay_constants_sets_.erase(key);
+        return false;
+      }
+      const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+      const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+      VkDescriptorSetAllocateInfo allocate_info = {};
+      allocate_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+      allocate_info.descriptorPool = replay_constants_pool_;
+      allocate_info.descriptorSetCount = 1;
+      allocate_info.pSetLayouts = &descriptor_set_layout_constants_;
+      VkDescriptorSet allocated = VK_NULL_HANDLE;
+      if (dfn.vkAllocateDescriptorSets(vulkan_device->device(), &allocate_info, &allocated) !=
+          VK_SUCCESS) {
+        replay_constants_sets_.erase(key);
+        return false;
+      }
+      --replay_constants_pool_sets_;
+      VkDescriptorBufferInfo infos[SpirvShaderTranslator::kConstantBufferCount];
+      VkWriteDescriptorSet writes[SpirvShaderTranslator::kConstantBufferCount] = {};
+      for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
+        infos[i] = {replay_constants_buffer_, 0, sizes[i]};
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = allocated;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        writes[i].pBufferInfo = &infos[i];
+      }
+      dfn.vkUpdateDescriptorSets(vulkan_device->device(),
+                                 SpirvShaderTranslator::kConstantBufferCount, writes, 0, nullptr);
+      set = allocated;
+    }
+    draw.constants_block = int64_t(replay_constants_used_);
+    std::memcpy(draw.constants_block_parts, parts, sizeof(parts));
+    draw.constants_block_set = set;
+    replay_constants_used_ += total;
+  }
+  const VkDeviceSize base = kReplayConstantsSlice * (frame_current_ % kMaxFramesInFlight) +
+                            VkDeviceSize(draw.constants_block);
+  uint8_t* const block = replay_constants_mapping_ + base;
+  const uint32_t* const parts = draw.constants_block_parts;
+  const RegisterFile& regs = *register_file_;
+  std::memcpy(block + parts[SpirvShaderTranslator::kConstantBufferSystem], &system_constants_,
+              sizeof(SpirvShaderTranslator::SystemConstants));
+  GatherFloatConstants(block + parts[SpirvShaderTranslator::kConstantBufferFloatVertex],
+                       vertex_map.float_bitmap, &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]);
+  if (pixel_shader) {
+    GatherFloatConstants(block + parts[SpirvShaderTranslator::kConstantBufferFloatPixel],
+                         pixel_shader->constant_register_map().float_bitmap,
+                         &regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X]);
+  }
+  std::memcpy(block + parts[SpirvShaderTranslator::kConstantBufferBoolLoop],
+              &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], sizeof(uint32_t) * (8 + 32));
+  std::memcpy(block + parts[SpirvShaderTranslator::kConstantBufferFetch],
+              &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(uint32_t) * 6 * 32);
+  for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
+    offsets_out[i] = uint32_t(base + parts[i]);
+  }
+  return true;
+}
+
 VulkanCommandProcessor::ReplayResult VulkanCommandProcessor::IssueReplayedDraw(
     const ReplayDraw& draw, VulkanShader* vertex_shader, VulkanShader* pixel_shader, bool first) {
   // Until the commands are appended, everything here is something the full
@@ -4793,17 +4974,34 @@ VulkanCommandProcessor::ReplayResult VulkanCommandProcessor::IssueReplayedDraw(
         ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferSystem);
   }
   VkDescriptorSet constants_set;
-  if (!PrepareConstantBindings(vertex_shader, pixel_shader, constants_set)) {
+  uint32_t block_offsets[SpirvShaderTranslator::kConstantBufferCount];
+  const uint32_t* constants_offsets = current_constant_dynamic_offsets_;
+  if (REXCVAR_GET(gpu_buffer_replay_persistent_constants) &&
+      WriteReplayConstantsBlock(draw, vertex_shader, pixel_shader, block_offsets)) {
+    constants_set = draw.constants_block_set;
+    constants_offsets = block_offsets;
+    replay_persistent_constants_bound_ = true;
+    ++replay_counts_.persistent;
+  } else if (!PrepareConstantBindings(vertex_shader, pixel_shader, constants_set)) {
     return ReplayResult::kFailed;
   }
 
-  // Recording from here on.
+  // Recording from here on. A draw recorded without a constants bind relied
+  // on the previous draw's constants; it binds its own here (the constants
+  // set is compatible across every guest pipeline layout).
+  if (draw.constants_bind < 0) {
+    deferred_command_buffer_.CmdVkBindDescriptorSets(
+        VK_PIPELINE_BIND_POINT_GRAPHICS,
+        static_cast<const PipelineLayout*>(draw.state.pipeline_layout)->GetPipelineLayout(),
+        SpirvShaderTranslator::kDescriptorSetConstants, 1, &constants_set,
+        SpirvShaderTranslator::kConstantBufferCount, constants_offsets);
+  }
   const size_t at = deferred_command_buffer_.size_elements();
   deferred_command_buffer_.AppendElements(draw.commands.data(), draw.commands.size());
   if (draw.constants_bind >= 0) {
     DeferredCommandBuffer::PatchConstantsBind(
         deferred_command_buffer_.mutable_elements() + at, draw.constants_bind,
-        draw.constants_bind_set_index, constants_set, current_constant_dynamic_offsets_,
+        draw.constants_bind_set_index, constants_set, constants_offsets,
         SpirvShaderTranslator::kConstantBufferCount);
   }
   ++pending_draw_calls_;
@@ -4822,13 +5020,22 @@ void VulkanCommandProcessor::EndReplayFrame() {
     }
     replay_stack_.clear();
   }
+  if (replay_constants_full_) {
+    // Between frames, so no block written this frame is given to another
+    // draw before the GPU has read it.
+    replay_ibs_.clear();
+    replay_constants_used_ = 0;
+    replay_constants_full_ = false;
+  }
   ReplayCounts& c = replay_counts_;
   if (REXCVAR_GET(gpu_buffer_replay) && ++c.frames == 600) {
     const double f = double(c.frames);
     REXGPU_INFO(
-        "Buffer replay per frame over 600 frames: {:.0f} draws replayed, {:.1f} fallbacks, "
-        "{:.0f} draws recorded, {:.1f} not recordable; {} buffers kept",
-        c.replayed / f, c.fallbacks / f, c.captured / f, c.uncapturable / f, replay_ibs_.size());
+        "Buffer replay per frame over 600 frames: {:.0f} draws replayed ({:.0f} from persistent "
+        "constants), {:.1f} fallbacks, {:.0f} draws recorded, {:.1f} not recordable; {} buffers "
+        "kept, {} KB of constant blocks",
+        c.replayed / f, c.persistent / f, c.fallbacks / f, c.captured / f, c.uncapturable / f,
+        replay_ibs_.size(), replay_constants_used_ >> 10);
     std::string reasons;
     for (uint64_t r : c.reasons) reasons += fmt::format(" {:.1f}", r / f);
     REXGPU_INFO("Buffer replay fallbacks per frame by reason (chain, count, signature, index, "

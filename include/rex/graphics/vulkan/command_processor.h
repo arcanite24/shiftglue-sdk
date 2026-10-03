@@ -770,6 +770,13 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t index_bytes = 0;
     bool system_constants_changed = false;
     SpirvShaderTranslator::SystemConstants system_constants;
+    // gpu_buffer_replay_persistent_constants: the draw's constants block in
+    // each frame-in-flight slice of the persistent buffer (allocated at the
+    // first replay; -1 for none), the offsets of its five buffers within it,
+    // and the constants set describing their ranges.
+    mutable int64_t constants_block = -1;
+    mutable uint32_t constants_block_parts[SpirvShaderTranslator::kConstantBufferCount] = {};
+    mutable VkDescriptorSet constants_block_set = VK_NULL_HANDLE;
   };
   struct ReplayIb {
     std::vector<ReplayDraw> draws;
@@ -823,8 +830,34 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::unordered_map<uint64_t, uint32_t> replay_occurrences_;
   std::vector<ReplayCursor> replay_stack_;
   bool replay_capture_system_dirty_ = false;
+  // Fills the draw's persistent constants block for this frame from the
+  // register file and the system constants; false to upload them the usual
+  // way instead.
+  bool WriteReplayConstantsBlock(const ReplayDraw& draw, const VulkanShader* vertex_shader,
+                                 const VulkanShader* pixel_shader,
+                                 uint32_t (&offsets_out)[SpirvShaderTranslator::kConstantBufferCount]);
+  bool CreateReplayConstants();
+  void DestroyReplayConstants();
+  // A slice of the persistent buffer per frame in flight: a frame writes only
+  // its slice, which the GPU has finished reading when the frame opens.
+  static constexpr VkDeviceSize kReplayConstantsSlice = VkDeviceSize(32) << 20;
+  VkBuffer replay_constants_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory replay_constants_memory_ = VK_NULL_HANDLE;
+  uint8_t* replay_constants_mapping_ = nullptr;
+  VkDescriptorPool replay_constants_pool_ = VK_NULL_HANDLE;
+  uint32_t replay_constants_pool_sets_ = 0;
+  std::unordered_map<uint64_t, VkDescriptorSet> replay_constants_sets_;
+  VkDeviceSize replay_constants_used_ = 0;
+  // The blocks ran out (or the buffers were dropped): all buffers and blocks
+  // are forgotten at the end of the frame, never inside it.
+  bool replay_constants_full_ = false;
+  bool replay_constants_failed_ = false;
+  // A replayed draw bound a persistent block, which the command processor's
+  // view of the bound constants set does not know.
+  bool replay_persistent_constants_bound_ = false;
   struct ReplayCounts {
     uint64_t frames = 0, replayed = 0, fallbacks = 0, captured = 0, uncapturable = 0;
+    uint64_t persistent = 0;
     uint64_t reasons[12] = {};
   } replay_counts_;
   // Allocates a descriptor set and fills one or two VkWriteDescriptorSet
