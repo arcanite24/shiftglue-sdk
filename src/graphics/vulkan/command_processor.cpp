@@ -95,9 +95,10 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
                     "Submit command buffer when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Defined by the backend-independent command processor.
+REXCVAR_DECLARE(bool, gpu_template_stats);
 #if REX_HAS_D3D12
 REXCVAR_DECLARE(double, fh1_hud_squeeze);
-REXCVAR_DECLARE(bool, gpu_template_stats);
 #else
 REXCVAR_DEFINE_DOUBLE(fh1_hud_squeeze, 1.0, "GPU",
                       "Horizontal squeeze of FH1's HUD around the screen center (the Hor+ "
