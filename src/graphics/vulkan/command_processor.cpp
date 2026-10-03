@@ -90,6 +90,7 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
 
 #if REX_HAS_D3D12
 REXCVAR_DECLARE(double, fh1_hud_squeeze);
+REXCVAR_DECLARE(bool, gpu_template_stats);
 #else
 REXCVAR_DEFINE_DOUBLE(fh1_hud_squeeze, 1.0, "GPU",
                       "Horizontal squeeze of FH1's HUD around the screen center (the Hor+ "
@@ -4435,6 +4436,47 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     }
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
+  if (REXCVAR_GET(gpu_template_stats)) {
+    // What a compiled replay would key on: everything the draw's derivation
+    // reads except the float, bool and loop constants it uploads. Five parts,
+    // so the statistics can tell which one varies.
+    auto mix = [](uint64_t& hash, uint64_t value) {
+      hash = (hash ^ value) * UINT64_C(0xBF58476D1CE4E5B9);
+      hash ^= hash >> 31;
+    };
+    uint64_t parts[5] = {state_hash_, 0, 0, 0, 0};
+    mix(parts[1], uint64_t(uintptr_t(vertex_shader)));
+    mix(parts[1], uint64_t(uintptr_t(pixel_shader)));
+    mix(parts[1], uint64_t(prim_type) << 32 | index_count);
+    mix(parts[1], uint64_t(edram_mode) << 1 | uint64_t(major_mode_explicit));
+    if (index_buffer_info) {
+      mix(parts[2], uint64_t(index_buffer_info->guest_base) << 32 | index_buffer_info->count);
+      mix(parts[2], uint64_t(index_buffer_info->format) << 8 |
+                        uint64_t(index_buffer_info->endianness));
+    }
+    for (const VulkanShader* shader : {vertex_shader, pixel_shader}) {
+      if (!shader) continue;
+      for (const Shader::TextureBinding& binding : shader->texture_bindings()) {
+        const uint32_t* words =
+            &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + binding.fetch_constant * 6];
+        for (uint32_t i = 0; i < 6; i += 2) {
+          mix(parts[3], uint64_t(words[i]) << 32 | words[i + 1]);
+        }
+      }
+    }
+    const Shader::ConstantRegisterMap& vertex_map = vertex_shader->constant_register_map();
+    for (uint32_t i = 0; i < 3; ++i) {
+      uint32_t bits = vertex_map.vertex_fetch_bitmap[i];
+      uint32_t bit;
+      while (rex::bit_scan_forward(bits, &bit)) {
+        bits &= ~(UINT32_C(1) << bit);
+        const uint32_t* words =
+            &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + (i * 32 + bit) * 2];
+        mix(parts[4], uint64_t(words[0]) << 32 | words[1]);
+      }
+    }
+    TemplateStatsDraw(parts);
+  }
   if (memexport_used_pixel) {
     if (!device_properties.fragmentStoresAndAtomics) {
       REXGPU_ERROR(

@@ -173,6 +173,36 @@ class CommandProcessor {
   // for backends that only override WriteRegistersFromMem.
   virtual void WriteRegistersHost(uint32_t start_index, const uint32_t* values,
                                   uint32_t num_registers);
+  // gpu_template_stats (DR-4.2's first stage, recorder thread): each draw's
+  // signature (register state, shaders, the fetch constants it uses, the draw
+  // packet) in the indirect buffer execution it belongs to, compared at the
+  // buffer's end with the same buffer's previous execution, to size what a
+  // compiled replay of repeated buffers could skip.
+  void TemplateStatsIbBegin(uint64_t ib_key, bool repeat);
+  void TemplateStatsIbEnd();
+  static constexpr size_t kTemplateParts = 5;
+  void TemplateStatsDraw(const uint64_t (&parts)[kTemplateParts]);
+  void TemplateStatsFrame();
+  struct TemplateStatsIb {
+    uint64_t key = 0;
+    bool repeat = false;
+    std::vector<std::array<uint64_t, kTemplateParts>> signatures;
+  };
+  std::vector<TemplateStatsIb> template_stats_stack_;
+  std::unordered_map<uint64_t, std::vector<std::array<uint64_t, kTemplateParts>>>
+      template_stats_last_;
+  std::unordered_map<uint64_t, uint32_t> template_stats_occurrences_;
+  struct TemplateStatsCounts {
+    uint64_t frames = 0, draws = 0, draws_in_ibs = 0, draws_in_repeated_ibs = 0,
+             draws_matching = 0, draws_in_matching_runs = 0, draws_in_matching_ibs = 0,
+             ibs = 0, matching_ibs = 0;
+    // Draws at a matching position whose part n matches.
+    uint64_t parts_matching[kTemplateParts] = {};
+  } template_stats_;
+  // A sample of buffers: the register file at their first draw, to count
+  // which registers differ from the previous execution's.
+  std::unordered_map<uint64_t, std::vector<uint32_t>> template_stats_registers_;
+  std::unordered_map<uint32_t, uint64_t> template_stats_register_diffs_;
   // CommandProcessor::WriteRegistersFromMem's own work for host order values.
   void WriteRegistersHostBase(uint32_t start_index, const uint32_t* values,
                               uint32_t num_registers);
@@ -305,10 +335,19 @@ class CommandProcessor {
     x *= UINT64_C(0xBF58476D1CE4E5B9);
     return x ^ (x >> 32);
   }
+  // Registers left out of the state epoch and hash: per-draw ones, and ones
+  // no draw derivation reads that change on their own every frame - the
+  // command processor's (CP_RB_WPTR moves with every kick), the display
+  // controller's (D1GRPH_PRIMARY_SURFACE_ADDRESS alternates with the front
+  // buffer) and the host coherency range. With them in, the hash of the same
+  // draw differed between frames 98 % of the time (gpu_template_stats), so
+  // the hash-keyed memos missed across frames.
   static bool IsPerDrawRegister(uint32_t index) {
     return (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) ||
            (index >= XE_GPU_REG_VGT_EVENT_INITIATOR && index <= XE_GPU_REG_VGT_DRAW_INITIATOR) ||
-           index == XE_GPU_REG_COHER_STATUS_HOST || index >= 0x5000;
+           (index >= XE_GPU_REG_COHER_SIZE_HOST && index <= XE_GPU_REG_COHER_STATUS_HOST) ||
+           (index >= 0x01C0 && index <= 0x01FF) || (index >= 0x1800 && index <= 0x19FF) ||
+           index >= 0x5000;
   }
   // Returns once the recorder has run everything recorded so far; the
   // recorder is then idle until the next publish, so this thread may touch

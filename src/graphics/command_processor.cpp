@@ -79,6 +79,12 @@ REXCVAR_DEFINE_BOOL(gpu_record_merge_constant_runs, true, "GPU",
                     "constant run over a gap of up to 16 registers (their current values) "
                     "instead of recording another run, so the recorder handles fewer runs")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_template_stats, false, "GPU",
+                    "Diagnostics (DR-4.2): with gpu_record_thread, compare every draw's "
+                    "signature (register state, shaders, used fetch constants, draw packet) "
+                    "with the same position in the same indirect buffer's previous execution "
+                    "and log every 600 frames how many draws a compiled replay could reuse")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(gpu_ib_identity_stats, false, "GPU",
                     "Diagnostics: hash every indirect buffer the commands thread executes and log "
                     "every 600 frames how many buffers, dwords and draws repeat byte for byte "
@@ -1221,19 +1227,26 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
   const bool ib_stats_enabled = REXCVAR_GET(gpu_ib_identity_stats);
+  const bool template_stats = record_split_ && REXCVAR_GET(gpu_template_stats);
   bool ib_repeat = false;
   const uint64_t draws_before = ib_stats.decoded_draws;
-  if (ib_stats_enabled) {
+  if (ib_stats_enabled || template_stats) {
     const uint64_t hash =
         XXH3_64bits(memory_->TranslatePhysical(ptr), size_t(count) * sizeof(uint32_t));
-    uint64_t& last = ib_stats.last_hash[(uint64_t(ptr) << 32) | count];
+    const uint64_t key = (uint64_t(ptr) << 32) | count;
+    uint64_t& last = ib_stats.last_hash[key];
     ib_repeat = last == hash;
     last = hash;
-    ++ib_stats.ibs;
-    ib_stats.dwords += count;
-    if (ib_repeat) {
-      ++ib_stats.repeats;
-      ib_stats.repeat_dwords += count;
+    if (ib_stats_enabled) {
+      ++ib_stats.ibs;
+      ib_stats.dwords += count;
+      if (ib_repeat) {
+        ++ib_stats.repeats;
+        ib_stats.repeat_dwords += count;
+      }
+    }
+    if (template_stats) {
+      RecordCall([this, key, ib_repeat]() { TemplateStatsIbBegin(key, ib_repeat); });
     }
   }
 
@@ -1249,12 +1262,118 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
     }
   } while (reader.read_count());
 
+  if (template_stats) {
+    RecordCall([this]() { TemplateStatsIbEnd(); });
+  }
   if (ib_stats_enabled) {
     // Nested buffers count in both.
     const uint64_t draws = ib_stats.decoded_draws - draws_before;
     ib_stats.draws += draws;
     if (ib_repeat) ib_stats.repeat_draws += draws;
   }
+}
+
+void CommandProcessor::TemplateStatsIbBegin(uint64_t ib_key, bool repeat) {
+  // A buffer executed more than once a frame (per pass, per view) compares
+  // with its previous execution in the same order.
+  const uint32_t occurrence = template_stats_occurrences_[ib_key]++;
+  TemplateStatsIb& ib = template_stats_stack_.emplace_back();
+  ib.key = ib_key ^ (uint64_t(occurrence) * UINT64_C(0x9E3779B97F4A7C15));
+  ib.repeat = repeat;
+}
+
+void CommandProcessor::TemplateStatsIbEnd() {
+  if (template_stats_stack_.empty()) {
+    return;
+  }
+  TemplateStatsIb ib = std::move(template_stats_stack_.back());
+  template_stats_stack_.pop_back();
+  TemplateStatsCounts& counts = template_stats_;
+  const size_t draws = ib.signatures.size();
+  counts.draws_in_ibs += draws;
+  ++counts.ibs;
+  if (ib.repeat) {
+    counts.draws_in_repeated_ibs += draws;
+  }
+  auto& last = template_stats_last_[ib.key];
+  size_t matching = 0, run = 0, in_runs = 0;
+  for (size_t i = 0; i < draws; ++i) {
+    if (i < last.size()) {
+      for (size_t part = 0; part < kTemplateParts; ++part) {
+        counts.parts_matching[part] += last[i][part] == ib.signatures[i][part];
+      }
+    }
+    if (i < last.size() && last[i] == ib.signatures[i]) {
+      ++matching;
+      ++run;
+    } else {
+      // Runs of 8 or more draws are what a replay would take whole.
+      if (run >= 8) in_runs += run;
+      run = 0;
+    }
+  }
+  if (run >= 8) in_runs += run;
+  counts.draws_matching += matching;
+  counts.draws_in_matching_runs += in_runs;
+  if (draws && matching == draws && last.size() == draws) {
+    ++counts.matching_ibs;
+    counts.draws_in_matching_ibs += draws;
+  }
+  last = std::move(ib.signatures);
+}
+
+void CommandProcessor::TemplateStatsDraw(const uint64_t (&parts)[kTemplateParts]) {
+  ++template_stats_.draws;
+  if (!template_stats_stack_.empty() && template_stats_stack_.back().signatures.empty() &&
+      (template_stats_stack_.back().key * UINT64_C(0x9E3779B97F4A7C15)) >> 58 == 0) {
+    std::vector<uint32_t>& last = template_stats_registers_[template_stats_stack_.back().key];
+    const uint32_t* now = register_file_->values;
+    if (last.size() == XE_GPU_REG_SHADER_CONSTANT_000_X) {
+      for (uint32_t i = 0; i < XE_GPU_REG_SHADER_CONSTANT_000_X; ++i) {
+        if (last[i] != now[i] && !IsPerDrawRegister(i)) ++template_stats_register_diffs_[i];
+      }
+    }
+    last.assign(now, now + XE_GPU_REG_SHADER_CONSTANT_000_X);
+  }
+  if (!template_stats_stack_.empty()) {
+    auto& signature = template_stats_stack_.back().signatures.emplace_back();
+    std::copy(std::begin(parts), std::end(parts), signature.begin());
+  }
+}
+
+void CommandProcessor::TemplateStatsFrame() {
+  template_stats_occurrences_.clear();
+  TemplateStatsCounts& c = template_stats_;
+  if (++c.frames < 600) {
+    return;
+  }
+  const double f = double(c.frames);
+  auto percent = [&](uint64_t part) { return 100.0 * double(part) / double(std::max<uint64_t>(c.draws, 1)); };
+  REXGPU_INFO(
+      "Draw templates per frame over 600 frames: {:.0f} draws, {:.0f} in indirect buffers "
+      "({:.1f} %), {:.0f} in byte-identical buffers ({:.1f} %), {:.0f} matching their previous "
+      "execution's signature ({:.1f} %), {:.0f} in matching runs of 8+ ({:.1f} %), {:.0f} in "
+      "wholly matching buffers ({:.1f} %, {:.1f} of {:.1f} buffers)",
+      c.draws / f, c.draws_in_ibs / f, percent(c.draws_in_ibs), c.draws_in_repeated_ibs / f,
+      percent(c.draws_in_repeated_ibs), c.draws_matching / f, percent(c.draws_matching),
+      c.draws_in_matching_runs / f, percent(c.draws_in_matching_runs),
+      c.draws_in_matching_ibs / f, percent(c.draws_in_matching_ibs), c.matching_ibs / f,
+      c.ibs / f);
+  REXGPU_INFO(
+      "Draw templates: parts matching at the same position: state {:.1f} %, shaders and packet "
+      "{:.1f} %, index buffer {:.1f} %, texture fetch {:.1f} %, vertex fetch {:.1f} %",
+      percent(c.parts_matching[0]), percent(c.parts_matching[1]), percent(c.parts_matching[2]),
+      percent(c.parts_matching[3]), percent(c.parts_matching[4]));
+  std::vector<std::pair<uint64_t, uint32_t>> diffs;
+  for (const auto& [index, count] : template_stats_register_diffs_) diffs.emplace_back(count, index);
+  std::sort(diffs.rbegin(), diffs.rend());
+  std::string top;
+  for (size_t i = 0; i < diffs.size() && i < 16; ++i) {
+    top += fmt::format(" {:04X}x{}", diffs[i].second, diffs[i].first);
+  }
+  REXGPU_INFO("Draw templates: registers differing at sampled buffers' first draws:{}", top);
+  template_stats_register_diffs_.clear();
+  c = TemplateStatsCounts();
 }
 
 void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
@@ -1656,6 +1775,9 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
     IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
     ++observation_frame_sequence_;
     debug_frame_draw_index_ = 0;
+    if (REXCVAR_GET(gpu_template_stats)) {
+      TemplateStatsFrame();
+    }
   });
   PublishRecordBatch();
 
