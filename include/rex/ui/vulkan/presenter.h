@@ -282,7 +282,6 @@ class VulkanPresenter final : public Presenter {
       ~Submission();
 
       VkSemaphore acquire_semaphore() const { return acquire_semaphore_; }
-      VkSemaphore present_semaphore() const { return present_semaphore_; }
       VkCommandPool draw_command_pool() const { return draw_command_pool_; }
       VkCommandBuffer draw_command_buffer() const { return draw_command_buffer_; }
 
@@ -293,7 +292,6 @@ class VulkanPresenter final : public Presenter {
 
       const VulkanDevice* vulkan_device_;
       VkSemaphore acquire_semaphore_ = VK_NULL_HANDLE;
-      VkSemaphore present_semaphore_ = VK_NULL_HANDLE;
       VkCommandPool draw_command_pool_ = VK_NULL_HANDLE;
       VkCommandBuffer draw_command_buffer_ = VK_NULL_HANDLE;
     };
@@ -334,11 +332,18 @@ class VulkanPresenter final : public Presenter {
     };
 
     struct SwapchainFramebuffer {
-      SwapchainFramebuffer(VkImageView image_view, VkFramebuffer framebuffer)
-          : image_view(image_view), framebuffer(framebuffer) {}
+      SwapchainFramebuffer(VkImageView image_view, VkFramebuffer framebuffer,
+                           VkSemaphore present_semaphore)
+          : image_view(image_view),
+            framebuffer(framebuffer),
+            present_semaphore(present_semaphore) {}
 
       VkImageView image_view;
       VkFramebuffer framebuffer;
+      // Signaled by the paint and awaited by the image's present: one per
+      // image, since a present may still be waiting for it when the next
+      // paint submission comes around (VUID-vkQueueSubmit-pSignalSemaphores-00067).
+      VkSemaphore present_semaphore;
     };
 
     explicit PaintContext(const VulkanDevice* const vulkan_device)
