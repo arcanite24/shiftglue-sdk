@@ -178,6 +178,10 @@ class CommandProcessor {
   // packet) in the indirect buffer execution it belongs to, compared at the
   // buffer's end with the same buffer's previous execution, to size what a
   // compiled replay of repeated buffers could skip.
+  // gpu_buffer_replay: the recorder learns where each indirect buffer's
+  // execution begins and ends (key: address and size).
+  virtual void OnReplayIbBegin(uint64_t ib_key) {}
+  virtual void OnReplayIbEnd() {}
   void TemplateStatsIbBegin(uint64_t ib_key, bool repeat);
   void TemplateStatsIbEnd();
   static constexpr size_t kTemplateParts = 6;

@@ -469,6 +469,89 @@ void DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering
   }
 }
 
+DeferredCommandBuffer::ReplayScan DeferredCommandBuffer::ScanForReplay(
+    const uintmax_t* elements, size_t count, uint32_t constants_set, uint32_t transient_sets) {
+  ReplayScan scan;
+  size_t offset = 0;
+  while (offset < count) {
+    if (count - offset < kCommandHeaderSizeElements) {
+      return ReplayScan();
+    }
+    const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(elements + offset);
+    const size_t args = offset + kCommandHeaderSizeElements;
+    switch (header.command) {
+      case Command::kVkBindDescriptorSets: {
+        const auto& bind = *reinterpret_cast<const ArgsVkBindDescriptorSets*>(elements + args);
+        const uint32_t bound_sets =
+            ((UINT32_C(1) << bind.descriptor_set_count) - 1) << bind.first_set;
+        if (bound_sets & transient_sets) {
+          return ReplayScan();
+        }
+        if (bind.first_set <= constants_set &&
+            constants_set < bind.first_set + bind.descriptor_set_count) {
+          if (!bind.dynamic_offset_count) {
+            return ReplayScan();
+          }
+          scan.constants_bind = ptrdiff_t(args);
+          scan.constants_bind_set_index = constants_set - bind.first_set;
+        }
+      } break;
+      case Command::kVkPushTextureDescriptorSet:
+        scan.texture_push = ptrdiff_t(args);
+        break;
+      case Command::kVkDraw:
+      case Command::kVkDrawIndexed:
+        scan.draws = true;
+        break;
+      case Command::kVkBindIndexBuffer:
+      case Command::kVkBindPipeline:
+      case Command::kVkSetBlendConstants:
+      case Command::kVkSetDepthBias:
+      case Command::kVkSetScissor:
+      case Command::kVkSetStencilCompareMask:
+      case Command::kVkSetStencilReference:
+      case Command::kVkSetStencilWriteMask:
+      case Command::kVkSetViewport:
+        break;
+      default:
+        return ReplayScan();
+    }
+    offset = args + header.arguments_size_elements;
+  }
+  scan.replayable = offset == count;
+  return scan;
+}
+
+bool DeferredCommandBuffer::PatchConstantsBind(uintmax_t* elements, ptrdiff_t bind,
+                                               uint32_t set_index, VkDescriptorSet set,
+                                               const uint32_t* dynamic_offsets,
+                                               uint32_t dynamic_offset_count) {
+  auto& args = *reinterpret_cast<ArgsVkBindDescriptorSets*>(elements + bind);
+  if (args.dynamic_offset_count != dynamic_offset_count ||
+      set_index >= args.descriptor_set_count) {
+    return false;
+  }
+  uint8_t* args_ptr = reinterpret_cast<uint8_t*>(&args);
+  size_t sets_offset = rex::align(sizeof(ArgsVkBindDescriptorSets), alignof(VkDescriptorSet));
+  reinterpret_cast<VkDescriptorSet*>(args_ptr + sets_offset)[set_index] = set;
+  size_t offsets_offset = rex::align(
+      sets_offset + sizeof(VkDescriptorSet) * args.descriptor_set_count, alignof(uint32_t));
+  std::memcpy(args_ptr + offsets_offset, dynamic_offsets, sizeof(uint32_t) * dynamic_offset_count);
+  return true;
+}
+
+const VkDescriptorImageInfo* DeferredCommandBuffer::PushedImageInfos(const uintmax_t* elements,
+                                                                    ptrdiff_t push,
+                                                                    uint32_t& texture_count,
+                                                                    uint32_t& sampler_count) {
+  const auto& args = *reinterpret_cast<const ArgsVkPushTextureDescriptorSet*>(elements + push);
+  texture_count = args.texture_count;
+  sampler_count = args.sampler_count;
+  return reinterpret_cast<const VkDescriptorImageInfo*>(
+      reinterpret_cast<const uint8_t*>(&args) +
+      rex::align(sizeof(ArgsVkPushTextureDescriptorSet), alignof(VkDescriptorImageInfo)));
+}
+
 void* DeferredCommandBuffer::WriteCommand(Command command, size_t arguments_size_bytes) {
   size_t arguments_size_elements =
       (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);

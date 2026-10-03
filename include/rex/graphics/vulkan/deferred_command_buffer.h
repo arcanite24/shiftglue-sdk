@@ -34,6 +34,40 @@ class DeferredCommandBuffer {
   // stream and leaves an empty one to record into).
   void Swap(DeferredCommandBuffer& other) { command_stream_.swap(other.command_stream_); }
 
+  // Buffer replay (gpu_buffer_replay): a range of recorded commands is kept
+  // and appended again in a later frame, with its constant bindings patched.
+  size_t size_elements() const { return command_stream_.size(); }
+  const uintmax_t* elements() const { return command_stream_.data(); }
+  uintmax_t* mutable_elements() { return command_stream_.data(); }
+  void AppendElements(const uintmax_t* elements, size_t count) {
+    command_stream_.insert(command_stream_.end(), elements, elements + count);
+  }
+  struct ReplayScan {
+    // Only pipeline and descriptor binds, texture pushes, dynamic state,
+    // index buffer binds and draws: the commands a draw records while its
+    // rendering is already open and no barrier is pending.
+    bool replayable = false;
+    // Element offsets of the last constants bind's arguments (and the set's
+    // index among the bind's sets) and of the last texture push, or -1.
+    ptrdiff_t constants_bind = -1;
+    uint32_t constants_bind_set_index = 0;
+    ptrdiff_t texture_push = -1;
+    bool draws = false;
+  };
+  // `constants_set` is the set with dynamic offsets; a bind including a set in
+  // `transient_sets` (per-frame descriptor sets) makes the range unreplayable.
+  static ReplayScan ScanForReplay(const uintmax_t* elements, size_t count, uint32_t constants_set,
+                                  uint32_t transient_sets);
+  // Replaces the constants set of a bind found by ScanForReplay, and its
+  // dynamic offsets.
+  static bool PatchConstantsBind(uintmax_t* elements, ptrdiff_t bind, uint32_t set_index,
+                                 VkDescriptorSet set, const uint32_t* dynamic_offsets,
+                                 uint32_t dynamic_offset_count);
+  // The image infos of a texture push found by ScanForReplay.
+  static const VkDescriptorImageInfo* PushedImageInfos(const uintmax_t* elements, ptrdiff_t push,
+                                                       uint32_t& texture_count,
+                                                       uint32_t& sampler_count);
+
   // render_pass_begin->pNext of all barriers must be null.
   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
                             VkSubpassContents contents) {
