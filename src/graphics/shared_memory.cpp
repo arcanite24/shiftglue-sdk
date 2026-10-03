@@ -575,6 +575,36 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
 }
 
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
+  // Nearly every request (vertex and index data, per draw) finds its pages
+  // valid: answer that from the bitmaps, without the merge and upload scan.
+  if (length && start <= kBufferSize && kBufferSize - start >= length) {
+    const uint32_t page_first = start >> page_size_log2_;
+    const uint32_t page_last = (start + length - 1) >> page_size_log2_;
+    // Same reasoning as the scan in RequestRanges for reading without the lock.
+    bool valid = true;
+    for (uint32_t i = page_first >> 6; valid && i <= page_last >> 6; ++i) {
+      uint64_t block_valid =
+          reinterpret_cast<const volatile uint64_t&>(system_page_flags_valid_[i]);
+      if (i == page_first >> 6) {
+        block_valid |= (uint64_t(1) << (page_first & 63)) - 1;
+      }
+      if (i == page_last >> 6 && (page_last & 63) != 63) {
+        block_valid |= ~((uint64_t(1) << ((page_last & 63) + 1)) - 1);
+      }
+      valid = block_valid == ~uint64_t(0);
+    }
+    if (valid && host_gpu_memory_sparse_granularity_log2_ != UINT32_MAX) {
+      const uint32_t allocation_first = start >> host_gpu_memory_sparse_granularity_log2_;
+      const uint32_t allocation_last =
+          (start + length - 1) >> host_gpu_memory_sparse_granularity_log2_;
+      for (uint32_t a = allocation_first; valid && a <= allocation_last; ++a) {
+        valid = (host_gpu_memory_sparse_allocated_[a >> 6] >> (a & 63)) & 1;
+      }
+    }
+    if (valid) {
+      return true;
+    }
+  }
   std::pair<uint32_t, uint32_t> range(start, length);
   return RequestRanges(&range, 1);
 }

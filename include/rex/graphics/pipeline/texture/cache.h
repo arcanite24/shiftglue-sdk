@@ -615,6 +615,8 @@ class TextureCache {
   // this will cause another attempt to create a texture or to untile it if
   // there was an error.
   void ResetTextureBindings(bool from_destructor = false);
+  // Resets only the bindings of outdated textures, keeping the binding memo.
+  void ResetOutdatedTextureBindings();
 
   const TextureBinding* GetValidTextureBinding(uint32_t fetch_constant_index) const {
     const TextureBinding& binding = texture_bindings_[fetch_constant_index];
@@ -708,6 +710,9 @@ class TextureCache {
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
   // The same textures by base address.
   std::multimap<uint32_t, Texture*> textures_by_base_;
+  // The largest base level of any texture created, bounding the textures
+  // FindDirectResolveTargets has to look at below a destination.
+  uint32_t max_texture_base_size_ = 0;
 
   uint64_t textures_total_host_memory_usage_ = 0;
 

@@ -244,8 +244,9 @@ class VulkanCommandProcessor : public CommandProcessor {
     return std::exchange(fh1_rendering_causes_, {});
   }
   // For kFh1RenderingEndedElsewhere: the functions that ended the previous
-  // rendering, with counts.
-  std::map<std::string, uint64_t> TakeFh1RenderingEnders() {
+  // rendering, with counts. Keyed by the source_location function name, a
+  // static string, so counting allocates nothing.
+  std::map<const char*, uint64_t> TakeFh1RenderingEnders() {
     return std::exchange(fh1_rendering_enders_, {});
   }
   // vulkan_diagnostic_checkpoints: marks the command stream so a device loss
@@ -365,6 +366,8 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   void WriteRegister(uint32_t index, uint32_t value) override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
+  void WriteRegistersHost(uint32_t start_index, const uint32_t* values,
+                          uint32_t num_registers) override;
   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
                                           uint32_t count) override;
   void FlushCpuVisibleResults() override;
@@ -828,8 +831,73 @@ class VulkanCommandProcessor : public CommandProcessor {
       return hash;
     }
   };
-  std::unordered_map<ConstantsDescriptorSetKey, VkDescriptorSet, ConstantsDescriptorSetKeyHasher>
-      constants_descriptor_sets_frame_;
+  // Open addressing with a generation per entry: clearing it each frame is a
+  // counter bump, and a new key allocates nothing (an unordered_map's node
+  // allocations and clears were 1 % of the recorder).
+  class ConstantsDescriptorSetTable {
+   public:
+    void Clear() {
+      if (++generation_ == 0) {
+        for (Entry& entry : entries_) {
+          entry.generation = 0;
+        }
+        generation_ = 1;
+      }
+      size_ = 0;
+    }
+    VkDescriptorSet* Find(const ConstantsDescriptorSetKey& key) {
+      if (entries_.empty()) {
+        return nullptr;
+      }
+      const size_t mask = entries_.size() - 1;
+      for (size_t i = ConstantsDescriptorSetKeyHasher()(key) & mask;; i = (i + 1) & mask) {
+        Entry& entry = entries_[i];
+        if (entry.generation != generation_) {
+          return nullptr;
+        }
+        if (entry.key == key) {
+          return &entry.set;
+        }
+      }
+    }
+    void Insert(const ConstantsDescriptorSetKey& key, VkDescriptorSet set) {
+      if ((size_ + 1) * 2 > entries_.size()) {
+        Grow();
+      }
+      const size_t mask = entries_.size() - 1;
+      size_t i = ConstantsDescriptorSetKeyHasher()(key) & mask;
+      while (entries_[i].generation == generation_) {
+        i = (i + 1) & mask;
+      }
+      entries_[i].key = key;
+      entries_[i].set = set;
+      entries_[i].generation = generation_;
+      ++size_;
+    }
+
+   private:
+    struct Entry {
+      ConstantsDescriptorSetKey key;
+      VkDescriptorSet set = VK_NULL_HANDLE;
+      uint32_t generation = 0;
+    };
+    void Grow() {
+      std::vector<Entry> old = std::move(entries_);
+      entries_.assign(std::max(old.size() * 2, size_t(1024)), Entry());
+      const uint32_t old_generation = generation_;
+      generation_ = 1;
+      size_ = 0;
+      for (const Entry& entry : old) {
+        if (entry.generation == old_generation) {
+          Insert(entry.key, entry.set);
+        }
+      }
+    }
+    std::vector<Entry> entries_;
+    uint32_t generation_ = 1;
+    size_t size_ = 0;
+  };
+  ConstantsDescriptorSetTable constants_descriptor_sets_frame_;
   uint64_t constants_descriptor_sets_frame_index_ = 0;
   ConstantsDescriptorSetKey last_constants_descriptor_set_key_;
   VkDescriptorSet last_constants_descriptor_set_ = VK_NULL_HANDLE;
@@ -1015,7 +1083,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t barrier_batch_count_ = 0;
   uint64_t rendering_begin_count_ = 0;
   std::array<uint64_t, kFh1RenderingCauseCount> fh1_rendering_causes_{};
-  std::map<std::string, uint64_t> fh1_rendering_enders_;
+  std::map<const char*, uint64_t> fh1_rendering_enders_;
   const char* last_rendering_ender_ = "";
   struct ActiveOcclusionQuery {
     uint32_t sample_count_address = 0;
@@ -1136,6 +1204,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   }
   uint64_t StateMemoKey() const;
   std::unique_ptr<PipelineMemo[]> pipeline_memos_{new PipelineMemo[kStateMemoCount]};
+  // The last draw's, to prefetch the next draw's pipeline memo entry.
+  uint32_t last_pipeline_render_pass_key_ = 0;
   mutable std::atomic<ui::vulkan::VulkanDevice*> vulkan_device_cache_{nullptr};
   // Draws issued since the draw counter was last updated (at each swap): the
   // counter is a thread-local lookup in another module.

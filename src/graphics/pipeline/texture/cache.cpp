@@ -35,6 +35,11 @@ REXCVAR_DEFINE_BOOL(texture_band_reloads, true, "GPU",
                     "(Vulkan with vulkan_texture_load_compute_copy), instead of the whole "
                     "texture")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(texture_selective_binding_reset, true, "GPU",
+                    "When a texture becomes outdated, re-derive only the bindings of outdated "
+                    "textures before the next draw instead of every binding and the binding "
+                    "memo (a destroyed texture still resets them all)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(android_allow_resolution_scale, false, "GPU",
                     "Android: allow internal resolution scales above 1x (each needs a "
                     "dedicated 512 MB x scale^2 resolve buffer)")
@@ -598,7 +603,11 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     // A texture has become outdated - make sure whether textures are outdated
     // is rechecked in this draw and in subsequent ones to reload the new data
     // if needed.
-    ResetTextureBindings();
+    if (REXCVAR_GET(texture_selective_binding_reset)) {
+      ResetOutdatedTextureBindings();
+    } else {
+      ResetTextureBindings();
+    }
   }
 
   // Update the texture keys and the textures.
@@ -1138,6 +1147,7 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     assert_true(new_texture->key() == key);
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
     textures_by_base_.emplace(key.base_page << 12, texture);
+    max_texture_base_size_ = std::max(max_texture_base_size_, texture->GetGuestBaseSize());
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");
@@ -1254,6 +1264,30 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
 
   if (swizzled_signs_out != nullptr) {
     *swizzled_signs_out = texture_util::SwizzleSigns(fetch);
+  }
+}
+
+void TextureCache::ResetOutdatedTextureBindings() {
+  // Only a binding whose texture is outdated needs its load rechecked: the
+  // others, and the memo's derivations (fetch words to key to texture, which
+  // an outdated texture keeps), stay valid. A texture outdated after the flag
+  // was taken sets it again, so the next draw rechecks it.
+  auto outdated = [](const Texture* texture) {
+    return texture != nullptr && texture->outdated_mask() != 0;
+  };
+  uint32_t bindings_reset = 0;
+  for (size_t i = 0; i < texture_bindings_.size(); ++i) {
+    TextureBinding& binding = texture_bindings_[i];
+    if (!binding.key.is_valid ||
+        (!outdated(binding.texture) && !outdated(binding.texture_signed))) {
+      continue;
+    }
+    binding.Reset();
+    bindings_reset |= UINT32_C(1) << i;
+  }
+  texture_bindings_in_sync_ &= ~bindings_reset;
+  if (bindings_reset) {
+    UpdateTextureBindingsImpl(bindings_reset);
   }
 }
 
@@ -1428,7 +1462,9 @@ void TextureCache::FindDirectResolveTargets(uint32_t dest_base, uint32_t extent_
   for (auto it = textures_by_base_.upper_bound(dest_base); it != textures_by_base_.begin();) {
     --it;
     const uint32_t base = it->first;
-    if (dest_base - base > (UINT32_C(32) << 20)) {
+    if (dest_base - base > (UINT32_C(32) << 20) ||
+        uint64_t(base) + max_texture_base_size_ < uint64_t(extent_start) + extent_length) {
+      // No texture from here down is large enough to hold the extent.
       break;
     }
     Texture& texture = *it->second;

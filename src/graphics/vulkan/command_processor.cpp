@@ -2691,6 +2691,106 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
   CommandProcessor::WriteRegistersFromMem(start_index, base, num_registers);
 }
 
+// WriteRegistersFromMem for host byte order values (the recorder's runs).
+void VulkanCommandProcessor::WriteRegistersHost(uint32_t start_index, const uint32_t* base,
+                                                uint32_t num_registers) {
+  if (!num_registers) {
+    return;
+  }
+  uint32_t end_index = start_index + num_registers - 1;
+
+  static constexpr uint32_t kHostClassBoundaries[] = {
+      XE_GPU_REG_SHADER_CONSTANT_000_X, XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0,
+      XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5 + 1, XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031,
+      XE_GPU_REG_SHADER_CONSTANT_LOOP_31 + 1};
+  for (uint32_t boundary : kHostClassBoundaries) {
+    if (start_index < boundary && end_index >= boundary) {
+      const uint32_t head = boundary - start_index;
+      WriteRegistersHost(start_index, base, head);
+      WriteRegistersHost(boundary, base + head, num_registers - head);
+      return;
+    }
+  }
+
+  auto range_has_any_constant_usage = [](const uint64_t* usage_map, uint32_t first_constant,
+                                         uint32_t last_constant) -> bool {
+    if (first_constant > last_constant) {
+      return false;
+    }
+    uint32_t first_word = first_constant >> 6;
+    uint32_t last_word = last_constant >> 6;
+    uint32_t first_bit = first_constant & 63;
+    uint32_t last_bit = last_constant & 63;
+    if (first_word == last_word) {
+      uint32_t bit_count = last_bit - first_bit + 1;
+      uint64_t mask = bit_count == 64 ? UINT64_MAX : ((UINT64_C(1) << bit_count) - 1) << first_bit;
+      return (usage_map[first_word] & mask) != 0;
+    }
+    if (usage_map[first_word] & (UINT64_MAX << first_bit)) {
+      return true;
+    }
+    for (uint32_t word = first_word + 1; word < last_word; ++word) {
+      if (usage_map[word]) {
+        return true;
+      }
+    }
+    uint64_t last_mask = last_bit == 63 ? UINT64_MAX : ((UINT64_C(1) << (last_bit + 1)) - 1);
+    return (usage_map[last_word] & last_mask) != 0;
+  };
+
+  if (start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+      end_index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+    std::memcpy(register_file_->values + start_index, base, sizeof(uint32_t) * num_registers);
+    if (frame_open_) {
+      uint32_t first_float_constant = (start_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+      uint32_t last_float_constant = (end_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+      if (first_float_constant < 256) {
+        uint32_t last_vertex_constant = std::min(last_float_constant, 255u);
+        if (range_has_any_constant_usage(current_float_constant_map_vertex_, first_float_constant,
+                                         last_vertex_constant)) {
+          current_constant_buffers_up_to_date_ &=
+              ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatVertex);
+        }
+      }
+      if (last_float_constant >= 256) {
+        uint32_t first_pixel_constant =
+            first_float_constant >= 256 ? first_float_constant - 256 : 0;
+        uint32_t last_pixel_constant = last_float_constant - 256;
+        if (range_has_any_constant_usage(current_float_constant_map_pixel_, first_pixel_constant,
+                                         last_pixel_constant)) {
+          current_constant_buffers_up_to_date_ &=
+              ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatPixel);
+        }
+      }
+    }
+    return;
+  }
+
+  if (start_index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+      end_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
+    std::memcpy(register_file_->values + start_index, base, sizeof(uint32_t) * num_registers);
+    current_constant_buffers_up_to_date_ &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferBoolLoop);
+    return;
+  }
+
+  if (start_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+      end_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
+    std::memcpy(register_file_->values + start_index, base, sizeof(uint32_t) * num_registers);
+    current_constant_buffers_up_to_date_ &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch);
+    uint32_t first_fetch_dword = start_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+    uint32_t last_fetch_dword = end_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+    if (texture_cache_) {
+      texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
+    }
+    InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
+    return;
+  }
+
+  WriteRegistersHostBase(start_index, base, num_registers);
+}
+
 void VulkanCommandProcessor::SparseBindBuffer(VkBuffer buffer, uint32_t bind_count,
                                               const VkSparseMemoryBind* binds,
                                               VkPipelineStageFlags wait_stage_mask) {
@@ -4354,6 +4454,28 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
                                                              ps_param_gen_pos))
                    : 0;
 
+  // The memo tables (about 1 MB together) miss the cache on most draws:
+  // fetch the entries this draw will read while primitives and samplers are
+  // processed. A wrong guess (the pipeline's render pass key is the last
+  // draw's) only costs the prefetch.
+  uint32_t normalized_color_mask =
+      pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
+                   : 0;
+  auto prefetch = [](const void* entry, size_t size) {
+    const char* bytes = static_cast<const char*>(entry);
+    for (size_t offset = 0; offset < size; offset += 64) {
+      __builtin_prefetch(bytes + offset);
+    }
+  };
+  prefetch(&translation_memos_[StateMemoSlot(
+               memo_state, uint64_t(uintptr_t(vertex_shader)),
+               uint64_t(uintptr_t(pixel_shader)) ^ uint64_t(interpolator_mask) << 1)],
+           sizeof(TranslationMemo));
+  prefetch(&viewport_memos_[StateMemoSlot(
+               memo_state, uint64_t(uintptr_t(pixel_shader)),
+               uint64_t(normalized_depth_control.value) << 32 | normalized_color_mask)],
+           sizeof(ViewportMemo));
+
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
   SpirvShaderTranslator::Modification vertex_shader_modification;
   SpirvShaderTranslator::Modification pixel_shader_modification;
@@ -4463,6 +4585,14 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       translation_memo.pixel_modification = pixel_shader_modification;
       translation_memo.vertex_translation = vertex_shader_translation;
       translation_memo.pixel_translation = pixel_shader_translation;
+    }
+    if (!i) {
+      prefetch(&pipeline_memos_[StateMemoSlot(
+                   memo_state, uint64_t(uintptr_t(vertex_shader_translation)),
+                   uint64_t(uintptr_t(pixel_shader_translation)) ^
+                       uint64_t(last_pipeline_render_pass_key_) << 3 ^
+                       uint64_t(normalized_color_mask) << 35)],
+               sizeof(PipelineMemo));
     }
 
     // Obtain the samplers. Note that the bindings don't depend on the shader
@@ -4586,10 +4716,6 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     CheckSubmissionFenceAndDeviceLoss(sampler_overflow_await_submission);
   }
 
-  uint32_t normalized_color_mask =
-      pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
-                   : 0;
-
   // Update the textures before most other work in the submission because
   // samplers depend on this (and in case of sampler overflow in a submission,
   // submissions must be split) - may perform dispatches and copying.
@@ -4641,6 +4767,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   const VulkanRenderTargetCache::RenderPassKey pipeline_render_pass_key =
       fh1_native_executor_ ? fh1_render_pass_key
                            : render_target_cache_->last_update_render_pass_key();
+  last_pipeline_render_pass_key_ = pipeline_render_pass_key.key;
   PipelineMemo& memo = pipeline_memos_[StateMemoSlot(
       memo_state, uint64_t(uintptr_t(vertex_shader_translation)),
       uint64_t(uintptr_t(pixel_shader_translation)) ^
@@ -6706,7 +6833,7 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
   transient_descriptor_allocator_storage_image_.Reset();
   transient_descriptor_allocator_uniform_buffer_.Reset();
   transient_descriptor_allocator_uniform_buffer_dynamic_.Reset();
-  constants_descriptor_sets_frame_.clear();
+  constants_descriptor_sets_frame_.Clear();
   last_constants_descriptor_set_ = VK_NULL_HANDLE;
 }
 
@@ -7893,7 +8020,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     // the offsets are dynamic, so draws whose constants share upload pages and
     // sizes share one set per frame.
     if (constants_descriptor_sets_frame_index_ != frame_current_) {
-      constants_descriptor_sets_frame_.clear();
+      constants_descriptor_sets_frame_.Clear();
       constants_descriptor_sets_frame_index_ = frame_current_;
       last_constants_descriptor_set_ = VK_NULL_HANDLE;
     }
@@ -7904,14 +8031,13 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       current_constant_dynamic_offsets_[i] = uint32_t(current_constant_buffer_infos_[i].offset);
     }
     VkDescriptorSet constants_descriptor_set;
-    auto constants_set_it = constants_descriptor_sets_frame_.end();
+    VkDescriptorSet* frame_constants_set = nullptr;
     if (last_constants_descriptor_set_ != VK_NULL_HANDLE &&
         last_constants_descriptor_set_key_ == constants_key) {
       // Consecutive draws nearly always share buffers and sizes.
       constants_descriptor_set = last_constants_descriptor_set_;
-    } else if ((constants_set_it = constants_descriptor_sets_frame_.find(constants_key)) !=
-               constants_descriptor_sets_frame_.end()) {
-      constants_descriptor_set = constants_set_it->second;
+    } else if ((frame_constants_set = constants_descriptor_sets_frame_.Find(constants_key))) {
+      constants_descriptor_set = *frame_constants_set;
     } else {
       if (!constants_transient_descriptors_free_.empty()) {
         constants_descriptor_set = constants_transient_descriptors_free_.back();
@@ -7927,7 +8053,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         }
       }
       constants_transient_descriptors_used_.emplace_back(frame_current_, constants_descriptor_set);
-      constants_descriptor_sets_frame_.emplace(constants_key, constants_descriptor_set);
+      constants_descriptor_sets_frame_.Insert(constants_key, constants_descriptor_set);
       // Consecutive bindings updated via a single VkWriteDescriptorSet must
       // have identical stage flags, but for the constants they vary.
       for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {

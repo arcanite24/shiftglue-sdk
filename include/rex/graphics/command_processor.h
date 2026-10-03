@@ -168,6 +168,15 @@ class CommandProcessor {
   virtual void WriteRegister(uint32_t index, uint32_t value);
   uint32_t ReadRegisterValue(uint32_t index) const;
   virtual void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
+  // As WriteRegistersFromMem with host byte order values: the recorder's runs,
+  // which the decoder swapped when recording them. The default swaps them back
+  // for backends that only override WriteRegistersFromMem.
+  virtual void WriteRegistersHost(uint32_t start_index, const uint32_t* values,
+                                  uint32_t num_registers);
+  // CommandProcessor::WriteRegistersFromMem's own work for host order values.
+  void WriteRegistersHostBase(uint32_t start_index, const uint32_t* values,
+                              uint32_t num_registers);
+  std::vector<uint32_t> write_registers_host_scratch_;
   virtual void WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint32_t base,
                                           uint32_t num_registers);
   void WriteALURangeFromRing(memory::RingBuffer* ring, uint32_t base, uint32_t num_registers);
@@ -392,7 +401,7 @@ class CommandProcessor {
 
  private:
   struct RecordBatch {
-    // Records: kRecordRun start count dwords..., kRecordOne index value,
+    // Records: kRecordRun start count dwords (host order)..., kRecordOne index value,
     // kRecordCall function-index.
     std::vector<uint32_t> words;
     std::vector<std::function<void()>> fns;

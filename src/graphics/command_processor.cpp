@@ -427,10 +427,28 @@ void CommandProcessor::StopRecordThread() {
 }
 
 void CommandProcessor::RecordThreadMain() {
+  // The thread's CPU time is a system call (GetThreadTimes, 2 % of the
+  // recorder when read around every batch), and it does not advance while the
+  // thread waits, so read it before waiting and at most once a millisecond.
+  int64_t cpu_read_ns = perf::CurrentThreadCpuTimeNs();
+  auto cpu_read_time = std::chrono::steady_clock::now();
+  auto read_cpu = [&](std::chrono::steady_clock::time_point now) {
+    const int64_t cpu_ns = perf::CurrentThreadCpuTimeNs();
+    if (cpu_ns >= cpu_read_ns) {
+      PERF_counter_add(kGpuRecorderCpuNs, cpu_ns - cpu_read_ns);
+    }
+    cpu_read_ns = cpu_ns;
+    cpu_read_time = now;
+  };
   for (;;) {
     std::unique_ptr<RecordBatch> batch;
     {
       std::unique_lock<std::mutex> lock(record_mutex_);
+      if (record_queue_.empty() && !record_stop_) {
+        lock.unlock();
+        read_cpu(std::chrono::steady_clock::now());
+        lock.lock();
+      }
       record_ready_.wait(lock, [this]() { return record_stop_ || !record_queue_.empty(); });
       if (record_queue_.empty()) {
         return;
@@ -439,13 +457,14 @@ void CommandProcessor::RecordThreadMain() {
       record_queue_.pop_front();
     }
     const auto busy_start = std::chrono::steady_clock::now();
-    const int64_t cpu_start = perf::CurrentThreadCpuTimeNs();
     ExecuteRecordBatch(*batch);
-    PERF_counter_add(kGpuRecorderCpuNs, perf::CurrentThreadCpuTimeNs() - cpu_start);
+    const auto busy_end = std::chrono::steady_clock::now();
     PERF_counter_add(kGpuRecorderBusyNs,
-                     std::chrono::duration_cast<std::chrono::nanoseconds>(
-                         std::chrono::steady_clock::now() - busy_start)
+                     std::chrono::duration_cast<std::chrono::nanoseconds>(busy_end - busy_start)
                          .count());
+    if (busy_end - cpu_read_time >= std::chrono::milliseconds(1)) {
+      read_cpu(busy_end);
+    }
     batch->words.clear();
     batch->fns.clear();
     {
@@ -465,7 +484,7 @@ void CommandProcessor::ExecuteRecordBatch(RecordBatch& batch) {
       case kRecordRun: {
         const uint32_t start = words[i + 1];
         const uint32_t run = words[i + 2];
-        WriteRegistersFromMem(start, const_cast<uint32_t*>(words + i + 3), run);
+        WriteRegistersHost(start, words + i + 3, run);
         i += 3 + run;
       } break;
       case kRecordOne:
@@ -598,10 +617,9 @@ void CommandProcessor::RecordRegisterRun(uint32_t start_index, const uint32_t* b
       const uint32_t gap = start_index - previous_end;
       const size_t offset = words.size();
       words.resize(offset + gap + num_registers);
-      for (uint32_t i = 0; i < gap; ++i) {
-        words[offset + i] = rex::byte_swap(decode_register_file_->values[previous_end + i]);
-      }
-      std::memcpy(words.data() + offset + gap, base, sizeof(uint32_t) * num_registers);
+      std::memcpy(words.data() + offset, decode_register_file_->values + previous_end,
+                  sizeof(uint32_t) * gap);
+      memory::copy_and_swap(words.data() + offset + gap, base, num_registers);
       words[last_constant_run_offset_ + 2] = previous_count + gap + num_registers;
       last_constant_run_end_ = words.size();
       if (words.size() >= 65536) {
@@ -615,7 +633,8 @@ void CommandProcessor::RecordRegisterRun(uint32_t start_index, const uint32_t* b
   words[offset] = kRecordRun;
   words[offset + 1] = start_index;
   words[offset + 2] = num_registers;
-  std::memcpy(words.data() + offset + 3, base, sizeof(uint32_t) * num_registers);
+  // In host byte order: the recorder stores them without swapping.
+  memory::copy_and_swap(words.data() + offset + 3, base, num_registers);
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
       start_index + num_registers - 1 <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
     last_constant_run_batch_ = record_batch_.get();
@@ -973,6 +992,44 @@ bool RegisterRangeHasWriteSideEffects(uint32_t first, uint32_t last) {
          overlaps(XE_GPU_REG_SHADER_CONSTANT_000_X, XE_GPU_REG_SHADER_CONSTANT_LOOP_31);
 }
 }  // namespace
+
+void CommandProcessor::WriteRegistersHost(uint32_t start_index, const uint32_t* values,
+                                          uint32_t num_registers) {
+  std::vector<uint32_t>& swapped = write_registers_host_scratch_;
+  swapped.resize(num_registers);
+  memory::copy_and_swap(swapped.data(), values, num_registers);
+  WriteRegistersFromMem(start_index, swapped.data(), num_registers);
+}
+
+void CommandProcessor::WriteRegistersHostBase(uint32_t start_index, const uint32_t* values,
+                                              uint32_t num_registers) {
+  if (!num_registers) {
+    return;
+  }
+  if (uint64_t(start_index) + num_registers <= RegisterFile::kRegisterCount &&
+      !RegisterRangeHasWriteSideEffects(start_index, start_index + num_registers - 1)) {
+    uint32_t* registers = register_file_->values + start_index;
+    bool changed = false;
+    for (uint32_t i = 0; i < num_registers; ++i) {
+      const uint32_t value = values[i];
+      if (registers[i] != value) {
+        const uint32_t index = start_index + i;
+        if (!IsPerDrawRegister(index)) {
+          changed = true;
+          state_hash_ ^= StateHashTerm(index, registers[i]) ^ StateHashTerm(index, value);
+        }
+        registers[i] = value;
+      }
+    }
+    if (changed) {
+      ++state_epoch_;
+    }
+    return;
+  }
+  for (uint32_t i = 0; i < num_registers; ++i) {
+    WriteRegister(start_index + i, values[i]);
+  }
+}
 
 void CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
                                              uint32_t num_registers) {
