@@ -5911,6 +5911,7 @@ bool VulkanCommandProcessor::AcquireOcclusionQueryIndex(uint32_t& host_index_out
 void VulkanCommandProcessor::DisableHostOcclusionQueries() {
   if (active_occlusion_query_.valid && occlusion_query_pool_ != VK_NULL_HANDLE) {
     if (BeginSubmission(true)) {
+      EndRenderPass();
       deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_,
                                              active_occlusion_query_.host_index);
       EndSubmission(false);
@@ -6406,13 +6407,15 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
   if (submission_open_) {
     assert_false(scratch_buffer_used_);
 
+    EndRenderPass();
+
+    // The query began outside a rendering instance, so it ends outside one
+    // too (VUID-vkCmdEndQuery-None-07007).
     if (active_occlusion_query_.valid && occlusion_query_pool_ != VK_NULL_HANDLE) {
       deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_,
                                              active_occlusion_query_.host_index);
       active_occlusion_query_ = {};
     }
-
-    EndRenderPass();
 
     if (is_closing_frame) {
       EndFrameGpuTiming();
