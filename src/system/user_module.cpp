@@ -23,6 +23,11 @@
 #include <rex/system/xfile.h>
 #include <rex/system/xthread.h>
 
+// Recompiled code matches one exact executable, so a title update must be
+// selected explicitly (codegen and runtime both load modules through here).
+REXCVAR_DEFINE_BOOL(xex_apply_patches, false, "Kernel",
+                    "Apply a sibling XEX patch (path + 'p') when loading a module");
+
 namespace rex::system {
 
 UserModule::UserModule(KernelState* kernel_state)
@@ -104,6 +109,11 @@ X_STATUS UserModule::LoadFromFile(const std::string_view path) {
 
   // Search for sibling XEX patch file
   auto patch_entry = kernel_state_->file_system()->ResolvePath(path_ + "p");
+  if (patch_entry && !REXCVAR_GET(xex_apply_patches)) {
+    REXSYS_WARN("Ignoring XEX patch {}; this build runs the unpatched module",
+                patch_entry->absolute_path());
+    patch_entry = nullptr;
+  }
   if (patch_entry) {
     auto patch_path = patch_entry->absolute_path();
 

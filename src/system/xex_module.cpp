@@ -267,8 +267,17 @@ int XexModule::ApplyPatch(XexModule* module) {
   auto file_format_header = opt_file_format_info();
   assert_not_null(file_format_header);
 
-  // Apply header patch...
-  uint32_t headerpatch_size = patch_header->info.compressed_len + 0xC;
+  // Apply header patch. The descriptor's size bounds the whole header delta,
+  // which may hold several records (for example a copy record followed by an
+  // LZX record); the first record's length alone truncates such patches and
+  // leaves the base's AES key in place.
+  constexpr uint32_t kHeaderDeltaOffset = offsetof(xex2_opt_delta_patch_descriptor, info);
+  if (patch_header->size < kHeaderDeltaOffset + 0xC) {
+    REXLOG_ERROR("XEX header patch descriptor is too small");
+    return 5;
+  }
+  uint32_t headerpatch_size = patch_header->size - kHeaderDeltaOffset;
+  const uint32_t original_load_address = module->xex_security_info()->load_address;
 
   int result_code =
       lzxdelta_apply_patch(&patch_header->info, headerpatch_size,
@@ -285,6 +294,12 @@ int XexModule::ApplyPatch(XexModule* module) {
 
   // Update security info context with latest security info data
   module->ReadSecurityInfo();
+  if (module->xex_security_info()->load_address != original_load_address) {
+    // Recompiled code is generated for one fixed image address.
+    REXLOG_ERROR("XEX patch moves the image from {:08X} to {:08X}; unsupported",
+                 original_load_address, uint32_t(module->xex_security_info()->load_address));
+    return 10;
+  }
 
   uint32_t new_image_size = module->image_size();
 
