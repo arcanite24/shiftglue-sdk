@@ -270,6 +270,19 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
   return X_ERROR_SUCCESS;
 }
 
+// A content root must never shadow an existing device link such as game: or
+// update: (the behaviour of Xenia Canary 9bfaff504).
+static bool ShadowsExistingLink(KernelState* kernel_state, const std::string_view root_name) {
+  std::string existing_link;
+  if (!kernel_state->file_system()->FindSymbolicLink(std::string(root_name) + ':',
+                                                     existing_link)) {
+    return false;
+  }
+  REXSYS_WARN("Refusing to mount content at {}: over the existing link to {}", root_name,
+              existing_link);
+  return true;
+}
+
 X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_t xuid,
                                        const XCONTENT_AGGREGATE_DATA& data) {
   {
@@ -277,6 +290,9 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
     if (open_packages_.count(string::string_key_case(root_name))) {
       return X_ERROR_ALREADY_EXISTS;
     }
+  }
+  if (ShadowsExistingLink(kernel_state_, root_name)) {
+    return X_ERROR_ALREADY_EXISTS;
   }
 
   auto package_path = ResolvePackagePath(xuid, data);
@@ -354,6 +370,9 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t 
     if (open_packages_.count(string::string_key_case(root_name))) {
       return X_ERROR_ALREADY_EXISTS;
     }
+  }
+  if (ShadowsExistingLink(kernel_state_, root_name)) {
+    return X_ERROR_ALREADY_EXISTS;
   }
 
   auto package_path = ResolvePackagePath(xuid, data);
