@@ -1364,6 +1364,21 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   // System shader constants.
   SpirvShaderTranslator::SystemConstants system_constants_;
+  // RR-2.3: the inputs of the register-derived system constants at the last
+  // draw. While they hold, only the per-texture fields are derived again.
+  struct SystemConstantsMemoKey {
+    uint64_t state_epoch;
+    uint32_t words[24];
+    bool operator==(const SystemConstantsMemoKey& other) const {
+      return state_epoch == other.state_epoch &&
+             std::memcmp(words, other.words, sizeof(words)) == 0;
+    }
+  };
+  SystemConstantsMemoKey system_constants_memo_key_ = {};
+  bool system_constants_memo_valid_ = false;
+  uint64_t system_constants_memo_miss_words_[25] = {};
+  uint64_t system_constants_memo_hits_ = 0, system_constants_memo_calls_ = 0,
+           system_constants_memo_mismatches_ = 0, system_constants_memo_frames_ = 0;
 
   // Temporary storage for memexport stream constants used in the draw.
   std::vector<draw_util::MemExportRange> memexport_ranges_;

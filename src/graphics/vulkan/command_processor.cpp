@@ -125,6 +125,15 @@ REXCVAR_DEFINE_BOOL(vulkan_fh1_native_executor, true, "GPU/Vulkan",
                     "and resolves over native surfaces) instead of the generic render "
                     "target cache; needs dynamic rendering")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(gpu_system_constants_memo, true, "GPU/Vulkan",
+                    "Derive the register-dependent system constants again only when the "
+                    "register state or the draw's inputs changed since the previous draw "
+                    "(RECORDER_REPLAY_BACKLOG RR-2.3)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_system_constants_memo_verify, false, "GPU/Vulkan",
+                    "Derive the system constants in full on memo hits too and count the "
+                    "draws whose constants the memo would have left different")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(gpu_draw_cost_model, false, "GPU/Vulkan",
                     "Diagnostics (RR-0.1): time one draw in 16 step by step on the recorder, "
                     "and every draw and register run whole, and log the cost by draw band "
@@ -708,6 +717,28 @@ void VulkanCommandProcessor::DrawCostFrame() {
   m.batch_ticks_at_frame = record_batch_ticks_;
   m.entries_at_frame = record_entries_;
   record_cost_enabled_ = REXCVAR_GET(gpu_draw_cost_model);
+  if (++system_constants_memo_frames_ >= 600) {
+    if (system_constants_memo_calls_ &&
+        (REXCVAR_GET(gpu_system_constants_memo_verify) || REXCVAR_GET(gpu_draw_cost_model))) {
+      REXGPU_INFO("System constants memo (RR-2.3) over 600 frames: {} of {} draws hit ({:.1f} %), "
+                  "{} verified different",
+                  system_constants_memo_hits_, system_constants_memo_calls_,
+                  100.0 * double(system_constants_memo_hits_) /
+                      double(system_constants_memo_calls_),
+                  system_constants_memo_mismatches_);
+    }
+    if (REXCVAR_GET(gpu_system_constants_memo_verify)) {
+      std::string words;
+      for (uint32_t i = 0; i < 25; ++i) {
+        words += fmt::format(" {}={}", i, system_constants_memo_miss_words_[i]);
+        system_constants_memo_miss_words_[i] = 0;
+      }
+      REXGPU_INFO("System constants memo misses by key word (24 is the epoch):{}", words);
+    }
+    system_constants_memo_frames_ = 0;
+    system_constants_memo_hits_ = system_constants_memo_calls_ = 0;
+    system_constants_memo_mismatches_ = 0;
+  }
   if (!m.enabled) {
     return;
   }
@@ -2150,6 +2181,7 @@ bool VulkanCommandProcessor::SetupContext() {
 
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
+  system_constants_memo_valid_ = false;
 
   StartSubmissionWorker();
 
@@ -2452,6 +2484,7 @@ void VulkanCommandProcessor::ResetCachedDrawState() {
   // The system constants hold the scale and the texture cache's swizzles and
   // signs; every constant buffer is uploaded again.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
+  system_constants_memo_valid_ = false;
   current_constant_buffers_up_to_date_ = 0;
   std::memset(current_float_constant_map_vertex_, 0, sizeof(current_float_constant_map_vertex_));
   std::memset(current_float_constant_map_pixel_, 0, sizeof(current_float_constant_map_pixel_));
@@ -7523,7 +7556,118 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  bool dirty = false;
+  // Texture signedness / gamma.
+  uint32_t textures_resolution_scaled = 0;
+  {
+    uint32_t textures_remaining = used_texture_mask;
+    uint32_t texture_index;
+    while (rex::bit_scan_forward(textures_remaining, &texture_index)) {
+      textures_remaining &= ~(UINT32_C(1) << texture_index);
+      uint32_t& texture_signs_uint = system_constants_.texture_swizzled_signs[texture_index >> 2];
+      uint32_t texture_signs_shift = 8 * (texture_index & 3);
+      uint8_t texture_signs = texture_cache_->GetActiveTextureSwizzledSigns(texture_index);
+      uint32_t texture_signs_shifted = uint32_t(texture_signs) << texture_signs_shift;
+      uint32_t texture_signs_mask = ((UINT32_C(1) << 8) - 1) << texture_signs_shift;
+      dirty |= (texture_signs_uint & texture_signs_mask) != texture_signs_shifted;
+      texture_signs_uint = (texture_signs_uint & ~texture_signs_mask) | texture_signs_shifted;
+      textures_resolution_scaled |=
+          uint32_t(texture_cache_->IsActiveTextureResolutionScaled(texture_index)) << texture_index;
+    }
+  }
+  dirty |= system_constants_.textures_resolution_scaled != textures_resolution_scaled;
+  system_constants_.textures_resolution_scaled = textures_resolution_scaled;
+
+  // Texture host swizzle in the shader.
+  if (!GetVulkanDevice()->properties().imageViewFormatSwizzle) {
+    uint32_t textures_remaining = used_texture_mask;
+    uint32_t texture_index;
+    while (rex::bit_scan_forward(textures_remaining, &texture_index)) {
+      textures_remaining &= ~(UINT32_C(1) << texture_index);
+      uint32_t& texture_swizzles_uint = system_constants_.texture_swizzles[texture_index >> 1];
+      uint32_t texture_swizzle_shift = 12 * (texture_index & 1);
+      uint32_t texture_swizzle = texture_cache_->GetActiveTextureHostSwizzle(texture_index);
+      uint32_t texture_swizzle_shifted = uint32_t(texture_swizzle) << texture_swizzle_shift;
+      uint32_t texture_swizzle_mask = ((UINT32_C(1) << 12) - 1) << texture_swizzle_shift;
+      dirty |= (texture_swizzles_uint & texture_swizzle_mask) != texture_swizzle_shifted;
+      texture_swizzles_uint =
+          (texture_swizzles_uint & ~texture_swizzle_mask) | texture_swizzle_shifted;
+    }
+  }
+
   const RegisterFile& regs = *register_file_;
+  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
+  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+
+  // Everything below derives from render state block registers (covered by
+  // the render state epoch), the two per-draw registers read here and the
+  // draw's own inputs.
+  SystemConstantsMemoKey memo_key;
+  memo_key.state_epoch = render_state_epoch_;
+  {
+    uint32_t* w = memo_key.words;
+    // Only the fields read below: the index counts change every draw.
+    const auto memo_dma_size = regs.Get<reg::VGT_DMA_SIZE>();
+    const auto memo_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+    w[0] = uint32_t(memo_dma_size.swap_mode);
+    w[1] = uint32_t(memo_draw_initiator.prim_type) | uint32_t(memo_draw_initiator.index_size) << 8;
+    w[2] = uint32_t(primitive_polygonal) | uint32_t(shader_32bit_index_dma) << 1 |
+           uint32_t(primitive_processing_result.host_primitive_reset_enabled) << 2 |
+           uint32_t(primitive_processing_result.index_buffer_type) << 8 |
+           uint32_t(primitive_processing_result.host_vertex_shader_type) << 16 |
+           uint32_t(primitive_processing_result.tessellation_mode) << 24;
+    // The index address (per draw) is refreshed apart, below.
+    w[3] = 0;
+    w[4] = uint32_t(primitive_processing_result.host_shader_index_endian);
+    w[5] = primitive_processing_result.line_loop_closing_index;
+    w[6] = compute_memexport_vertex_count;
+    w[7] = normalized_depth_control.value;
+    w[8] = normalized_color_mask;
+    w[9] = viewport_info.xy_extent[0];
+    w[10] = viewport_info.xy_extent[1];
+    std::memcpy(&w[11], viewport_info.ndc_scale, 3 * sizeof(float));
+    std::memcpy(&w[14], viewport_info.ndc_offset, 3 * sizeof(float));
+    w[17] = draw_resolution_scale_x;
+    w[18] = draw_resolution_scale_y;
+    w[19] = uint32_t(render_target_cache_->GetPath());
+    w[20] = w[21] = w[22] = w[23] = 0;
+  }
+  ++system_constants_memo_calls_;
+  const bool memo_hit = REXCVAR_GET(gpu_system_constants_memo) && system_constants_memo_valid_ &&
+                        memo_key == system_constants_memo_key_;
+  SpirvShaderTranslator::SystemConstants memo_expected;
+  const bool memo_verify = memo_hit && REXCVAR_GET(gpu_system_constants_memo_verify);
+  if (memo_hit) {
+    ++system_constants_memo_hits_;
+    // The flags are the memo's; only the index address they may load
+    // changes between draws.
+    if (system_constants_.flags & (SpirvShaderTranslator::kSysFlag_VertexIndexLoad |
+                                   SpirvShaderTranslator::kSysFlag_ComputeOrPrimitiveVertexIndexLoad)) {
+      dirty |= system_constants_.vertex_index_load_address !=
+               primitive_processing_result.guest_index_base;
+      system_constants_.vertex_index_load_address = primitive_processing_result.guest_index_base;
+    }
+    if (!memo_verify) {
+      if (dirty) {
+        current_constant_buffers_up_to_date_ &=
+            ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferSystem);
+      }
+      return;
+    }
+    std::memcpy(&memo_expected, &system_constants_, sizeof(memo_expected));
+  }
+  if (!memo_hit && system_constants_memo_valid_ &&
+      REXCVAR_GET(gpu_system_constants_memo_verify)) {
+    for (uint32_t i = 0; i < 24; ++i) {
+      system_constants_memo_miss_words_[i] +=
+          memo_key.words[i] != system_constants_memo_key_.words[i];
+    }
+    system_constants_memo_miss_words_[24] +=
+        memo_key.state_epoch != system_constants_memo_key_.state_epoch;
+  }
+  system_constants_memo_key_ = memo_key;
+  system_constants_memo_valid_ = true;
+
   auto pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
   auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
   auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
@@ -7541,8 +7685,6 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
 
   bool edram_fragment_shader_interlock =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
 
   // Get the color info register values for each render target. Also, for FSI,
   // exclude components that don't exist in the format from the write mask.
@@ -7578,8 +7720,6 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
       }
     }
   }
-
-  bool dirty = false;
 
   // Flags.
   uint32_t flags = 0;
@@ -7819,44 +7959,6 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
         point_screen_diameter_to_ndc_radius_y;
   }
 
-  // Texture signedness / gamma.
-  uint32_t textures_resolution_scaled = 0;
-  {
-    uint32_t textures_remaining = used_texture_mask;
-    uint32_t texture_index;
-    while (rex::bit_scan_forward(textures_remaining, &texture_index)) {
-      textures_remaining &= ~(UINT32_C(1) << texture_index);
-      uint32_t& texture_signs_uint = system_constants_.texture_swizzled_signs[texture_index >> 2];
-      uint32_t texture_signs_shift = 8 * (texture_index & 3);
-      uint8_t texture_signs = texture_cache_->GetActiveTextureSwizzledSigns(texture_index);
-      uint32_t texture_signs_shifted = uint32_t(texture_signs) << texture_signs_shift;
-      uint32_t texture_signs_mask = ((UINT32_C(1) << 8) - 1) << texture_signs_shift;
-      dirty |= (texture_signs_uint & texture_signs_mask) != texture_signs_shifted;
-      texture_signs_uint = (texture_signs_uint & ~texture_signs_mask) | texture_signs_shifted;
-      textures_resolution_scaled |=
-          uint32_t(texture_cache_->IsActiveTextureResolutionScaled(texture_index)) << texture_index;
-    }
-  }
-  dirty |= system_constants_.textures_resolution_scaled != textures_resolution_scaled;
-  system_constants_.textures_resolution_scaled = textures_resolution_scaled;
-
-  // Texture host swizzle in the shader.
-  if (!GetVulkanDevice()->properties().imageViewFormatSwizzle) {
-    uint32_t textures_remaining = used_texture_mask;
-    uint32_t texture_index;
-    while (rex::bit_scan_forward(textures_remaining, &texture_index)) {
-      textures_remaining &= ~(UINT32_C(1) << texture_index);
-      uint32_t& texture_swizzles_uint = system_constants_.texture_swizzles[texture_index >> 1];
-      uint32_t texture_swizzle_shift = 12 * (texture_index & 1);
-      uint32_t texture_swizzle = texture_cache_->GetActiveTextureHostSwizzle(texture_index);
-      uint32_t texture_swizzle_shifted = uint32_t(texture_swizzle) << texture_swizzle_shift;
-      uint32_t texture_swizzle_mask = ((UINT32_C(1) << 12) - 1) << texture_swizzle_shift;
-      dirty |= (texture_swizzles_uint & texture_swizzle_mask) != texture_swizzle_shifted;
-      texture_swizzles_uint =
-          (texture_swizzles_uint & ~texture_swizzle_mask) | texture_swizzle_shifted;
-    }
-  }
-
   // Alpha test.
   dirty |= system_constants_.alpha_test_reference != rb_alpha_ref;
   system_constants_.alpha_test_reference = rb_alpha_ref;
@@ -8005,6 +8107,11 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     dirty |=
         system_constants_.edram_blend_constant[3] != regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA);
     system_constants_.edram_blend_constant[3] = regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA);
+  }
+
+  if (memo_verify &&
+      std::memcmp(&memo_expected, &system_constants_, sizeof(memo_expected)) != 0) {
+    ++system_constants_memo_mismatches_;
   }
 
   if (dirty) {

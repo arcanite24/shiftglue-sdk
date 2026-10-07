@@ -922,6 +922,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       !(index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31)) {
     ++state_epoch_;
     state_hash_ ^= StateHashTerm(index, regs.values[index]) ^ StateHashTerm(index, value);
+    render_state_epoch_ += IsRenderStateRegister(index);
   }
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
@@ -1092,13 +1093,14 @@ void CommandProcessor::WriteRegistersHostBase(uint32_t start_index, const uint32
   if (uint64_t(start_index) + num_registers <= RegisterFile::kRegisterCount &&
       !RegisterRangeHasWriteSideEffects(start_index, start_index + num_registers - 1)) {
     uint32_t* registers = register_file_->values + start_index;
-    bool changed = false;
+    bool changed = false, render_changed = false;
     for (uint32_t i = 0; i < num_registers; ++i) {
       const uint32_t value = values[i];
       if (registers[i] != value) {
         const uint32_t index = start_index + i;
         if (!IsPerDrawRegister(index)) {
           changed = true;
+          render_changed |= IsRenderStateRegister(index);
           state_hash_ ^= StateHashTerm(index, registers[i]) ^ StateHashTerm(index, value);
         }
         registers[i] = value;
@@ -1106,6 +1108,7 @@ void CommandProcessor::WriteRegistersHostBase(uint32_t start_index, const uint32
     }
     if (changed) {
       ++state_epoch_;
+      render_state_epoch_ += render_changed;
     }
     return;
   }
@@ -1124,13 +1127,14 @@ void CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* bas
   if (uint64_t(start_index) + num_registers <= RegisterFile::kRegisterCount &&
       !RegisterRangeHasWriteSideEffects(start_index, start_index + num_registers - 1)) {
     uint32_t* values = register_file_->values + start_index;
-    bool changed = false;
+    bool changed = false, render_changed = false;
     for (uint32_t i = 0; i < num_registers; ++i) {
       const uint32_t value = rex::byte_swap(base[i]);
       if (values[i] != value) {
         const uint32_t index = start_index + i;
         if (!IsPerDrawRegister(index)) {
           changed = true;
+          render_changed |= IsRenderStateRegister(index);
           state_hash_ ^= StateHashTerm(index, values[i]) ^ StateHashTerm(index, value);
         }
         values[i] = value;
@@ -1138,6 +1142,7 @@ void CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* bas
     }
     if (changed) {
       ++state_epoch_;
+      render_state_epoch_ += render_changed;
     }
     return;
   }

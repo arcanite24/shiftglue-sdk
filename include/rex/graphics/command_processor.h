@@ -368,6 +368,12 @@ class CommandProcessor {
   // changed register: equal hashes mean equal state, so derivations can be
   // reused across draws and frames, not only while nothing changes.
   uint64_t state_hash_ = 0;
+  // Bumped when a register of the render state block (0x2000-0x23FF: render
+  // backend, VGT, clipper and setup unit) other than a per-draw one changes:
+  // derivations that read only that block, such as the system constants, can
+  // be reused while it holds, across shader and fetch constant writes.
+  uint64_t render_state_epoch_ = 1;
+  static bool IsRenderStateRegister(uint32_t index) { return index - 0x2000u < 0x400u; }
   static uint64_t StateHashTerm(uint32_t index, uint32_t value) {
     uint64_t x = (uint64_t(index) << 32 | value) * UINT64_C(0x9E3779B97F4A7C15);
     x ^= x >> 29;
