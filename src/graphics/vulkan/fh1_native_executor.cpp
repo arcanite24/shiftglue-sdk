@@ -31,7 +31,7 @@ REXCVAR_DEFINE_BOOL(fh1_scaled_msaa_single_sample, false, "GPU",
                     "host sample. Much less GPU work at 3x and 4x; edges lose their MSAA")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_BOOL(fh1_msaa_single_sample, false, "GPU",
+REXCVAR_DEFINE_BOOL(fh1_msaa_single_sample, true, "GPU",
                     "Keep the guest's 2x and 4x MSAA surfaces as single-sampled images at any "
                     "resolution scale (Vulkan): at 1x the game renders without MSAA - harder "
                     "edges - for much less GPU work, the cheaper choice for phones")

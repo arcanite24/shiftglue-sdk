@@ -69,7 +69,7 @@ constexpr int32_t kWaitRegMemYieldUsDefault = 2000;
 constexpr int32_t kWaitRegMemSleepUsDefault = 0;
 #endif
 REXCVAR_DEFINE_INT32(wait_reg_mem_yield_us, kWaitRegMemYieldUsDefault, "GPU",
-                     "With vsync, how long a WAIT_REG_MEM poll yields before it sleeps (the "
+                     "With vsync or configured short sleeps, how long a WAIT_REG_MEM poll yields (the "
                      "sleep is at least a millisecond, which can outlast the wait); 0 sleeps at "
                      "once")
     .range(0, 16000)
@@ -102,8 +102,8 @@ REXCVAR_DEFINE_INT32(gpu_idle_spin_count, 500, "GPU",
     .range(0, 100000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(wait_reg_mem_sleep_us, kWaitRegMemSleepUsDefault, "GPU",
-                     "With vsync, how long each WAIT_REG_MEM sleep after the yield period lasts; "
-                     "0 sleeps the packet's own interval (at least a millisecond). Short sleeps "
+                     "How long each WAIT_REG_MEM sleep after the yield period lasts, even without vsync; "
+                     "0 retains busy polling without vsync, or uses the packet interval with vsync. Short sleeps "
                      "stop the commands thread spinning for power without the millisecond's "
                      "latency")
     .range(0, 16000)
@@ -1914,8 +1914,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         if (!record_split_) {
           PrepareForWait();
         }
-        if (!REXCVAR_GET(vsync)) {
-          // User wants it fast and dangerous.
+        // A configured short sleep bounds polling even without VSync.
+        // Android defaults to this to avoid burning a core while waiting.
+        if (!REXCVAR_GET(vsync) && REXCVAR_GET(wait_reg_mem_sleep_us) == 0) {
           rex::thread::MaybeYield();
         } else if (std::chrono::steady_clock::now() - wait_start <
                    std::chrono::microseconds(REXCVAR_GET(wait_reg_mem_yield_us))) {
