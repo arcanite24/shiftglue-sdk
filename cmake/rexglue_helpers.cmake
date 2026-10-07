@@ -74,6 +74,28 @@ endfunction()
 #     Guest modules colocate with the host (see rexglue_configure_module_target),
 #     so this single copy handles them transitively.
 #==========================================================
+# Copies a library next to the host whenever the library's file changes. A
+# POST_BUILD copy on the host runs only when the host relinks, which a
+# runtime-loaded plugin, or a DLL whose exports did not change, never causes:
+# the host then ran the previous build's DLL.
+function(rexglue_stage_on_change target_name library_target name)
+    set(_stamp "${CMAKE_CURRENT_BINARY_DIR}/${target_name}-stage-${name}.stamp")
+    add_custom_command(OUTPUT ${_stamp}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:${library_target}>
+            $<TARGET_FILE_DIR:${target_name}>
+        COMMAND ${CMAKE_COMMAND} -E touch ${_stamp}
+        DEPENDS $<TARGET_FILE:${library_target}>
+        VERBATIM
+    )
+    add_custom_target(${target_name}-stage-${name} DEPENDS ${_stamp})
+    get_target_property(_imported ${library_target} IMPORTED)
+    if(NOT _imported)
+        add_dependencies(${target_name}-stage-${name} ${library_target})
+    endif()
+    add_dependencies(${target_name} ${target_name}-stage-${name})
+endfunction()
+
 function(rexglue_configure_target target_name)
     cmake_parse_arguments(ARG "" "" "GPU_PLUGINS" ${ARGN})
 
@@ -163,8 +185,19 @@ function(rexglue_configure_target target_name)
                 $<TARGET_FILE_DIR:${target_name}>
             VERBATIM
         )
+        rexglue_stage_on_change(${target_name} ${_plugin_target} gpu-${_plugin})
         unset(_plugin_target)
     endforeach()
+    # The runtime DLL too: a change that keeps its exports keeps its import
+    # library, so the host does not relink and its POST_BUILD copy skips it.
+    if(WIN32)
+        foreach(_rexglue_runtime_lib rexruntime rex::runtime)
+            if(TARGET ${_rexglue_runtime_lib})
+                rexglue_stage_on_change(${target_name} ${_rexglue_runtime_lib} runtime)
+                break()
+            endif()
+        endforeach()
+    endif()
 
     if(APPLE AND REXGLUE_USE_VULKAN)
         _rexglue_stage_macos_vulkan_runtime(${target_name})
