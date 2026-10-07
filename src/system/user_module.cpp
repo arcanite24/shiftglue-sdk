@@ -107,8 +107,18 @@ X_STATUS UserModule::LoadFromFile(const std::string_view path) {
     return result;
   }
 
-  // Search for sibling XEX patch file
+  // Search for a sibling XEX patch file, then for an installed title update's
+  // patch on update:, where the console mounts title-update content.
+  // A patch file is itself loaded through here; it has no patch of its own.
+  if (xex_module()->is_patch()) {
+    return LoadXexContinue();
+  }
   auto patch_entry = kernel_state_->file_system()->ResolvePath(path_ + "p");
+  if (!patch_entry) {
+    const auto separator = path_.find_last_of("\\/");
+    const auto file_name = separator == std::string::npos ? path_ : path_.substr(separator + 1);
+    patch_entry = kernel_state_->file_system()->ResolvePath("update:\\" + file_name + "p");
+  }
   if (patch_entry && !REXCVAR_GET(xex_apply_patches)) {
     REXSYS_WARN("Ignoring XEX patch {}; this build runs the unpatched module",
                 patch_entry->absolute_path());
