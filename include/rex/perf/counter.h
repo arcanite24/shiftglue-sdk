@@ -158,6 +158,17 @@ enum class CounterId : uint16_t {
   // Texture reloads limited to the rows GPU writes changed (DR-2.2).
   kTextureBandReloads,
 
+  // Memory (LS-0.4), sampled about once a second, in MiB: device-local heap
+  // usage and budget (VK_EXT_memory_budget), the FH1 executor's native
+  // surfaces (and their count), the texture cache and the process's resident
+  // set. Gauges: each frame repeats the latest sample.
+  kMemoryDeviceUsageMb,
+  kMemoryDeviceBudgetMb,
+  kFh1SurfaceCount,
+  kFh1SurfaceMb,
+  kTextureCacheMb,
+  kProcessResidentMb,
+
   kCount  // sentinel -- must be last
 };
 
@@ -180,6 +191,9 @@ int64_t GetTotalCounter(CounterId id);
 
 // Current host thread's accumulated user + kernel CPU time, or zero if unavailable.
 int64_t CurrentThreadCpuTimeNs();
+
+// The process's resident set (working set on Windows), or zero if unknown.
+uint64_t ProcessResidentBytes();
 
 // Snapshot current values into the read buffer and zero the live counters.
 // Called once per frame by Profiler::Flip().

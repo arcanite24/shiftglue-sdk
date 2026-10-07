@@ -81,6 +81,12 @@ class TextureCache {
   // For a while after this call (from any thread), textures unused for a
   // second are destroyed down to a small floor instead of the usual limits.
   static void RequestMemoryReduction();
+  // The device memory textures may take without pushing the device past its
+  // budget (LS-4.2), from the backend's VK_EXT_memory_budget reading; 0 when
+  // unknown. Lowers the configured limits, never raises them.
+  void SetMemoryBudgetLimitMb(uint32_t limit_mb) {
+    budget_limit_mb_.store(limit_mb, std::memory_order_relaxed);
+  }
   virtual void BeginSubmission(uint64_t new_submission_index);
   virtual void BeginFrame();
 
@@ -721,6 +727,7 @@ class TextureCache {
   uint64_t total_host_memory_usage() const { return textures_total_host_memory_usage_; }
 
  private:
+  std::atomic<uint32_t> budget_limit_mb_{0};
 
   Texture* texture_used_first_ = nullptr;
   Texture* texture_used_last_ = nullptr;

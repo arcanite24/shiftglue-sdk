@@ -631,10 +631,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   void BeginFrameGpuTiming();
   void EndFrameGpuTiming();
   void ReadFrameGpuTiming();
-  // Every vulkan_memory_budget_log_seconds: each heap's usage against its
-  // budget (VK_EXT_memory_budget), the texture cache and the resident size.
+  // Once a second, the perf capture's memory gauges; every
+  // vulkan_memory_budget_log_seconds, a log line: each heap's usage against
+  // its budget (VK_EXT_memory_budget), the native surfaces, the texture cache
+  // and the resident size.
   void LogMemoryBudget();
+  std::chrono::steady_clock::time_point memory_sampled_{};
   std::chrono::steady_clock::time_point memory_budget_logged_{};
+  bool memory_over_budget_ = false;
   std::vector<uint64_t> memory_heap_peak_;
   uint64_t memory_resident_peak_ = 0;
   // Keep primary-buffer-end submit behavior aligned with D3D12: only submit

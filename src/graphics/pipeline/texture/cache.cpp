@@ -337,6 +337,12 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
   uint32_t limit_hard_mb =
       REXCVAR_GET(texture_cache_memory_limit_hard) + limit_scaled_resolve_add_mb;
   uint32_t limit_soft_lifetime = REXCVAR_GET(texture_cache_memory_limit_soft_lifetime) * 1000;
+  // LS-4.2: the fixed limits suit an 8 GB card at 3x; a 4 GB card or shared
+  // memory has less. Never past what the device's budget leaves textures.
+  if (const uint32_t budget_mb = budget_limit_mb_.load(std::memory_order_relaxed)) {
+    limit_hard_mb = std::min(limit_hard_mb, budget_mb);
+    limit_soft_mb = std::min(limit_soft_mb, std::max(budget_mb / 2, kMemoryReductionFloorMb));
+  }
   const bool reducing = current_time < memory_reduction_until_ms.load(std::memory_order_relaxed);
   if (reducing) {
     limit_soft_mb = std::min(limit_soft_mb, kMemoryReductionFloorMb);

@@ -24,7 +24,14 @@
 #if REX_PLATFORM_WIN32
 #include <share.h>
 #include <windows.h>
+#include <psapi.h>
 #include <TraceLoggingProvider.h>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <intrin.h>
+#endif
+#else
+#include <unistd.h>
+#include <fstream>
 #endif
 
 REXCVAR_DEFINE_STRING(perf_log_csv, "", "Perf",
@@ -191,6 +198,12 @@ constexpr const char* kCounterNames[] = {
     "title_gpu_fence_wait_count",
     "title_gpu_fence_wait_ns",
     "texture_band_reloads",
+    "memory_device_usage_mb",
+    "memory_device_budget_mb",
+    "fh1_surface_count",
+    "fh1_surface_mb",
+    "texture_cache_mb",
+    "process_resident_mb",
 };
 static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
 
@@ -282,6 +295,12 @@ constexpr bool kIsGauge[] = {
     false,  // kTitleGpuFenceWaitCount
     false,  // kTitleGpuFenceWaitNs
     false,  // kTextureBandReloads
+    true,   // kMemoryDeviceUsageMb
+    true,   // kMemoryDeviceBudgetMb
+    true,   // kFh1SurfaceCount
+    true,   // kFh1SurfaceMb
+    true,   // kTextureCacheMb
+    true,   // kProcessResidentMb
 };
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 
@@ -343,8 +362,40 @@ int64_t GetSnapshotCounter(CounterId id) {
   return g_snapshot[static_cast<size_t>(id)].load(std::memory_order_relaxed);
 }
 
+#if REX_PLATFORM_WIN32 && (defined(_M_X64) || defined(__x86_64__))
+namespace {
+// Time-stamp counter ticks a nanosecond, measured once against the
+// performance counter over 20 ms (the TSC is invariant on the CPUs the port
+// supports; QueryThreadCycleTime counts in it).
+double TscTicksPerNs() {
+  static const double rate = [] {
+    LARGE_INTEGER frequency = {}, start = {}, now = {};
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start);
+    const uint64_t tsc_start = __rdtsc();
+    do {
+      QueryPerformanceCounter(&now);
+    } while (now.QuadPart - start.QuadPart < frequency.QuadPart / 50);
+    const uint64_t tsc_end = __rdtsc();
+    const double ns = double(now.QuadPart - start.QuadPart) * 1e9 / double(frequency.QuadPart);
+    return ns > 0 ? double(tsc_end - tsc_start) / ns : 0.0;
+  }();
+  return rate;
+}
+}  // namespace
+#endif
+
 int64_t CurrentThreadCpuTimeNs() {
-#if REX_PLATFORM_WIN32
+#if REX_PLATFORM_WIN32 && (defined(_M_X64) || defined(__x86_64__))
+  // GetThreadTimes advances in scheduler ticks (15.6 ms), coarser than a
+  // frame (DR-0.2); the thread's cycle count is exact (LS-0.3).
+  ULONG64 cycles = 0;
+  const double rate = TscTicksPerNs();
+  if (rate > 0 && QueryThreadCycleTime(GetCurrentThread(), &cycles)) {
+    return int64_t(double(cycles) / rate);
+  }
+  return 0;
+#elif REX_PLATFORM_WIN32
   FILETIME created, exited, kernel, user;
   if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user))
     return 0;
@@ -358,6 +409,26 @@ int64_t CurrentThreadCpuTimeNs() {
   timespec time = {};
   if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time)) return 0;
   return int64_t(time.tv_sec) * 1000000000 + time.tv_nsec;
+#endif
+}
+
+uint64_t ProcessResidentBytes() {
+#if REX_PLATFORM_WIN32
+  PROCESS_MEMORY_COUNTERS counters = {};
+  if (GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+    return counters.WorkingSetSize;
+  }
+  return 0;
+#elif REX_PLATFORM_LINUX
+  // statm: total and resident pages.
+  std::ifstream statm("/proc/self/statm");
+  uint64_t total = 0, resident = 0;
+  if (statm >> total >> resident) {
+    return resident * uint64_t(sysconf(_SC_PAGESIZE));
+  }
+  return 0;
+#else
+  return 0;
 #endif
 }
 

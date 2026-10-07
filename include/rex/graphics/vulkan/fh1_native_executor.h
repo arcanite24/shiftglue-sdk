@@ -81,6 +81,9 @@ class Fh1NativeExecutor {
   void FlushResolveReadbacks();
   void OnSwap(uint64_t frame);
   void LogStats(uint64_t frame);
+  // Native surfaces alive and the device memory their images take (LS-0.4).
+  size_t surface_count() const { return surfaces_.size(); }
+  uint64_t surface_bytes() const { return surface_bytes_; }
   // Texture loads (untile and copy) timed with the GPU profile, split by
   // whether a resolve wrote the texture's memory.
   uint32_t BeginTextureLoadGpuTiming() { return GpuBegin(); }
@@ -115,6 +118,8 @@ class Fh1NativeExecutor {
     uint32_t samples = 1;
     uint32_t width = 0;
     uint32_t height = 0;
+    // The image's memory requirement.
+    uint64_t bytes = 0;
     // Clears not recorded yet (fh1_fold_clears), in order: folded into the
     // next draw rendering on this surface, or recorded in a rendering of
     // their own before anything else uses the image.
@@ -266,6 +271,7 @@ class Fh1NativeExecutor {
   Fh1EdramTiles tiles_;
   Fh1ExecutorCounters counters_;
   std::map<uint32_t, Surface> surfaces_;
+  uint64_t surface_bytes_ = 0;
   // Direct-mapped front for FindSurface: map nodes stay put until erased,
   // and DestroySurface clears it.
   struct SurfaceFront {

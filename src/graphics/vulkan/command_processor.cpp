@@ -125,7 +125,11 @@ REXCVAR_DEFINE_BOOL(vulkan_fh1_native_executor, true, "GPU/Vulkan",
                     "and resolves over native surfaces) instead of the generic render "
                     "target cache; needs dynamic rendering")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_INT32(vulkan_memory_budget_log_seconds, REX_PLATFORM_ANDROID ? 30 : 0, "GPU/Vulkan",
+REXCVAR_DEFINE_BOOL(texture_cache_memory_budget_limits, true, "GPU/Vulkan",
+                    "Lower the texture cache limits to what the device's memory budget "
+                    "(VK_EXT_memory_budget) leaves, for small cards and shared memory")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(vulkan_memory_budget_log_seconds, 30, "GPU/Vulkan",
                      "Log each memory heap's usage against its budget, the texture cache and "
                      "the resident size, with their peaks, this often (0: never)")
     .range(0, 3600)
@@ -685,19 +689,21 @@ void VulkanCommandProcessor::ClearCaches() {
 }
 
 void VulkanCommandProcessor::LogMemoryBudget() {
-  const int32_t interval = REXCVAR_GET(vulkan_memory_budget_log_seconds);
-  if (interval <= 0) {
-    return;
-  }
+  // Sampled once a second into the perf capture's memory columns (LS-0.4);
+  // logged, with peaks, every vulkan_memory_budget_log_seconds.
   const auto now = std::chrono::steady_clock::now();
-  if (now - memory_budget_logged_ < std::chrono::seconds(interval)) {
+  if (now - memory_sampled_ < std::chrono::seconds(1)) {
     return;
   }
-  memory_budget_logged_ = now;
+  memory_sampled_ = now;
+  const int32_t interval = REXCVAR_GET(vulkan_memory_budget_log_seconds);
+  const bool log = interval > 0 && now - memory_budget_logged_ >= std::chrono::seconds(interval);
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanInstance* const vulkan_instance = vulkan_device->vulkan_instance();
   std::string heaps;
+  uint64_t device_usage = 0;
+  uint64_t device_budget = 0;
   if (vulkan_device->extensions().ext_EXT_memory_budget &&
       vulkan_instance->extensions().ext_1_1_KHR_get_physical_device_properties2) {
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget = {
@@ -711,30 +717,59 @@ void VulkanCommandProcessor::LogMemoryBudget() {
     memory_heap_peak_.resize(heap_count);
     for (uint32_t i = 0; i < heap_count; ++i) {
       memory_heap_peak_[i] = std::max(memory_heap_peak_[i], uint64_t(budget.heapUsage[i]));
-      heaps += fmt::format(
-          "{}heap {}{}: {} of {} MB (peak {})", heaps.empty() ? "" : "; ", i,
-          (properties.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
-              ? " device"
-              : "",
-          budget.heapUsage[i] >> 20, budget.heapBudget[i] >> 20, memory_heap_peak_[i] >> 20);
+      const bool device_local =
+          properties.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
+      // The largest device-local heap (a discrete card's VRAM; on shared
+      // memory the one heap).
+      if (device_local && budget.heapBudget[i] > device_budget) {
+        device_budget = budget.heapBudget[i];
+        device_usage = budget.heapUsage[i];
+      }
+      heaps += fmt::format("{}heap {}{}: {} of {} MB (peak {})", heaps.empty() ? "" : "; ", i,
+                           device_local ? " device" : "", budget.heapUsage[i] >> 20,
+                           budget.heapBudget[i] >> 20, memory_heap_peak_[i] >> 20);
     }
+    // Over budget, the OS demotes allocations to system memory, which shows
+    // as stutter (LS-4.6): note each time usage crosses it.
+    const bool over = device_budget && device_usage > device_budget;
+    if (over && !memory_over_budget_) {
+      REXGPU_WARN("Memory: device-local usage {} MB is over its {} MB budget",
+                  device_usage >> 20, device_budget >> 20);
+    }
+    memory_over_budget_ = over;
   } else {
     heaps = "no VK_EXT_memory_budget";
   }
-  uint64_t resident = 0;
-#if REX_PLATFORM_LINUX
-  std::ifstream status("/proc/self/status");
-  for (std::string line; std::getline(status, line);) {
-    if (line.rfind("VmRSS:", 0) == 0) {
-      resident = std::strtoull(line.c_str() + 6, nullptr, 10) << 10;
-      break;
-    }
-  }
-#endif
+  const uint64_t resident = perf::ProcessResidentBytes();
   memory_resident_peak_ = std::max(memory_resident_peak_, resident);
-  REXGPU_INFO("Memory: {}; textures {} MB; resident {} MB (peak {})", heaps,
-              texture_cache_ ? texture_cache_->total_host_memory_usage() >> 20 : 0,
-              resident >> 20, memory_resident_peak_ >> 20);
+  const uint64_t textures = texture_cache_ ? texture_cache_->total_host_memory_usage() : 0;
+  const uint64_t surface_count = fh1_native_executor_ ? fh1_native_executor_->surface_count() : 0;
+  const uint64_t surfaces = fh1_native_executor_ ? fh1_native_executor_->surface_bytes() : 0;
+  if (texture_cache_) {
+    // LS-4.2: textures may take what the budget leaves after everything else
+    // (surfaces, buffers, other processes' share is already out of the
+    // budget), with a tenth kept free, and never less than 256 MB.
+    uint32_t limit_mb = 0;
+    if (REXCVAR_GET(texture_cache_memory_budget_limits) && device_budget) {
+      const uint64_t others = device_usage > textures ? device_usage - textures : 0;
+      const uint64_t usable = device_budget - device_budget / 10;
+      limit_mb = uint32_t(std::max<uint64_t>(usable > others ? (usable - others) >> 20 : 0, 256));
+    }
+    texture_cache_->SetMemoryBudgetLimitMb(limit_mb);
+  }
+  PERF_counter_set(kMemoryDeviceUsageMb, int64_t(device_usage >> 20));
+  PERF_counter_set(kMemoryDeviceBudgetMb, int64_t(device_budget >> 20));
+  PERF_counter_set(kFh1SurfaceCount, int64_t(surface_count));
+  PERF_counter_set(kFh1SurfaceMb, int64_t(surfaces >> 20));
+  PERF_counter_set(kTextureCacheMb, int64_t(textures >> 20));
+  PERF_counter_set(kProcessResidentMb, int64_t(resident >> 20));
+  if (!log) {
+    return;
+  }
+  memory_budget_logged_ = now;
+  REXGPU_INFO(
+      "Memory: {}; native surfaces {} ({} MB); textures {} MB; resident {} MB (peak {})", heaps,
+      surface_count, surfaces >> 20, textures >> 20, resident >> 20, memory_resident_peak_ >> 20);
 }
 
 void VulkanCommandProcessor::OnReduceMemory() {

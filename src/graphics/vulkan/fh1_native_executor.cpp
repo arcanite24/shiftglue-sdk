@@ -552,6 +552,7 @@ void Fh1NativeExecutor::DestroySurface(Surface& surface) {
   if (surface.image) dfn.vkDestroyImage(device, surface.image, nullptr);
   if (surface.memory) dfn.vkFreeMemory(device, surface.memory, nullptr);
   if (!surface.pending_clears.empty()) --pending_clear_surfaces_;
+  surface_bytes_ -= surface.bytes;
   surface = Surface();
 }
 
@@ -756,6 +757,10 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
     Skip("surface_view_create");
     return nullptr;
   }
+  VkMemoryRequirements requirements = {};
+  dfn.vkGetImageMemoryRequirements(device, surface.image, &requirements);
+  surface.bytes = requirements.size;
+  surface_bytes_ += surface.bytes;
   Surface& stored = surfaces_.emplace(packed, surface).first->second;
   // Render targets must be initialized before use; zero is also what the
   // stencil tracking assumes for a new surface.
