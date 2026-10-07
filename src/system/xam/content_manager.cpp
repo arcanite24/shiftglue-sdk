@@ -9,8 +9,11 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <array>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <queue>
 #include <string>
 
@@ -20,7 +23,9 @@
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/stfs_container_device.h>
 #include <rex/string.h>
+#include <rex/system/flags.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/util/xdbf_utils.h>
 #include <rex/system/xam/content_device.h>
 #include <rex/system/xam/content_manager.h>
 #include <rex/system/xfile.h>
@@ -46,7 +51,11 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
   content_data_ = data;
 
   auto fs = kernel_state_->file_system();
-  auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false,
+  // Marketplace content is the player's verified import: mount it read-only
+  // so the title can never change a verified payload.
+  const bool read_only = data.content_type == XContentType::kMarketplaceContent;
+  auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path,
+                                                                  read_only,
                                                                   /*allow_share_delete=*/true);
   device->Initialize();
   fs->RegisterDevice(std::move(device));
@@ -290,6 +299,53 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
   return X_ERROR_SUCCESS;
 }
 
+namespace {
+
+// Marketplace packages carry the title's achievement table extended with their
+// own entries (spa.bin). Register only IDs the title does not already define,
+// so base metadata (and its unlock state, stored by ID) is never replaced.
+void RegisterContentAchievements(KernelState* kernel_state,
+                                 const std::filesystem::path& package_path) {
+  std::ifstream file(package_path / "spa.bin", std::ios::binary);
+  if (!file) {
+    return;
+  }
+  const std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
+                                  std::istreambuf_iterator<char>());
+  const util::XdbfGameData db(data.data(), data.size());
+  if (!db.is_valid()) {
+    REXSYS_WARN("Ignoring unreadable content spa.bin in {}", package_path.string());
+    return;
+  }
+  auto& manager = kernel_state->achievements();
+  const auto known = manager.ListAchievements();
+  const XLanguage language =
+      db.GetExistingLanguage(static_cast<XLanguage>(REXCVAR_GET(user_language)));
+  size_t added = 0;
+  for (const auto& entry : db.GetAchievements()) {
+    const uint32_t id = entry.id;
+    if (std::any_of(known.begin(), known.end(),
+                    [id](const AchievementInfo& info) { return info.id == id; })) {
+      continue;
+    }
+    AchievementInfo info;
+    info.id = id;
+    info.label = db.GetStringTableEntry(language, entry.label_id);
+    info.description = db.GetStringTableEntry(language, entry.description_id);
+    info.unachieved_description = db.GetStringTableEntry(language, entry.unachieved_id);
+    info.image_id = entry.image_id;
+    info.gamerscore = entry.gamerscore;
+    info.flags = entry.flags;
+    added += manager.RegisterAchievement(std::move(info)) ? 1 : 0;
+  }
+  if (added) {
+    REXSYS_INFO("Registered {} achievement(s) from content {}", added,
+                package_path.filename().string());
+  }
+}
+
+}  // namespace
+
 X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t xuid,
                                      const XCONTENT_AGGREGATE_DATA& data,
                                      uint32_t& content_license) {
@@ -316,6 +372,9 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t 
       return X_ERROR_ALREADY_EXISTS;
     }
     open_packages_.insert({string::string_key_case::create(root_name), package.release()});
+  }
+  if (data.content_type == XContentType::kMarketplaceContent) {
+    RegisterContentAchievements(kernel_state_, package_path);
   }
   return X_ERROR_SUCCESS;
 }

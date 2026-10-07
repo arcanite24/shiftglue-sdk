@@ -645,6 +645,43 @@ u32 XamShowAchievementsUI_entry(u32 user_index, u32 unknown) {
   return X_ERROR_SUCCESS;
 }
 
+// There is no Marketplace. Complete store requests as an immediately closed
+// system UI (XN_SYS_UI on, then off, and any overlapped completion) so a title
+// waiting on the store never hangs. Never grant or change a licence: owned
+// content comes only from the player's imported packages.
+u32 XamShowMarketplaceUIEx_entry(u32 user_index, u32 ui_type, u64 offer_id, u32 offer_type) {
+  if (user_index >= 4) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  REXKRNL_INFO("XamShowMarketplaceUI(user {}, type {}, offer {:016X}, offer type {:08X}): "
+               "no store available",
+               uint32_t(user_index), uint32_t(ui_type), uint64_t(offer_id), uint32_t(offer_type));
+  return xeXamDispatchHeadless([]() -> X_RESULT { return X_ERROR_SUCCESS; }, 0);
+}
+
+u32 XamShowMarketplaceUI_entry(u32 user_index, u32 ui_type, u64 offer_id, u32 offer_type) {
+  return XamShowMarketplaceUIEx_entry(user_index, ui_type, offer_id, offer_type);
+}
+
+u32 XamShowMarketplaceDownloadItemsUI_entry(u32 user_index, u32 ui_type, mapped_void offers,
+                                            u32 offer_count, mapped_u32 hresult_ptr,
+                                            mapped_void overlapped) {
+  if (user_index >= 4 || !offers.guest_address() || offer_count > 6) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  REXKRNL_INFO("XamShowMarketplaceDownloadItemsUI(user {}, type {}, {} offer(s)): no store "
+               "available",
+               uint32_t(user_index), uint32_t(ui_type), uint32_t(offer_count));
+  return xeXamDispatchHeadless(
+      [hresult_ptr]() -> X_RESULT {
+        if (hresult_ptr.guest_address()) {
+          *hresult_ptr = 0;  // S_OK: the dialog closed normally.
+        }
+        return X_ERROR_SUCCESS;
+      },
+      overlapped.guest_address());
+}
+
 u32 XamShowPartyUI_entry(u32 r3, u32 r4) {
   return X_ERROR_FUNCTION_FAILED;
 }
@@ -676,6 +713,10 @@ REX_EXPORT(__imp__XamShowPartyUI, rex::kernel::xam::XamShowPartyUI_entry)
 REX_EXPORT(__imp__XamShowAchievementsUI, rex::kernel::xam::XamShowAchievementsUI_entry)
 REX_EXPORT(__imp__XamShowCommunitySessionsUI, rex::kernel::xam::XamShowCommunitySessionsUI_entry)
 REX_EXPORT(__imp__XamShowMessageBoxUIEx, rex::kernel::xam::XamShowMessageBoxUIEx_entry)
+REX_EXPORT(__imp__XamShowMarketplaceUI, rex::kernel::xam::XamShowMarketplaceUI_entry)
+REX_EXPORT(__imp__XamShowMarketplaceUIEx, rex::kernel::xam::XamShowMarketplaceUIEx_entry)
+REX_EXPORT(__imp__XamShowMarketplaceDownloadItemsUI,
+           rex::kernel::xam::XamShowMarketplaceDownloadItemsUI_entry)
 
 REX_EXPORT_STUB(__imp__XamIsGuideDisabled);
 REX_EXPORT_STUB(__imp__XamIsMessageBoxActive);
@@ -731,12 +772,9 @@ REX_EXPORT_STUB(__imp__XamShowKeyboardUIMessenger);
 REX_EXPORT_STUB(__imp__XamShowLiveSignupUI);
 REX_EXPORT_STUB(__imp__XamShowLiveUpsellUI);
 REX_EXPORT_STUB(__imp__XamShowLiveUpsellUIEx);
-REX_EXPORT_STUB(__imp__XamShowMarketplaceDownloadItemsUI);
 REX_EXPORT_STUB(__imp__XamShowMarketplaceGetOrderReceipts);
 REX_EXPORT_STUB(__imp__XamShowMarketplacePurchaseOrderUI);
 REX_EXPORT_STUB(__imp__XamShowMarketplacePurchaseOrderUIEx);
-REX_EXPORT_STUB(__imp__XamShowMarketplaceUI);
-REX_EXPORT_STUB(__imp__XamShowMarketplaceUIEx);
 REX_EXPORT_STUB(__imp__XamShowMessageBox);
 REX_EXPORT_STUB(__imp__XamShowMessageComposeUI);
 REX_EXPORT_STUB(__imp__XamShowMessagesUI);
