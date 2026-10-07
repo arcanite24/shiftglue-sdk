@@ -14,6 +14,8 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
 #include "platform_win.h"
 
 #include <algorithm>
+#include <bit>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -21,6 +23,13 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
 
 #include <rex/assert.h>
 #include <rex/chrono/chrono_steady_cast.h>
+#include <rex/cvar.h>
+
+REXCVAR_DEFINE_STRING(host_cpu_simulation, "", "Kernel",
+                      "Diagnostics (LS-0.5): run on these logical processors only, a list such as "
+                      "0,2,4,6 or 0-7, to approximate a CPU with fewer cores and threads. "
+                      "Sensitivity data only: it keeps this machine's caches, memory and clocks")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 #define LOG_LASTERROR() \
   { spdlog::error("Win32 Error 0x{:08X} in {}(...)", GetLastError(), __FUNCTION__); }
@@ -29,12 +38,53 @@ typedef HANDLE (*SetThreadDescriptionFn)(HANDLE hThread, PCWSTR lpThreadDescript
 
 namespace rex::thread {
 
+namespace {
+// The logical processors host_cpu_simulation limits the process to, or 0.
+uint64_t g_simulated_cpu_mask = 0;
+
+// "0,2,4,6" or "0-7" (or both, comma-separated) as a mask; 0 if malformed.
+uint64_t ParseCpuList(const std::string& text) {
+  uint64_t mask = 0;
+  size_t position = 0;
+  while (position < text.size()) {
+    const size_t end = std::min(text.find(',', position), text.size());
+    const std::string item = text.substr(position, end - position);
+    const size_t dash = item.find('-');
+    try {
+      const unsigned first = std::stoul(item.substr(0, dash));
+      const unsigned last = dash == std::string::npos ? first : std::stoul(item.substr(dash + 1));
+      if (first > last || last >= 64) return 0;
+      for (unsigned cpu = first; cpu <= last; ++cpu) mask |= uint64_t(1) << cpu;
+    } catch (...) {
+      return 0;
+    }
+    position = end + 1;
+  }
+  return mask;
+}
+}  // namespace
+
 void EnableAffinityConfiguration() {
   HANDLE process_handle = GetCurrentProcess();
   DWORD_PTR process_affinity_mask;
   DWORD_PTR system_affinity_mask;
   GetProcessAffinityMask(process_handle, &process_affinity_mask, &system_affinity_mask);
-  SetProcessAffinityMask(process_handle, system_affinity_mask);
+  DWORD_PTR mask = system_affinity_mask;
+  if (const std::string list = REXCVAR_GET(host_cpu_simulation); !list.empty()) {
+    const uint64_t simulated = ParseCpuList(list) & system_affinity_mask;
+    if (simulated) {
+      // Every thread, guest CPU placement and processor count sees only
+      // these processors, as on a smaller CPU.
+      mask = DWORD_PTR(simulated);
+      g_simulated_cpu_mask = simulated;
+      SetLogicalProcessorCountOverride(uint32_t(std::popcount(simulated)));
+      spdlog::warn("host_cpu_simulation: running on logical processors {} ({} of them)", list,
+                   std::popcount(simulated));
+    } else {
+      spdlog::error("host_cpu_simulation: no usable processor in '{}'", list);
+    }
+  }
+  SetProcessAffinityMask(process_handle, mask);
 }
 
 uint32_t current_thread_system_id() {
@@ -453,7 +503,9 @@ const std::vector<HostCore>& HostCores() {
           reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
       const PROCESSOR_RELATIONSHIP& core = entry->Processor;
       if (core.GroupCount && core.GroupMask[0].Group == 0) {
-        result.push_back({uint64_t(core.GroupMask[0].Mask), core.EfficiencyClass});
+        uint64_t mask = uint64_t(core.GroupMask[0].Mask);
+        if (g_simulated_cpu_mask) mask &= g_simulated_cpu_mask;
+        if (mask) result.push_back({mask, core.EfficiencyClass});
       }
       offset += entry->Size;
     }

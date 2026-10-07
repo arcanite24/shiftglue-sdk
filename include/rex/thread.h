@@ -88,8 +88,10 @@ class Fence {
   std::atomic<state_t_> signal_state_;
 };
 
-// Returns the total number of logical processors in the host system.
+// Returns the total number of logical processors in the host system, or the
+// number host_cpu_simulation limits the process to.
 uint32_t logical_processor_count();
+void SetLogicalProcessorCountOverride(uint32_t count);
 
 // Affinity mask of one host physical core (all its logical processors) for
 // guest hardware thread `guest_cpu` (0-5). The Xenon's three cores map onto

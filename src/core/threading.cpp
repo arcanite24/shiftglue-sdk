@@ -19,12 +19,23 @@ namespace rex::thread {
 // Common code
 // =============================================================================
 
+namespace {
+uint32_t g_logical_processor_override = 0;
+}  // namespace
+
 uint32_t logical_processor_count() {
+  if (g_logical_processor_override) {
+    return g_logical_processor_override;
+  }
   static uint32_t value = 0;
   if (!value) {
     value = std::thread::hardware_concurrency();
   }
   return value;
+}
+
+void SetLogicalProcessorCountOverride(uint32_t count) {
+  g_logical_processor_override = count;
 }
 
 thread_local uint32_t current_thread_id_ = UINT_MAX;
