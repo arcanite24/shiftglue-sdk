@@ -84,6 +84,8 @@ class Fh1NativeExecutor {
   // Native surfaces alive and the device memory their images take (LS-0.4).
   size_t surface_count() const { return surfaces_.size(); }
   uint64_t surface_bytes() const { return surface_bytes_; }
+  // EDRAM ownership transfers requested since startup (LS-3.3's census).
+  uint64_t transfer_count() const { return transfer_count_; }
   // Texture loads (untile and copy) timed with the GPU profile, split by
   // whether a resolve wrote the texture's memory.
   uint32_t BeginTextureLoadGpuTiming() { return GpuBegin(); }
@@ -272,6 +274,7 @@ class Fh1NativeExecutor {
   Fh1ExecutorCounters counters_;
   std::map<uint32_t, Surface> surfaces_;
   uint64_t surface_bytes_ = 0;
+  uint64_t transfer_count_ = 0;
   // Direct-mapped front for FindSurface: map nodes stay put until erased,
   // and DestroySurface clears it.
   struct SurfaceFront {

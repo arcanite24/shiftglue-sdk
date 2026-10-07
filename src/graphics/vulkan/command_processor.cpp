@@ -4480,7 +4480,13 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     }
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
-  if (REXCVAR_GET(gpu_template_stats)) {
+  // LS-3.3: what the draw's host work did, for TemplateStatsDrawHost below.
+  const bool template_stats = REXCVAR_GET(gpu_template_stats);
+  const uint64_t template_transfers_before =
+      template_stats && fh1_native_executor_ ? fh1_native_executor_->transfer_count() : 0;
+  const uint64_t template_uploads_before =
+      template_stats ? shared_memory_->upload_request_count() : 0;
+  if (template_stats) {
     // What a compiled replay would key on: everything the draw's derivation
     // reads except the float, bool and loop constants it uploads. Five parts,
     // so the statistics can tell which one varies.
@@ -5133,6 +5139,19 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       state.size = vfetch_constant.size;
       vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
     }
+  }
+  if (template_stats) {
+    // The image views and samplers bound (both stages, in binding order).
+    uint64_t views = 0;
+    for (const VkDescriptorImageInfo& info : descriptor_write_image_info_) {
+      views = (views ^ uint64_t(uintptr_t(info.imageView))) * UINT64_C(0xBF58476D1CE4E5B9);
+      views = (views ^ uint64_t(uintptr_t(info.sampler))) * UINT64_C(0xBF58476D1CE4E5B9);
+      views ^= views >> 31;
+    }
+    TemplateStatsDrawHost(
+        views,
+        fh1_native_executor_ && fh1_native_executor_->transfer_count() != template_transfers_before,
+        shared_memory_->upload_request_count() != template_uploads_before);
   }
 
   // Synchronize the memory pages backing memory scatter export streams, and

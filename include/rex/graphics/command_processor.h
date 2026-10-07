@@ -180,8 +180,16 @@ class CommandProcessor {
   // compiled replay of repeated buffers could skip.
   void TemplateStatsIbBegin(uint64_t ib_key, bool repeat);
   void TemplateStatsIbEnd();
-  static constexpr size_t kTemplateParts = 6;
-  void TemplateStatsDraw(const uint64_t (&parts)[kTemplateParts]);
+  // Parts 0-5 are the guest-side signature (TemplateStatsDraw); 6-8 are
+  // filled after binding (TemplateStatsDrawHost, LS-3.3): the host image
+  // views and samplers bound, and whether the draw needed an EDRAM ownership
+  // transfer or a shared memory upload. A replayed command segment is invalid
+  // when its bound views differ or it would need a transfer the recording did
+  // not have; uploads only need revalidation.
+  static constexpr size_t kTemplateParts = 9;
+  static constexpr size_t kTemplateGuestParts = 6;
+  void TemplateStatsDraw(const uint64_t (&parts)[kTemplateGuestParts]);
+  void TemplateStatsDrawHost(uint64_t bound_views_hash, bool transferred, bool uploaded);
   void TemplateStatsFrame();
   struct TemplateStatsIb {
     uint64_t key = 0;
@@ -199,6 +207,11 @@ class CommandProcessor {
     // Draws at a matching position whose part n matches.
     uint64_t parts_matching[kTemplateParts] = {};
     uint64_t draws_matching_with_constants = 0;
+    // LS-3.3: draws with a transfer or an upload; draws whose state matches
+    // and whose bound views match too without a transfer (replayable as
+    // recorded commands, with fresh constants); and buffers wholly so.
+    uint64_t draws_transferring = 0, draws_uploading = 0, draws_replayable = 0,
+             replayable_ibs = 0, draws_in_replayable_ibs = 0;
   } template_stats_;
   // A sample of buffers: the register file at their first draw, to count
   // which registers differ from the previous execution's.

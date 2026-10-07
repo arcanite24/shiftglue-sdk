@@ -1327,18 +1327,26 @@ void CommandProcessor::TemplateStatsIbEnd() {
     counts.draws_in_repeated_ibs += draws;
   }
   auto& last = template_stats_last_[ib.key];
-  size_t matching = 0, run = 0, in_runs = 0;
+  size_t matching = 0, run = 0, in_runs = 0, replayable = 0;
   for (size_t i = 0; i < draws; ++i) {
     if (i < last.size()) {
       for (size_t part = 0; part < kTemplateParts; ++part) {
         counts.parts_matching[part] += last[i][part] == ib.signatures[i][part];
       }
     }
-    if (i < last.size() && last[i] == ib.signatures[i]) {
+    if (i < last.size() && std::equal(last[i].begin(), last[i].begin() + kTemplateGuestParts,
+                                      ib.signatures[i].begin())) {
       ++counts.draws_matching_with_constants;
     }
-    if (i < last.size() && std::equal(last[i].begin(), last[i].begin() + 5,
-                                      ib.signatures[i].begin())) {
+    const auto& signature = ib.signatures[i];
+    counts.draws_transferring += signature[7] != 0;
+    counts.draws_uploading += signature[8] != 0;
+    const bool state_matches = i < last.size() && std::equal(last[i].begin(), last[i].begin() + 5,
+                                                             signature.begin());
+    if (state_matches && last[i][6] == signature[6] && !signature[7] && !last[i][7]) {
+      ++replayable;
+    }
+    if (state_matches) {
       ++matching;
       ++run;
     } else {
@@ -1354,10 +1362,26 @@ void CommandProcessor::TemplateStatsIbEnd() {
     ++counts.matching_ibs;
     counts.draws_in_matching_ibs += draws;
   }
+  counts.draws_replayable += replayable;
+  if (draws && replayable == draws && last.size() == draws) {
+    ++counts.replayable_ibs;
+    counts.draws_in_replayable_ibs += draws;
+  }
   last = std::move(ib.signatures);
 }
 
-void CommandProcessor::TemplateStatsDraw(const uint64_t (&parts)[kTemplateParts]) {
+void CommandProcessor::TemplateStatsDrawHost(uint64_t bound_views_hash, bool transferred,
+                                             bool uploaded) {
+  if (template_stats_stack_.empty() || template_stats_stack_.back().signatures.empty()) {
+    return;
+  }
+  auto& signature = template_stats_stack_.back().signatures.back();
+  signature[6] = bound_views_hash;
+  signature[7] = transferred;
+  signature[8] = uploaded;
+}
+
+void CommandProcessor::TemplateStatsDraw(const uint64_t (&parts)[kTemplateGuestParts]) {
   ++template_stats_.draws;
   if (!template_stats_stack_.empty() && template_stats_stack_.back().signatures.empty() &&
       (template_stats_stack_.back().key * UINT64_C(0x9E3779B97F4A7C15)) >> 58 == 0) {
@@ -1372,6 +1396,7 @@ void CommandProcessor::TemplateStatsDraw(const uint64_t (&parts)[kTemplateParts]
   }
   if (!template_stats_stack_.empty()) {
     auto& signature = template_stats_stack_.back().signatures.emplace_back();
+    signature.fill(0);
     std::copy(std::begin(parts), std::end(parts), signature.begin());
   }
 }
@@ -1401,6 +1426,14 @@ void CommandProcessor::TemplateStatsFrame() {
       percent(c.parts_matching[0]), percent(c.parts_matching[1]), percent(c.parts_matching[2]),
       percent(c.parts_matching[3]), percent(c.parts_matching[4]), percent(c.parts_matching[5]),
       percent(c.draws_matching_with_constants));
+  REXGPU_INFO(
+      "Draw templates (LS-3.3): {:.1f} % of draws needed an EDRAM transfer and {:.1f} % a shared "
+      "memory upload; host image views and samplers matching at matching positions {:.1f} %; "
+      "{:.0f} draws a frame ({:.1f} %) replayable as recorded commands with fresh constants, "
+      "{:.0f} ({:.1f} %) in wholly replayable buffers ({:.1f} buffers)",
+      percent(c.draws_transferring), percent(c.draws_uploading), percent(c.parts_matching[6]),
+      c.draws_replayable / f, percent(c.draws_replayable), c.draws_in_replayable_ibs / f,
+      percent(c.draws_in_replayable_ibs), c.replayable_ibs / f);
   std::vector<std::pair<uint64_t, uint32_t>> diffs;
   for (const auto& [index, count] : template_stats_register_diffs_) diffs.emplace_back(count, index);
   std::sort(diffs.rbegin(), diffs.rend());

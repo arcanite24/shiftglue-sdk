@@ -79,6 +79,8 @@ class SharedMemory {
   // the range has been fully updated and is usable.
   bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
   bool RequestRange(uint32_t start, uint32_t length);
+  // Requests that had pages to upload, since startup (LS-3.3's census).
+  uint64_t upload_request_count() const { return upload_request_count_; }
 
   // What the current requests are for, to size uploads by kind (NP-2.8).
   enum class UploadKind : uint32_t { kOther, kVertex, kIndex, kTexture, kMemexport, kCount };
@@ -204,6 +206,7 @@ class SharedMemory {
   std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_;
   UploadKind upload_kind_ = UploadKind::kOther;
   UploadStats upload_stats_[size_t(UploadKind::kCount)];
+  uint64_t upload_request_count_ = 0;
   uint32_t upload_frame_ = 1;
   std::vector<uint32_t> page_upload_frame_;
   // RequestRanges scratch for the merged request list.

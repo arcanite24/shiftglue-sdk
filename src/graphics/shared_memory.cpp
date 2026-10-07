@@ -556,6 +556,7 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     return true;
   }
 
+  ++upload_request_count_;
   UploadStats& stats = upload_stats_[size_t(upload_kind_)];
   ++stats.requests;
   stats.ranges += upload_ranges_.size();

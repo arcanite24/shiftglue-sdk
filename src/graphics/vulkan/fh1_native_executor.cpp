@@ -1074,6 +1074,7 @@ void Fh1NativeExecutor::TransferRects(Surface& dest, uint32_t previous_owner, co
     return Skip("transfer_format");
   }
   Count("transfer");
+  ++transfer_count_;
   const bool source_stencil =
       source->key.is_depth ? source->stencil_nonzero && tiles_stencil : true;
   uint32_t pass_count = 1;
