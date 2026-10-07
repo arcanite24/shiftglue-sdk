@@ -636,6 +636,58 @@ class VulkanCommandProcessor : public CommandProcessor {
   // its budget (VK_EXT_memory_budget), the native surfaces, the texture cache
   // and the resident size.
   void LogMemoryBudget();
+
+  // RR-0.1, gpu_draw_cost_model: where a draw's recorder time goes. One draw
+  // in 16 is timed step by step; every draw's IssueDraw and every register
+  // run are timed whole, and the frame's record batch time is the total they
+  // are checked against. Logged by the frame's draw band every 600 frames.
+  enum DrawCostStep : uint32_t {
+    kCostAnalysis,          // shader and memexport analysis, census
+    kCostPrimitives,        // submission begin, primitive processing
+    kCostTranslation,       // translations and samplers
+    kCostTextures,          // RequestTextures
+    kCostTargets,           // executor PrepareTargets and BindTargets
+    kCostPipeline,          // pipeline lookup and bind, layout
+    kCostDynamicState,      // viewport and dynamic state
+    kCostSystemConstants,   // UpdateSystemConstantValues
+    kCostConstantUploads,   // UpdateBindings: constant buffers
+    kCostTextureBindings,   // UpdateBindings: texture and sampler sets
+    kCostDescriptorBinds,   // UpdateBindings: binds and pushes
+    kCostVertexBuffers,     // vertex residency
+    kCostMemexport,         // memexport ranges, shared memory use
+    kCostBeginRendering,    // executor BeginDrawRendering
+    kCostDraw,              // the draw command and what follows it
+    kCostStepCount
+  };
+  void DrawCostMark(DrawCostStep step) {
+    if (draw_cost_.sampling) {
+      const uint64_t now = DrawCostNow();
+      draw_cost_.pending[step] += now - draw_cost_.last;
+      draw_cost_.last = now;
+    }
+  }
+  static uint64_t DrawCostNow() { return CostTicks(); }
+  void DrawCostFrame();
+  struct DrawCostModel {
+    bool enabled = false;
+    bool sampling = false;
+    uint64_t last = 0;
+    uint64_t pending[kCostStepCount] = {};
+    uint64_t counter = 0;
+    uint64_t frame_draws = 0, frame_sampled = 0, frame_issue_ns = 0, frame_register_ns = 0;
+    uint64_t frame_steps[kCostStepCount] = {};
+    uint64_t batch_ns_at_frame = 0;
+    uint64_t draws_ns_at_frame = 0, ones_ns_at_frame = 0, calls_ns_at_frame = 0;
+    uint64_t batch_ticks_at_frame = 0, entries_at_frame = 0;
+    // Tick rate: ticks and steady nanoseconds at the start of the window.
+    uint64_t window_ticks = 0, window_ns = 0;
+    struct Band {
+      uint64_t frames = 0, draws = 0, sampled = 0, issue_ns = 0, register_ns = 0, batch_ns = 0;
+      uint64_t draw_records_ns = 0, ones_ns = 0, calls_ns = 0, batch_ticks = 0, entries = 0;
+      uint64_t steps[kCostStepCount] = {};
+    } bands[3];
+    uint64_t frames = 0;
+  } draw_cost_;
   std::chrono::steady_clock::time_point memory_sampled_{};
   std::chrono::steady_clock::time_point memory_budget_logged_{};
   bool memory_over_budget_ = false;

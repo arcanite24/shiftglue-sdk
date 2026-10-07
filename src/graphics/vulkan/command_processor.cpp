@@ -125,6 +125,11 @@ REXCVAR_DEFINE_BOOL(vulkan_fh1_native_executor, true, "GPU/Vulkan",
                     "and resolves over native surfaces) instead of the generic render "
                     "target cache; needs dynamic rendering")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(gpu_draw_cost_model, false, "GPU/Vulkan",
+                    "Diagnostics (RR-0.1): time one draw in 16 step by step on the recorder, "
+                    "and every draw and register run whole, and log the cost by draw band "
+                    "every 600 frames")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(texture_cache_memory_budget_limits, true, "GPU/Vulkan",
                     "Lower the texture cache limits to what the device's memory budget "
                     "(VK_EXT_memory_budget) leaves, for small cards and shared memory")
@@ -686,6 +691,104 @@ void VulkanCommandProcessor::ClearCaches() {
   CommandProcessor::ClearCaches();
   InvalidateAllVertexBufferResidency();
   cache_clear_requested_ = true;
+}
+
+void VulkanCommandProcessor::DrawCostFrame() {
+  DrawCostModel& m = draw_cost_;
+  const uint64_t batch_ns = record_batch_ns_ - m.batch_ns_at_frame;
+  m.batch_ns_at_frame = record_batch_ns_;
+  const uint64_t draw_records_ns = record_draws_ns_ - m.draws_ns_at_frame;
+  const uint64_t ones_ns = record_ones_ns_ - m.ones_ns_at_frame;
+  const uint64_t calls_ns = record_calls_ns_ - m.calls_ns_at_frame;
+  m.draws_ns_at_frame = record_draws_ns_;
+  m.ones_ns_at_frame = record_ones_ns_;
+  m.calls_ns_at_frame = record_calls_ns_;
+  const uint64_t batch_ticks = record_batch_ticks_ - m.batch_ticks_at_frame;
+  const uint64_t entries = record_entries_ - m.entries_at_frame;
+  m.batch_ticks_at_frame = record_batch_ticks_;
+  m.entries_at_frame = record_entries_;
+  record_cost_enabled_ = REXCVAR_GET(gpu_draw_cost_model);
+  if (!m.enabled) {
+    return;
+  }
+  if (m.frame_draws) {
+    // The bands of summarize-low-spec.py: heavy, gameplay, light.
+    DrawCostModel::Band& band =
+        m.bands[m.frame_draws >= 5000 ? 0 : m.frame_draws >= 2000 ? 1 : 2];
+    ++band.frames;
+    band.draws += m.frame_draws;
+    band.sampled += m.frame_sampled;
+    band.issue_ns += m.frame_issue_ns;
+    band.register_ns += m.frame_register_ns;
+    band.batch_ns += batch_ns;
+    band.draw_records_ns += draw_records_ns;
+    band.ones_ns += ones_ns;
+    band.calls_ns += calls_ns;
+    band.batch_ticks += batch_ticks;
+    band.entries += entries;
+    for (uint32_t step = 0; step < kCostStepCount; ++step) band.steps[step] += m.frame_steps[step];
+  }
+  m.frame_draws = m.frame_sampled = m.frame_issue_ns = m.frame_register_ns = 0;
+  std::fill(std::begin(m.frame_steps), std::end(m.frame_steps), 0);
+  if (!m.window_ticks) {
+    m.window_ticks = CostTicks();
+    m.window_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count());
+  }
+  if (++m.frames < 600) {
+    return;
+  }
+  m.frames = 0;
+  // Nanoseconds a tick over the window (1 off x86, where ticks are ns).
+  const uint64_t now_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count());
+  const uint64_t now_ticks = CostTicks();
+  const double ns_per_tick =
+      now_ticks > m.window_ticks ? double(now_ns - m.window_ns) / double(now_ticks - m.window_ticks)
+                                 : 1.0;
+  m.window_ticks = now_ticks;
+  m.window_ns = now_ns;
+  static constexpr const char* kStepNames[kCostStepCount] = {
+      "analysis", "primitives", "translation", "textures", "targets",
+      "pipeline", "dynamic", "system_constants", "constant_uploads", "texture_bindings",
+      "binds", "vertex", "memexport", "begin_rendering", "draw"};
+  static constexpr const char* kBandNames[3] = {"heavy", "gameplay", "light"};
+  for (uint32_t b = 0; b < 3; ++b) {
+    DrawCostModel::Band& band = m.bands[b];
+    if (!band.frames || !band.sampled || !band.draws) continue;
+    uint64_t sampled_total = 0;
+    std::string steps;
+    for (uint32_t step = 0; step < kCostStepCount; ++step) {
+      sampled_total += band.steps[step];
+      steps += fmt::format(" {}={:.0f}", kStepNames[step],
+                           ns_per_tick * double(band.steps[step]) / double(band.sampled));
+    }
+    const double issue_per_draw = ns_per_tick * double(band.issue_ns) / double(band.draws);
+    const double t = ns_per_tick / double(band.frames) / 1e6;  // ticks a frame to ms
+    REXGPU_INFO(
+        "Draw cost (RR-0.1) {} band, {} frames, {:.0f} draws a frame: ns a draw{}; steps {:.0f} "
+        "of IssueDraw {:.0f} ns a draw ({:.1f} %); a frame: IssueDraw {:.2f} ms, register runs "
+        "{:.2f} ms, record batches {:.2f} ms (IssueDraw and registers {:.1f} % of it); by entry: "
+        "draw records {:.2f} ms, single registers {:.2f} ms, calls {:.2f} ms (entries {:.1f} % "
+        "of batches, {:.0f} entries a frame, timed batch loop {:.2f} ms)",
+        kBandNames[b], band.frames, double(band.draws) / double(band.frames), steps,
+        ns_per_tick * double(sampled_total) / double(band.sampled), issue_per_draw,
+        100.0 * ns_per_tick * double(sampled_total) / double(band.sampled) / issue_per_draw,
+        double(band.issue_ns) * t, double(band.register_ns) * t,
+        double(band.batch_ns) / double(band.frames) / 1e6,
+        band.batch_ns ? 100.0 * ns_per_tick * double(band.issue_ns + band.register_ns) /
+                            double(band.batch_ns)
+                      : 0.0,
+        double(band.draw_records_ns) * t, double(band.ones_ns) * t, double(band.calls_ns) * t,
+        band.batch_ticks ? 100.0 * double(band.draw_records_ns + band.register_ns + band.ones_ns +
+                                          band.calls_ns) /
+                               double(band.batch_ticks)
+                         : 0.0,
+        double(band.entries) / double(band.frames), double(band.batch_ticks) * t);
+    band = DrawCostModel::Band();
+  }
 }
 
 void VulkanCommandProcessor::LogMemoryBudget() {
@@ -2742,6 +2845,14 @@ void VulkanCommandProcessor::WriteRegistersHost(uint32_t start_index, const uint
   if (!num_registers) {
     return;
   }
+  struct RegisterCost {
+    DrawCostModel& model;
+    const uint64_t start;
+    explicit RegisterCost(DrawCostModel& m) : model(m), start(m.enabled ? DrawCostNow() : 0) {}
+    ~RegisterCost() {
+      if (model.enabled) model.frame_register_ns += DrawCostNow() - start;
+    }
+  } register_cost(draw_cost_);
   uint32_t end_index = start_index + num_registers - 1;
 
   static constexpr uint32_t kHostClassBoundaries[] = {
@@ -2861,6 +2972,7 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
+  DrawCostFrame();
   IssueSwapImpl(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   // Settings that rebuild host objects apply between frames.
   SwitchDrawResolutionScaleIfRequested();
@@ -4376,8 +4488,15 @@ Shader* VulkanCommandProcessor::LoadShaderHashed(xenos::ShaderType shader_type,
 bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
+  draw_cost_.enabled = REXCVAR_GET(gpu_draw_cost_model);
+  const uint64_t issue_start = draw_cost_.enabled ? DrawCostNow() : 0;
   const bool issued =
       IssueDrawImpl(prim_type, index_count, index_buffer_info, major_mode_explicit);
+  if (draw_cost_.enabled) {
+    draw_cost_.frame_issue_ns += DrawCostNow() - issue_start;
+    ++draw_cost_.frame_draws;
+    draw_cost_.sampling = false;
+  }
   // Hand the worker a part of the frame now and then, when ending the
   // submission neither ends a guest occlusion query nor waits for pipelines.
   if (async_submission_ && submission_split_draws_ && submission_open_ &&
@@ -4406,6 +4525,11 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   const RegisterFile& regs = *register_file_;
   const uint64_t memo_state = StateMemoKey();
   (void)index_buffer_info;
+  if (draw_cost_.enabled && (++draw_cost_.counter & 15) == 0) {
+    draw_cost_.sampling = true;
+    std::fill(std::begin(draw_cost_.pending), std::end(draw_cost_.pending), 0);
+    draw_cost_.last = DrawCostNow();
+  }
   auto draw_fail = [&](const char* stage) {
     auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
     REXGPU_ERROR(
@@ -4596,6 +4720,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   VulkanShader::VulkanTranslation* pixel_shader_translation;
   bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
 
+  DrawCostMark(kCostAnalysis);
   // Two iterations because a submission (even the current one - in which case
   // it needs to be ended, and a new one must be started) may need to be awaited
   // in case of a sampler count overflow, and if that happens, all subsystem
@@ -4618,6 +4743,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     if (!primitive_processor_->Process(primitive_processing_result)) {
       return draw_fail("primitive_processing");
     }
+    DrawCostMark(kCostPrimitives);
     if (!primitive_processing_result.host_draw_vertex_count) {
       // Nothing to draw.
       return true;
@@ -4829,6 +4955,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     CheckSubmissionFenceAndDeviceLoss(sampler_overflow_await_submission);
   }
 
+  DrawCostMark(kCostTranslation);
   // Update the textures before most other work in the submission because
   // samplers depend on this (and in case of sampler overflow in a submission,
   // submissions must be split) - may perform dispatches and copying.
@@ -4851,6 +4978,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
             : 0);
   }
 
+  DrawCostMark(kCostTextures);
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
   // Set up the render targets - this may perform dispatches and draws.
   Fh1DrawInfo fh1_draw;
@@ -4872,6 +5000,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     return draw_fail("render_target_update");
   }
 
+  DrawCostMark(kCostTargets);
   // Create the pipeline (for this, need the render pass from the render target
   // cache), translating the shaders - doing this now to obtain the used
   // textures.
@@ -4988,6 +5117,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     current_guest_graphics_pipeline_layout_ = pipeline_layout;
   }
 
+  DrawCostMark(kCostPipeline);
   bool host_render_targets_used =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
   uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
@@ -5080,10 +5210,12 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     }
   }
 
+  DrawCostMark(kCostDynamicState);
   // Update system constants before uploading them.
   UpdateSystemConstantValues(primitive_polygonal, primitive_processing_result,
                              shader_32bit_index_dma, 0, viewport_info, used_texture_mask,
                              normalized_depth_control, normalized_color_mask);
+  DrawCostMark(kCostSystemConstants);
 
   // Update uniform buffers and descriptor sets after binding the pipeline with
   // the new layout.
@@ -5154,6 +5286,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         shared_memory_->upload_request_count() != template_uploads_before);
   }
 
+  DrawCostMark(kCostVertexBuffers);
   // Synchronize the memory pages backing memory scatter export streams, and
   // calculate the range that includes the streams for the buffer barrier.
   uint32_t memexport_extent_start = UINT32_MAX, memexport_extent_end = 0;
@@ -5235,6 +5368,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
   }
 
+  DrawCostMark(kCostMemexport);
   // After all commands that may dispatch, copy or insert barriers, submit
   // the barriers (may end the render pass), and (re)enter the render pass
   // before drawing.
@@ -5246,6 +5380,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         render_target_cache_->last_update_framebuffer());
   }
 
+  DrawCostMark(kCostBeginRendering);
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
@@ -5320,6 +5455,15 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     }
   }
 
+  DrawCostMark(kCostDraw);
+  if (draw_cost_.sampling) {
+    // Only draws that completed count; one that returned early is dropped.
+    for (uint32_t step = 0; step < kCostStepCount; ++step) {
+      draw_cost_.frame_steps[step] += draw_cost_.pending[step];
+    }
+    ++draw_cost_.frame_sampled;
+    draw_cost_.sampling = false;
+  }
   return true;
 }
 
@@ -8049,6 +8193,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     }
   }
 
+  DrawCostMark(kCostConstantUploads);
   // Textures and samplers.
   const std::vector<VulkanShader::SamplerBinding>& samplers_vertex =
       vertex_shader->GetSamplerBindingsAfterTranslation();
@@ -8316,6 +8461,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   // successfully.
   current_graphics_descriptor_set_values_up_to_date_ |= write_descriptor_set_bits;
 
+  DrawCostMark(kCostTextureBindings);
   // Bind the new descriptor sets.
   uint32_t descriptor_sets_needed = (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetCount) - 1;
   if (!texture_count_vertex && !sampler_count_vertex) {
@@ -8358,7 +8504,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     current_graphics_descriptor_sets_bound_up_to_date_ |=
         UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
   }
-
+  DrawCostMark(kCostDescriptorBinds);
   return true;
 }
 

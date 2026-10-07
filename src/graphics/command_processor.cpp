@@ -496,9 +496,10 @@ void CommandProcessor::RecordThreadMain() {
     const auto busy_start = std::chrono::steady_clock::now();
     ExecuteRecordBatch(*batch);
     const auto busy_end = std::chrono::steady_clock::now();
-    PERF_counter_add(kGpuRecorderBusyNs,
-                     std::chrono::duration_cast<std::chrono::nanoseconds>(busy_end - busy_start)
-                         .count());
+    const int64_t busy_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(busy_end - busy_start).count();
+    PERF_counter_add(kGpuRecorderBusyNs, busy_ns);
+    record_batch_ns_ += uint64_t(busy_ns);
     if (busy_end - cpu_read_time >= std::chrono::milliseconds(1)) {
       read_cpu(busy_end);
     }
@@ -516,6 +517,10 @@ void CommandProcessor::RecordThreadMain() {
 void CommandProcessor::ExecuteRecordBatch(RecordBatch& batch) {
   const uint32_t* words = batch.words.data();
   const size_t count = batch.words.size();
+  if (record_cost_enabled_) {
+    ExecuteRecordBatchTimed(batch);
+    return;
+  }
   for (size_t i = 0; i < count;) {
     switch (words[i]) {
       case kRecordRun: {
@@ -543,6 +548,47 @@ void CommandProcessor::ExecuteRecordBatch(RecordBatch& batch) {
         return;
     }
   }
+}
+
+void CommandProcessor::ExecuteRecordBatchTimed(RecordBatch& batch) {
+  // ExecuteRecordBatch with each entry kind's time (RR-0.1's coverage).
+  auto elapsed = [](uint64_t start) { return CostTicks() - start; };
+  const uint64_t batch_start = CostTicks();
+  const uint32_t* words = batch.words.data();
+  const size_t count = batch.words.size();
+  for (size_t i = 0; i < count;) {
+    const uint64_t start = CostTicks();
+    ++record_entries_;
+    switch (words[i]) {
+      case kRecordRun: {
+        const uint32_t first = words[i + 1];
+        const uint32_t run = words[i + 2];
+        WriteRegistersHost(first, words + i + 3, run);
+        i += 3 + run;
+      } break;
+      case kRecordOne:
+        WriteRegister(words[i + 1], words[i + 2]);
+        i += 3;
+        record_ones_ns_ += elapsed(start);
+        break;
+      case kRecordCall:
+        batch.fns[words[i + 1]]();
+        i += 2;
+        record_calls_ns_ += elapsed(start);
+        break;
+      case kRecordDraw: {
+        DrawRecord record;
+        std::memcpy(&record, words + i + 1, sizeof(record));
+        ExecuteDrawRecord(record);
+        i += 1 + kDrawRecordWords;
+        record_draws_ns_ += elapsed(start);
+      } break;
+      default:
+        assert_always();
+        return;
+    }
+  }
+  record_batch_ticks_ += CostTicks() - batch_start;
 }
 
 namespace {

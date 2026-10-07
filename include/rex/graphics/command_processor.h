@@ -12,6 +12,10 @@
 #pragma once
 
 #include <array>
+#include <chrono>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <intrin.h>
+#endif
 #include <atomic>
 #include <cstring>
 #include <functional>
@@ -173,6 +177,27 @@ class CommandProcessor {
   // for backends that only override WriteRegistersFromMem.
   virtual void WriteRegistersHost(uint32_t start_index, const uint32_t* values,
                                   uint32_t num_registers);
+  // Recorder time spent executing record batches since startup (the
+  // recorder thread only; RR-0.1's coverage check).
+  uint64_t record_batch_ns_ = 0;
+  // RR-0.1's clock: the time-stamp counter on x86 (a few cycles a read),
+  // steady-clock nanoseconds elsewhere; converted to nanoseconds when logged.
+  static uint64_t CostTicks() {
+#if defined(__x86_64__) || defined(_M_X64)
+    return __rdtsc();
+#else
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
+#endif
+  }
+  // With record_cost_enabled_ (gpu_draw_cost_model), the batch time by entry:
+  // draw records (IssueDraw and its record handling), single register writes
+  // and calls.
+  bool record_cost_enabled_ = false;
+  // In CostTicks units despite the names' unit, like record_batch_ticks_.
+  uint64_t record_draws_ns_ = 0, record_ones_ns_ = 0, record_calls_ns_ = 0;
+  uint64_t record_batch_ticks_ = 0, record_entries_ = 0;
   // gpu_template_stats (DR-4.2's first stage, recorder thread): each draw's
   // signature (register state, shaders, the fetch constants it uses, the draw
   // packet) in the indirect buffer execution it belongs to, compared at the
@@ -480,6 +505,7 @@ class CommandProcessor {
   void StopRecordThread();
   void RecordThreadMain();
   void ExecuteRecordBatch(RecordBatch& batch);
+  void ExecuteRecordBatchTimed(RecordBatch& batch);
   bool record_split_ = false;
   // gpu_record_elide_unchanged_registers, read when the split starts.
   bool elide_unchanged_registers_ = false;
