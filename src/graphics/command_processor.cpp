@@ -58,25 +58,10 @@ REXCVAR_DEFINE_BOOL(gpu_record_elide_unchanged_registers, true, "GPU",
                     "plain state register or shader constant unchanged, so the recorder neither "
                     "applies them nor invalidates what depends on them")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-#if !REX_PLATFORM_WIN32
-// POSIX sleeps are fine-grained: short sleeps instead of a busy yield, for
-// power (measured on the Snapdragon 8 Elite: a third less CPU on the
-// commands thread, same frames). Linux and the Steam Deck share it (LS-2.1).
-constexpr int32_t kWaitRegMemYieldUsDefault = 100;
-constexpr int32_t kWaitRegMemSleepUsDefault = 100;
-#else
-// Windows sleeps 100 us on a high-resolution waitable timer after a 200 us
-// yield (LS-2.2): against the former 2 ms yield it took 2.3-3.5 ms less
-// decoder CPU a race frame at 60 fps, with a p95 about 0.9 ms lower, on 16,
-// 8 and 4 threads of a Ryzen 7 5800X.
-constexpr int32_t kWaitRegMemYieldUsDefault = 200;
-constexpr int32_t kWaitRegMemSleepUsDefault = 100;
-#endif
-REXCVAR_DEFINE_INT32(wait_reg_mem_yield_us, kWaitRegMemYieldUsDefault, "GPU",
-                     "With vsync or configured short sleeps, how long a WAIT_REG_MEM poll yields (the "
-                     "sleep is at least a millisecond, which can outlast the wait); 0 sleeps at "
-                     "once")
-    .range(0, 16000)
+REXCVAR_DEFINE_INT32(wait_reg_mem_yield_us, -1, "GPU",
+                     "With vsync or configured short sleeps, how long a WAIT_REG_MEM poll yields "
+                     "before sleeping; 0 sleeps at once, -1 chooses by platform and game rate")
+    .range(-1, 16000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(gpu_record_merge_constant_runs, true, "GPU",
                     "With gpu_record_thread, the decoder extends the last recorded float "
@@ -105,13 +90,55 @@ REXCVAR_DEFINE_INT32(gpu_idle_spin_count, 500, "GPU",
                      "when no other thread wants the core)")
     .range(0, 100000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_INT32(wait_reg_mem_sleep_us, kWaitRegMemSleepUsDefault, "GPU",
+REXCVAR_DEFINE_INT32(wait_reg_mem_sleep_us, -1, "GPU",
                      "How long each WAIT_REG_MEM sleep after the yield period lasts, even without vsync; "
                      "0 retains busy polling without vsync, or uses the packet interval with vsync. Short sleeps "
                      "stop the commands thread spinning for power without the millisecond's "
-                     "latency")
-    .range(0, 16000)
+                     "latency; -1 chooses by platform and game rate")
+    .range(-1, 16000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+namespace {
+struct WaitRegMemPolicy {
+  int32_t yield_us;
+  int32_t sleep_us;
+};
+
+// The WAIT_REG_MEM yield and sleep, -1 in either setting chosen here (LS-2.1,
+// LS-2.2). POSIX sleeps are fine-grained: short sleeps instead of a busy
+// yield, for power (Snapdragon 8 Elite: a third less CPU on the commands
+// thread, same frames); Linux and the Steam Deck share it. On Windows, at a
+// game rate of 60 or less, 100 us sleeps on a high-resolution waitable timer
+// after a 200 us yield took 2.3-3.5 ms less decoder CPU a race frame than
+// the former 2 ms yield, with a p95 about 0.9 ms lower, on 16, 8 and 4
+// threads of a Ryzen 7 5800X. Above 60 the wake-up latency cost 3 % of the
+// frame rate at 120, so faster rates keep the 2 ms yield (NP-9.3).
+WaitRegMemPolicy CurrentWaitRegMemPolicy() {
+  WaitRegMemPolicy policy{REXCVAR_GET(wait_reg_mem_yield_us), REXCVAR_GET(wait_reg_mem_sleep_us)};
+#if REX_PLATFORM_WIN32
+  if (policy.yield_us < 0 || policy.sleep_us < 0) {
+    // The game rate's settings live in other modules: read them by name,
+    // at most twice a second (the decoder thread is the only caller).
+    thread_local bool fast = false;
+    thread_local std::chrono::steady_clock::time_point next_read{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= next_read) {
+      next_read = now + std::chrono::milliseconds(500);
+      const int limit = std::atoi(rex::cvar::GetFlagByName("pinyon_shift_fh1_render_fps_limit").c_str());
+      const double rate = limit > 0 ? double(limit)
+                                    : std::atof(rex::cvar::GetFlagByName("video_mode_refresh_rate").c_str());
+      fast = rate > 61.0;
+    }
+    if (policy.yield_us < 0) policy.yield_us = fast ? 2000 : 200;
+    if (policy.sleep_us < 0) policy.sleep_us = fast ? 0 : 100;
+  }
+#else
+  if (policy.yield_us < 0) policy.yield_us = 100;
+  if (policy.sleep_us < 0) policy.sleep_us = 100;
+#endif
+  return policy;
+}
+}  // namespace
 
 REXCVAR_DEFINE_STRING(fh1_debug_skip_draws, "", "GPU",
                       "Diagnostics: skip the draws with these indices in every frame, as "
@@ -1920,12 +1947,13 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         }
         // A configured short sleep bounds polling even without VSync.
         // Android defaults to this to avoid burning a core while waiting.
-        if (!REXCVAR_GET(vsync) && REXCVAR_GET(wait_reg_mem_sleep_us) == 0) {
+        const WaitRegMemPolicy policy = CurrentWaitRegMemPolicy();
+        if (!REXCVAR_GET(vsync) && policy.sleep_us == 0) {
           rex::thread::MaybeYield();
         } else if (std::chrono::steady_clock::now() - wait_start <
-                   std::chrono::microseconds(REXCVAR_GET(wait_reg_mem_yield_us))) {
+                   std::chrono::microseconds(policy.yield_us)) {
           rex::thread::MaybeYield();
-        } else if (const int32_t sleep_us = REXCVAR_GET(wait_reg_mem_sleep_us)) {
+        } else if (const int32_t sleep_us = policy.sleep_us) {
           // WaitUntil uses a high-resolution waitable timer on Windows, where
           // Sleep rounds anything under a millisecond down to a yield (LS-2.2).
           rex::thread::WaitUntil(std::chrono::steady_clock::now() +
