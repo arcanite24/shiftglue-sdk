@@ -218,6 +218,8 @@ class UserProfile {
   UserProfile();
 
   uint64_t xuid() const { return xuid_; }
+  // The user_xuid cvar's value, or the default when it is not a usable XUID.
+  static uint64_t ParseXuid(std::string_view requested);
   std::string name() const { return name_; }
   // A valid gamertag from `requested` ("User" when nothing usable is left).
   static std::string SanitizeGamertag(std::string_view requested);

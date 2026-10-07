@@ -23,6 +23,12 @@ REXCVAR_DEFINE_STRING(user_name, "User", "Kernel",
                       "digits and spaces); the save directory does not depend on it")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_STRING(user_xuid, "B13EBABEBABEBABE", "Kernel",
+                      "Offline XUID of the signed-in profile, 16 hex digits. Titles may sign "
+                      "saves with it, and content lives under a folder of this name, so saves "
+                      "copied from another emulator profile need that profile's XUID")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex {
 namespace system {
 namespace xam {
@@ -44,11 +50,42 @@ std::string UserProfile::SanitizeGamertag(std::string_view requested) {
   return name.empty() ? std::string("User") : name;
 }
 
+uint64_t UserProfile::ParseXuid(std::string_view requested) {
+  constexpr uint64_t kDefault = 0xB13EBABEBABEBABE;
+  // Accept exactly 16 hex digits, optionally prefixed with 0x. Zero and XUIDs
+  // carrying the 0x00C0000000000000 bits (refused by titles, see below) fall
+  // back to the default rather than locking the player out.
+  if (requested.size() == 18 && requested[0] == '0' && (requested[1] == 'x' || requested[1] == 'X')) {
+    requested.remove_prefix(2);
+  }
+  if (requested.size() != 16) {
+    if (!requested.empty()) REXSYS_WARN("user_xuid must be 16 hex digits; using the default");
+    return kDefault;
+  }
+  uint64_t value = 0;
+  for (char c : requested) {
+    uint64_t digit;
+    if (c >= '0' && c <= '9') digit = c - '0';
+    else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+    else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+    else {
+      REXSYS_WARN("user_xuid must be 16 hex digits; using the default");
+      return kDefault;
+    }
+    value = (value << 4) | digit;
+  }
+  if (!value || (value & 0x00C0000000000000ull)) {
+    REXSYS_WARN("user_xuid {:016X} is not a usable offline XUID; using the default", value);
+    return kDefault;
+  }
+  return value;
+}
+
 UserProfile::UserProfile() {
   // 58410A1F checks the user XUID against a mask of 0x00C0000000000000 (3<<54),
   // if non-zero, it prevents the user from playing the game.
   // "You do not have permissions to perform this operation."
-  xuid_ = 0xB13EBABEBABEBABE;
+  xuid_ = ParseXuid(REXCVAR_GET(user_xuid));
   name_ = SanitizeGamertag(REXCVAR_GET(user_name));
 
   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=gfwl+live&start=195
