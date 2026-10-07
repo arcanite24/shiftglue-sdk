@@ -688,6 +688,15 @@ class VulkanCommandProcessor : public CommandProcessor {
     } bands[3];
     uint64_t frames = 0;
   } draw_cost_;
+  // RR-2.1 census, with the cost model: uploads by constant buffer (system,
+  // float vertex, float pixel, bool and loop, fetch), their bytes, and how
+  // many repeat the buffer's previous upload byte for byte.
+  struct ConstantCensus {
+    uint64_t draws = 0;
+    uint64_t uploads[5] = {}, bytes[5] = {}, repeats[5] = {};
+    std::vector<uint8_t> last[5];
+  } constant_census_;
+  void CountConstantUpload(uint32_t buffer, const void* data, size_t size);
   std::chrono::steady_clock::time_point memory_sampled_{};
   std::chrono::steady_clock::time_point memory_budget_logged_{};
   bool memory_over_budget_ = false;

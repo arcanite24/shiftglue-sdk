@@ -735,6 +735,21 @@ void VulkanCommandProcessor::DrawCostFrame() {
       }
       REXGPU_INFO("System constants memo misses by key word (24 is the epoch):{}", words);
     }
+    if (constant_census_.draws) {
+      const ConstantCensus& c = constant_census_;
+      static const char* const kNames[] = {"system", "float_vertex", "float_pixel", "bool_loop",
+                                           "fetch"};
+      std::string parts;
+      for (uint32_t i = 0; i < 5; ++i) {
+        parts += fmt::format(" {}: {:.2f} a draw, {:.0f} bytes, {:.1f} % repeats;", kNames[i],
+                             double(c.uploads[i]) / double(c.draws),
+                             c.uploads[i] ? double(c.bytes[i]) / double(c.uploads[i]) : 0.0,
+                             c.uploads[i] ? 100.0 * double(c.repeats[i]) / double(c.uploads[i])
+                                          : 0.0);
+      }
+      REXGPU_INFO("Constant census (RR-2.1) over 600 frames, {} draws:{}", c.draws, parts);
+      constant_census_ = {};
+    }
     system_constants_memo_frames_ = 0;
     system_constants_memo_hits_ = system_constants_memo_calls_ = 0;
     system_constants_memo_mismatches_ = 0;
@@ -8141,6 +8156,17 @@ void GatherFloatConstants(uint8_t* out, const uint64_t (&bitmap)[4], const uint3
 
 }  // namespace
 
+void VulkanCommandProcessor::CountConstantUpload(uint32_t buffer, const void* data, size_t size) {
+  ConstantCensus& c = constant_census_;
+  ++c.uploads[buffer];
+  c.bytes[buffer] += size;
+  std::vector<uint8_t>& last = c.last[buffer];
+  if (last.size() == size && std::memcmp(last.data(), data, size) == 0) {
+    ++c.repeats[buffer];
+  }
+  last.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
+}
+
 bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
                                             const VulkanShader* pixel_shader) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -8218,6 +8244,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       }
       buffer_info.range = sizeof(SpirvShaderTranslator::SystemConstants);
       std::memcpy(mapping, &system_constants_, sizeof(SpirvShaderTranslator::SystemConstants));
+      if (draw_cost_.enabled) {
+        CountConstantUpload(0, mapping, sizeof(SpirvShaderTranslator::SystemConstants));
+      }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferSystem;
     }
@@ -8242,6 +8271,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       buffer_info.range = VkDeviceSize(float_constants_size);
       GatherFloatConstants(mapping, current_float_constant_map_vertex_,
                            &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]);
+      if (draw_cost_.enabled) {
+        CountConstantUpload(1, mapping, float_constants_size);
+      }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferFloatVertex;
     }
@@ -8261,6 +8293,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       buffer_info.range = VkDeviceSize(float_constants_size);
       GatherFloatConstants(mapping, current_float_constant_map_pixel_,
                            &regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X]);
+      if (draw_cost_.enabled) {
+        CountConstantUpload(2, mapping, float_constants_size);
+      }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferFloatPixel;
     }
@@ -8278,6 +8313,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       }
       buffer_info.range = VkDeviceSize(kBoolLoopConstantsSize);
       std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], kBoolLoopConstantsSize);
+      if (draw_cost_.enabled) {
+        CountConstantUpload(3, mapping, kBoolLoopConstantsSize);
+      }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferBoolLoop;
     }
@@ -8295,12 +8333,16 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       }
       buffer_info.range = VkDeviceSize(kFetchConstantsSize);
       std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], kFetchConstantsSize);
+      if (draw_cost_.enabled) {
+        CountConstantUpload(4, mapping, kFetchConstantsSize);
+      }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferFetch;
     }
   }
 
   DrawCostMark(kCostConstantUploads);
+  constant_census_.draws += draw_cost_.enabled;
   // Textures and samplers.
   const std::vector<VulkanShader::SamplerBinding>& samplers_vertex =
       vertex_shader->GetSamplerBindingsAfterTranslation();
