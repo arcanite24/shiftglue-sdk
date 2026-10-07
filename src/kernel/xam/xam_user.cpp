@@ -74,12 +74,22 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
   return result;
 }
 
+// Diagnostic only, default off: report the local profile as signed into
+// Xbox LIVE (state 2) to find which title features gate on LIVE. There is no
+// service behind it.
+REXCVAR_DEFINE_BOOL(xam_report_live_signin, false, "Kernel",
+                    "Report the local profile as signed into Xbox LIVE (diagnostic)");
+
+static uint32_t ReportedSigninState(uint32_t state) {
+  return state && REXCVAR_GET(xam_report_live_signin) ? 2u : state;
+}
+
 u32 XamUserGetSigninState_entry(u32 user_index) {
   uint32_t signin_state = 0;
   if (user_index < 4) {
     if (user_index == 0) {
       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-      signin_state = user_profile->signin_state();
+      signin_state = ReportedSigninState(user_profile->signin_state());
     }
   }
   return signin_state;
@@ -107,7 +117,7 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   info->xuid = user_profile->xuid();
-  info->signin_state = user_profile->signin_state();
+  info->signin_state = ReportedSigninState(user_profile->signin_state());
   rex::string::copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
   return X_E_SUCCESS;
 }
