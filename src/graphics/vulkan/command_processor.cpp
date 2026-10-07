@@ -98,6 +98,11 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
 // Defined by the backend-independent command processor.
 REXCVAR_DECLARE(bool, gpu_template_stats);
 REXCVAR_DECLARE(bool, gpu_buffer_replay);
+REXCVAR_DEFINE_BOOL(gpu_buffer_replay_verify, false, "GPU/Vulkan",
+                    "Diagnostics (RR-0.2): with gpu_buffer_replay, every draw that would be "
+                    "replayed takes the full path instead, and its commands, system constants "
+                    "and resulting state are compared with the recorded ones")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 #if REX_HAS_D3D12
 REXCVAR_DECLARE(double, fh1_hud_squeeze);
 #else
@@ -728,7 +733,13 @@ void VulkanCommandProcessor::DrawCostFrame() {
     band.batch_ticks += batch_ticks;
     band.entries += entries;
     for (uint32_t step = 0; step < kCostStepCount; ++step) band.steps[step] += m.frame_steps[step];
+    band.replay_sampled += m.frame_replay_sampled;
+    for (uint32_t step = 0; step < kReplayStepCount; ++step) {
+      band.replay_steps[step] += m.frame_replay_steps[step];
+    }
   }
+  m.frame_replay_sampled = 0;
+  std::fill(std::begin(m.frame_replay_steps), std::end(m.frame_replay_steps), 0);
   m.frame_draws = m.frame_sampled = m.frame_issue_ns = m.frame_register_ns = 0;
   std::fill(std::begin(m.frame_steps), std::end(m.frame_steps), 0);
   if (!m.window_ticks) {
@@ -788,6 +799,21 @@ void VulkanCommandProcessor::DrawCostFrame() {
                                double(band.batch_ticks)
                          : 0.0,
         double(band.entries) / double(band.frames), double(band.batch_ticks) * t);
+    if (band.replay_sampled) {
+      static constexpr const char* kReplayNames[kReplayStepCount] = {
+          "lookup", "residency", "textures", "targets", "checks", "constants", "append"};
+      uint64_t replay_total = 0;
+      std::string replay_steps;
+      for (uint32_t step = 0; step < kReplayStepCount; ++step) {
+        replay_total += band.replay_steps[step];
+        replay_steps += fmt::format(" {}={:.0f}", kReplayNames[step],
+                                    ns_per_tick * double(band.replay_steps[step]) /
+                                        double(band.replay_sampled));
+      }
+      REXGPU_INFO("Draw cost (RR-0.1) {} band: a replayed draw, ns:{}; total {:.0f}",
+                  kBandNames[b], replay_steps,
+                  ns_per_tick * double(replay_total) / double(band.replay_sampled));
+    }
     band = DrawCostModel::Band();
   }
 }
@@ -2825,6 +2851,7 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
+    HashFetchConstants(start_index, base, num_registers, true);
     memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
     current_constant_buffers_up_to_date_ &=
         ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch);
@@ -2933,6 +2960,7 @@ void VulkanCommandProcessor::WriteRegistersHost(uint32_t start_index, const uint
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
+    HashFetchConstants(start_index, base, num_registers, false);
     std::memcpy(register_file_->values + start_index, base, sizeof(uint32_t) * num_registers);
     current_constant_buffers_up_to_date_ &=
         ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch);
@@ -4615,14 +4643,24 @@ void VulkanCommandProcessor::ComputeDrawSignature(
     xenos::EdramMode edram_mode, bool major_mode_explicit,
     uint64_t (&parts)[kDrawSignatureParts]) const {
   // Everything the draw's derivation reads except the float, bool and loop
-  // constants it uploads.
-  const RegisterFile& regs = *register_file_;
+  // constants it uploads, in O(1) (RR-1): the register state and fetch
+  // constant hashes are kept up to date as registers are written, instead of
+  // hashing the draw's fetch constants here, which cost as much as deriving
+  // the draw (DR-4.2). All fetch constants count, used or not.
   auto mix = [](uint64_t& hash, uint64_t value) {
     hash = (hash ^ value) * UINT64_C(0xBF58476D1CE4E5B9);
     hash ^= hash >> 31;
   };
   parts[0] = state_hash_;
   parts[1] = parts[2] = parts[3] = parts[4] = 0;
+  // The fetch slots the shaders read (computed once per shader).
+  uint32_t slots = vertex_shader->fetch_slot_mask() |
+                   (pixel_shader ? pixel_shader->fetch_slot_mask() : 0);
+  while (slots) {
+    const uint32_t slot = uint32_t(std::countr_zero(slots));
+    slots &= slots - 1;
+    mix(parts[3], fetch_slot_hash_[slot] ^ slot);
+  }
   mix(parts[1], uint64_t(uintptr_t(vertex_shader)));
   mix(parts[1], uint64_t(uintptr_t(pixel_shader)));
   mix(parts[1], uint64_t(prim_type) << 32 | index_count);
@@ -4632,52 +4670,138 @@ void VulkanCommandProcessor::ComputeDrawSignature(
     mix(parts[2],
         uint64_t(index_buffer_info->format) << 8 | uint64_t(index_buffer_info->endianness));
   }
-  for (const VulkanShader* shader : {vertex_shader, pixel_shader}) {
-    if (!shader) continue;
-    for (const Shader::TextureBinding& binding : shader->texture_bindings()) {
-      const uint32_t* words =
-          &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + binding.fetch_constant * 6];
-      for (uint32_t i = 0; i < 6; i += 2) {
-        mix(parts[3], uint64_t(words[i]) << 32 | words[i + 1]);
-      }
-    }
-  }
-  const Shader::ConstantRegisterMap& vertex_map = vertex_shader->constant_register_map();
-  for (uint32_t i = 0; i < 3; ++i) {
-    uint32_t bits = vertex_map.vertex_fetch_bitmap[i];
-    uint32_t bit;
-    while (rex::bit_scan_forward(bits, &bit)) {
-      bits &= ~(UINT32_C(1) << bit);
-      const uint32_t* words =
-          &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + (i * 32 + bit) * 2];
-      mix(parts[4], uint64_t(words[0]) << 32 | words[1]);
-    }
-  }
 }
 
-void VulkanCommandProcessor::OnReplayIbBegin(uint64_t ib_key) {
-  if (!replay_stack_.empty()) {
-    // A nested buffer's draws come between the parent's: the parent neither
-    // replays nor records the rest of its execution.
-    ReplayCursor& parent = replay_stack_.back();
-    if (parent.mode == ReplayMode::kReplaying) {
-      parent.ib->valid = false;
-      EndReplay(parent);
+uint32_t VulkanCommandProcessor::ReplayState::DiffMask(const ReplayState& other) const {
+  uint32_t mask = 0;
+  mask |= uint32_t(pipeline != other.pipeline) << 0;
+  mask |= uint32_t(pipeline_layout != other.pipeline_layout) << 1;
+  mask |= uint32_t(std::memcmp(&viewport, &other.viewport, sizeof(viewport)) != 0) << 2;
+  mask |= uint32_t(std::memcmp(&scissor, &other.scissor, sizeof(scissor)) != 0) << 3;
+  mask |= uint32_t(depth_bias_constant_factor != other.depth_bias_constant_factor ||
+                   depth_bias_slope_factor != other.depth_bias_slope_factor)
+          << 4;
+  mask |= uint32_t(std::memcmp(blend_constants, other.blend_constants, sizeof(blend_constants)) !=
+                   0)
+          << 5;
+  mask |= uint32_t(std::memcmp(stencil, other.stencil, sizeof(stencil)) != 0) << 6;
+  mask |= uint32_t(update_needed != other.update_needed) << 7;
+  mask |= uint32_t(sets_bound != other.sets_bound) << 8;
+  mask |= uint32_t(sets_values != other.sets_values) << 9;
+  for (uint32_t i = 0; i < SpirvShaderTranslator::kDescriptorSetCount; ++i) {
+    if (i != SpirvShaderTranslator::kDescriptorSetConstants && sets[i] != other.sets[i]) {
+      mask |= 1u << 10;
     }
-    parent.mode = ReplayMode::kNone;
   }
-  const uint32_t occurrence = replay_occurrences_[ib_key]++;
+  mask |= uint32_t(push_layout != other.push_layout || push_textures != other.push_textures ||
+                   push_samplers != other.push_samplers || push_hash != other.push_hash)
+          << 11;
+  return mask;
+}
+
+uint32_t VulkanCommandProcessor::ReplayState::DiffMask(const ReplayState& other, uint32_t covered,
+                                                       uint32_t sets_needed) const {
+  uint32_t mask = 0;
+  mask |= uint32_t(!(covered & 1) && pipeline != other.pipeline) << 0;
+  // The layout always: binding a pipeline of an incompatible layout
+  // disturbs set bindings the commands may not repeat.
+  mask |= uint32_t(pipeline_layout != other.pipeline_layout) << 1;
+  mask |= uint32_t(!(covered & (1u << 2)) &&
+                   std::memcmp(&viewport, &other.viewport, sizeof(viewport)) != 0)
+          << 2;
+  mask |= uint32_t(!(covered & (1u << 3)) &&
+                   std::memcmp(&scissor, &other.scissor, sizeof(scissor)) != 0)
+          << 3;
+  mask |= uint32_t(!(covered & (1u << 4)) &&
+                   (depth_bias_constant_factor != other.depth_bias_constant_factor ||
+                    depth_bias_slope_factor != other.depth_bias_slope_factor))
+          << 4;
+  mask |= uint32_t(!(covered & (1u << 5)) &&
+                   std::memcmp(blend_constants, other.blend_constants, sizeof(blend_constants)) != 0)
+          << 5;
+  mask |= uint32_t(std::memcmp(stencil, other.stencil, sizeof(stencil)) != 0) << 6;
+  // Update flags: viewport, scissor, depth bias, blend, then stencil.
+  uint32_t flags_ignored = 0;
+  if (covered & (1u << 2)) flags_ignored |= 1u << 0;
+  if (covered & (1u << 3)) flags_ignored |= 1u << 1;
+  if (covered & (1u << 4)) flags_ignored |= 1u << 2;
+  if (covered & (1u << 5)) flags_ignored |= 1u << 3;
+  mask |= uint32_t(((update_needed ^ other.update_needed) & ~flags_ignored) != 0) << 7;
+  const uint32_t uncovered_sets = ~(covered >> 16) & sets_needed & 0xFFFF;
+  mask |= uint32_t(((sets_bound ^ other.sets_bound) & uncovered_sets) != 0) << 8;
+  mask |= uint32_t(((sets_values ^ other.sets_values) & uncovered_sets) != 0) << 9;
+  for (uint32_t i = 0; i < SpirvShaderTranslator::kDescriptorSetCount; ++i) {
+    if (i != SpirvShaderTranslator::kDescriptorSetConstants && (uncovered_sets & (1u << i)) &&
+        sets[i] != other.sets[i]) {
+      mask |= 1u << 10;
+    }
+  }
+  mask |= uint32_t(!(covered & (1u << 11)) &&
+                   (push_layout != other.push_layout || push_textures != other.push_textures ||
+                    push_samplers != other.push_samplers || push_hash != other.push_hash))
+          << 11;
+  return mask;
+}
+
+void VulkanCommandProcessor::OnReplayIbBegin(uint64_t content_key, uint64_t address_key,
+                                             uint64_t skeleton_key, uint64_t sequence_key) {
+  // About 1,200 buffers a frame, so the common case is cheap: the skeleton
+  // key (which a content match implies) first, the address key only when it
+  // misses. The content and sequence keys are not used: a position in the
+  // frame's sequence shifts when the frame's buffers change, and replaying
+  // the wrong buffer's recording costs its invalidation.
+  (void)content_key;
+  (void)sequence_key;
+  // A nested buffer's draws come between the parent's: the parent's next
+  // entry replays only if the state the child left matches its own.
+  auto occurrence_key = [this](uint64_t key) {
+    const uint32_t occurrence = replay_occurrences_[key]++;
+    return key ^ (uint64_t(occurrence) * UINT64_C(0x9E3779B97F4A7C15));
+  };
   ReplayCursor& cursor = replay_stack_.emplace_back();
-  cursor.key = ib_key ^ (uint64_t(occurrence) * UINT64_C(0x9E3779B97F4A7C15));
-  const auto found = replay_ibs_.find(cursor.key);
-  if (found != replay_ibs_.end() && found->second.valid) {
-    cursor.mode = ReplayMode::kReplaying;
-    cursor.ib = &found->second;
-  } else if (found != replay_ibs_.end() && found->second.rejects >= 3) {
-    cursor.mode = ReplayMode::kNone;
-  } else {
-    cursor.mode = ReplayMode::kCapturing;
+  cursor.skeleton_key = occurrence_key(skeleton_key);
+  std::shared_ptr<ReplayIb> found;
+  auto it = replay_ibs_.find(cursor.skeleton_key);
+  if (it != replay_ibs_.end()) {
+    if (it->second->valid) {
+      cursor.mode = ReplayMode::kReplaying;
+      cursor.ib = it->second;
+      return;
+    }
+    found = it->second;
   }
+  cursor.address_key = occurrence_key(address_key);
+  it = replay_ibs_.find(cursor.address_key);
+  if (it != replay_ibs_.end()) {
+    if (it->second->valid) {
+      cursor.mode = ReplayMode::kReplaying;
+      cursor.ib = it->second;
+      return;
+    }
+    if (!found) found = it->second;
+  }
+  bool seen = false;
+  for (uint64_t key : {cursor.skeleton_key, cursor.address_key}) {
+    replay_seen_current_.insert(key);
+    seen = seen || replay_seen_previous_.count(key) || replay_seen_before_previous_.count(key);
+  }
+  if (!seen) {
+    ++replay_counts_.first_sightings;
+    return;
+  }
+  const uint64_t window = replay_frame_ / 600;
+  if (found) {
+    if (found->window != window) {
+      found->window = window;
+      found->recordings = 0;
+    }
+    if (found->recordings >= 8) {
+      // Recorded too often in this window: its draws change between
+      // executions, so recording costs more than replay returns.
+      return;
+    }
+  }
+  cursor.mode = ReplayMode::kCapturing;
 }
 
 void VulkanCommandProcessor::OnReplayIbEnd() {
@@ -4689,36 +4813,133 @@ void VulkanCommandProcessor::OnReplayIbEnd() {
   if (cursor.mode == ReplayMode::kReplaying) {
     if (cursor.index != cursor.ib->draws.size()) {
       cursor.ib->valid = false;
-      ++cursor.ib->rejects;
+      ++replay_counts_.invalidated;
     }
-    EndReplay(cursor);
-  } else if (cursor.mode == ReplayMode::kCapturing && !cursor.draw_open &&
-             !cursor.capture.draws.empty()) {
-    if (replay_ibs_.size() >= 16384 && replay_stack_.empty()) {
-      replay_ibs_.clear();
+    return;
+  }
+  if (cursor.mode != ReplayMode::kCapturing) {
+    return;
+  }
+  if (cursor.draw_open) {
+    // The last draw ended early (nothing to draw, a placeholder pipeline).
+    CaptureReplayDraw(cursor, 0, 0, false, reg::RB_DEPTHCONTROL(), 0, nullptr, false);
+  }
+  if (cursor.capture.draws.empty()) {
+    return;
+  }
+  if (replay_ibs_.size() >= 65536 && replay_stack_.empty()) {
+    replay_ibs_.clear();
+  }
+  const uint64_t window = replay_frame_ / 600;
+  uint32_t recordings = 0;
+  for (uint64_t key : {cursor.skeleton_key, cursor.address_key}) {
+    auto it = replay_ibs_.find(key);
+    if (it != replay_ibs_.end() && it->second->window == window) {
+      recordings = std::max(recordings, it->second->recordings);
     }
-    ReplayIb& ib = replay_ibs_[cursor.key];
-    const uint32_t rejects = ib.rejects;
-    ib = std::move(cursor.capture);
-    ib.rejects = rejects;
-    ib.valid = true;
-  } else if (cursor.capture_failed || (cursor.mode == ReplayMode::kCapturing && cursor.draw_open)) {
-    ++replay_ibs_[cursor.key].rejects;
   }
-  if (!replay_stack_.empty()) {
-    replay_stack_.back().mode = ReplayMode::kNone;
-  }
+  auto ib = std::make_shared<ReplayIb>(std::move(cursor.capture));
+  ib->window = window;
+  ib->recordings = recordings + 1;
+  ib->valid = true;
+  replay_ibs_[cursor.skeleton_key] = ib;
+  replay_ibs_[cursor.address_key] = ib;
+  ++replay_counts_.recordings;
 }
 
 bool VulkanCommandProcessor::ReplayChained(const ReplayCursor& cursor) const {
-  return !cursor.position_valid || (cursor.position_submission == GetCurrentSubmission() &&
-                                    cursor.position_elements == deferred_command_buffer_.size_elements());
+  return cursor.position_valid && cursor.position_submission == GetCurrentSubmission() &&
+         cursor.position_elements == deferred_command_buffer_.size_elements();
 }
 
 void VulkanCommandProcessor::SetReplayPosition(ReplayCursor& cursor) {
   cursor.position_valid = true;
   cursor.position_submission = GetCurrentSubmission();
   cursor.position_elements = deferred_command_buffer_.size_elements();
+}
+
+uint32_t VulkanCommandProcessor::LiveStateDiff(const ReplayDraw& draw) const {
+  const ReplayState& e = draw.entry_state;
+  const uint32_t covered = draw.covered;
+  uint32_t mask = 0;
+  mask |= uint32_t(!(covered & 1) && current_guest_graphics_pipeline_ != e.pipeline) << 0;
+  mask |= uint32_t(current_guest_graphics_pipeline_layout_ != e.pipeline_layout) << 1;
+  mask |= uint32_t(!(covered & (1u << 2)) &&
+                   std::memcmp(&dynamic_viewport_, &e.viewport, sizeof(e.viewport)) != 0)
+          << 2;
+  mask |= uint32_t(!(covered & (1u << 3)) &&
+                   std::memcmp(&dynamic_scissor_, &e.scissor, sizeof(e.scissor)) != 0)
+          << 3;
+  mask |= uint32_t(!(covered & (1u << 4)) &&
+                   (dynamic_depth_bias_constant_factor_ != e.depth_bias_constant_factor ||
+                    dynamic_depth_bias_slope_factor_ != e.depth_bias_slope_factor))
+          << 4;
+  mask |= uint32_t(!(covered & (1u << 5)) &&
+                   std::memcmp(dynamic_blend_constants_, e.blend_constants,
+                               sizeof(e.blend_constants)) != 0)
+          << 5;
+  // Stencil fields in ReplayState order with their coverage bits.
+  static constexpr uint32_t kStencilCover[6] = {6, 7, 8, 9, 10, 12};
+  const uint32_t live_stencil[6] = {
+      dynamic_stencil_compare_mask_front_, dynamic_stencil_compare_mask_back_,
+      dynamic_stencil_write_mask_front_,   dynamic_stencil_write_mask_back_,
+      dynamic_stencil_reference_front_,    dynamic_stencil_reference_back_};
+  for (uint32_t i = 0; i < 6; ++i) {
+    if (!(covered & (1u << kStencilCover[i])) && live_stencil[i] != e.stencil[i]) {
+      mask |= 1u << 6;
+    }
+  }
+  const bool needed[] = {dynamic_viewport_update_needed_,
+                         dynamic_scissor_update_needed_,
+                         dynamic_depth_bias_update_needed_,
+                         dynamic_blend_constants_update_needed_,
+                         dynamic_stencil_compare_mask_front_update_needed_,
+                         dynamic_stencil_compare_mask_back_update_needed_,
+                         dynamic_stencil_write_mask_front_update_needed_,
+                         dynamic_stencil_write_mask_back_update_needed_,
+                         dynamic_stencil_reference_front_update_needed_,
+                         dynamic_stencil_reference_back_update_needed_};
+  uint32_t update_needed = 0;
+  for (uint32_t i = 0; i < 10; ++i) update_needed |= uint32_t(needed[i]) << i;
+  uint32_t flags_ignored = 0;
+  if (covered & (1u << 2)) flags_ignored |= 1u << 0;
+  if (covered & (1u << 3)) flags_ignored |= 1u << 1;
+  if (covered & (1u << 4)) flags_ignored |= 1u << 2;
+  if (covered & (1u << 5)) flags_ignored |= 1u << 3;
+  for (uint32_t i = 0; i < 6; ++i) {
+    if (covered & (1u << kStencilCover[i])) flags_ignored |= 1u << (4 + i);
+  }
+  mask |= uint32_t(((update_needed ^ e.update_needed) & ~flags_ignored) != 0) << 7;
+  const uint32_t constants_bit = UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants;
+  const uint32_t uncovered_sets = ~(covered >> 16) & draw.sets_needed & 0xFFFF & ~constants_bit;
+  mask |= uint32_t(((current_graphics_descriptor_sets_bound_up_to_date_ ^ e.sets_bound) &
+                    uncovered_sets) != 0)
+          << 8;
+  mask |= uint32_t(((current_graphics_descriptor_set_values_up_to_date_ ^ e.sets_values) &
+                    uncovered_sets) != 0)
+          << 9;
+  for (uint32_t i = 0; i < SpirvShaderTranslator::kDescriptorSetCount; ++i) {
+    if ((uncovered_sets & (1u << i)) && current_graphics_descriptor_sets_[i] != e.sets[i]) {
+      mask |= 1u << 10;
+    }
+  }
+  if (!(covered & (1u << 11)) && draw.uses_pushed_textures) {
+    const LastTextureDescriptorSet& push = last_pushed_pixel_textures_;
+    bool differs = push.layout != e.push_layout || push.texture_count != e.push_textures ||
+                   push.sampler_count != e.push_samplers;
+    if (!differs) {
+      uint64_t hash = 0;
+      for (const VkDescriptorImageInfo& info : push.infos) {
+        hash = (hash ^ uint64_t(uintptr_t(info.imageView))) * UINT64_C(0xBF58476D1CE4E5B9);
+        hash = (hash ^ uint64_t(uintptr_t(info.sampler))) * UINT64_C(0xBF58476D1CE4E5B9);
+        hash = (hash ^ uint64_t(info.imageLayout)) * UINT64_C(0xBF58476D1CE4E5B9);
+        hash ^= hash >> 31;
+      }
+      differs = hash != e.push_hash;
+    }
+    mask |= uint32_t(differs) << 11;
+  }
+  return mask;
 }
 
 void VulkanCommandProcessor::SaveReplayState(ReplayState& state) const {
@@ -4749,76 +4970,132 @@ void VulkanCommandProcessor::SaveReplayState(ReplayState& state) const {
   for (uint32_t i = 0; i < 10; ++i) {
     state.update_needed |= uint32_t(needed[i]) << i;
   }
-  state.sets_bound = current_graphics_descriptor_sets_bound_up_to_date_;
+  const uint32_t constants_bit = UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants;
+  state.sets_bound = current_graphics_descriptor_sets_bound_up_to_date_ & ~constants_bit;
+  state.sets_values = current_graphics_descriptor_set_values_up_to_date_ & ~constants_bit;
+  std::memcpy(state.sets, current_graphics_descriptor_sets_, sizeof(state.sets));
+  state.sets[SpirvShaderTranslator::kDescriptorSetConstants] = VK_NULL_HANDLE;
+  const LastTextureDescriptorSet& push = last_pushed_pixel_textures_;
+  state.push_layout = push.layout;
+  state.push_textures = push.texture_count;
+  state.push_samplers = push.sampler_count;
+  uint64_t hash = 0;
+  for (const VkDescriptorImageInfo& info : push.infos) {
+    hash = (hash ^ uint64_t(uintptr_t(info.imageView))) * UINT64_C(0xBF58476D1CE4E5B9);
+    hash = (hash ^ uint64_t(uintptr_t(info.sampler))) * UINT64_C(0xBF58476D1CE4E5B9);
+    hash = (hash ^ uint64_t(info.imageLayout)) * UINT64_C(0xBF58476D1CE4E5B9);
+    hash ^= hash >> 31;
+  }
+  state.push_hash = hash;
 }
 
-void VulkanCommandProcessor::RestoreReplayState(const ReplayState& state) {
-  current_guest_graphics_pipeline_ = state.pipeline;
-  current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+uint32_t VulkanCommandProcessor::ReplayNeededSets(const VulkanShader* vertex_shader,
+                                                  const VulkanShader* pixel_shader) const {
+  uint32_t needed = (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetCount) - 1;
+  if (vertex_shader->GetTextureBindingsAfterTranslation().empty() &&
+      vertex_shader->GetSamplerBindingsAfterTranslation().empty()) {
+    needed &= ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex);
+  }
+  if (!pixel_shader ||
+      (pixel_shader->GetTextureBindingsAfterTranslation().empty() &&
+       pixel_shader->GetSamplerBindingsAfterTranslation().empty()) ||
+      (current_guest_graphics_pipeline_layout_ &&
+       current_guest_graphics_pipeline_layout_->textures_pixel_pushed())) {
+    needed &= ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel);
+  }
+  return needed;
+}
+
+void VulkanCommandProcessor::RestoreReplayState(const ReplayDraw& draw) {
+  // What the replayed commands set comes from the recording; everything else
+  // they leave as it was (equal to the recording where the draw needs it).
+  const ReplayState& state = draw.exit_state;
+  const uint32_t covered = draw.covered;
+  if (covered & 1) {
+    current_guest_graphics_pipeline_ = state.pipeline;
+    current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+  }
   current_guest_graphics_pipeline_layout_ = static_cast<const PipelineLayout*>(state.pipeline_layout);
-  dynamic_viewport_ = state.viewport;
-  dynamic_scissor_ = state.scissor;
-  dynamic_depth_bias_constant_factor_ = state.depth_bias_constant_factor;
-  dynamic_depth_bias_slope_factor_ = state.depth_bias_slope_factor;
-  std::memcpy(dynamic_blend_constants_, state.blend_constants, sizeof(state.blend_constants));
-  dynamic_stencil_compare_mask_front_ = state.stencil[0];
-  dynamic_stencil_compare_mask_back_ = state.stencil[1];
-  dynamic_stencil_write_mask_front_ = state.stencil[2];
-  dynamic_stencil_write_mask_back_ = state.stencil[3];
-  dynamic_stencil_reference_front_ = state.stencil[4];
-  dynamic_stencil_reference_back_ = state.stencil[5];
-  bool* needed[] = {&dynamic_viewport_update_needed_,
-                    &dynamic_scissor_update_needed_,
-                    &dynamic_depth_bias_update_needed_,
-                    &dynamic_blend_constants_update_needed_,
-                    &dynamic_stencil_compare_mask_front_update_needed_,
-                    &dynamic_stencil_compare_mask_back_update_needed_,
-                    &dynamic_stencil_write_mask_front_update_needed_,
-                    &dynamic_stencil_write_mask_back_update_needed_,
-                    &dynamic_stencil_reference_front_update_needed_,
-                    &dynamic_stencil_reference_back_update_needed_};
-  for (uint32_t i = 0; i < 10; ++i) {
-    *needed[i] = (state.update_needed >> i) & 1;
+  if (covered & (1u << 2)) {
+    dynamic_viewport_ = state.viewport;
+    dynamic_viewport_update_needed_ = state.update_needed & 1;
   }
-  // The constants set and offsets the replay bound are the current ones.
-  current_graphics_descriptor_sets_bound_up_to_date_ = state.sets_bound;
-  // The pushed textures are in the replayed commands only.
-  last_pushed_pixel_textures_ = {};
-}
-
-void VulkanCommandProcessor::EndReplay(ReplayCursor& cursor) {
-  if (cursor.mode == ReplayMode::kReplaying && cursor.replayed_state) {
-    RestoreReplayState(*cursor.replayed_state);
+  if (covered & (1u << 3)) {
+    dynamic_scissor_ = state.scissor;
+    dynamic_scissor_update_needed_ = (state.update_needed >> 1) & 1;
   }
-  cursor.replayed_state = nullptr;
-}
-
-void VulkanCommandProcessor::ForceFullDrawState() {
-  current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
-  current_guest_graphics_pipeline_layout_ = nullptr;
-  current_graphics_descriptor_sets_bound_up_to_date_ = 0;
-  last_pushed_pixel_textures_ = {};
-  dynamic_viewport_update_needed_ = true;
-  dynamic_scissor_update_needed_ = true;
-  dynamic_depth_bias_update_needed_ = true;
-  dynamic_blend_constants_update_needed_ = true;
-  dynamic_stencil_compare_mask_front_update_needed_ = true;
-  dynamic_stencil_compare_mask_back_update_needed_ = true;
-  dynamic_stencil_write_mask_front_update_needed_ = true;
-  dynamic_stencil_write_mask_back_update_needed_ = true;
-  dynamic_stencil_reference_front_update_needed_ = true;
-  dynamic_stencil_reference_back_update_needed_ = true;
+  if (covered & (1u << 4)) {
+    dynamic_depth_bias_constant_factor_ = state.depth_bias_constant_factor;
+    dynamic_depth_bias_slope_factor_ = state.depth_bias_slope_factor;
+    dynamic_depth_bias_update_needed_ = (state.update_needed >> 2) & 1;
+  }
+  if (covered & (1u << 5)) {
+    std::memcpy(dynamic_blend_constants_, state.blend_constants, sizeof(state.blend_constants));
+    dynamic_blend_constants_update_needed_ = (state.update_needed >> 3) & 1;
+  }
+  {
+    static constexpr uint32_t kStencilCover[6] = {6, 7, 8, 9, 10, 12};
+    uint32_t* stencil[6] = {&dynamic_stencil_compare_mask_front_, &dynamic_stencil_compare_mask_back_,
+                            &dynamic_stencil_write_mask_front_,   &dynamic_stencil_write_mask_back_,
+                            &dynamic_stencil_reference_front_,    &dynamic_stencil_reference_back_};
+    bool* stencil_needed[6] = {&dynamic_stencil_compare_mask_front_update_needed_,
+                               &dynamic_stencil_compare_mask_back_update_needed_,
+                               &dynamic_stencil_write_mask_front_update_needed_,
+                               &dynamic_stencil_write_mask_back_update_needed_,
+                               &dynamic_stencil_reference_front_update_needed_,
+                               &dynamic_stencil_reference_back_update_needed_};
+    for (uint32_t i = 0; i < 6; ++i) {
+      if (covered & (1u << kStencilCover[i])) {
+        *stencil[i] = state.stencil[i];
+        *stencil_needed[i] = (state.update_needed >> (4 + i)) & 1;
+      }
+    }
+  }
+  for (uint32_t i = 0; i < SpirvShaderTranslator::kDescriptorSetCount; ++i) {
+    if (i == SpirvShaderTranslator::kDescriptorSetConstants || !(covered & (1u << (16 + i)))) {
+      continue;
+    }
+    const uint32_t bit = UINT32_C(1) << i;
+    current_graphics_descriptor_sets_[i] = state.sets[i];
+    current_graphics_descriptor_sets_bound_up_to_date_ =
+        (current_graphics_descriptor_sets_bound_up_to_date_ & ~bit) | (state.sets_bound & bit);
+    current_graphics_descriptor_set_values_up_to_date_ =
+        (current_graphics_descriptor_set_values_up_to_date_ & ~bit) | (state.sets_values & bit);
+  }
+  // The constants set the replay bound (or kept) is the current one.
+  const uint32_t constants_bit = UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants;
+  current_graphics_descriptor_sets_bound_up_to_date_ |= constants_bit;
+  current_graphics_descriptor_set_values_up_to_date_ |= constants_bit;
+  if (covered & (1u << 11)) {
+    LastTextureDescriptorSet& push = last_pushed_pixel_textures_;
+    push.layout = state.push_layout;
+    push.texture_count = state.push_textures;
+    push.sampler_count = state.push_samplers;
+    push.infos.assign(draw.exit_push_infos.begin(), draw.exit_push_infos.end());
+  }
 }
 
 void VulkanCommandProcessor::CaptureReplayDraw(
     ReplayCursor& cursor, uint64_t signature, uint32_t used_texture_mask, bool rasterization_done,
     reg::RB_DEPTHCONTROL depth_control, uint32_t color_mask,
-    const PrimitiveProcessor::ProcessingResult& primitive_processing_result, bool index_scratch) {
+    const PrimitiveProcessor::ProcessingResult* primitive_processing_result, bool index_scratch,
+    uint32_t sets_needed, bool uses_pushed_textures) {
   cursor.draw_open = false;
+  ReplayDraw& draw = cursor.capture.draws.emplace_back();
+  draw.signature = signature;
+  draw.entry_state = cursor.draw_entry_state;
+  draw.entry_follows_previous = cursor.capture.draws.size() > 1 &&
+                                cursor.capture.draws[cursor.capture.draws.size() - 2].exit_state ==
+                                    draw.entry_state;
+  SaveReplayState(draw.exit_state);
+  draw.exit_push_infos = last_pushed_pixel_textures_.infos;
+  ++replay_counts_.captured;
+  PERF_counter_inc(kReplayCapturedDraws);
+  ++cursor.index;
   const size_t end = deferred_command_buffer_.size_elements();
-  bool capturable = cursor.draw_submission == GetCurrentSubmission() &&
+  bool capturable = primitive_processing_result && cursor.draw_submission == GetCurrentSubmission() &&
                     cursor.draw_elements <= end && !index_scratch &&
-                    primitive_processing_result.index_buffer_type !=
+                    primitive_processing_result->index_buffer_type !=
                         PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted;
   DeferredCommandBuffer::ReplayScan scan;
   if (capturable) {
@@ -4827,20 +5104,31 @@ void VulkanCommandProcessor::CaptureReplayDraw(
         SpirvShaderTranslator::kDescriptorSetConstants,
         (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
             (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
-    capturable = scan.replayable && scan.draws &&
-                 // The first draw records the whole state, its constants included.
-                 (cursor.index || scan.constants_bind >= 0) && current_fh1_rendering_id_;
+    capturable = scan.replayable && scan.draws && current_fh1_rendering_id_;
   }
   if (!capturable) {
-    ++replay_counts_.uncapturable;
-    cursor.mode = ReplayMode::kNone;
-    cursor.capture_failed = true;
+    ++replay_counts_.full_entries;
     return;
   }
-  ReplayDraw& draw = cursor.capture.draws.emplace_back();
-  draw.signature = signature;
+  draw.replayable = true;
   draw.commands.assign(deferred_command_buffer_.elements() + cursor.draw_elements,
                        deferred_command_buffer_.elements() + end);
+  draw.covered = DeferredCommandBuffer::CoveredState(draw.commands.data(), draw.commands.size());
+  draw.sets_needed = sets_needed;
+  draw.uses_pushed_textures = uses_pushed_textures;
+  if (!(draw.covered & (1u << 11)) && draw.uses_pushed_textures) {
+    // The textures the draw found pushed: a replay that finds others pushed
+    // pushes these itself.
+    draw.entry_push_infos = cursor.draw_entry_push_infos;
+    draw.entry_push_layout = cursor.draw_entry_state.push_layout;
+    draw.entry_push_textures = cursor.draw_entry_state.push_textures;
+    draw.entry_push_samplers = cursor.draw_entry_state.push_samplers;
+    if (draw.entry_push_textures || draw.entry_push_samplers) {
+      for (const auto& sampler : current_samplers_pixel_) {
+        draw.pixel_samplers.push_back(sampler.first);
+      }
+    }
+  }
   draw.constants_bind = scan.constants_bind;
   draw.constants_bind_set_index = scan.constants_bind_set_index;
   draw.texture_push = scan.texture_push;
@@ -4854,27 +5142,25 @@ void VulkanCommandProcessor::CaptureReplayDraw(
   draw.rasterization_done = rasterization_done;
   draw.depth_control = depth_control;
   draw.color_mask = color_mask;
-  draw.index_type = primitive_processing_result.index_buffer_type;
+  draw.index_type = primitive_processing_result->index_buffer_type;
   if (draw.index_type == PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA) {
-    draw.index_base = primitive_processing_result.guest_index_base;
-    draw.index_bytes = primitive_processing_result.host_draw_vertex_count *
-                       (primitive_processing_result.host_index_format ==
+    draw.index_base = primitive_processing_result->guest_index_base;
+    draw.index_bytes = primitive_processing_result->host_draw_vertex_count *
+                       (primitive_processing_result->host_index_format ==
                                 xenos::IndexFormat::kInt16
                             ? 2
                             : 4);
   }
-  SaveReplayState(draw.state);
-  draw.system_constants_changed = replay_capture_system_dirty_ || !cursor.index;
-  if (draw.system_constants_changed) {
-    draw.system_constants = system_constants_;
-  }
-  ++cursor.index;
-  ++replay_counts_.captured;
-  SetReplayPosition(cursor);
+  draw.system_constants_changed = replay_capture_system_dirty_;
+  draw.point_list = register_file_->Get<reg::VGT_DRAW_INITIATOR>().prim_type ==
+                    xenos::PrimitiveType::kPointList;
+  draw.system_constants = system_constants_;
 }
 
 VulkanCommandProcessor::ReplayResult VulkanCommandProcessor::IssueReplayedDraw(
-    const ReplayDraw& draw, VulkanShader* vertex_shader, VulkanShader* pixel_shader, bool first) {
+    const ReplayDraw& draw, VulkanShader* vertex_shader, VulkanShader* pixel_shader,
+    bool verify_only, bool repair_push) {
+  ReplayCostMark(kReplayLookup);
   // Until the commands are appended, everything here is something the full
   // path repeats harmlessly.
   if (!BeginSubmission(true)) {
@@ -4882,14 +5168,16 @@ VulkanCommandProcessor::ReplayResult VulkanCommandProcessor::IssueReplayedDraw(
   }
   if (draw.index_type == PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA &&
       !shared_memory_->RequestRange(draw.index_base, draw.index_bytes)) {
-    ++replay_counts_.reasons[3];
+    ++replay_counts_.reasons[2];
     return ReplayResult::kFallBack;
   }
   if (!RequestVertexBuffers(*vertex_shader)) {
-    ++replay_counts_.reasons[4];
+    ++replay_counts_.reasons[3];
     return ReplayResult::kFallBack;
   }
+  ReplayCostMark(kReplayResidency);
   texture_cache_->RequestTextures(draw.used_texture_mask);
+  ReplayCostMark(kReplayTextures);
   Fh1DrawInfo fh1_draw;
   fh1_draw.rasterization_done = draw.rasterization_done;
   fh1_draw.normalized_depth_control = draw.depth_control;
@@ -4901,24 +5189,26 @@ VulkanCommandProcessor::ReplayResult VulkanCommandProcessor::IssueReplayedDraw(
   shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
   SplitPendingBarrier();
   if (!pending_barriers_.empty()) {
-    ++replay_counts_.reasons[5];
+    ++replay_counts_.reasons[4];
     return ReplayResult::kFallBack;
   }
   if (!fh1_native_executor_->PreparedTargetsContinueRendering(draw.rendering_id)) {
-    ++replay_counts_.reasons[IsFh1RenderingOpen(draw.rendering_id) ? 6 : 7];
+    ++replay_counts_.reasons[IsFh1RenderingOpen(draw.rendering_id) ? 5 : 6];
     return ReplayResult::kFallBack;
   }
-  if (draw.texture_push >= 0) {
-    uint32_t texture_count, sampler_count;
-    const VkDescriptorImageInfo* infos = DeferredCommandBuffer::PushedImageInfos(
-        draw.commands.data(), draw.texture_push, texture_count, sampler_count);
+  ReplayCostMark(kReplayTargets);
+  // The pushed textures, recorded in the commands or, for a push repair,
+  // those the draw found pushed: they must still be what the bindings hold.
+  auto pushed_textures_current = [&](const VkDescriptorImageInfo* infos, uint32_t texture_count,
+                                     uint32_t sampler_count) {
     if (!pixel_shader) {
-      return ReplayResult::kFallBack;
+      ++replay_counts_.reasons[7];
+      return false;
     }
     const auto& texture_bindings = pixel_shader->GetTextureBindingsAfterTranslation();
     if (texture_bindings.size() != texture_count || draw.pixel_samplers.size() != sampler_count) {
-      ++replay_counts_.reasons[8];
-      return ReplayResult::kFallBack;
+      ++replay_counts_.reasons[7];
+      return false;
     }
     for (uint32_t i = 0; i < texture_count; ++i) {
       const VulkanShader::TextureBinding& binding = texture_bindings[i];
@@ -4926,23 +5216,49 @@ VulkanCommandProcessor::ReplayResult VulkanCommandProcessor::IssueReplayedDraw(
                                                           binding.dimension,
                                                           bool(binding.is_signed)) !=
           infos[i].imageView) {
-        ++replay_counts_.reasons[9];
-        return ReplayResult::kFallBack;
+        ++replay_counts_.reasons[8];
+        return false;
       }
     }
     for (uint32_t i = 0; i < sampler_count; ++i) {
       bool overflowed = false;
       if (texture_cache_->UseSampler(draw.pixel_samplers[i], overflowed) !=
           infos[texture_count + i].sampler) {
-        ++replay_counts_.reasons[10];
-        return ReplayResult::kFallBack;
+        ++replay_counts_.reasons[9];
+        return false;
       }
     }
+    return true;
+  };
+  if (draw.texture_push >= 0) {
+    uint32_t texture_count, sampler_count;
+    const VkDescriptorImageInfo* infos = DeferredCommandBuffer::PushedImageInfos(
+        draw.commands.data(), draw.texture_push, texture_count, sampler_count);
+    if (!pushed_textures_current(infos, texture_count, sampler_count)) {
+      return ReplayResult::kFallBack;
+    }
   }
-  (void)first;
-  if (draw.system_constants_changed &&
-      std::memcmp(&system_constants_, &draw.system_constants, sizeof(system_constants_))) {
+  if (repair_push &&
+      (draw.entry_push_infos.size() != draw.entry_push_textures + draw.entry_push_samplers ||
+       !pushed_textures_current(draw.entry_push_infos.data(), draw.entry_push_textures,
+                                draw.entry_push_samplers))) {
+    ++replay_counts_.reasons[11];
+    return ReplayResult::kFallBack;
+  }
+  ReplayCostMark(kReplayChecks);
+  if (verify_only) {
+    return ReplayResult::kChecked;
+  }
+  // The state matched the recording's before this draw, so the system
+  // constants the full path would derive are the recorded ones.
+  bool system_dirty = false;
+  if (draw.system_constants_changed) {
     std::memcpy(&system_constants_, &draw.system_constants, sizeof(system_constants_));
+    system_dirty = true;
+  }
+  // What the texture cache holds now, not when it was recorded.
+  system_dirty |= UpdateTextureSystemConstants(system_constants_, draw.used_texture_mask);
+  if (system_dirty) {
     current_constant_buffers_up_to_date_ &=
         ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferSystem);
   }
@@ -4950,8 +5266,28 @@ VulkanCommandProcessor::ReplayResult VulkanCommandProcessor::IssueReplayedDraw(
   if (!PrepareConstantBindings(vertex_shader, pixel_shader, constants_set)) {
     return ReplayResult::kFailed;
   }
+  const uint32_t constants_bit = UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants;
+  if (draw.constants_bind < 0 && !(current_graphics_descriptor_sets_bound_up_to_date_ & constants_bit)) {
+    // New constants with no bind in the recorded commands to carry them.
+    ++replay_counts_.reasons[10];
+    return ReplayResult::kFallBack;
+  }
+  ReplayCostMark(kReplayConstants);
 
   // Recording from here on.
+  if (repair_push) {
+    deferred_command_buffer_.CmdVkPushTextureDescriptorSet(
+        current_guest_graphics_pipeline_layout_->GetPipelineLayout(),
+        SpirvShaderTranslator::kDescriptorSetTexturesPixel, draw.entry_push_textures,
+        draw.entry_push_samplers, draw.entry_push_infos.data(),
+        draw.entry_push_infos.data() + draw.entry_push_textures);
+    LastTextureDescriptorSet& push = last_pushed_pixel_textures_;
+    push.layout = draw.entry_push_layout;
+    push.texture_count = draw.entry_push_textures;
+    push.sampler_count = draw.entry_push_samplers;
+    push.infos.assign(draw.entry_push_infos.begin(), draw.entry_push_infos.end());
+    ++replay_counts_.push_repairs;
+  }
   const size_t at = deferred_command_buffer_.size_elements();
   deferred_command_buffer_.AppendElements(draw.commands.data(), draw.commands.size());
   if (draw.constants_bind >= 0) {
@@ -4960,33 +5296,181 @@ VulkanCommandProcessor::ReplayResult VulkanCommandProcessor::IssueReplayedDraw(
         draw.constants_bind_set_index, constants_set, current_constant_dynamic_offsets_,
         SpirvShaderTranslator::kConstantBufferCount);
   }
+  RestoreReplayState(draw);
   ++pending_draw_calls_;
   fh1_native_executor_->NativeDrawIssued(fh1_draw);
+  ReplayCostMark(kReplayAppend);
+  if (draw_cost_.sampling) {
+    for (uint32_t step = 0; step < kReplayStepCount; ++step) {
+      draw_cost_.frame_replay_steps[step] += draw_cost_.replay_pending[step];
+    }
+    ++draw_cost_.frame_replay_sampled;
+    draw_cost_.sampling = false;
+  }
   return ReplayResult::kIssued;
 }
 
-void VulkanCommandProcessor::EndReplayFrame() {
-  replay_occurrences_.clear();
-  if (!replay_stack_.empty()) {
-    for (ReplayCursor& cursor : replay_stack_) {
-      if (cursor.mode == ReplayMode::kReplaying) {
-        cursor.ib->valid = false;
-        EndReplay(cursor);
+void VulkanCommandProcessor::VerifyReplayDraw(const ReplayDraw& draw, uint64_t submission,
+                                             size_t start, bool strict) {
+  ReplayCounts& c = replay_counts_;
+  const size_t end = deferred_command_buffer_.size_elements();
+  if (submission != GetCurrentSubmission() || start > end) {
+    ++c.verify_skipped;
+    return;
+  }
+  ++c.verified;
+  // The commands, with the constants set and its dynamic offsets (the only
+  // parts a replay changes) blanked in both.
+  std::vector<uintmax_t> full(deferred_command_buffer_.elements() + start,
+                              deferred_command_buffer_.elements() + end);
+  std::vector<uintmax_t> recorded = draw.commands;
+  const uint32_t zero_offsets[SpirvShaderTranslator::kConstantBufferCount] = {};
+  const auto scan = DeferredCommandBuffer::ScanForReplay(
+      full.data(), full.size(), SpirvShaderTranslator::kDescriptorSetConstants,
+      (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
+          (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+  if (scan.constants_bind >= 0) {
+    DeferredCommandBuffer::PatchConstantsBind(full.data(), scan.constants_bind,
+                                              scan.constants_bind_set_index, VK_NULL_HANDLE,
+                                              zero_offsets,
+                                              SpirvShaderTranslator::kConstantBufferCount);
+  }
+  if (draw.constants_bind >= 0) {
+    DeferredCommandBuffer::PatchConstantsBind(recorded.data(), draw.constants_bind,
+                                              draw.constants_bind_set_index, VK_NULL_HANDLE,
+                                              zero_offsets,
+                                              SpirvShaderTranslator::kConstantBufferCount);
+  }
+  // A replay falls back when new constants have no bind in the recorded
+  // commands, and binds redundantly when they carry one the full path skips.
+  if (!strict) {
+    // State the commands set anyway differed before the draw: the full path
+    // recorded less than the replay would; the resulting state is compared.
+    ++c.verify_covered;
+  } else if (draw.constants_bind < 0 && scan.constants_bind >= 0) {
+    ++c.verify_rebind;
+  } else if (draw.constants_bind >= 0 && scan.constants_bind < 0) {
+    ++c.verify_extra_bind;
+  } else {
+  const bool commands_match =
+      scan.replayable && full.size() == recorded.size() &&
+      !std::memcmp(full.data(), recorded.data(), full.size() * sizeof(uintmax_t));
+  if (!commands_match) {
+    if (++c.verify_commands <= 8) {
+      REXGPU_WARN(
+          "Buffer replay verify: draw commands differ ({} elements recorded, {} now, constants "
+          "bind {} and {}, scan {})",
+          recorded.size(), full.size(), draw.constants_bind, scan.constants_bind,
+          scan.replayable);
+    }
+  }
+  }
+  // The index load address is written only for draws that load indices in
+  // the shader (their flags compare), otherwise it is history.
+  const uint32_t index_load_flags = SpirvShaderTranslator::kSysFlag_VertexIndexLoad |
+                                    SpirvShaderTranslator::kSysFlag_ComputeOrPrimitiveVertexIndexLoad;
+  // What a replay would upload: the recorded system constants with the used
+  // textures' entries refreshed; the unused entries hold history no shader
+  // reads, so they are made equal before comparing.
+  SpirvShaderTranslator::SystemConstants replayed = draw.system_constants;
+  UpdateTextureSystemConstants(replayed, draw.used_texture_mask);
+  std::memcpy(replayed.texture_swizzled_signs, system_constants_.texture_swizzled_signs,
+              sizeof(replayed.texture_swizzled_signs));
+  std::memcpy(replayed.texture_swizzles, system_constants_.texture_swizzles,
+              sizeof(replayed.texture_swizzles));
+  {
+    SpirvShaderTranslator::SystemConstants used = draw.system_constants;
+    UpdateTextureSystemConstants(used, draw.used_texture_mask);
+    for (uint32_t i = 0; i < 32; ++i) {
+      if (!(draw.used_texture_mask & (UINT32_C(1) << i))) continue;
+      reinterpret_cast<uint8_t*>(replayed.texture_swizzled_signs)[i] =
+          reinterpret_cast<const uint8_t*>(used.texture_swizzled_signs)[i];
+    }
+    for (uint32_t i = 0; i < 16; ++i) {
+      if (draw.used_texture_mask & (UINT32_C(3) << (2 * i))) {
+        replayed.texture_swizzles[i] = used.texture_swizzles[i];
       }
     }
-    replay_stack_.clear();
   }
+  if (!(replayed.flags & index_load_flags)) {
+    replayed.vertex_index_load_address = system_constants_.vertex_index_load_address;
+  }
+  if (!draw.point_list) {
+    replayed.point_vertex_diameter_min = system_constants_.point_vertex_diameter_min;
+    replayed.point_vertex_diameter_max = system_constants_.point_vertex_diameter_max;
+    std::memcpy(replayed.point_constant_diameter, system_constants_.point_constant_diameter,
+                sizeof(replayed.point_constant_diameter));
+    std::memcpy(replayed.point_screen_diameter_to_ndc_radius,
+                system_constants_.point_screen_diameter_to_ndc_radius,
+                sizeof(replayed.point_screen_diameter_to_ndc_radius));
+  }
+  if (draw.system_constants_changed &&
+      std::memcmp(&system_constants_, &replayed, sizeof(system_constants_))) {
+    ++c.verify_system;
+    const auto* now_words = reinterpret_cast<const uint32_t*>(&system_constants_);
+    const auto* recorded_words = reinterpret_cast<const uint32_t*>(&replayed);
+    for (uint32_t word = 0; word < sizeof(system_constants_) / 4; ++word) {
+      if (now_words[word] != recorded_words[word]) ++c.system_words[word];
+    }
+  }
+  ReplayState now;
+  SaveReplayState(now);
+  if (now.DiffMask(draw.exit_state, 0, draw.sets_needed)) {
+    ++c.verify_state;
+  }
+}
+
+void VulkanCommandProcessor::EndReplayFrame() {
+  ++replay_frame_;
+  replay_occurrences_.clear();
+  replay_seen_before_previous_.swap(replay_seen_previous_);
+  replay_seen_previous_.swap(replay_seen_current_);
+  replay_seen_current_.clear();
+  replay_stack_.clear();
   ReplayCounts& c = replay_counts_;
   if (REXCVAR_GET(gpu_buffer_replay) && ++c.frames == 600) {
     const double f = double(c.frames);
     REXGPU_INFO(
-        "Buffer replay per frame over 600 frames: {:.0f} draws replayed, {:.1f} fallbacks, "
-        "{:.0f} draws recorded, {:.1f} not recordable; {} buffers kept",
-        c.replayed / f, c.fallbacks / f, c.captured / f, c.uncapturable / f, replay_ibs_.size());
+        "Buffer replay per frame over 600 frames: {:.0f} draws, {:.0f} replayed, {:.0f} full path "
+        "in replaying buffers, {:.1f} fallbacks, {:.0f} recorded ({:.0f} as full-path entries), "
+        "{:.0f} outside buffers, {:.0f} excluded, {:.0f} in buffers left to the full path, "
+        "{:.1f} buffers recorded, {:.1f} invalidated, {:.1f} first seen, {:.0f} push repairs; {} "
+        "buffers kept",
+        c.draws / f, c.replayed / f, c.full_path / f, c.fallbacks / f, c.captured / f,
+        c.full_entries / f, c.outside / f, c.excluded / f, c.idle_ib / f, c.recordings / f,
+        c.invalidated / f, c.first_sightings / f, c.push_repairs / f, replay_ibs_.size());
     std::string reasons;
     for (uint64_t r : c.reasons) reasons += fmt::format(" {:.1f}", r / f);
-    REXGPU_INFO("Buffer replay fallbacks per frame by reason (chain, count, signature, index, "
-                "vertex, barriers, targets, rendering, push size, view, sampler):{}", reasons);
+    REXGPU_INFO("Buffer replay fallbacks per frame by reason (signature, state, index, vertex, "
+                "barriers, targets, rendering, push size, view, sampler, constants bind, push "
+                "repair):{}",
+                reasons);
+    std::string fields;
+    for (uint64_t r : c.state_fields) fields += fmt::format(" {:.1f}", r / f);
+    REXGPU_INFO("Buffer replay state mismatches per frame by field (pipeline, layout, viewport, "
+                "scissor, depth bias, blend, stencil, update flags, sets bound, sets written, set "
+                "handles, pushed textures):{}",
+                fields);
+    if (c.verified || c.verify_skipped) {
+      REXGPU_INFO(
+          "Buffer replay verify (RR-0.2) over 600 frames: {} draws compared, {} with different "
+          "commands, {} with different system constants, {} with a different resulting state, "
+          "{} not comparable, {} needing a constants bind the recording lacks (replay falls "
+          "back), {} with a recorded constants bind the full path skips (replay binds again)",
+          c.verified, c.verify_commands, c.verify_system, c.verify_state, c.verify_skipped,
+          c.verify_rebind, c.verify_extra_bind);
+      REXGPU_INFO("Buffer replay verify: {} draws compared by resulting state only (covered "
+                  "state differed before them)",
+                  c.verify_covered);
+      std::vector<std::pair<uint64_t, uint32_t>> words;
+      for (const auto& [word, count] : c.system_words) words.emplace_back(count, word);
+      std::sort(words.rbegin(), words.rend());
+      std::string top;
+      for (size_t i = 0; i < words.size() && i < 12; ++i) {
+        top += fmt::format(" byte {}x{}", words[i].second * 4, words[i].first);
+      }
+      REXGPU_INFO("Buffer replay verify: system constant words that differed:{}", top);
+    }
     c = ReplayCounts();
   }
 }
@@ -5004,6 +5488,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   if (draw_cost_.enabled && (++draw_cost_.counter & 15) == 0) {
     draw_cost_.sampling = true;
     std::fill(std::begin(draw_cost_.pending), std::end(draw_cost_.pending), 0);
+    std::fill(std::begin(draw_cost_.replay_pending), std::end(draw_cost_.replay_pending), 0);
     draw_cost_.last = DrawCostNow();
   }
   auto draw_fail = [&](const char* stage) {
@@ -5148,13 +5633,29 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     }
     TemplateStatsDraw(parts);
   }
-  const bool buffer_replay = REXCVAR_GET(gpu_buffer_replay) && fh1_native_executor_ &&
-                             !memexport_used_vertex && !memexport_used_pixel &&
-                             !checkpoints_enabled_ && !(frame_dump_ && frame_dump_->recording());
+  const bool replay_enabled = REXCVAR_GET(gpu_buffer_replay);
+  const bool buffer_replay = replay_enabled && fh1_native_executor_ && !memexport_used_vertex &&
+                             !memexport_used_pixel && !checkpoints_enabled_ &&
+                             !(frame_dump_ && frame_dump_->recording());
   ReplayCursor* replay_cursor =
       buffer_replay && !replay_stack_.empty() && replay_stack_.back().mode != ReplayMode::kNone
           ? &replay_stack_.back()
           : nullptr;
+  if (replay_enabled) {
+    ReplayCounts& c = replay_counts_;
+    ++c.draws;
+    if (replay_stack_.empty()) {
+      ++c.outside;
+    } else if (!buffer_replay) {
+      ++c.excluded;
+    } else if (!replay_cursor) {
+      ++c.idle_ib;
+    }
+  }
+  if (replay_cursor && replay_cursor->mode == ReplayMode::kCapturing && replay_cursor->draw_open) {
+    // The previous draw ended early: a full-path entry.
+    CaptureReplayDraw(*replay_cursor, 0, 0, false, reg::RB_DEPTHCONTROL(), 0, nullptr, false);
+  }
   uint64_t draw_signature = 0;
   if (replay_cursor) {
     uint64_t parts[kDrawSignatureParts];
@@ -5164,53 +5665,83 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       draw_signature = (draw_signature ^ parts[part]) * UINT64_C(0x9E3779B97F4A7C15);
     }
   }
+  const ReplayDraw* verify_draw = nullptr;
+  uint64_t verify_submission = 0;
+  size_t verify_start = 0;
+  bool verify_strict = false;
   if (replay_cursor && replay_cursor->mode == ReplayMode::kReplaying) {
     ReplayCursor& cursor = *replay_cursor;
-    if (!ReplayChained(cursor)) {
+    if (cursor.index >= cursor.ib->draws.size() ||
+        cursor.ib->draws[cursor.index].signature != draw_signature) {
+      // A different draw: this execution takes the full path, the next records
+      // the buffer again.
       ++replay_counts_.reasons[0];
-    } else if (cursor.index >= cursor.ib->draws.size()) {
-      ++replay_counts_.reasons[1];
-    } else if (cursor.ib->draws[cursor.index].signature != draw_signature) {
-      ++replay_counts_.reasons[2];
-    }
-    if (ReplayChained(cursor) && cursor.index < cursor.ib->draws.size() &&
-        cursor.ib->draws[cursor.index].signature == draw_signature) {
-      const ReplayResult result = IssueReplayedDraw(cursor.ib->draws[cursor.index], vertex_shader,
-                                                    pixel_shader, cursor.index == 0);
-      if (result == ReplayResult::kIssued) {
-        cursor.replayed_state = &cursor.ib->draws[cursor.index].state;
-        ++cursor.index;
-        ++replay_counts_.replayed;
-        SetReplayPosition(cursor);
-        return true;
+      ++replay_counts_.invalidated;
+      cursor.ib->valid = false;
+      cursor.mode = ReplayMode::kNone;
+      replay_cursor = nullptr;
+    } else {
+      const ReplayDraw& draw = cursor.ib->draws[cursor.index++];
+      if (draw.replayable) {
+        bool state_matches = draw.entry_follows_previous && ReplayChained(cursor);
+        bool repair_push = false;
+        if (!state_matches) {
+          uint32_t diff = LiveStateDiff(draw);
+          // Only other textures pushed: the replay pushes the draw's own.
+          if (diff == (1u << 11) && (draw.entry_push_textures || draw.entry_push_samplers)) {
+            repair_push = true;
+            diff = 0;
+          }
+          state_matches = !diff;
+          for (uint32_t field = 0; field < 12; ++field) {
+            replay_counts_.state_fields[field] += (diff >> field) & 1;
+          }
+        }
+        if (!state_matches) {
+          ++replay_counts_.reasons[1];
+        } else if (REXCVAR_GET(gpu_buffer_replay_verify)) {
+          // Everything a replay checks, then the full path to compare with.
+          const ReplayResult result =
+              IssueReplayedDraw(draw, vertex_shader, pixel_shader, true, repair_push);
+          if (result == ReplayResult::kFailed) {
+            return draw_fail("buffer_replay");
+          }
+          if (result == ReplayResult::kChecked) {
+            verify_draw = &draw;
+            verify_submission = GetCurrentSubmission();
+            verify_start = deferred_command_buffer_.size_elements();
+            // The commands compare only when no covered state differed.
+            ReplayState now;
+            SaveReplayState(now);
+            verify_strict = !now.DiffMask(draw.entry_state, 0, draw.sets_needed);
+          }
+        } else {
+          const ReplayResult result =
+              IssueReplayedDraw(draw, vertex_shader, pixel_shader, false, repair_push);
+          if (result == ReplayResult::kIssued) {
+            ++replay_counts_.replayed;
+            PERF_counter_inc(kReplayDraws);
+            SetReplayPosition(cursor);
+            return true;
+          }
+          if (result == ReplayResult::kFailed) {
+            return draw_fail("buffer_replay");
+          }
+          ++replay_counts_.fallbacks;
+          PERF_counter_inc(kReplayFallbacks);
+        }
       }
-      if (result == ReplayResult::kFailed) {
-        return draw_fail("buffer_replay");
-      }
+      ++replay_counts_.full_path;
+      cursor.position_valid = false;
     }
-    // The rest of this execution takes the full path, and the next records
-    // the buffer again.
-    ++replay_counts_.fallbacks;
-    cursor.ib->valid = false;
-    ++cursor.ib->rejects;
-    EndReplay(cursor);
-    cursor.mode = ReplayMode::kNone;
-    replay_cursor = nullptr;
   }
   if (replay_cursor && replay_cursor->mode == ReplayMode::kCapturing) {
     ReplayCursor& cursor = *replay_cursor;
-    if (cursor.draw_open || (cursor.index && !ReplayChained(cursor))) {
-      cursor.mode = ReplayMode::kNone;
-      cursor.capture_failed = true;
-      replay_cursor = nullptr;
-    } else {
-      if (!cursor.index) {
-        ForceFullDrawState();
-      }
-      cursor.draw_open = true;
-      cursor.draw_submission = GetCurrentSubmission();
-      cursor.draw_elements = deferred_command_buffer_.size_elements();
-    }
+    cursor.draw_open = true;
+    cursor.draw_submission = GetCurrentSubmission();
+    cursor.draw_elements = deferred_command_buffer_.size_elements();
+    SaveReplayState(cursor.draw_entry_state);
+    cursor.draw_entry_push_infos = last_pushed_pixel_textures_.infos;
   }
   if (memexport_used_pixel) {
     if (!device_properties.fragmentStoresAndAtomics) {
@@ -5886,8 +6417,16 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   }
   if (replay_cursor && replay_cursor->mode == ReplayMode::kCapturing) {
     CaptureReplayDraw(*replay_cursor, draw_signature, used_texture_mask, is_rasterization_done,
-                      normalized_depth_control, normalized_color_mask, primitive_processing_result,
-                      guest_dma_index_scratch_buffer.buffer() != VK_NULL_HANDLE);
+                      normalized_depth_control, normalized_color_mask, &primitive_processing_result,
+                      guest_dma_index_scratch_buffer.buffer() != VK_NULL_HANDLE,
+                      ReplayNeededSets(vertex_shader, pixel_shader),
+                      pixel_shader && current_guest_graphics_pipeline_layout_ &&
+                          current_guest_graphics_pipeline_layout_->textures_pixel_pushed() &&
+                          (!pixel_shader->GetTextureBindingsAfterTranslation().empty() ||
+                           !pixel_shader->GetSamplerBindingsAfterTranslation().empty()));
+  }
+  if (verify_draw) {
+    VerifyReplayDraw(*verify_draw, verify_submission, verify_start, verify_strict);
   }
   Checkpoint(CheckpointKind::kDrawEnd);
   if (fh1_native_executor_) {
@@ -7981,6 +8520,48 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
   // VK_EXT_extended_dynamic_state2.
 }
 
+bool VulkanCommandProcessor::UpdateTextureSystemConstants(
+    SpirvShaderTranslator::SystemConstants& constants, uint32_t used_texture_mask) const {
+  // The used textures' entries only: the others keep what earlier draws left,
+  // which no shader of this draw reads.
+  bool dirty = false;
+  uint32_t textures_resolution_scaled = 0;
+  {
+    uint32_t textures_remaining = used_texture_mask;
+    uint32_t texture_index;
+    while (rex::bit_scan_forward(textures_remaining, &texture_index)) {
+      textures_remaining &= ~(UINT32_C(1) << texture_index);
+      uint32_t& texture_signs_uint = constants.texture_swizzled_signs[texture_index >> 2];
+      uint32_t texture_signs_shift = 8 * (texture_index & 3);
+      uint8_t texture_signs = texture_cache_->GetActiveTextureSwizzledSigns(texture_index);
+      uint32_t texture_signs_shifted = uint32_t(texture_signs) << texture_signs_shift;
+      uint32_t texture_signs_mask = ((UINT32_C(1) << 8) - 1) << texture_signs_shift;
+      dirty |= (texture_signs_uint & texture_signs_mask) != texture_signs_shifted;
+      texture_signs_uint = (texture_signs_uint & ~texture_signs_mask) | texture_signs_shifted;
+      textures_resolution_scaled |=
+          uint32_t(texture_cache_->IsActiveTextureResolutionScaled(texture_index)) << texture_index;
+    }
+  }
+  dirty |= constants.textures_resolution_scaled != textures_resolution_scaled;
+  constants.textures_resolution_scaled = textures_resolution_scaled;
+  if (!GetVulkanDevice()->properties().imageViewFormatSwizzle) {
+    uint32_t textures_remaining = used_texture_mask;
+    uint32_t texture_index;
+    while (rex::bit_scan_forward(textures_remaining, &texture_index)) {
+      textures_remaining &= ~(UINT32_C(1) << texture_index);
+      uint32_t& texture_swizzles_uint = constants.texture_swizzles[texture_index >> 1];
+      uint32_t texture_swizzle_shift = 12 * (texture_index & 1);
+      uint32_t texture_swizzle = texture_cache_->GetActiveTextureHostSwizzle(texture_index);
+      uint32_t texture_swizzle_shifted = uint32_t(texture_swizzle) << texture_swizzle_shift;
+      uint32_t texture_swizzle_mask = ((UINT32_C(1) << 12) - 1) << texture_swizzle_shift;
+      dirty |= (texture_swizzles_uint & texture_swizzle_mask) != texture_swizzle_shifted;
+      texture_swizzles_uint =
+          (texture_swizzles_uint & ~texture_swizzle_mask) | texture_swizzle_shifted;
+    }
+  }
+  return dirty;
+}
+
 void VulkanCommandProcessor::UpdateSystemConstantValues(
     bool primitive_polygonal,
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
@@ -8287,43 +8868,8 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
         point_screen_diameter_to_ndc_radius_y;
   }
 
-  // Texture signedness / gamma.
-  uint32_t textures_resolution_scaled = 0;
-  {
-    uint32_t textures_remaining = used_texture_mask;
-    uint32_t texture_index;
-    while (rex::bit_scan_forward(textures_remaining, &texture_index)) {
-      textures_remaining &= ~(UINT32_C(1) << texture_index);
-      uint32_t& texture_signs_uint = system_constants_.texture_swizzled_signs[texture_index >> 2];
-      uint32_t texture_signs_shift = 8 * (texture_index & 3);
-      uint8_t texture_signs = texture_cache_->GetActiveTextureSwizzledSigns(texture_index);
-      uint32_t texture_signs_shifted = uint32_t(texture_signs) << texture_signs_shift;
-      uint32_t texture_signs_mask = ((UINT32_C(1) << 8) - 1) << texture_signs_shift;
-      dirty |= (texture_signs_uint & texture_signs_mask) != texture_signs_shifted;
-      texture_signs_uint = (texture_signs_uint & ~texture_signs_mask) | texture_signs_shifted;
-      textures_resolution_scaled |=
-          uint32_t(texture_cache_->IsActiveTextureResolutionScaled(texture_index)) << texture_index;
-    }
-  }
-  dirty |= system_constants_.textures_resolution_scaled != textures_resolution_scaled;
-  system_constants_.textures_resolution_scaled = textures_resolution_scaled;
-
-  // Texture host swizzle in the shader.
-  if (!GetVulkanDevice()->properties().imageViewFormatSwizzle) {
-    uint32_t textures_remaining = used_texture_mask;
-    uint32_t texture_index;
-    while (rex::bit_scan_forward(textures_remaining, &texture_index)) {
-      textures_remaining &= ~(UINT32_C(1) << texture_index);
-      uint32_t& texture_swizzles_uint = system_constants_.texture_swizzles[texture_index >> 1];
-      uint32_t texture_swizzle_shift = 12 * (texture_index & 1);
-      uint32_t texture_swizzle = texture_cache_->GetActiveTextureHostSwizzle(texture_index);
-      uint32_t texture_swizzle_shifted = uint32_t(texture_swizzle) << texture_swizzle_shift;
-      uint32_t texture_swizzle_mask = ((UINT32_C(1) << 12) - 1) << texture_swizzle_shift;
-      dirty |= (texture_swizzles_uint & texture_swizzle_mask) != texture_swizzle_shifted;
-      texture_swizzles_uint =
-          (texture_swizzles_uint & ~texture_swizzle_mask) | texture_swizzle_shifted;
-    }
-  }
+  // Texture signedness / gamma, host swizzles.
+  dirty |= UpdateTextureSystemConstants(system_constants_, used_texture_mask);
 
   // Alpha test.
   dirty |= system_constants_.alpha_test_reference != rb_alpha_ref;

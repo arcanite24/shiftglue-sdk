@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <bit>
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
@@ -632,6 +633,9 @@ void ParseAluInstruction(const ucode::AluInstruction& op, xenos::ShaderType shad
                          ParsedAluInstruction& instr);
 
 class Shader {
+  mutable uint32_t fetch_slot_mask_ = 0;
+  mutable bool fetch_slot_mask_valid_ = false;
+
  public:
   // Type of the vertex shader on the host - shader interface depends on in, so
   // it must be known at translation time. If values are changed, INVALIDATE
@@ -895,6 +899,21 @@ class Shader {
 
   // All texture bindings used in the shader.
   const std::vector<TextureBinding>& texture_bindings() const { return texture_bindings_; }
+  // The texture fetch constant slots the shader samples, computed once after
+  // analysis (the recorder replay's draw identity: vertex fetch constants
+  // reach shaders through the fetch constant buffer a replay uploads anew,
+  // and only decide which memory is requested).
+  uint32_t fetch_slot_mask() const {
+    if (!fetch_slot_mask_valid_) {
+      uint32_t slots = 0;
+      for (const TextureBinding& binding : texture_bindings_) {
+        slots |= UINT32_C(1) << (binding.fetch_constant & 31);
+      }
+      fetch_slot_mask_ = slots;
+      fetch_slot_mask_valid_ = true;
+    }
+    return fetch_slot_mask_;
+  }
 
   // Bitmaps of all constant registers accessed by the shader.
   const ConstantRegisterMap& constant_register_map() const { return constant_register_map_; }

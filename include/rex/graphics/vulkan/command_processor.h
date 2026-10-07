@@ -24,6 +24,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstring>
 #include <map>
 #include <source_location>
@@ -667,12 +668,33 @@ class VulkanCommandProcessor : public CommandProcessor {
     }
   }
   static uint64_t DrawCostNow() { return CostTicks(); }
+  // A replayed draw's steps, in their own table.
+  enum ReplayCostStep : uint32_t {
+    kReplayLookup,      // analysis and the replay decision
+    kReplayResidency,   // submission, index and vertex ranges
+    kReplayTextures,    // RequestTextures
+    kReplayTargets,     // PrepareTargets, barriers, rendering continuity
+    kReplayChecks,      // pushed views and samplers
+    kReplayConstants,   // system constants and constant bindings
+    kReplayAppend,      // appending and patching the commands
+    kReplayStepCount
+  };
+  void ReplayCostMark(ReplayCostStep step) {
+    if (draw_cost_.sampling) {
+      const uint64_t now = DrawCostNow();
+      draw_cost_.replay_pending[step] += now - draw_cost_.last;
+      draw_cost_.last = now;
+    }
+  }
   void DrawCostFrame();
   struct DrawCostModel {
     bool enabled = false;
     bool sampling = false;
     uint64_t last = 0;
     uint64_t pending[kCostStepCount] = {};
+    uint64_t replay_pending[kReplayStepCount] = {};
+    uint64_t frame_replay_sampled = 0;
+    uint64_t frame_replay_steps[kReplayStepCount] = {};
     uint64_t counter = 0;
     uint64_t frame_draws = 0, frame_sampled = 0, frame_issue_ns = 0, frame_register_ns = 0;
     uint64_t frame_steps[kCostStepCount] = {};
@@ -685,6 +707,8 @@ class VulkanCommandProcessor : public CommandProcessor {
       uint64_t frames = 0, draws = 0, sampled = 0, issue_ns = 0, register_ns = 0, batch_ns = 0;
       uint64_t draw_records_ns = 0, ones_ns = 0, calls_ns = 0, batch_ticks = 0, entries = 0;
       uint64_t steps[kCostStepCount] = {};
+      uint64_t replay_sampled = 0;
+      uint64_t replay_steps[kReplayStepCount] = {};
     } bands[3];
     uint64_t frames = 0;
   } draw_cost_;
@@ -765,6 +789,10 @@ class VulkanCommandProcessor : public CommandProcessor {
       bool shader_32bit_index_dma, uint32_t compute_memexport_vertex_count,
       const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask);
+  // The used textures' signs, resolution-scaled bits and host swizzles in
+  // the system constants; true if any changed.
+  bool UpdateTextureSystemConstants(SpirvShaderTranslator::SystemConstants& constants,
+                                    uint32_t used_texture_mask) const;
   bool UpdateBindings(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader);
   // UpdateBindings' constants half: uploads the dirty constant buffers and
   // picks the frame's constants set for them (dynamic offsets in
@@ -779,22 +807,25 @@ class VulkanCommandProcessor : public CommandProcessor {
   void BindGuestGraphicsPipeline(
       VkPipeline pipeline, const VulkanPipelineCache::PipelineLayoutProvider* layout_provider);
 
-  // gpu_buffer_replay (DR-4.2's third stage). The first execution of an
-  // indirect buffer records, per draw, the commands the draw added (its
-  // first draw recording the whole state); a later execution whose draws
-  // have the same signatures (register state, shaders, used fetch constants,
-  // draw packet) appends those commands again, uploading only the draws'
-  // constants and keeping texture, buffer and target state current. A draw
-  // that does not match, or anything recorded between draws, ends the replay
-  // for the rest of the execution.
+  // gpu_buffer_replay (RECORDER_REPLAY_BACKLOG RR-1 and RR-3, from DR-4.2's
+  // third stage). The first execution of an indirect buffer records an entry
+  // per draw: the commands the draw added when they are only binds, dynamic
+  // state, texture pushes and the draw inside an open rendering, otherwise a
+  // note to take the full path; with each, the command processor's state
+  // before and after the draw. A later execution replays an entry when the
+  // draw's O(1) signature matches and the command processor's state equals
+  // the recorded state before it, uploading only the draw's constants; any
+  // other draw takes the full path, and the next entry can replay again once
+  // the state matches. A signature mismatch ends the buffer's replay and it
+  // is recorded again.
   static constexpr size_t kDrawSignatureParts = 5;
   void ComputeDrawSignature(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader,
                             xenos::PrimitiveType prim_type, uint32_t index_count,
                             const IndexBufferInfo* index_buffer_info, xenos::EdramMode edram_mode,
                             bool major_mode_explicit,
                             uint64_t (&parts)[kDrawSignatureParts]) const;
-  // What the command processor knows the command buffer holds after a draw,
-  // restored after replayed commands instead of recording everything again.
+  // What the command processor knows the command buffer holds: what decides
+  // which binds and state commands the next draw records.
   struct ReplayState {
     VkPipeline pipeline = VK_NULL_HANDLE;
     const void* pipeline_layout = nullptr;
@@ -805,11 +836,49 @@ class VulkanCommandProcessor : public CommandProcessor {
     float blend_constants[4] = {};
     uint32_t stencil[6] = {};
     uint32_t update_needed = 0;
+    // Bound and written descriptor sets, the constants set's bits and handle
+    // left out (its handle and offsets change with every upload).
     uint32_t sets_bound = 0;
+    uint32_t sets_values = 0;
+    VkDescriptorSet sets[SpirvShaderTranslator::kDescriptorSetCount] = {};
+    // The last pushed pixel textures (last_pushed_pixel_textures_).
+    VkDescriptorSetLayout push_layout = VK_NULL_HANDLE;
+    uint32_t push_textures = 0;
+    uint32_t push_samplers = 0;
+    uint64_t push_hash = 0;
+    bool operator==(const ReplayState& other) const { return !DiffMask(other); }
+    // Bit per field that differs: pipeline, layout, viewport, scissor, depth
+    // bias, blend, stencil, update flags, sets bound, sets written, set
+    // handles, pushed textures.
+    uint32_t DiffMask(const ReplayState& other) const;
+    // DiffMask leaving out the state `covered` (CoveredState) sets anyway and
+    // the sets not in `sets_needed`.
+    uint32_t DiffMask(const ReplayState& other, uint32_t covered, uint32_t sets_needed) const;
   };
   struct ReplayDraw {
     uint64_t signature = 0;
-    ReplayState state;
+    // False: the draw takes the full path when replaying.
+    bool replayable = false;
+    ReplayState entry_state;
+    ReplayState exit_state;
+    // The recorded state before the draw is the previous draw's after it:
+    // replaying right after the previous entry needs no state check.
+    bool entry_follows_previous = false;
+    // DeferredCommandBuffer::CoveredState of the commands: state the entry
+    // check leaves out.
+    uint32_t covered = 0;
+    // Descriptor sets the draw reads (texture sets only when it has textures
+    // that are not pushed); the others' state does not matter to it.
+    uint32_t sets_needed = 0;
+    // The pixel shader samples textures through a push: only then does the
+    // pushed set's state matter to the draw.
+    bool uses_pushed_textures = false;
+    std::vector<VkDescriptorImageInfo> exit_push_infos;
+    // When the commands push no textures: those pushed before the draw.
+    std::vector<VkDescriptorImageInfo> entry_push_infos;
+    VkDescriptorSetLayout entry_push_layout = VK_NULL_HANDLE;
+    uint32_t entry_push_textures = 0;
+    uint32_t entry_push_samplers = 0;
     std::vector<uintmax_t> commands;
     ptrdiff_t constants_bind = -1;
     uint32_t constants_bind_set_index = 0;
@@ -825,63 +894,99 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t index_base = 0;
     uint32_t index_bytes = 0;
     bool system_constants_changed = false;
+    // Point lists write the point fields of the system constants; for other
+    // primitives they are history no shader reads.
+    bool point_list = false;
     SpirvShaderTranslator::SystemConstants system_constants;
   };
   struct ReplayIb {
     std::vector<ReplayDraw> draws;
     bool valid = false;
-    // Executions that could not be recorded or replayed: from 3 on the
-    // buffer is left to the full path.
-    uint32_t rejects = 0;
+    // Recordings in the current window of 600 frames; past 8 the buffer is
+    // left to the full path until the window ends.
+    uint32_t recordings = 0;
+    uint64_t window = 0;
   };
   enum class ReplayMode { kNone, kReplaying, kCapturing };
   struct ReplayCursor {
     uint64_t key = 0;
+    uint64_t address_key = 0;
+    uint64_t skeleton_key = 0;
+    uint64_t sequence_key = 0;
     ReplayMode mode = ReplayMode::kNone;
     size_t index = 0;
-    ReplayIb* ib = nullptr;
+    std::shared_ptr<ReplayIb> ib;
     ReplayIb capture;
-    // Where the last draw's commands ended: anything recorded after it ends
-    // the chain of state the next draw's commands assume.
+    // Where the last replayed draw's commands ended, with no state recorded
+    // since: the next entry's state check can be skipped.
     bool position_valid = false;
     uint64_t position_submission = 0;
     size_t position_elements = 0;
-    // The last replayed draw's state, to restore when the replay ends.
-    const ReplayState* replayed_state = nullptr;
-    bool capture_failed = false;
     // Capture: the current draw's commands start here.
     bool draw_open = false;
     uint64_t draw_submission = 0;
     size_t draw_elements = 0;
+    ReplayState draw_entry_state;
+    std::vector<VkDescriptorImageInfo> draw_entry_push_infos;
   };
-  enum class ReplayResult { kIssued, kFallBack, kFailed };
-  void OnReplayIbBegin(uint64_t ib_key) override;
+  // kChecked: with verify_only, every check passed and nothing was recorded.
+  enum class ReplayResult { kIssued, kFallBack, kFailed, kChecked };
+  void OnReplayIbBegin(uint64_t content_key, uint64_t address_key, uint64_t skeleton_key,
+                       uint64_t sequence_key) override;
   void OnReplayIbEnd() override;
   bool ReplayChained(const ReplayCursor& cursor) const;
   void SetReplayPosition(ReplayCursor& cursor);
-  // Forgets what the command buffer is known to hold, so the next draw records
-  // its whole state.
-  void ForceFullDrawState();
   void SaveReplayState(ReplayState& state) const;
-  void RestoreReplayState(const ReplayState& state);
-  // Ends a cursor's replay: the command processor takes up the state its
-  // last replayed draw left.
-  void EndReplay(ReplayCursor& cursor);
-  ReplayResult IssueReplayedDraw(const ReplayDraw& draw, VulkanShader* vertex_shader,
-                                 VulkanShader* pixel_shader, bool first);
+  // ReplayState::DiffMask of the live state against a draw's recorded entry
+  // state, with its coverage and needed sets, without building a snapshot.
+  uint32_t LiveStateDiff(const ReplayDraw& draw) const;
+  // Takes up the state a replayed draw's commands leave.
+  void RestoreReplayState(const ReplayDraw& draw);
+  // Closes the capture of the cursor's open draw: replayable with its
+  // commands, or a full-path entry.
+  // The descriptor sets a draw with these shaders reads under the current
+  // pipeline layout, as UpdateBindings binds them.
+  uint32_t ReplayNeededSets(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader) const;
   void CaptureReplayDraw(ReplayCursor& cursor, uint64_t signature, uint32_t used_texture_mask,
                          bool rasterization_done, reg::RB_DEPTHCONTROL depth_control,
                          uint32_t color_mask,
-                         const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
-                         bool index_scratch);
+                         const PrimitiveProcessor::ProcessingResult* primitive_processing_result,
+                         bool index_scratch, uint32_t sets_needed = 0,
+                         bool uses_pushed_textures = false);
+  // repair_push: the live pushed textures differ from the recorded entry's
+  // and the commands push none: the draw's textures are pushed first.
+  ReplayResult IssueReplayedDraw(const ReplayDraw& draw, VulkanShader* vertex_shader,
+                                 VulkanShader* pixel_shader, bool verify_only = false,
+                                 bool repair_push = false);
+  // gpu_buffer_replay_verify (RR-0.2): the draw an entry would have replayed
+  // takes the full path, and its commands, system constants and resulting
+  // state are compared with the entry's.
+  void VerifyReplayDraw(const ReplayDraw& draw, uint64_t submission, size_t start, bool strict);
   void EndReplayFrame();
-  std::unordered_map<uint64_t, ReplayIb> replay_ibs_;
+  // By content key and by address key, the same recording under both.
+  std::unordered_map<uint64_t, std::shared_ptr<ReplayIb>> replay_ibs_;
   std::unordered_map<uint64_t, uint32_t> replay_occurrences_;
+  // Buffer keys executed this frame and the previous one: a buffer is
+  // recorded only once it has been seen in an earlier frame, so buffers
+  // executed once are not recorded at all.
+  std::unordered_set<uint64_t> replay_seen_current_, replay_seen_previous_,
+      replay_seen_before_previous_;
   std::vector<ReplayCursor> replay_stack_;
   bool replay_capture_system_dirty_ = false;
+  uint64_t replay_frame_ = 0;
   struct ReplayCounts {
-    uint64_t frames = 0, replayed = 0, fallbacks = 0, captured = 0, uncapturable = 0;
+    uint64_t frames = 0, replayed = 0, fallbacks = 0, captured = 0, full_entries = 0;
+    // Fallbacks by reason: signature, state, index, vertex, barriers,
+    // targets, rendering, push size, view, sampler, constants bind, push
+    // repair.
     uint64_t reasons[12] = {};
+    uint64_t draws = 0, outside = 0, excluded = 0, idle_ib = 0, full_path = 0;
+    uint64_t invalidated = 0, recordings = 0, first_sightings = 0, push_repairs = 0;
+    uint64_t verified = 0, verify_commands = 0, verify_system = 0, verify_state = 0,
+             verify_skipped = 0, verify_rebind = 0, verify_extra_bind = 0, verify_covered = 0;
+    uint64_t state_fields[12] = {};
+    // Words of the system constants that differed in verify.
+    std::unordered_map<uint32_t, uint64_t> system_words;
   } replay_counts_;
   // Allocates a descriptor set and fills one or two VkWriteDescriptorSet
   // structure instances (for images and samplers).

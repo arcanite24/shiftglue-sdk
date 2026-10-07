@@ -169,6 +169,13 @@ enum class CounterId : uint16_t {
   kTextureCacheMb,
   kProcessResidentMb,
 
+  // Recorder replay (RECORDER_REPLAY_BACKLOG): draws replayed from recorded
+  // commands, draws that fell back to the full path while replaying, draws
+  // recorded for a later replay.
+  kReplayDraws,
+  kReplayFallbacks,
+  kReplayCapturedDraws,
+
   kCount  // sentinel -- must be last
 };
 

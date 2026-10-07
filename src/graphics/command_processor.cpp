@@ -924,6 +924,10 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     return;
   }
 
+  if (index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+      index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5 && regs.values[index] != value) {
+    HashFetchDword(index, regs.values[index], value);
+  }
   if (regs.values[index] != value && !IsPerDrawRegister(index) &&
       !(index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31)) {
     ++state_epoch_;
@@ -1306,6 +1310,85 @@ struct IbIdentityStats {
 IbIdentityStats ib_stats;
 }  // namespace
 
+uint64_t CommandProcessor::IndirectBufferSkeletonHash(uint32_t ptr, uint32_t count) const {
+  // The buffer's packets with their payloads, except the values of shader
+  // constants (written inline or loaded from memory): buffers
+  // the title rebuilds every frame with new constants at a new address keep
+  // this key, and the draws' signatures check everything else.
+  const uint32_t* words = memory_->TranslatePhysical<const uint32_t*>(ptr);
+  uint64_t hash = UINT64_C(0x9E3779B97F4A7C15) ^ count;
+  auto mix = [&hash](uint64_t value) {
+    hash = (hash ^ value) * UINT64_C(0xBF58476D1CE4E5B9);
+    hash ^= hash >> 31;
+  };
+  // Fetch constants too: vertex buffers in a ring change their addresses
+  // every frame, and the draws' signatures check the texture fetches.
+  auto is_constant_value = [](uint32_t index) {
+    return index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31;
+  };
+  for (uint32_t i = 0; i < count;) {
+    const uint32_t header = rex::byte_swap(words[i]);
+    mix(header);
+    switch (header >> 30) {
+      case 0: {
+        const uint32_t base = header & 0x7FFF;
+        const uint32_t n = ((header >> 16) & 0x3FFF) + 1;
+        const bool one_register = (header >> 15) & 1;
+        for (uint32_t j = 0; j < n && i + 1 + j < count; ++j) {
+          if (!is_constant_value(one_register ? base : base + j)) {
+            mix(words[i + 1 + j]);
+          }
+        }
+        i += 1 + n;
+      } break;
+      case 1:
+        if (i + 2 < count) {
+          mix(words[i + 1]);
+          mix(words[i + 2]);
+        }
+        i += 3;
+        break;
+      case 2:
+        i += 1;
+        break;
+      default: {
+        const uint32_t opcode = (header >> 8) & 0x7F;
+        const uint32_t n = ((header >> 16) & 0x3FFF) + 1;
+        const uint32_t end = std::min(count, i + 1 + n);
+        bool skip_values = false;
+        uint32_t first = i + 1;
+        if ((opcode == PM4_SET_CONSTANT) && first < end) {
+          const uint32_t offset_type = rex::byte_swap(words[first]);
+          const uint32_t type = (offset_type >> 16) & 0xFF;
+          // Float, fetch, bool and loop constants.
+          skip_values = type <= 3;
+          mix(offset_type);
+          ++first;
+        } else if ((opcode == PM4_SET_CONSTANT2 || opcode == PM4_SET_SHADER_CONSTANTS) &&
+                   first < end) {
+          const uint32_t offset_type = rex::byte_swap(words[first]);
+          skip_values = is_constant_value(offset_type & 0xFFFF);
+          mix(offset_type);
+          ++first;
+        } else if (opcode == PM4_LOAD_ALU_CONSTANT && first + 2 < end) {
+          // The source address of float, bool and loop constants.
+          const uint32_t offset_type = rex::byte_swap(words[first + 1]);
+          const uint32_t type = (offset_type >> 16) & 0xFF;
+          if (type > 3) mix(words[first]);
+          mix(offset_type);
+          mix(words[first + 2]);
+          first = end;
+        }
+        if (!skip_values) {
+          for (uint32_t j = first; j < end; ++j) mix(words[j]);
+        }
+        i += 1 + n;
+      } break;
+    }
+  }
+  return hash;
+}
+
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
@@ -1313,8 +1396,19 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   const bool template_stats = record_split_ && REXCVAR_GET(gpu_template_stats);
   const bool buffer_replay = record_split_ && REXCVAR_GET(gpu_buffer_replay);
   if (buffer_replay) {
-    const uint64_t key = (uint64_t(ptr) << 32) | count;
-    RecordCall([this, key]() { OnReplayIbBegin(key); });
+    // Keyed by content, for buffers the title writes again at other addresses
+    // (a ring), and by address, for buffers whose inline constants change
+    // (the draws' signatures cover the rest) (RR-1.1).
+    const uint64_t content_key =
+        XXH3_64bits(memory_->TranslatePhysical(ptr), size_t(count) * sizeof(uint32_t)) ^
+        (uint64_t(count) << 40);
+    const uint64_t address_key = (uint64_t(ptr) << 32) | count;
+    const uint64_t skeleton_key = IndirectBufferSkeletonHash(ptr, count);
+    const uint64_t sequence_key =
+        (uint64_t(replay_ib_sequence_++) << 32 | count) * UINT64_C(0xD6E8FEB86659FD93);
+    RecordCall([this, content_key, address_key, skeleton_key, sequence_key]() {
+      OnReplayIbBegin(content_key, address_key, skeleton_key, sequence_key);
+    });
   }
   bool ib_repeat = false;
   const uint64_t draws_before = ib_stats.decoded_draws;
@@ -1853,6 +1947,7 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
 
 bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet,
                                                   uint32_t count) {
+  replay_ib_sequence_ = 0;
   SCOPE_profile_cpu_f("gpu");
 
   if (REXCVAR_GET(gpu_ib_identity_stats) && ++ib_stats.frames == 600) {

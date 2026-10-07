@@ -522,6 +522,56 @@ DeferredCommandBuffer::ReplayScan DeferredCommandBuffer::ScanForReplay(
   return scan;
 }
 
+uint32_t DeferredCommandBuffer::CoveredState(const uintmax_t* elements, size_t count) {
+  uint32_t covered = 0;
+  size_t offset = 0;
+  while (offset + kCommandHeaderSizeElements <= count) {
+    const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(elements + offset);
+    const size_t args = offset + kCommandHeaderSizeElements;
+    switch (header.command) {
+      case Command::kVkBindPipeline:
+        covered |= 1u << 0;
+        break;
+      case Command::kVkSetViewport:
+        covered |= 1u << 2;
+        break;
+      case Command::kVkSetScissor:
+        covered |= 1u << 3;
+        break;
+      case Command::kVkSetDepthBias:
+        covered |= 1u << 4;
+        break;
+      case Command::kVkSetBlendConstants:
+        covered |= 1u << 5;
+        break;
+      case Command::kVkPushTextureDescriptorSet:
+        covered |= 1u << 11;
+        break;
+      case Command::kVkSetStencilCompareMask:
+      case Command::kVkSetStencilWriteMask:
+      case Command::kVkSetStencilReference: {
+        const auto& stencil = *reinterpret_cast<const ArgsSetStencilMaskReference*>(elements + args);
+        const uint32_t front = header.command == Command::kVkSetStencilCompareMask ? 6
+                               : header.command == Command::kVkSetStencilWriteMask ? 8
+                                                                                     : 10;
+        const uint32_t back = front == 10 ? 12 : front + 1;
+        if (stencil.face_mask & VK_STENCIL_FACE_FRONT_BIT) covered |= 1u << front;
+        if (stencil.face_mask & VK_STENCIL_FACE_BACK_BIT) covered |= 1u << back;
+      } break;
+      case Command::kVkBindDescriptorSets: {
+        const auto& bind = *reinterpret_cast<const ArgsVkBindDescriptorSets*>(elements + args);
+        for (uint32_t i = 0; i < bind.descriptor_set_count && bind.first_set + i < 16; ++i) {
+          covered |= 1u << (16 + bind.first_set + i);
+        }
+      } break;
+      default:
+        break;
+    }
+    offset = args + header.arguments_size_elements;
+  }
+  return covered;
+}
+
 bool DeferredCommandBuffer::PatchConstantsBind(uintmax_t* elements, ptrdiff_t bind,
                                                uint32_t set_index, VkDescriptorSet set,
                                                const uint32_t* dynamic_offsets,

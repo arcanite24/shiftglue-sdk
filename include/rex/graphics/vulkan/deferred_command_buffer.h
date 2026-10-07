@@ -58,6 +58,12 @@ class DeferredCommandBuffer {
   // `transient_sets` (per-frame descriptor sets) makes the range unreplayable.
   static ReplayScan ScanForReplay(const uintmax_t* elements, size_t count, uint32_t constants_set,
                                   uint32_t transient_sets);
+  // The state the commands set themselves, so the state before them does not
+  // matter for it: bit 0 a pipeline bind, 2 viewport, 3 scissor, 4 depth
+  // bias, 5 blend constants, 6 and 7 the front and back stencil compare
+  // masks, 8 and 9 write masks, 10 and 12 references, 11 a texture push,
+  // 16 + n a bind of set n.
+  static uint32_t CoveredState(const uintmax_t* elements, size_t count);
   // Replaces the constants set of a bind found by ScanForReplay, and its
   // dynamic offsets.
   static bool PatchConstantsBind(uintmax_t* elements, ptrdiff_t bind, uint32_t set_index,

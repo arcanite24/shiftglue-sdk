@@ -205,7 +205,15 @@ class CommandProcessor {
   // compiled replay of repeated buffers could skip.
   // gpu_buffer_replay: the recorder learns where each indirect buffer's
   // execution begins and ends (key: address and size).
-  virtual void OnReplayIbBegin(uint64_t ib_key) {}
+  // Keys: the buffer's content, its address and size, its skeleton (the
+  // content without shader constant values), and its place in the frame's
+  // sequence of buffers with its size.
+  virtual void OnReplayIbBegin(uint64_t content_key, uint64_t address_key, uint64_t skeleton_key,
+                               uint64_t sequence_key) {}
+  // Indirect buffers the decoder executed since the last swap.
+  uint32_t replay_ib_sequence_ = 0;
+  // The skeleton key of an indirect buffer (RR-1.1).
+  uint64_t IndirectBufferSkeletonHash(uint32_t ptr, uint32_t count) const;
   virtual void OnReplayIbEnd() {}
   void TemplateStatsIbBegin(uint64_t ib_key, bool repeat);
   void TemplateStatsIbEnd();
@@ -372,6 +380,30 @@ class CommandProcessor {
   // changed register: equal hashes mean equal state, so derivations can be
   // reused across draws and frames, not only while nothing changes.
   uint64_t state_hash_ = 0;
+  // The texture and vertex fetch constants' content, hashed the same way
+  // (they are outside state_hash_): with state_hash_, an O(1) identity of
+  // everything a draw's derivation reads except its float, bool and loop
+  // constants (RECORDER_REPLAY_BACKLOG RR-1).
+  uint64_t fetch_hash_ = 0;
+  // The same per 6-dword texture fetch slot (a vertex fetch constant v is in
+  // slot v / 3), so a draw's identity can take only the slots it reads.
+  uint64_t fetch_slot_hash_[32] = {};
+  void HashFetchDword(uint32_t index, uint32_t old_value, uint32_t value) {
+    const uint64_t term = StateHashTerm(index, old_value) ^ StateHashTerm(index, value);
+    fetch_hash_ ^= term;
+    fetch_slot_hash_[((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6) & 31] ^= term;
+  }
+  // Updates the fetch hashes for fetch constant dwords about to change.
+  void HashFetchConstants(uint32_t start_index, const uint32_t* new_values, uint32_t count,
+                          bool big_endian) {
+    const uint32_t* old_values = register_file_->values + start_index;
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint32_t value = big_endian ? rex::byte_swap(new_values[i]) : new_values[i];
+      if (old_values[i] != value) {
+        HashFetchDword(start_index + i, old_values[i], value);
+      }
+    }
+  }
   static uint64_t StateHashTerm(uint32_t index, uint32_t value) {
     uint64_t x = (uint64_t(index) << 32 | value) * UINT64_C(0x9E3779B97F4A7C15);
     x ^= x >> 29;
