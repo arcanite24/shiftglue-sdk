@@ -58,15 +58,19 @@ REXCVAR_DEFINE_BOOL(gpu_record_elide_unchanged_registers, true, "GPU",
                     "plain state register or shader constant unchanged, so the recorder neither "
                     "applies them nor invalidates what depends on them")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-#if REX_PLATFORM_ANDROID
-// Phones: short sleeps instead of a busy yield, for power (measured on the
-// Snapdragon 8 Elite: a third less CPU on the commands thread, same frames).
+#if !REX_PLATFORM_WIN32
+// POSIX sleeps are fine-grained: short sleeps instead of a busy yield, for
+// power (measured on the Snapdragon 8 Elite: a third less CPU on the
+// commands thread, same frames). Linux and the Steam Deck share it (LS-2.1).
 constexpr int32_t kWaitRegMemYieldUsDefault = 100;
 constexpr int32_t kWaitRegMemSleepUsDefault = 100;
 #else
-// Windows sleeps in timer ticks (about a millisecond), so desktops spin.
-constexpr int32_t kWaitRegMemYieldUsDefault = 2000;
-constexpr int32_t kWaitRegMemSleepUsDefault = 0;
+// Windows sleeps 100 us on a high-resolution waitable timer after a 200 us
+// yield (LS-2.2): against the former 2 ms yield it took 2.3-3.5 ms less
+// decoder CPU a race frame at 60 fps, with a p95 about 0.9 ms lower, on 16,
+// 8 and 4 threads of a Ryzen 7 5800X.
+constexpr int32_t kWaitRegMemYieldUsDefault = 200;
+constexpr int32_t kWaitRegMemSleepUsDefault = 100;
 #endif
 REXCVAR_DEFINE_INT32(wait_reg_mem_yield_us, kWaitRegMemYieldUsDefault, "GPU",
                      "With vsync or configured short sleeps, how long a WAIT_REG_MEM poll yields (the "
@@ -433,7 +437,7 @@ void CommandProcessor::StopRecordThread() {
 }
 
 void CommandProcessor::RecordThreadMain() {
-  // The thread's CPU time is a system call (GetThreadTimes, 2 % of the
+  // The thread's CPU time is a system call (GetThreadTimes cost 2 % of the
   // recorder when read around every batch), and it does not advance while the
   // thread waits, so read it before waiting and at most once a millisecond.
   int64_t cpu_read_ns = perf::CurrentThreadCpuTimeNs();
@@ -1922,7 +1926,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
                    std::chrono::microseconds(REXCVAR_GET(wait_reg_mem_yield_us))) {
           rex::thread::MaybeYield();
         } else if (const int32_t sleep_us = REXCVAR_GET(wait_reg_mem_sleep_us)) {
-          rex::thread::Sleep(std::chrono::microseconds(sleep_us));
+          // WaitUntil uses a high-resolution waitable timer on Windows, where
+          // Sleep rounds anything under a millisecond down to a yield (LS-2.2).
+          rex::thread::WaitUntil(std::chrono::steady_clock::now() +
+                                 std::chrono::microseconds(sleep_us));
           slept = true;
         } else {
           rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
