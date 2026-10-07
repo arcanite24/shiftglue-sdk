@@ -144,6 +144,12 @@ class ContentManager {
   ContentManager(KernelState* kernel_state, const std::filesystem::path& root_path);
   ~ContentManager();
 
+  // Set before guest content is opened. Saved games stay in root_path_, while
+  // Marketplace installations and their headers may be shared across profiles.
+  void SetMarketplaceRoot(const std::filesystem::path& root_path) {
+    marketplace_root_path_ = root_path;
+  }
+
   std::vector<XCONTENT_AGGREGATE_DATA> ListContent(uint32_t device_id, uint64_t xuid,
                                                    XContentType content_type,
                                                    uint32_t title_id = -1);
@@ -198,6 +204,7 @@ class ContentManager {
 
   KernelState* kernel_state_;
   std::filesystem::path root_path_;
+  std::filesystem::path marketplace_root_path_;
 
   // TODO(benvanik): remove use of global lock, it's bad here!
   rex::thread::global_critical_region global_critical_region_;
