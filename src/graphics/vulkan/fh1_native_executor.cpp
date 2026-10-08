@@ -65,6 +65,10 @@ REXCVAR_DEFINE_BOOL(fh1_debug_skip_stencil_transfers, false, "GPU",
                     "Diagnostics: transfer depth without its stencil bit passes on devices "
                     "without stencil export (wrong stencil), to bound what they cost")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(fh1_debug_skip_transfers, "", "GPU",
+                      "Diagnostics: skip transfers between these surfaces, as "
+                      "<source>=<destination> descriptions (wrong image if they are needed)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_debug_skip_clears, false, "GPU",
                     "Diagnostics: skip every EDRAM clear (wrong image), to bound what clears "
                     "cost")
@@ -1073,6 +1077,14 @@ void Fh1NativeExecutor::TransferRects(Surface& dest, uint32_t previous_owner, co
        !Fh1IsResolveColorFormatSupported(xenos::ColorRenderTargetFormat(source->key.format)))) {
     return Skip("transfer_format");
   }
+  {
+    static const std::string skip_pairs = REXCVAR_GET(fh1_debug_skip_transfers);
+    if (!skip_pairs.empty() &&
+        skip_pairs.find(source->key.Describe() + "=" + dest.key.Describe()) != std::string::npos) {
+      Count("debug_transfer_skipped");
+      return;
+    }
+  }
   Count("transfer");
   ++transfer_count_;
   const bool source_stencil =
@@ -1109,6 +1121,19 @@ void Fh1NativeExecutor::FlushTransfers() {
       ++group_end;
     }
     if (Surface* dest = FindSurface(pending_transfers_[group].dest)) {
+      uint64_t label_timing = UINT64_MAX;
+      if (gpu_query_pool_ != VK_NULL_HANDLE) {
+        const Surface* first_source = FindSurface(pending_transfers_[group].source);
+        const std::string label = fmt::format("T {}={}",
+            first_source ? first_source->key.Describe() : std::string("?"), dest->key.Describe());
+        command_processor_.EndRenderPass();
+        label_timing = (uint64_t(GpuLabel(label)) << 32) | GpuBegin();
+      }
+      struct EndLabel {
+        Fh1NativeExecutor& executor;
+        uint64_t token;
+        ~EndLabel() { executor.EndLabelGpuTiming(token); }
+      } end_label{*this, label_timing};
       if (dest->key.is_depth) {
         FlushDepthTransfers(*dest, group, group_end);
       } else {
