@@ -20,6 +20,11 @@
 #include <rex/platform.h>
 #include <rex/ui/vulkan/instance.h>
 #include <rex/ui/vulkan/presenter.h>
+
+REXCVAR_DEFINE_BOOL(vulkan_validation_sync, false, "UI/Vulkan",
+                    "Diagnostics: with vulkan_validation_enabled, also enable the validation "
+                    "layer's synchronization validation (hazards between GPU work)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 #if REX_PLATFORM_ANDROID
 #include <rex/platform/env.h>
 #include <rex/ui/vulkan/android_gpu_driver.h>
@@ -374,6 +379,16 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   instance_create_info.ppEnabledLayerNames = enabled_layers.data();
   instance_create_info.enabledExtensionCount = uint32_t(enabled_extensions.size());
   instance_create_info.ppEnabledExtensionNames = enabled_extensions.data();
+  const VkValidationFeatureEnableEXT sync_validation =
+      VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
+  VkValidationFeaturesEXT validation_features = {};
+  validation_features.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
+  validation_features.enabledValidationFeatureCount = 1;
+  validation_features.pEnabledValidationFeatures = &sync_validation;
+  if (layer_khronos_validation && REXCVAR_GET(vulkan_validation_sync)) {
+    instance_create_info.pNext = &validation_features;
+    REXLOG_INFO("Vulkan validation: synchronization validation enabled");
+  }
   VkResult instance_create_result =
       ifn.vkCreateInstance(&instance_create_info, nullptr, &vulkan_instance->instance_);
 
