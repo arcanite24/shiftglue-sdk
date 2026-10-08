@@ -811,6 +811,21 @@ void VulkanCommandProcessor::DrawCostFrame() {
                   double(e.scratch_same) / d, double(e.scratch_writeback) / d);
       record_census_ = std::make_unique<RecordCensus>();
     }
+    if (fh1_native_executor_ && draw_cost_.enabled) {
+      const uint64_t calls = fh1_native_executor_->prepare_calls() - prepare_calls_at_window_;
+      const uint64_t hits = fh1_native_executor_->prepare_memo_hits() - prepare_hits_at_window_;
+      prepare_calls_at_window_ = fh1_native_executor_->prepare_calls();
+      prepare_hits_at_window_ = fh1_native_executor_->prepare_memo_hits();
+      REXGPU_INFO("Target preparation (PD-3.5) over 600 frames: {} preparations, memo hits "
+                  "{:.1f} %",
+                  calls, calls ? 100.0 * double(hits) / double(calls) : 0.0);
+    }
+    if (constants_set_last_ + constants_set_table_ + constants_set_new_) {
+      REXGPU_INFO("Constants set (PD-3.3) over 600 frames: {} same as the last draw, {} from "
+                  "the frame table, {} new",
+                  constants_set_last_, constants_set_table_, constants_set_new_);
+      constants_set_last_ = constants_set_table_ = constants_set_new_ = 0;
+    }
     if (sampler_census_.slots || sampler_census_.verified_different) {
       const SamplerCensus& sc = sampler_census_;
       const double slots = double(std::max<uint64_t>(sc.slots, 1));
@@ -869,7 +884,7 @@ void VulkanCommandProcessor::DrawCostFrame() {
   m.window_ns = now_ns;
   static constexpr const char* kStepNames[kCostStepCount] = {
       "analysis", "primitives", "translation", "samplers", "textures", "targets",
-      "pipeline", "dynamic", "system_constants", "constant_uploads", "texture_bindings",
+      "pipeline", "dynamic", "system_constants", "constant_uploads", "image_infos", "texture_bindings",
       "constants_set", "texture_sets", "descriptor_update", "binds", "vertex", "memexport",
       "begin_rendering", "draw"};
   static constexpr const char* kBandNames[3] = {"heavy", "gameplay", "light"};
@@ -8517,6 +8532,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     }
   }
 
+  DrawCostMark(kCostImageInfos);
   if (write_vertex_textures &&
       ReuseTextureDescriptorSet(
           false, texture_count_vertex, sampler_count_vertex,
@@ -8611,8 +8627,10 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         last_constants_descriptor_set_key_ == constants_key) {
       // Consecutive draws nearly always share buffers and sizes.
       constants_descriptor_set = last_constants_descriptor_set_;
+      constants_set_last_ += draw_cost_.enabled;
     } else if ((frame_constants_set = constants_descriptor_sets_frame_.Find(constants_key))) {
       constants_descriptor_set = *frame_constants_set;
+      constants_set_table_ += draw_cost_.enabled;
     } else {
       if (!constants_transient_descriptors_free_.empty()) {
         constants_descriptor_set = constants_transient_descriptors_free_.back();
@@ -8627,6 +8645,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
           return false;
         }
       }
+      constants_set_new_ += draw_cost_.enabled;
       constants_transient_descriptors_used_.emplace_back(frame_current_, constants_descriptor_set);
       constants_descriptor_sets_frame_.Insert(constants_key, constants_descriptor_set);
       // Consecutive bindings updated via a single VkWriteDescriptorSet must

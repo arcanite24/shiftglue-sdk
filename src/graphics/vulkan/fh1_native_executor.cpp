@@ -1604,12 +1604,14 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1DrawInfo& draw) {
   const bool memo_allowed = draw.state_epoch && !draw.memexport &&
                             !register_file_.Get<reg::PA_CL_CLIP_CNTL>().clip_disable;
   PrepareMemo& memo = prepare_memo_;
+  ++prepare_calls_;
   if (memo_allowed && memo.state_epoch == draw.state_epoch &&
       memo.vertex_shader == draw.vertex_shader &&
       memo.depth_control == draw.normalized_depth_control.value &&
       memo.color_mask == draw.normalized_color_mask &&
       memo.rasterization_done == draw.rasterization_done &&
       memo.generation == tiles_.generation()) {
+    ++prepare_memo_hits_;
     pending_targets_valid_ = true;
     pending_used_bits_ = memo.used_bits;
     std::memcpy(pending_keys_, memo.keys, sizeof(memo.keys));

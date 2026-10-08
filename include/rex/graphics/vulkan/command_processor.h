@@ -652,7 +652,8 @@ class VulkanCommandProcessor : public CommandProcessor {
     kCostDynamicState,      // viewport and dynamic state
     kCostSystemConstants,   // UpdateSystemConstantValues
     kCostConstantUploads,   // UpdateBindings: constant buffers
-    kCostTextureBindings,   // UpdateBindings: image infos, reuse and push checks
+    kCostImageInfos,        // UpdateBindings: image and sampler infos
+    kCostTextureBindings,   // UpdateBindings: set reuse and push checks
     kCostConstantsSet,      // UpdateBindings: constants set lookup and writes
     kCostTextureSets,       // UpdateBindings: texture set allocation and writes
     kCostDescriptorUpdate,  // UpdateBindings: vkUpdateDescriptorSets
@@ -701,6 +702,9 @@ class VulkanCommandProcessor : public CommandProcessor {
     std::vector<uint8_t> last[5];
   } constant_census_;
   bool constant_census_enabled_ = false;
+  // PD-3.3 census, with the cost model: constants set lookups by outcome.
+  uint64_t constants_set_last_ = 0, constants_set_table_ = 0, constants_set_new_ = 0;
+  uint64_t prepare_calls_at_window_ = 0, prepare_hits_at_window_ = 0;
   void CountConstantUpload(uint32_t buffer, const void* data, size_t size);
   std::chrono::steady_clock::time_point memory_sampled_{};
   std::chrono::steady_clock::time_point memory_budget_logged_{};

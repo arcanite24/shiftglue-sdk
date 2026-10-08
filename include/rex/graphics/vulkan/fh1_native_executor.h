@@ -69,6 +69,9 @@ class Fh1NativeExecutor {
   // writes and takes their EDRAM tiles, transferring the previous owners'
   // contents.
   void PrepareTargets(const Fh1DrawInfo& draw);
+  // PD-3.5 census: target preparations and the memo hits among them.
+  uint64_t prepare_calls() const { return prepare_calls_; }
+  uint64_t prepare_memo_hits() const { return prepare_memo_hits_; }
   // The render pass key the draw's pipeline is created for (formats and
   // samples of the surfaces PrepareTargets derived). False skips the draw.
   bool BindTargets(VulkanRenderTargetCache::RenderPassKey& key_out);
@@ -359,6 +362,7 @@ class Fh1NativeExecutor {
     SurfaceKey keys[5];
   };
   PrepareMemo prepare_memo_;
+  uint64_t prepare_calls_ = 0, prepare_memo_hits_ = 0;
   void PrepareTargetsImpl(const Fh1DrawInfo& draw);
   uint32_t recent_prepare_next_ = 0;
 
