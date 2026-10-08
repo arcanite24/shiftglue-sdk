@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <map>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -1455,11 +1456,23 @@ void TextureCache::FindReloadRowBand(
   loading_rows_end_ = end;
 }
 
+// FH1 resolves into memory shared by textures of several formats each frame,
+// so each resolve found its own texture outdated by the others and reloaded it.
+REXCVAR_DEFINE_BOOL(fh1_direct_resolve_outdated, true, "GPU",
+                    "Resolves also write outdated textures directly when they cover all of "
+                    "them, instead of the textures reloading")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(fh1_trace_direct_resolves, false, "GPU",
+                    "Diagnostics: count why textures over a resolve's destination are not "
+                    "written by it directly, logged every 5000 resolves")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 void TextureCache::FindDirectResolveTargets(uint32_t dest_base, uint32_t extent_start,
                                             uint32_t extent_length, xenos::TextureFormat format,
                                             uint32_t pitch_texels, uint32_t dest_width,
                                             uint32_t dest_height, bool scaled,
-                                            std::vector<DirectResolveTarget>& targets_out) {
+                                            std::vector<DirectResolveTarget>& targets_out,
+                                            bool from_origin) {
   targets_out.clear();
   const FormatInfo* format_info = FormatInfo::Get(format);
   const uint32_t bytes_per_block = format_info->bytes_per_block();
@@ -1468,6 +1481,51 @@ void TextureCache::FindDirectResolveTargets(uint32_t dest_base, uint32_t extent_
   }
   const uint32_t pitch_aligned = (pitch_texels + 31) & ~UINT32_C(31);
   auto global_lock = global_critical_region_.Acquire();
+  static std::map<std::string, uint64_t> reasons;
+  static uint64_t calls = 0;
+  const bool trace = REXCVAR_GET(fh1_trace_direct_resolves);
+  struct TraceEnd {
+    bool trace;
+    std::vector<DirectResolveTarget>& out;
+    ~TraceEnd() {
+      if (!trace) return;
+      ++reasons[out.empty() ? "result none" : out.size() == 1 ? "result one" : "result several"];
+      if (++calls % 5000 == 0) {
+        std::string text;
+        for (const auto& [reason, count] : reasons) text += fmt::format(" {}={};", reason, count);
+        REXGPU_INFO("Direct resolve census over {} resolves:{}", calls, text);
+      }
+    }
+  } trace_end{trace, targets_out};
+  if (trace) {
+    // Every texture overlapping the extent, and why it does not qualify.
+    for (const auto& [base, texture_ptr] : textures_by_base_) {
+      const Texture& texture = *texture_ptr;
+      if (base >= extent_start + extent_length || base + texture.GetGuestBaseSize() <= extent_start) {
+        continue;
+      }
+      const TextureKey& key = texture.key();
+      const texture_util::TextureGuestLayout& layout = texture.guest_layout();
+      const char* reason =
+          key.format != format ? "format"
+          : !key.tiled ? "linear"
+          : key.dimension != xenos::DataDimension::k2DOrStacked || key.GetDepthOrArraySize() != 1
+              ? "dimension"
+          : key.mip_max_level != 0 ? "mips"
+          : layout.packed_level == 0 ? "packed"
+          : bool(key.scaled_resolve) != scaled ? "scaled"
+          : texture.outdated_mask() ? "outdated"
+          : layout.base.row_pitch_bytes != pitch_aligned * bytes_per_block ? "pitch"
+          : (dest_base - base) % (layout.base.row_pitch_bytes * 32) || extent_start < base ||
+                  uint64_t(extent_start) + extent_length > uint64_t(base) + texture.GetGuestBaseSize()
+              ? "placement"
+              : "candidate";
+      ++reasons[std::string(reason) + (key.format != format
+                                           ? fmt::format(" {}<-{}", uint32_t(key.format),
+                                                         uint32_t(format))
+                                           : std::string())];
+    }
+  }
   // Textures starting at most 32 MB before the destination.
   for (auto it = textures_by_base_.upper_bound(dest_base); it != textures_by_base_.begin();) {
     --it;
@@ -1482,7 +1540,7 @@ void TextureCache::FindDirectResolveTargets(uint32_t dest_base, uint32_t extent_
     const texture_util::TextureGuestLayout& layout = texture.guest_layout();
     if (key.format != format || !key.tiled || key.dimension != xenos::DataDimension::k2DOrStacked ||
         key.GetDepthOrArraySize() != 1 || key.mip_max_level != 0 || layout.packed_level == 0 ||
-        bool(key.scaled_resolve) != scaled || texture.outdated_mask() ||
+        bool(key.scaled_resolve) != scaled ||
         layout.base.row_pitch_bytes != pitch_aligned * bytes_per_block) {
       continue;
     }
@@ -1496,6 +1554,15 @@ void TextureCache::FindDirectResolveTargets(uint32_t dest_base, uint32_t extent_
     // first row) must lie inside the texture.
     const uint32_t row_offset = offset / macro_row_bytes * 32;
     if (dest_width > key.GetWidth() || row_offset + dest_height > key.GetHeight()) {
+      continue;
+    }
+    // An outdated texture (its memory written since its load, such as by
+    // another texture's resolve over the same memory) can only be written
+    // when the resolve covers all of it (from texel 0, 0), which makes it
+    // current again.
+    if (texture.outdated_mask() &&
+        !(REXCVAR_GET(fh1_direct_resolve_outdated) && from_origin && row_offset == 0 &&
+          dest_width >= key.GetWidth() && dest_height >= key.GetHeight())) {
       continue;
     }
     targets_out.push_back({&texture, row_offset});

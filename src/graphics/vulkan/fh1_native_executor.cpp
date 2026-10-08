@@ -2449,7 +2449,8 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
       for (uint32_t i = 0; i < (pack == 4 ? 2u : 1u) && direct_resolve_targets_.empty(); ++i) {
         config_.textures->FindDirectResolveTargets(
             plan.dest_base, extent_start, extent_length, formats[i], plan.dest_pitch,
-            uint32_t(plan.x1), uint32_t(plan.y1), scale_ > 1, direct_resolve_targets_);
+            uint32_t(plan.x1), uint32_t(plan.y1), scale_ > 1, direct_resolve_targets_,
+            plan.x0 == 0 && plan.y0 == 0);
         if (pack == 4) direct_resolve_conversion = i + 1;
       }
     }

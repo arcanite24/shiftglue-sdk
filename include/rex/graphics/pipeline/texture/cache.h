@@ -605,7 +605,8 @@ class TextureCache {
   void FindDirectResolveTargets(uint32_t dest_base, uint32_t extent_start, uint32_t extent_length,
                                 xenos::TextureFormat format, uint32_t pitch_texels,
                                 uint32_t dest_width, uint32_t dest_height, bool scaled,
-                                std::vector<DirectResolveTarget>& targets_out);
+                                std::vector<DirectResolveTarget>& targets_out,
+                                bool from_origin = false);
   // After MarkRangeAsResolved invalidated the targets: their data was written
   // directly, so they are current again.
   void CompleteDirectResolve(const std::vector<DirectResolveTarget>& targets);
