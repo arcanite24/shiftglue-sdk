@@ -426,6 +426,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // indices after the fetch constants (vulkan_bindless_textures and the
     // device's descriptor indexing).
     bool bindless_textures;
+    // 2D fetches in pixel shaders with the LOD computed from the pixel's
+    // derivatives sample with implicit LOD (spirv_implicit_lod_2d).
+    bool implicit_lod_2d;
   };
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,

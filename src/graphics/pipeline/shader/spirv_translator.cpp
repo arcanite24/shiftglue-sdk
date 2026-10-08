@@ -55,6 +55,14 @@ REXCVAR_DEFINE_BOOL(spirv_specialize_texture_signs, REX_PLATFORM_ANDROID, "GPU",
                     "made without it read the signedness at run time as before")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// Turnip on the Odin 2 Portal (Adreno 740): 6 % off the frame at 4x MSAA,
+// the image unchanged but for a few pixels at level transitions. Qualcomm's
+// own driver gained nothing.
+REXCVAR_DEFINE_BOOL(spirv_implicit_lod_2d_turnip, true, "GPU",
+                    "Vulkan: on Mesa Turnip, sample 2D textures in pixel shaders with implicit "
+                    "LOD as spirv_implicit_lod_2d does")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(spirv_implicit_lod_2d, false, "GPU",
                     "Vulkan: sample 2D textures whose level the pixel shader computes with "
                     "implicit level of detail plus the bias, as cube maps already are, "
@@ -99,7 +107,8 @@ SpirvShaderTranslator::Features::Features(bool all)
       demote_to_helper_invocation(all),
       sample_rate_shading(all),
       quad_operations_fragment(all),
-      bindless_textures(false) {}
+      bindless_textures(false),
+      implicit_lod_2d(false) {}
 
 SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const vulkan_device)
     : max_storage_buffer_range(vulkan_device->properties().maxStorageBufferRange),
@@ -117,7 +126,10 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
       fragment_shader_sample_interlock(vulkan_device->properties().fragmentShaderSampleInterlock),
       demote_to_helper_invocation(vulkan_device->properties().shaderDemoteToHelperInvocation),
       sample_rate_shading(vulkan_device->properties().sampleRateShading),
-      quad_operations_fragment(vulkan_device->properties().subgroupQuadFragment) {
+      quad_operations_fragment(vulkan_device->properties().subgroupQuadFragment),
+      implicit_lod_2d(REXCVAR_GET(spirv_implicit_lod_2d) ||
+                      (REXCVAR_GET(spirv_implicit_lod_2d_turnip) &&
+                       vulkan_device->properties().driverID == VK_DRIVER_ID_MESA_TURNIP)) {
   const uint32_t vulkan_api_version = vulkan_device->properties().apiVersion;
   if (vulkan_api_version >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
     spirv_version = spv::Spv_1_5;
