@@ -68,6 +68,14 @@ REXCVAR_DEFINE_BOOL(gpu_3d_to_2d_texture, true, "GPU",
                     "Sample problematic 3D textures through 2D-compatible wrappers")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(texture_key_unused_packed_mips, true, "GPU",
+                    "Treat textures whose stored levels are all above the packed mip tail as "
+                    "the same texture whether their fetch constant packs mips or not")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_debug_skip_resolve_reloads, false, "GPU",
+                    "Diagnostics: never reload textures from resolved memory (stale images), "
+                    "to bound what the remaining reloads cost")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_texture_reload_probe, false, "GPU",
                     "Log FH1 texture invalidation ranges and reload attempts")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -497,12 +505,16 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
         "FH1 texture reload attempt {{\"texture\":{},\"base\":\"{:08X}\",\"mips\":\"{:08X}\","
         "\"width\":{},\"height\":{},\"depth\":{},\"format\":{},\"base_dirty\":{},"
         "\"mips_dirty\":{},\"base_bytes\":{},\"mips_bytes\":{},\"scaled\":{},"
-        "\"allocation_id\":{},\"payload_generation\":{}}}",
+        "\"allocation_id\":{},\"payload_generation\":{},\"tiled\":{},\"pitch\":{},"
+        "\"endian\":{},\"mip_max\":{},\"packed\":{},\"dimension\":{}}}",
         reinterpret_cast<uintptr_t>(&texture), uint32_t(key.base_page << 12),
         uint32_t(key.mip_page << 12), key.GetWidth(),
         key.GetHeight(), key.GetDepthOrArraySize(), uint32_t(key.format), base_outdated,
         mips_outdated, texture.GetGuestBaseSize(), texture.GetGuestMipsSize(),
-        uint32_t(key.scaled_resolve), texture.allocation_id(), texture.payload_generation());
+        uint32_t(key.scaled_resolve), texture.allocation_id(), texture.payload_generation(),
+        uint32_t(key.tiled), texture.guest_layout().base.row_pitch_bytes,
+        uint32_t(key.endianness), uint32_t(key.mip_max_level),
+        texture.guest_layout().packed_level, uint32_t(key.dimension));
   }
   if (TryLoadTextureDataFromCpu(texture, base_outdated, mips_outdated, resolve_sourced)) {
     texture.CompleteLoad(global_critical_region_.Acquire(), base_outdated, mips_outdated);
@@ -561,6 +573,11 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
     }
   }
 
+  if (pending_load.resolve_sourced && REXCVAR_GET(fh1_debug_skip_resolve_reloads)) {
+    texture.CompleteLoad(global_critical_region_.Acquire(), pending_load.load_base,
+                         pending_load.load_mips);
+    return true;
+  }
   loading_resolve_sourced_ = pending_load.resolve_sourced;
   uint64_t write_log_count;
   {
@@ -1266,6 +1283,15 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
   key_out.mip_max_level = mip_max_level;
   key_out.tiled = fetch.tiled;
   key_out.packed_mips = fetch.packed_mips;
+  // Packing only places the levels of 16 texels or less: when no stored level
+  // is one of them, both settings describe the same texture, and FH1 fetches
+  // its single-level resolve targets both ways, which made two textures over
+  // the same memory of which a resolve could write only one.
+  if (key_out.packed_mips && REXCVAR_GET(texture_key_unused_packed_mips) &&
+      fetch.dimension != xenos::DataDimension::k3D &&
+      mip_max_level < texture_util::GetPackedMipLevel(width_minus_1 + 1, height_minus_1 + 1)) {
+    key_out.packed_mips = 0;
+  }
   key_out.format = format;
   key_out.endianness = fetch.endianness;
 

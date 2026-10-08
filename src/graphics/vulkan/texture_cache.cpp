@@ -40,6 +40,7 @@
 // FH1's bloom and luminance chains (320x192 down to 2x2) reloaded every
 // frame because only textures of 256x256 texels or more could be resolved
 // into directly.
+REXCVAR_DECLARE(bool, fh1_texture_reload_probe);
 REXCVAR_DEFINE_BOOL(vulkan_small_texture_copy_views, true, "GPU/Vulkan",
                     "Give textures of any size with 4-byte texels the raw-bits view resolves "
                     "write directly through, not only those of 256x256 texels or more")
@@ -621,6 +622,16 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
     if (binding_texture != nullptr) {
       // Will be referenced by the command buffer, so mark as used.
       binding_texture->MarkAsUsed();
+      if (REXCVAR_GET(fh1_texture_reload_probe) && binding_texture->GetGuestBaseSize() >= (1u << 20)) {
+        const TextureKey& k = binding_texture->key();
+        REXGPU_INFO("FH1 texture sampled {:X} base {:08X} format {} {}x{} endian {} outdated {} "
+                    "dim {} tiled {} packed {} mip_page {:X} depth {} pitch {} mips {} signed {}",
+                    uintptr_t(binding_texture), uint32_t(k.base_page << 12), uint32_t(k.format),
+                    k.GetWidth(), k.GetHeight(), uint32_t(k.endianness),
+                    binding_texture->outdated_mask(), uint32_t(k.dimension), uint32_t(k.tiled),
+                    uint32_t(k.packed_mips), uint32_t(k.mip_page), k.GetDepthOrArraySize(),
+                    uint32_t(k.pitch), uint32_t(k.mip_max_level), uint32_t(k.signed_separate));
+      }
       VulkanTexture::Usage old_usage =
           binding_texture->SetUsage(VulkanTexture::Usage::kGuestShaderSampled);
       if (old_usage != VulkanTexture::Usage::kGuestShaderSampled) {
