@@ -370,6 +370,9 @@ class VulkanPipelineCache {
   // at the point of the call: shaders must be translated, and the pipeline
   // layout and render pass object (unless dynamic rendering is used) must be
   // available.
+  // vulkan_pipeline_statistics: logs the driver's statistics for a pipeline.
+  void LogPipelineStatistics(VkPipeline pipeline,
+                             const PipelineCreationArguments& creation_arguments);
   bool EnsurePipelineCreated(const PipelineCreationArguments& creation_arguments,
                              VkShaderModule fragment_shader_override = VK_NULL_HANDLE);
   void CreationThread(size_t thread_index);

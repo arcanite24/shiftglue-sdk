@@ -181,6 +181,11 @@ class VulkanDevice {
     bool presentId = false;
     bool presentWait = false;
 
+    // VK_KHR_pipeline_executable_properties (#270), only with
+    // vulkan_pipeline_statistics.
+
+    bool pipelineExecutableInfo = false;
+
     // Descriptor indexing (promoted to 1.2), for bindless textures
     // (RECORDER_PER_DRAW_BACKLOG PD-4). Enabled only on Vulkan 1.2+ devices.
 
@@ -231,6 +236,8 @@ class VulkanDevice {
     // Have optional features not implied by these being true.
     bool ext_KHR_present_id = false;    // #295
     bool ext_KHR_present_wait = false;  // #249
+    // Only with vulkan_pipeline_statistics.
+    bool ext_KHR_pipeline_executable_properties = false;  // #270
   };
 
   const Extensions& extensions() const { return extensions_; }

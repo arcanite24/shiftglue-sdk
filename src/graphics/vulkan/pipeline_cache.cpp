@@ -53,6 +53,10 @@
 #include <rex/ui/vulkan/util.h>
 
 REXCVAR_DECLARE(bool, spirv_specialize_texture_signs);
+REXCVAR_DEFINE_BOOL(vulkan_debug_flat_pixel_shaders, false, "GPU/Vulkan",
+                    "Diagnostics: replace every guest pixel shader with one writing a constant "
+                    "color (wrong image), to bound what pixel shading costs")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_pipeline_cache_persist, true, "GPU/Vulkan",
                     "Keep the driver's pipeline cache on disk beside the shader storage, so "
                     "pipelines are not compiled again at every start")
@@ -3411,6 +3415,59 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
   return true;
 }
 
+void VulkanPipelineCache::LogPipelineStatistics(
+    VkPipeline pipeline, const PipelineCreationArguments& creation_arguments) {
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& ifn = vulkan_device->vulkan_instance()->functions();
+  const VkDevice device = vulkan_device->device();
+  static const auto get_properties = PFN_vkGetPipelineExecutablePropertiesKHR(
+      ifn.vkGetDeviceProcAddr(device, "vkGetPipelineExecutablePropertiesKHR"));
+  static const auto get_statistics = PFN_vkGetPipelineExecutableStatisticsKHR(
+      ifn.vkGetDeviceProcAddr(device, "vkGetPipelineExecutableStatisticsKHR"));
+  if (!get_properties || !get_statistics) return;
+  VkPipelineInfoKHR pipeline_info = {VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, nullptr, pipeline};
+  uint32_t count = 0;
+  get_properties(device, &pipeline_info, &count, nullptr);
+  std::vector<VkPipelineExecutablePropertiesKHR> executables(
+      count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
+  get_properties(device, &pipeline_info, &count, executables.data());
+  const uint64_t vs = creation_arguments.vertex_shader->shader().ucode_data_hash();
+  const uint64_t ps =
+      creation_arguments.pixel_shader ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+                                      : 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    VkPipelineExecutableInfoKHR executable_info = {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR,
+                                                   nullptr, pipeline, i};
+    uint32_t statistic_count = 0;
+    get_statistics(device, &executable_info, &statistic_count, nullptr);
+    std::vector<VkPipelineExecutableStatisticKHR> statistics(
+        statistic_count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
+    get_statistics(device, &executable_info, &statistic_count, statistics.data());
+    std::string text;
+    for (const VkPipelineExecutableStatisticKHR& statistic : statistics) {
+      text += fmt::format("{}{}=", text.empty() ? "" : "; ", statistic.name);
+      switch (statistic.format) {
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
+          text += statistic.value.b32 ? "1" : "0";
+          break;
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:
+          text += std::to_string(statistic.value.i64);
+          break;
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
+          text += std::to_string(statistic.value.u64);
+          break;
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR:
+          text += fmt::format("{:.2f}", statistic.value.f64);
+          break;
+        default:
+          break;
+      }
+    }
+    REXGPU_INFO("Pipeline statistics vs={:016X} ps={:016X} {}: {}", vs, ps,
+                executables[i].name, text);
+  }
+}
+
 bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments& creation_arguments,
                                                 VkShaderModule fragment_shader_override) {
   VkPipeline existing_pipeline =
@@ -3540,8 +3597,23 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   shader_stage_fragment.module = VK_NULL_HANDLE;
   shader_stage_fragment.pName = "main";
   shader_stage_fragment.pSpecializationInfo = guest_specialization;
+  static VkShaderModule flat_pixel_shader = VK_NULL_HANDLE;
+  if (REXCVAR_GET(vulkan_debug_flat_pixel_shaders) && flat_pixel_shader == VK_NULL_HANDLE) {
+    std::vector<uint32_t> spirv;
+    std::string error;
+    if (command_processor_.CompileGlslToSpirv(VK_SHADER_STAGE_FRAGMENT_BIT,
+                                              "#version 460\nlayout(location = 0) out vec4 oC0;\n"
+                                              "void main() { oC0 = vec4(0.5); }\n",
+                                              spirv, error)) {
+      flat_pixel_shader = ui::vulkan::util::CreateShaderModule(vulkan_device, spirv.data(),
+                                                              spirv.size() * sizeof(uint32_t));
+    }
+  }
   if (fragment_shader_override != VK_NULL_HANDLE) {
     shader_stage_fragment.module = fragment_shader_override;
+  } else if (creation_arguments.pixel_shader && flat_pixel_shader != VK_NULL_HANDLE) {
+    shader_stage_fragment.module = flat_pixel_shader;
+    shader_stage_fragment.pSpecializationInfo = nullptr;
   } else if (creation_arguments.pixel_shader) {
     assert_true(creation_arguments.pixel_shader->is_translated());
     if (!creation_arguments.pixel_shader->is_valid()) {
@@ -3895,8 +3967,15 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   VkPipeline pipeline;
+  const bool log_statistics = vulkan_device->properties().pipelineExecutableInfo;
+  if (log_statistics) {
+    pipeline_create_info.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+  }
   VkResult create_result = dfn.vkCreateGraphicsPipelines(device, vk_pipeline_cache_, 1,
                                                          &pipeline_create_info, nullptr, &pipeline);
+  if (log_statistics && create_result == VK_SUCCESS) {
+    LogPipelineStatistics(pipeline, creation_arguments);
+  }
   vk_pipeline_cache_creations_.fetch_add(1, std::memory_order_relaxed);
   if (create_result != VK_SUCCESS) {
     uint64_t ps_hash = creation_arguments.pixel_shader

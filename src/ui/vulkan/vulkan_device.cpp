@@ -31,6 +31,11 @@ REXCVAR_DEFINE_BOOL(vulkan_diagnostic_checkpoints, false, "UI/Vulkan",
                     "passes with VK_NV_device_diagnostic_checkpoints and log the last ones the "
                     "GPU reached if the device is lost")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(vulkan_pipeline_statistics, false, "UI/Vulkan",
+                    "Diagnostics: log the driver's statistics (instructions, registers, "
+                    "spills) for every graphics pipeline, where the driver reports them "
+                    "through VK_KHR_pipeline_executable_properties")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
                     "required for Vulkan GPU emulation")
@@ -455,6 +460,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       // Required for true null descriptors in bindless texture bindings.
       XE_UI_VULKAN_STRUCT_EXTENSION(EXT_robustness2)
     }
+    if (get_physical_device_properties2_supported && REXCVAR_GET(vulkan_pipeline_statistics)) {
+      // #270.
+      XE_UI_VULKAN_STRUCT_EXTENSION(KHR_pipeline_executable_properties)
+    }
     if (REXCVAR_GET(vulkan_diagnostic_checkpoints)) {
       // #207.
       XE_UI_VULKAN_STRUCT_EXTENSION(NV_device_diagnostic_checkpoints)
@@ -567,6 +576,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDevicePresentWaitFeaturesKHR,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR>
       features_KHR_present_wait;
+  VulkanFeatures<VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR>
+      features_KHR_pipeline_executable_properties;
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -624,6 +636,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (device->extensions_.ext_KHR_present_wait) {
       features_KHR_present_wait.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_KHR_pipeline_executable_properties) {
+      features_KHR_pipeline_executable_properties.Link(supported_features_2, device_create_info);
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
@@ -1002,6 +1017,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
   if (device->extensions_.ext_KHR_present_wait) {
     XE_UI_VULKAN_FEATURE_2(features_KHR_present_wait, presentWait)
+  }
+  if (device->extensions_.ext_KHR_pipeline_executable_properties) {
+    XE_UI_VULKAN_FEATURE_2(features_KHR_pipeline_executable_properties, pipelineExecutableInfo)
   }
 
 #undef XE_UI_VULKAN_LIMIT
