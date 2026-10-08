@@ -104,10 +104,14 @@ class CommandProcessor {
   uint64_t bin_mask() const { return bin_mask_; }
   uint64_t bin_select() const { return bin_select_; }
   // FH1: the last resolve of the screen's shadow mask (any thread).
+  // fh1_shadow_mask_resolves counts them, so a title hook that keeps the mask
+  // lit sees when the game wrote it again.
   void set_fh1_shadow_mask(uint32_t base, uint32_t length) {
     fh1_shadow_mask_.store(uint64_t(base) << 32 | length, std::memory_order_relaxed);
+    fh1_shadow_mask_resolves_.fetch_add(1, std::memory_order_release);
   }
-  bool fh1_shadow_mask(uint32_t* base, uint32_t* length) const {
+  bool fh1_shadow_mask(uint32_t* base, uint32_t* length, uint32_t* resolves) const {
+    if (resolves) *resolves = fh1_shadow_mask_resolves_.load(std::memory_order_acquire);
     const uint64_t mask = fh1_shadow_mask_.load(std::memory_order_relaxed);
     *base = uint32_t(mask >> 32);
     *length = uint32_t(mask);
@@ -490,6 +494,7 @@ class CommandProcessor {
 
   uint64_t bin_select_ = 0xFFFFFFFFull;
   std::atomic<uint64_t> fh1_shadow_mask_{0};
+  std::atomic<uint32_t> fh1_shadow_mask_resolves_{0};
   uint64_t bin_mask_ = 0xFFFFFFFFull;
  public:
   // gpu_trace_bins_vblank: swaps decoded, to trace one whole frame.

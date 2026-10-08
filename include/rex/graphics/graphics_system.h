@@ -85,7 +85,7 @@ class GraphicsSystem : public system::IGraphicsSystem {
     return native_guest_output_renderer_.IsRegistered();
   }
   uint32_t draw_resolution_scale() const override;
-  bool fh1_shadow_mask(uint32_t* base, uint32_t* length) const override;
+  bool fh1_shadow_mask(uint32_t* base, uint32_t* length, uint32_t* resolves) const override;
   const system::NativeGuestOutputRendererRegistration&
   native_guest_output_renderer() const {
     return native_guest_output_renderer_;
