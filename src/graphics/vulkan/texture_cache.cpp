@@ -37,6 +37,13 @@
 #include <rex/ui/vulkan/ui_samplers.h>
 #include <rex/ui/vulkan/util.h>
 
+// FH1's bloom and luminance chains (320x192 down to 2x2) reloaded every
+// frame because only textures of 256x256 texels or more could be resolved
+// into directly.
+REXCVAR_DEFINE_BOOL(vulkan_small_texture_copy_views, true, "GPU/Vulkan",
+                    "Give textures of any size with 4-byte texels the raw-bits view resolves "
+                    "write directly through, not only those of 256x256 texels or more")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
 // On Android too: the raw-bits view it gives large textures also lets
 // resolves write them directly (fh1_resolve_to_textures) instead of reloading
@@ -1536,8 +1543,13 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
     const uint32_t texels = key.GetWidth() * key.GetHeight() *
                             (key.scaled_resolve ? draw_resolution_scale_x() * draw_resolution_scale_y()
                                                 : 1);
+    // Small 4-byte textures get the view too: resolves write them directly
+    // through it (fh1_resolve_to_textures) instead of them reloading.
     if (!copy_host_format.block_compressed &&
-        copy_host_format.load_shader != kLoadShaderIndexUnknown && texels >= 256 * 256) {
+        copy_host_format.load_shader != kLoadShaderIndexUnknown &&
+        (texels >= 256 * 256 ||
+         (REXCVAR_GET(vulkan_small_texture_copy_views) &&
+          GetLoadShaderInfo(copy_host_format.load_shader).bytes_per_host_block == 4))) {
       switch (GetLoadShaderInfo(copy_host_format.load_shader).bytes_per_host_block) {
         case 4:
           copy_words = 1;
