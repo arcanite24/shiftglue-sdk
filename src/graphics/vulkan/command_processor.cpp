@@ -64,6 +64,14 @@ REXCVAR_DEFINE_INT32(vulkan_async_pipeline_wait_ms, REX_PLATFORM_ANDROID ? 0 : 2
     .range(0, 5000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
+REXCVAR_DEFINE_BOOL(fh1_debug_tiny_draws, false, "GPU",
+                    "Diagnostics: draw only the first triangle of every draw, keeping all "
+                    "state changes (wrong image), to bound per-draw overhead (Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_native_gpu_profile_draws, false, "GPU",
+                    "Diagnostics: with fh1_native_gpu_profile, also time every draw by its "
+                    "pixel shader (Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(fh1_debug_dump_range, "", "GPU",
                       "Diagnostics: <draw>:<hex address>:<hex length> - before that draw of "
                       "every frame, write those guest bytes as the GPU has them to "
@@ -5621,12 +5629,21 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   }
 
   DrawCostMark(kCostBeginRendering);
+  uint64_t draw_gpu_timing = UINT64_MAX;
+  if (fh1_native_executor_ && REXCVAR_GET(fh1_native_gpu_profile_draws)) {
+    draw_gpu_timing = fh1_native_executor_->BeginLabelGpuTiming(
+        fmt::format("P {:016X}", pixel_shader ? pixel_shader->ucode_data_hash() : 0).c_str());
+  }
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
       shader_32bit_index_dma) {
     ++pending_draw_calls_;
-    deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
+    deferred_command_buffer_.CmdVkDraw(
+        REXCVAR_GET(fh1_debug_tiny_draws)
+            ? std::min(primitive_processing_result.host_draw_vertex_count, uint32_t(3))
+            : primitive_processing_result.host_draw_vertex_count,
+        1, 0, 0);
   } else {
     std::pair<VkBuffer, VkDeviceSize> index_buffer;
     switch (primitive_processing_result.index_buffer_type) {
@@ -5658,11 +5675,16 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
             ? VK_INDEX_TYPE_UINT16
             : VK_INDEX_TYPE_UINT32);
     ++pending_draw_calls_;
-    deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
+    deferred_command_buffer_.CmdVkDrawIndexed(
+        REXCVAR_GET(fh1_debug_tiny_draws)
+            ? std::min(primitive_processing_result.host_draw_vertex_count, uint32_t(3))
+            : primitive_processing_result.host_draw_vertex_count,
+        1,
                                               0, 0, 0);
   }
   Checkpoint(CheckpointKind::kDrawEnd);
   if (fh1_native_executor_) {
+    fh1_native_executor_->EndLabelGpuTiming(draw_gpu_timing);
     fh1_native_executor_->NativeDrawIssued(fh1_draw);
   }
 

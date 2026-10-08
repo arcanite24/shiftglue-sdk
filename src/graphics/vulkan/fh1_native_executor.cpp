@@ -2632,7 +2632,7 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
     for (uint32_t i = 0; i < gpu_label_ticks_.size(); ++i) heavy.emplace_back(gpu_label_ticks_[i], i);
     std::sort(heavy.begin(), heavy.end(), std::greater<>());
     std::string top;
-    for (size_t i = 0; i < heavy.size() && i < 24; ++i) {
+    for (size_t i = 0; i < heavy.size() && i < 64; ++i) {
       top += fmt::format("{}{} {:.2f}ms x{:.1f}", i ? "; " : "", gpu_labels_[heavy[i].second],
                          heavy[i].first * scale,
                          double(gpu_label_counts_[heavy[i].second]) / double(gpu_frames_));
