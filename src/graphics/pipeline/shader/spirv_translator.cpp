@@ -58,9 +58,11 @@ REXCVAR_DEFINE_BOOL(spirv_specialize_texture_signs, REX_PLATFORM_ANDROID, "GPU",
 // Turnip on the Odin 2 Portal (Adreno 740): 6 % off the frame at 4x MSAA,
 // the image unchanged but for a few pixels at level transitions. Qualcomm's
 // own driver gained nothing.
-REXCVAR_DEFINE_BOOL(spirv_implicit_lod_2d_turnip, true, "GPU",
+REXCVAR_DEFINE_BOOL(spirv_implicit_lod_2d_turnip, false, "GPU",
                     "Vulkan: on Mesa Turnip, sample 2D textures in pixel shaders with implicit "
-                    "LOD as spirv_implicit_lod_2d does")
+                    "LOD as spirv_implicit_lod_2d does. Off by default: on the Adreno 740 some "
+                    "2x2 quads of FH1's flags, signs and foliage then sample wrong mips, "
+                    "speckles that change every frame")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(spirv_implicit_lod_2d, false, "GPU",
