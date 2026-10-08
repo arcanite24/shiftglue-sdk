@@ -550,12 +550,34 @@ void CommandProcessor::ExecuteRecordBatch(RecordBatch& batch) {
   }
 }
 
+uint32_t CommandProcessor::RecordRunClass(uint32_t start_index) {
+  if (start_index >= 0x2000 && start_index < 0x2400) return 0;
+  if (start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+      start_index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+    return 1;
+  }
+  if (start_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+      start_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
+    return 2;
+  }
+  if (start_index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+      start_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
+    return 3;
+  }
+  return 4;
+}
+
 void CommandProcessor::ExecuteRecordBatchTimed(RecordBatch& batch) {
   // ExecuteRecordBatch with each entry kind's time (RR-0.1's coverage).
   auto elapsed = [](uint64_t start) { return CostTicks() - start; };
   const uint64_t batch_start = CostTicks();
   const uint32_t* words = batch.words.data();
   const size_t count = batch.words.size();
+  if (!record_census_) {
+    record_census_ = std::make_unique<RecordCensus>();
+  }
+  RecordCensus* census = record_census_.get();
+  ++census->batches;
   for (size_t i = 0; i < count;) {
     const uint64_t start = CostTicks();
     ++record_entries_;
@@ -565,9 +587,17 @@ void CommandProcessor::ExecuteRecordBatchTimed(RecordBatch& batch) {
         const uint32_t run = words[i + 2];
         WriteRegistersHost(first, words + i + 3, run);
         i += 3 + run;
+        const uint32_t run_class = RecordRunClass(first);
+        ++census->runs[run_class];
+        census->run_registers[run_class] += run;
       } break;
       case kRecordOne:
         WriteRegister(words[i + 1], words[i + 2]);
+        if (words[i + 1] < RegisterFile::kRegisterCount) {
+          ++census->ones[words[i + 1]];
+        } else {
+          ++census->ones_other;
+        }
         i += 3;
         record_ones_ns_ += elapsed(start);
         break;
@@ -575,6 +605,7 @@ void CommandProcessor::ExecuteRecordBatchTimed(RecordBatch& batch) {
         batch.fns[words[i + 1]]();
         i += 2;
         record_calls_ns_ += elapsed(start);
+        ++census->calls;
         break;
       case kRecordDraw: {
         DrawRecord record;
@@ -582,6 +613,7 @@ void CommandProcessor::ExecuteRecordBatchTimed(RecordBatch& batch) {
         ExecuteDrawRecord(record);
         i += 1 + kDrawRecordWords;
         record_draws_ns_ += elapsed(start);
+        ++census->draws;
       } break;
       default:
         assert_always();
@@ -650,6 +682,8 @@ void CommandProcessor::PacketWriteRegistersFromMem(uint32_t start_index, const u
     // matters); the rest would leave the recorder's register file as it is.
     uint32_t* shadow = decode_register_file_->values + start_index;
     uint32_t i = 0;
+    decode_source_runs_.store(decode_source_runs_.load(std::memory_order_relaxed) + 1,
+                              std::memory_order_relaxed);
     while (i < num_registers) {
       if (shadow[i] == rex::byte_swap(base[i]) && !RegisterWriteAlwaysMatters(start_index + i)) {
         ++i;
@@ -666,6 +700,8 @@ void CommandProcessor::PacketWriteRegistersFromMem(uint32_t start_index, const u
           start_index + end > XE_GPU_REG_COHER_STATUS_HOST) {
         decode_register_file_->values[XE_GPU_REG_COHER_STATUS_HOST] |= UINT32_C(0x80000000);
       }
+      decode_sub_runs_.store(decode_sub_runs_.load(std::memory_order_relaxed) + 1,
+                             std::memory_order_relaxed);
       RecordRegisterRun(start_index + i, base + i, end - i);
       i = end;
     }

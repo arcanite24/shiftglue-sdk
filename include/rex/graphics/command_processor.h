@@ -198,6 +198,19 @@ class CommandProcessor {
   // In CostTicks units despite the names' unit, like record_batch_ticks_.
   uint64_t record_draws_ns_ = 0, record_ones_ns_ = 0, record_calls_ns_ = 0;
   uint64_t record_batch_ticks_ = 0, record_entries_ = 0;
+  // PD-0.2 entry census, with record_cost_enabled_: single registers by
+  // register, runs by class (render state, float, fetch, bool and loop,
+  // other) with their registers, calls and batches; and on the decoder,
+  // source runs and the sub-runs elision split them into.
+  struct RecordCensus {
+    uint64_t ones[RegisterFile::kRegisterCount] = {};
+    uint64_t ones_other = 0;
+    uint64_t runs[5] = {}, run_registers[5] = {};
+    uint64_t calls = 0, batches = 0, draws = 0;
+  };
+  std::unique_ptr<RecordCensus> record_census_;
+  static uint32_t RecordRunClass(uint32_t start_index);
+  std::atomic<uint64_t> decode_source_runs_{0}, decode_sub_runs_{0};
   // gpu_template_stats (DR-4.2's first stage, recorder thread): each draw's
   // signature (register state, shaders, the fetch constants it uses, the draw
   // packet) in the indirect buffer execution it belongs to, compared at the

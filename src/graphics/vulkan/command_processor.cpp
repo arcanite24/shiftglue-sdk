@@ -134,6 +134,11 @@ REXCVAR_DEFINE_BOOL(gpu_system_constants_memo_verify, false, "GPU/Vulkan",
                     "Derive the system constants in full on memo hits too and count the "
                     "draws whose constants the memo would have left different")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_constant_census, false, "GPU/Vulkan",
+                    "Count constant buffer uploads by buffer, their bytes and repeats, logged "
+                    "every 600 frames (RECORDER_REPLAY_BACKLOG RR-2.1); apart from the draw "
+                    "cost model because its copies and compares inflate the uploads step")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(gpu_draw_cost_model, false, "GPU/Vulkan",
                     "Diagnostics (RR-0.1): time one draw in 16 step by step on the recorder, "
                     "and every draw and register run whole, and log the cost by draw band "
@@ -717,6 +722,7 @@ void VulkanCommandProcessor::DrawCostFrame() {
   m.batch_ticks_at_frame = record_batch_ticks_;
   m.entries_at_frame = record_entries_;
   record_cost_enabled_ = REXCVAR_GET(gpu_draw_cost_model);
+  constant_census_enabled_ = REXCVAR_GET(gpu_constant_census);
   if (++system_constants_memo_frames_ >= 600) {
     if (system_constants_memo_calls_ &&
         (REXCVAR_GET(gpu_system_constants_memo_verify) || REXCVAR_GET(gpu_draw_cost_model))) {
@@ -749,6 +755,40 @@ void VulkanCommandProcessor::DrawCostFrame() {
       }
       REXGPU_INFO("Constant census (RR-2.1) over 600 frames, {} draws:{}", c.draws, parts);
       constant_census_ = {};
+    }
+    if (record_census_ && record_census_->draws) {
+      RecordCensus& e = *record_census_;
+      const double d = double(std::max<uint64_t>(e.draws, 1));
+      std::vector<std::pair<uint64_t, uint32_t>> top;
+      uint64_t ones = e.ones_other;
+      for (uint32_t r = 0; r < RegisterFile::kRegisterCount; ++r) {
+        if (e.ones[r]) {
+          ones += e.ones[r];
+          top.emplace_back(e.ones[r], r);
+        }
+      }
+      std::sort(top.begin(), top.end(), std::greater<>());
+      std::string top_text;
+      for (size_t t = 0; t < std::min<size_t>(top.size(), 8); ++t) {
+        top_text += fmt::format(" {:04X}={:.2f}", top[t].second, double(top[t].first) / d);
+      }
+      static const char* const kRunNames[] = {"render_state", "float", "fetch", "bool_loop",
+                                              "other"};
+      std::string runs_text;
+      for (uint32_t k = 0; k < 5; ++k) {
+        runs_text += fmt::format(" {} {:.2f} ({:.1f} registers);", kRunNames[k],
+                                 double(e.runs[k]) / d,
+                                 e.runs[k] ? double(e.run_registers[k]) / double(e.runs[k])
+                                           : 0.0);
+      }
+      const uint64_t source = decode_source_runs_.exchange(0, std::memory_order_relaxed);
+      const uint64_t sub = decode_sub_runs_.exchange(0, std::memory_order_relaxed);
+      REXGPU_INFO("Entry census (PD-0.2) a draw: single registers {:.2f} (top:{}); runs{} "
+                  "calls {:.2f}; batches {:.1f} a frame; elision split {:.2f} sub-runs "
+                  "a source run",
+                  double(ones) / d, top_text, runs_text, double(e.calls) / d,
+                  double(e.batches) / 600.0, source ? double(sub) / double(source) : 0.0);
+      record_census_ = std::make_unique<RecordCensus>();
     }
     system_constants_memo_frames_ = 0;
     system_constants_memo_hits_ = system_constants_memo_calls_ = 0;
@@ -797,9 +837,10 @@ void VulkanCommandProcessor::DrawCostFrame() {
   m.window_ticks = now_ticks;
   m.window_ns = now_ns;
   static constexpr const char* kStepNames[kCostStepCount] = {
-      "analysis", "primitives", "translation", "textures", "targets",
+      "analysis", "primitives", "translation", "samplers", "textures", "targets",
       "pipeline", "dynamic", "system_constants", "constant_uploads", "texture_bindings",
-      "binds", "vertex", "memexport", "begin_rendering", "draw"};
+      "constants_set", "texture_sets", "descriptor_update", "binds", "vertex", "memexport",
+      "begin_rendering", "draw"};
   static constexpr const char* kBandNames[3] = {"heavy", "gameplay", "light"};
   for (uint32_t b = 0; b < 3; ++b) {
     DrawCostModel::Band& band = m.bands[b];
@@ -2900,7 +2941,7 @@ void VulkanCommandProcessor::WriteRegistersHost(uint32_t start_index, const uint
     ~RegisterCost() {
       if (model.enabled) model.frame_register_ns += DrawCostNow() - start;
     }
-  } register_cost(draw_cost_);
+  };
   uint32_t end_index = start_index + num_registers - 1;
 
   static constexpr uint32_t kHostClassBoundaries[] = {
@@ -2915,6 +2956,8 @@ void VulkanCommandProcessor::WriteRegistersHost(uint32_t start_index, const uint
       return;
     }
   }
+  // After the split, so a run crossing a class is timed once (PD-0.2).
+  RegisterCost register_cost(draw_cost_);
 
   auto range_has_any_constant_usage = [](const uint64_t* usage_map, uint32_t first_constant,
                                          uint32_t last_constant) -> bool {
@@ -4889,6 +4932,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     // vertex shader types), the bindings will stay the same.
     // TODO(Triang3l): Sampler caching and reuse for adjacent draws within one
     // submission.
+    DrawCostMark(kCostTranslation);
     uint32_t samplers_overflowed_count = 0;
     for (uint32_t j = 0; j < 2; ++j) {
       std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>& shader_samplers =
@@ -5003,7 +5047,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     CheckSubmissionFenceAndDeviceLoss(sampler_overflow_await_submission);
   }
 
-  DrawCostMark(kCostTranslation);
+  DrawCostMark(kCostSamplers);
   // Update the textures before most other work in the submission because
   // samplers depend on this (and in case of sampler overflow in a submission,
   // submissions must be split) - may perform dispatches and copying.
@@ -8244,7 +8288,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       }
       buffer_info.range = sizeof(SpirvShaderTranslator::SystemConstants);
       std::memcpy(mapping, &system_constants_, sizeof(SpirvShaderTranslator::SystemConstants));
-      if (draw_cost_.enabled) {
+      if (constant_census_enabled_) {
         CountConstantUpload(0, mapping, sizeof(SpirvShaderTranslator::SystemConstants));
       }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
@@ -8271,7 +8315,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       buffer_info.range = VkDeviceSize(float_constants_size);
       GatherFloatConstants(mapping, current_float_constant_map_vertex_,
                            &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]);
-      if (draw_cost_.enabled) {
+      if (constant_census_enabled_) {
         CountConstantUpload(1, mapping, float_constants_size);
       }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
@@ -8293,7 +8337,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       buffer_info.range = VkDeviceSize(float_constants_size);
       GatherFloatConstants(mapping, current_float_constant_map_pixel_,
                            &regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X]);
-      if (draw_cost_.enabled) {
+      if (constant_census_enabled_) {
         CountConstantUpload(2, mapping, float_constants_size);
       }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
@@ -8313,7 +8357,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       }
       buffer_info.range = VkDeviceSize(kBoolLoopConstantsSize);
       std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], kBoolLoopConstantsSize);
-      if (draw_cost_.enabled) {
+      if (constant_census_enabled_) {
         CountConstantUpload(3, mapping, kBoolLoopConstantsSize);
       }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
@@ -8333,7 +8377,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       }
       buffer_info.range = VkDeviceSize(kFetchConstantsSize);
       std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], kFetchConstantsSize);
-      if (draw_cost_.enabled) {
+      if (constant_census_enabled_) {
         CountConstantUpload(4, mapping, kFetchConstantsSize);
       }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
@@ -8342,7 +8386,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   }
 
   DrawCostMark(kCostConstantUploads);
-  constant_census_.draws += draw_cost_.enabled;
+  constant_census_.draws += constant_census_enabled_;
   // Textures and samplers.
   const std::vector<VulkanShader::SamplerBinding>& samplers_vertex =
       vertex_shader->GetSamplerBindingsAfterTranslation();
@@ -8478,6 +8522,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   // Consecutive bindings updated via a single VkWriteDescriptorSet must have
   // identical stage flags, but for the constants they vary. Plus vertex and
   // pixel texture images and samplers.
+  DrawCostMark(kCostTextureBindings);
   std::array<VkWriteDescriptorSet, SpirvShaderTranslator::kConstantBufferCount + 2 * 2>
       write_descriptor_sets;
   uint32_t write_descriptor_set_count = 0;
@@ -8554,6 +8599,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     current_graphics_descriptor_sets_bound_up_to_date_ &=
         ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants);
   }
+  DrawCostMark(kCostConstantsSet);
   // Vertex shader textures and samplers.
   if (write_vertex_textures) {
     VkWriteDescriptorSet* write_textures =
@@ -8592,6 +8638,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     last_texture_descriptor_sets_[1].set = write_textures[0].dstSet;
     last_texture_descriptor_sets_[1].frame = frame_current_;
   }
+  DrawCostMark(kCostTextureSets);
   if (checkpoints_enabled_ && write_pixel_textures && texture_count_pixel) {
     std::string views;
     for (uint32_t i = 0; i < texture_count_pixel; ++i) {
@@ -8610,7 +8657,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   // successfully.
   current_graphics_descriptor_set_values_up_to_date_ |= write_descriptor_set_bits;
 
-  DrawCostMark(kCostTextureBindings);
+  DrawCostMark(kCostDescriptorUpdate);
   // Bind the new descriptor sets.
   uint32_t descriptor_sets_needed = (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetCount) - 1;
   if (!texture_count_vertex && !sampler_count_vertex) {

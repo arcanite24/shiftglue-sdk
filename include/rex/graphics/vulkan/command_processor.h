@@ -644,14 +644,18 @@ class VulkanCommandProcessor : public CommandProcessor {
   enum DrawCostStep : uint32_t {
     kCostAnalysis,          // shader and memexport analysis, census
     kCostPrimitives,        // submission begin, primitive processing
-    kCostTranslation,       // translations and samplers
+    kCostTranslation,       // translations
+    kCostSamplers,          // sampler parameters and UseSampler
     kCostTextures,          // RequestTextures
     kCostTargets,           // executor PrepareTargets and BindTargets
     kCostPipeline,          // pipeline lookup and bind, layout
     kCostDynamicState,      // viewport and dynamic state
     kCostSystemConstants,   // UpdateSystemConstantValues
     kCostConstantUploads,   // UpdateBindings: constant buffers
-    kCostTextureBindings,   // UpdateBindings: texture and sampler sets
+    kCostTextureBindings,   // UpdateBindings: image infos, reuse and push checks
+    kCostConstantsSet,      // UpdateBindings: constants set lookup and writes
+    kCostTextureSets,       // UpdateBindings: texture set allocation and writes
+    kCostDescriptorUpdate,  // UpdateBindings: vkUpdateDescriptorSets
     kCostDescriptorBinds,   // UpdateBindings: binds and pushes
     kCostVertexBuffers,     // vertex residency
     kCostMemexport,         // memexport ranges, shared memory use
@@ -696,6 +700,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint64_t uploads[5] = {}, bytes[5] = {}, repeats[5] = {};
     std::vector<uint8_t> last[5];
   } constant_census_;
+  bool constant_census_enabled_ = false;
   void CountConstantUpload(uint32_t buffer, const void* data, size_t size);
   std::chrono::steady_clock::time_point memory_sampled_{};
   std::chrono::steady_clock::time_point memory_budget_logged_{};
