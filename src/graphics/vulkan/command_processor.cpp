@@ -1212,8 +1212,14 @@ bool VulkanCommandProcessor::SetupContext() {
   // fullDrawIndexUint32 is not supported.
   guest_shader_pipeline_stages_ =
       VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-  push_pixel_texture_descriptors_ = REXCVAR_GET(vulkan_push_texture_descriptors) &&
-                                   vulkan_device->extensions().ext_KHR_push_descriptor;
+  // The Adreno driver leaves pushed textures unreadable in some FH1 draws
+  // (the shadow mask samples its shadow map as a null texture, so the sky
+  // turns white and the paint and foliage lose their shading) while the
+  // same descriptors written into a set work: sets there.
+  push_pixel_texture_descriptors_ =
+      REXCVAR_GET(vulkan_push_texture_descriptors) &&
+      vulkan_device->extensions().ext_KHR_push_descriptor &&
+      device_properties.vendorID != uint32_t(ui::GraphicsProvider::GpuVendorID::kQualcomm);
   guest_shader_vertex_stages_ = VK_SHADER_STAGE_VERTEX_BIT;
   if (device_properties.tessellationShader) {
     guest_shader_pipeline_stages_ |= VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT |
