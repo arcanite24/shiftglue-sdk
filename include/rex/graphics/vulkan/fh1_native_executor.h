@@ -409,6 +409,7 @@ class Fh1NativeExecutor {
   uint64_t frame_ = 0;
   // fh1_scaled_msaa_single_sample at a scale above 1x.
   bool single_sample_msaa_ = false;
+  bool two_sample_msaa_ = false;
   // The device exports stencil from shaders: depth transfers take one pass.
   bool stencil_export_ = false;
   // The layout constant's host sample mode: 0 native, 1 native 2x, 2 2x

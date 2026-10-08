@@ -31,6 +31,11 @@ REXCVAR_DEFINE_BOOL(fh1_scaled_msaa_single_sample, false, "GPU",
                     "host sample. Much less GPU work at 3x and 4x; edges lose their MSAA")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(fh1_msaa_2x, false, "GPU",
+                    "Store FH1's 4x MSAA surfaces with 2 host samples (its top and bottom "
+                    "sample pairs each in one): smoother edges than fh1_msaa_single_sample "
+                    "for about half the cost of 4x (Vulkan FH1 native executor)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_msaa_single_sample, true, "GPU",
                     "Keep the guest's 2x and 4x MSAA surfaces as single-sampled images at any "
                     "resolution scale (Vulkan): at 1x the game renders without MSAA - harder "
@@ -387,8 +392,12 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
                         REXCVAR_GET(fh1_msaa_single_sample);
   stencil_export_ = REXCVAR_GET(fh1_native_stencil_export) &&
                     command_processor_.GetVulkanDevice()->extensions().ext_EXT_shader_stencil_export;
+  two_sample_msaa_ =
+      !single_sample_msaa_ && REXCVAR_GET(fh1_msaa_2x) && config_.msaa_2x_supported;
   if (single_sample_msaa_) {
     REXGPU_INFO("FH1 native executor (Vulkan): MSAA surfaces single-sampled at {}x", scale_);
+  } else if (two_sample_msaa_) {
+    REXGPU_INFO("FH1 native executor (Vulkan): 4x MSAA surfaces with 2 host samples");
   }
   if (config_.textures->draw_resolution_scale_y() != scale_ || scale_ > 4) {
     REXGPU_WARN("FH1 native executor (Vulkan): resolution scale {}x{} is not supported",
@@ -727,6 +736,8 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
   surface.height = SurfaceHeight(key.pitch_tiles, key.msaa);
   surface.image_height = std::max(surface.height, untile_height_);
   surface.samples = single_sample_msaa_ ? 1u
+                    : two_sample_msaa_ && key.msaa == uint32_t(xenos::MsaaSamples::k4X)
+                        ? 2u
                     : key.msaa == uint32_t(xenos::MsaaSamples::k2X) && !config_.msaa_2x_supported
                         ? 4u
                         : 1u << key.msaa;
@@ -832,6 +843,9 @@ uint32_t Fh1NativeExecutor::HostSampleMode(const Surface& surface) {
   const SurfaceKey& key = surface.key;
   if (key.msaa != uint32_t(xenos::MsaaSamples::k1X) && surface.samples == 1) {
     return 3u;  // Every guest sample in the one host sample.
+  }
+  if (key.msaa == uint32_t(xenos::MsaaSamples::k4X) && surface.samples == 2) {
+    return 4u;  // Each pair of guest samples in one host sample.
   }
   return key.msaa == uint32_t(xenos::MsaaSamples::k2X) ? (surface.samples == 4 ? 2u : 1u) : 0u;
 }
@@ -1838,6 +1852,9 @@ bool Fh1NativeExecutor::BindTargets(VulkanRenderTargetCache::RenderPassKey& key_
   key_out.msaa_samples = single_sample_msaa_
                              ? xenos::MsaaSamples::k1X
                              : register_file_.Get<reg::RB_SURFACE_INFO>().msaa_samples;
+  if (two_sample_msaa_ && key_out.msaa_samples == xenos::MsaaSamples::k4X) {
+    key_out.msaa_samples = xenos::MsaaSamples::k2X;
+  }
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
     if (!(used_bits & (1u << i))) continue;
     Surface* surface = FindSurface(keys[i].Pack());

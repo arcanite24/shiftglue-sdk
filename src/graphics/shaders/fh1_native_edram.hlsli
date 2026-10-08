@@ -105,7 +105,7 @@ uint LayoutMsaa(uint layout) { return (layout >> 19u) & 3u; }
 uint LayoutIs64bpp(uint layout) { return (layout >> 21u) & 1u; }
 uint LayoutIsDepth(uint layout) { return (layout >> 22u) & 1u; }
 uint LayoutFormat(uint layout) { return (layout >> 23u) & 0xFu; }
-uint LayoutHostSampleMode(uint layout) { return (layout >> 27u) & 3u; }
+uint LayoutHostSampleMode(uint layout) { return (layout >> 27u) & 7u; }
 
 // xenos::Float32To20e4.
 uint Float32To20e4(float f32, bool round_to_nearest_even) {
@@ -292,6 +292,10 @@ uint HostSample(uint guest_sample, uint msaa, uint host_mode) {
     host_sample = guest_sample ^ 1u;  // Native 2x: host 1 is the top sample.
   } else if (msaa == 1u && host_mode == 2u) {
     host_sample = guest_sample ? 3u : 0u;  // 2x stored as 4x.
+  } else if (msaa == 2u && host_mode == 4u) {
+    // 4x stored as 2x: the guest's top pair (0, 1) in host 1, the top
+    // sample of native 2x, and its bottom pair (2, 3) in host 0.
+    host_sample = (guest_sample >> 1u) ^ 1u;
   }
   return host_sample;
 }
@@ -305,6 +309,8 @@ uint GuestSample(uint host_sample, uint msaa, uint host_mode) {
     guest_sample = host_sample ^ 1u;
   } else if (msaa == 1u && host_mode == 2u) {
     guest_sample = host_sample ? 1u : 0u;
+  } else if (msaa == 2u && host_mode == 4u) {
+    guest_sample = host_sample ? 0u : 2u;
   }
   return guest_sample;
 }
