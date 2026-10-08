@@ -134,6 +134,16 @@ REXCVAR_DEFINE_BOOL(gpu_system_constants_memo_verify, false, "GPU/Vulkan",
                     "Derive the system constants in full on memo hits too and count the "
                     "draws whose constants the memo would have left different")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_sampler_fetch_key, true, "GPU/Vulkan",
+                    "Key the per-slot sampler cache and the sampler parameters memo on the "
+                    "fetch words without the texture addresses (only whether their pages are "
+                    "zero), which sampler parameters do not read (RECORDER_PER_DRAW_BACKLOG "
+                    "PD-3.4)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_sampler_fetch_key_verify, false, "GPU/Vulkan",
+                    "On sampler cache hits, derive the sampler parameters again and count the "
+                    "slots whose cached parameters differ")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(gpu_constant_census, false, "GPU/Vulkan",
                     "Count constant buffer uploads by buffer, their bytes and repeats, logged "
                     "every 600 frames (RECORDER_REPLAY_BACKLOG RR-2.1); apart from the draw "
@@ -785,10 +795,21 @@ void VulkanCommandProcessor::DrawCostFrame() {
       const uint64_t sub = decode_sub_runs_.exchange(0, std::memory_order_relaxed);
       REXGPU_INFO("Entry census (PD-0.2) a draw: single registers {:.2f} (top:{}); runs{} "
                   "calls {:.2f}; batches {:.1f} a frame; elision split {:.2f} sub-runs "
-                  "a source run",
+                  "a source run; scratch writes repeating {:.2f}, written back {:.2f}",
                   double(ones) / d, top_text, runs_text, double(e.calls) / d,
-                  double(e.batches) / 600.0, source ? double(sub) / double(source) : 0.0);
+                  double(e.batches) / 600.0, source ? double(sub) / double(source) : 0.0,
+                  double(e.scratch_same) / d, double(e.scratch_writeback) / d);
       record_census_ = std::make_unique<RecordCensus>();
+    }
+    if (sampler_census_.slots || sampler_census_.verified_different) {
+      const SamplerCensus& sc = sampler_census_;
+      const double slots = double(std::max<uint64_t>(sc.slots, 1));
+      REXGPU_INFO("Sampler census (PD-3.4) over 600 frames: {} slots, slot cache hits {:.1f} %, "
+                  "memo hits {:.1f} %, UseSampler {:.1f} %; {} verified different",
+                  sc.slots, 100.0 * double(sc.slot_hits) / slots,
+                  100.0 * double(sc.memo_hits) / slots, 100.0 * double(sc.use_sampler) / slots,
+                  sc.verified_different);
+      sampler_census_ = {};
     }
     system_constants_memo_frames_ = 0;
     system_constants_memo_hits_ = system_constants_memo_calls_ = 0;
@@ -4955,12 +4976,21 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         shader_samplers.reserve(shader_sampler_bindings.size());
         const int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
         const bool force_trilinear = REXCVAR_GET(force_trilinear_filtering);
+        const bool fetch_key = REXCVAR_GET(gpu_sampler_fetch_key);
+        const bool fetch_key_verify = fetch_key && REXCVAR_GET(gpu_sampler_fetch_key_verify);
         for (size_t k = 0; k < shader_sampler_bindings.size(); ++k) {
           const VulkanShader::SamplerBinding& shader_sampler_binding = shader_sampler_bindings[k];
           SamplerCacheEntry& cached = sampler_cache[k];
-          const uint32_t* fetch =
+          const uint32_t* fetch_words =
               &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 +
                            shader_sampler_binding.fetch_constant * uint32_t(cached.fetch.size())];
+          uint32_t fetch_key_words[6];
+          const uint32_t* fetch = fetch_words;
+          if (fetch_key) {
+            SamplerFetchKey(fetch_words, fetch_key_words);
+            fetch = fetch_key_words;
+          }
+          if (draw_cost_.enabled) ++sampler_census_.slots;
           const uint32_t binding = shader_sampler_binding.fetch_constant |
                                    (uint32_t(shader_sampler_binding.mag_filter) << 8) |
                                    (uint32_t(shader_sampler_binding.min_filter) << 12) |
@@ -4985,6 +5015,12 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
                 memo.anisotropic_override == anisotropic_override &&
                 memo.force_trilinear == force_trilinear) {
               cached.parameters = memo.parameters;
+              if (draw_cost_.enabled) ++sampler_census_.memo_hits;
+              if (fetch_key_verify &&
+                  texture_cache_->GetSamplerParameters(shader_sampler_binding).value !=
+                      cached.parameters.value) {
+                ++sampler_census_.verified_different;
+              }
             } else {
               cached.parameters = texture_cache_->GetSamplerParameters(shader_sampler_binding);
               memo.fetch = cached.fetch;
@@ -4994,6 +5030,13 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
               memo.parameters = cached.parameters;
             }
             cached.sampler = VK_NULL_HANDLE;
+          } else {
+            if (draw_cost_.enabled) ++sampler_census_.slot_hits;
+            if (fetch_key_verify &&
+                texture_cache_->GetSamplerParameters(shader_sampler_binding).value !=
+                    cached.parameters.value) {
+              ++sampler_census_.verified_different;
+            }
           }
           shader_samplers.emplace_back(cached.parameters, VK_NULL_HANDLE);
         }
@@ -5013,6 +5056,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
           shader_sampler = cached.sampler;
         } else {
           shader_sampler = texture_cache_->UseSampler(shader_sampler_pair.first, sampler_overflowed);
+          if (draw_cost_.enabled) ++sampler_census_.use_sampler;
           cached.sampler = shader_sampler;
           cached.submission = GetCurrentSubmission();
         }

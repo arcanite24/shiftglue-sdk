@@ -63,6 +63,11 @@ REXCVAR_DEFINE_INT32(wait_reg_mem_yield_us, -1, "GPU",
                      "before sleeping; 0 sleeps at once, -1 chooses by platform and game rate")
     .range(-1, 16000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_record_fused_draw_registers, true, "GPU",
+                    "With gpu_record_thread, a draw record carries its packet's "
+                    "VGT_DRAW_INITIATOR, VGT_DMA_BASE and VGT_DMA_SIZE instead of the decoder "
+                    "recording them as single-register entries (RECORDER_PER_DRAW_BACKLOG PD-1.1)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(gpu_record_merge_constant_runs, true, "GPU",
                     "With gpu_record_thread, the decoder extends the last recorded float "
                     "constant run over a gap of up to 16 registers (their current values) "
@@ -592,6 +597,12 @@ void CommandProcessor::ExecuteRecordBatchTimed(RecordBatch& batch) {
         census->run_registers[run_class] += run;
       } break;
       case kRecordOne:
+        if (words[i + 1] >= XE_GPU_REG_SCRATCH_REG0 && words[i + 1] <= XE_GPU_REG_SCRATCH_REG7) {
+          census->scratch_same += register_file_->values[words[i + 1]] == words[i + 2];
+          census->scratch_writeback +=
+              (register_file_->values[XE_GPU_REG_SCRATCH_UMSK] >>
+               (words[i + 1] - XE_GPU_REG_SCRATCH_REG0)) & 1;
+        }
         WriteRegister(words[i + 1], words[i + 2]);
         if (words[i + 1] < RegisterFile::kRegisterCount) {
           ++census->ones[words[i + 1]];
@@ -2355,7 +2366,36 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   reg::VGT_DRAW_INITIATOR vgt_draw_initiator;
   vgt_draw_initiator.value = reader->ReadAndSwap<uint32_t>();
   --count_remaining;
-  PacketWriteRegister(XE_GPU_REG_VGT_DRAW_INITIATOR, vgt_draw_initiator.value);
+  // PD-1.1: on the recorded path the draw record carries the packet's
+  // register writes (they only store on the recorder, and nothing is recorded
+  // between them and the draw). The decoder's shadow takes them now; a packet
+  // that ends without a draw record writes them as entries.
+  const bool fuse_registers =
+      record_split_ && REXCVAR_GET(gpu_record_fused_draw_registers) &&
+      (vgt_draw_initiator.source_select == xenos::SourceSelect::kDMA ||
+       vgt_draw_initiator.source_select == xenos::SourceSelect::kAutoIndex);
+  uint32_t fused_registers = 0;
+  uint32_t fused_dma_base = 0, fused_dma_size = 0;
+  auto write_draw_register = [&](uint32_t index, uint32_t value) {
+    if (fuse_registers) {
+      decode_register_file_->values[index] = value;
+      ++fused_registers;
+    } else {
+      PacketWriteRegister(index, value);
+    }
+  };
+  auto unfuse_registers = [&]() {
+    if (fused_registers >= 1) {
+      PacketWriteRegister(XE_GPU_REG_VGT_DRAW_INITIATOR, vgt_draw_initiator.value);
+    }
+    if (fused_registers >= 2) {
+      PacketWriteRegister(XE_GPU_REG_VGT_DMA_BASE, fused_dma_base);
+    }
+    if (fused_registers >= 3) {
+      PacketWriteRegister(XE_GPU_REG_VGT_DMA_SIZE, fused_dma_size);
+    }
+  };
+  write_draw_register(XE_GPU_REG_VGT_DRAW_INITIATOR, vgt_draw_initiator.value);
 
   bool draw_succeeded = true;
   // TODO(Triang3l): Remove IndexBufferInfo and replace handling of all this
@@ -2373,20 +2413,24 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
       assert_not_zero(count_remaining);
       if (!count_remaining) {
         REXGPU_ERROR("{}: Packet too small, can't read VGT_DMA_BASE", opcode_name);
+        unfuse_registers();
         return false;
       }
       uint32_t vgt_dma_base = reader->ReadAndSwap<uint32_t>();
       --count_remaining;
-      PacketWriteRegister(XE_GPU_REG_VGT_DMA_BASE, vgt_dma_base);
+      fused_dma_base = vgt_dma_base;
+      write_draw_register(XE_GPU_REG_VGT_DMA_BASE, vgt_dma_base);
       reg::VGT_DMA_SIZE vgt_dma_size;
       assert_not_zero(count_remaining);
       if (!count_remaining) {
         REXGPU_ERROR("{}: Packet too small, can't read VGT_DMA_SIZE", opcode_name);
+        unfuse_registers();
         return false;
       }
       vgt_dma_size.value = reader->ReadAndSwap<uint32_t>();
       --count_remaining;
-      PacketWriteRegister(XE_GPU_REG_VGT_DMA_SIZE, vgt_dma_size.value);
+      fused_dma_size = vgt_dma_size.value;
+      write_draw_register(XE_GPU_REG_VGT_DMA_SIZE, vgt_dma_size.value);
 
       uint32_t index_size_bytes = vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16
                                       ? sizeof(uint16_t)
@@ -2424,11 +2468,17 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   // we don't support yet.
   reader->AdvanceRead(count_remaining * sizeof(uint32_t));
 
+  if (!draw_succeeded) {
+    unfuse_registers();
+  }
   if (draw_succeeded) {
     DrawRecord record;
     record.packet = packet;
     record.initiator = vgt_draw_initiator.value;
     record.is_indexed = is_indexed;
+    record.fused_registers = fused_registers;
+    record.dma_base = fused_dma_base;
+    record.dma_size = fused_dma_size;
     record.index_buffer_info = index_buffer_info;
     record.opcode_name = opcode_name;
     if (!record_split_) {
@@ -2456,6 +2506,16 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 }
 
 void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
+  if (record.fused_registers) {
+    // Per-draw registers outside the state epoch and hash, with no write side
+    // effect: stored as WriteRegister would.
+    uint32_t* values = register_file_->values;
+    values[XE_GPU_REG_VGT_DRAW_INITIATOR] = record.initiator;
+    if (record.fused_registers >= 3) {
+      values[XE_GPU_REG_VGT_DMA_BASE] = record.dma_base;
+      values[XE_GPU_REG_VGT_DMA_SIZE] = record.dma_size;
+    }
+  }
   const uint32_t packet = record.packet;
   const char* opcode_name = record.opcode_name;
   reg::VGT_DRAW_INITIATOR vgt_draw_initiator;

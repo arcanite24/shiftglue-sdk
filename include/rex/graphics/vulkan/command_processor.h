@@ -1242,6 +1242,18 @@ class VulkanCommandProcessor : public CommandProcessor {
     VulkanTextureCache::SamplerParameters parameters;
   };
   static constexpr size_t kSamplerParametersMemoCount = 1024;
+  // PD-3.4: the fetch words as the sampler parameters read them. The base
+  // and mip addresses matter only by whether their pages are zero (mips and
+  // the base level present), so a texture moving to another address keeps
+  // its slot's sampler.
+  static void SamplerFetchKey(const uint32_t* fetch, uint32_t (&key)[6]) {
+    for (uint32_t word = 0; word < 6; ++word) key[word] = fetch[word];
+    key[1] = (fetch[1] & 0xFFF) | (((fetch[1] >> 12) & 0x1FFFF) ? 0x1000 : 0);
+    key[5] = (fetch[5] & 0xFFF) | (((fetch[5] >> 12) & 0x1FFFF) ? 0x1000 : 0);
+  }
+  struct SamplerCensus {
+    uint64_t slots = 0, slot_hits = 0, memo_hits = 0, use_sampler = 0, verified_different = 0;
+  } sampler_census_;
   std::unique_ptr<SamplerParametersMemo[]> sampler_parameters_memos_{
       new SamplerParametersMemo[kSamplerParametersMemoCount]};
   // The last texture descriptor set written per stage (vertex, pixel) and its

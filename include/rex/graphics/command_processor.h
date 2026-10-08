@@ -207,6 +207,8 @@ class CommandProcessor {
     uint64_t ones_other = 0;
     uint64_t runs[5] = {}, run_registers[5] = {};
     uint64_t calls = 0, batches = 0, draws = 0;
+    // Scratch register writes: repeating the value, and written back.
+    uint64_t scratch_same = 0, scratch_writeback = 0;
   };
   std::unique_ptr<RecordCensus> record_census_;
   static uint32_t RecordRunClass(uint32_t start_index);
@@ -510,7 +512,12 @@ class CommandProcessor {
     uint32_t packet;
     uint32_t initiator;
     uint32_t is_indexed;
-    uint32_t padding;
+    // PD-1.1: the draw packet's register writes the record carries instead of
+    // single-register entries: 0 (written as entries), 1 (VGT_DRAW_INITIATOR)
+    // or 3 (and VGT_DMA_BASE and VGT_DMA_SIZE).
+    uint32_t fused_registers;
+    uint32_t dma_base;
+    uint32_t dma_size;
     IndexBufferInfo index_buffer_info;
     const char* opcode_name;
   };
