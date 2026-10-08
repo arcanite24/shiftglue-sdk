@@ -17,17 +17,20 @@
 #include <sstream>
 #include <system_error>
 
+#include <jni.h>
+
 #include <SDL3/SDL_system.h>
 #include <adrenotools/driver.h>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
 
-REXCVAR_DEFINE_STRING(android_gpu_driver, "", "UI/Vulkan",
+REXCVAR_DEFINE_STRING(android_gpu_driver, "auto", "UI/Vulkan",
                       "A custom Vulkan driver (such as Mesa Turnip) to load instead of the "
                       "system's: the name of a folder under REX_ANDROID_DRIVERS_DIR, holding "
                       "an adrenotools driver package (meta.json and the .so) or a lone .so. "
-                      "Empty uses the system driver")
+                      "Empty uses the system driver; auto the driver the app recommends for "
+                      "the device's GPU (REX_ANDROID_RECOMMENDED_DRIVER), else the system's")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(android_gpu_driver_env, "", "UI/Vulkan",
                       "Environment for the custom driver, as NAME=value pairs separated by "
@@ -77,10 +80,42 @@ std::string DriverLibraryName(const std::filesystem::path& folder) {
   return found;
 }
 
+std::string g_loaded_driver;
+
 }  // namespace
 
+const std::string& LoadedAndroidGpuDriver() { return g_loaded_driver; }
+
+bool CallAndroidActivityMethod(const char* method) {
+  auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+  auto activity = static_cast<jobject>(SDL_GetAndroidActivity());
+  if (!env || !activity) return false;
+  jclass activity_class = env->GetObjectClass(activity);
+  jmethodID id = env->GetMethodID(activity_class, method, "()V");
+  bool called = false;
+  if (id) {
+    env->CallVoidMethod(activity, id);
+    called = !env->ExceptionCheck();
+  }
+  if (env->ExceptionCheck()) env->ExceptionClear();
+  env->DeleteLocalRef(activity_class);
+  env->DeleteLocalRef(activity);
+  return called;
+}
+
 void* OpenAndroidCustomVulkanDriver(const std::filesystem::path& drivers_root) {
-  const std::string name = REXCVAR_GET(android_gpu_driver);
+  std::string name = REXCVAR_GET(android_gpu_driver);
+  if (name == "auto") {
+    const char* recommended = std::getenv("REX_ANDROID_RECOMMENDED_DRIVER");
+    std::error_code exists_error;
+    if (!recommended || !*recommended ||
+        !std::filesystem::is_directory(drivers_root / recommended, exists_error)) {
+      REXLOG_INFO("GPU driver auto: no driver recommended for this GPU, using the system's");
+      return nullptr;
+    }
+    name = recommended;
+    REXLOG_INFO("GPU driver auto: {} recommended for this GPU", name);
+  }
   if (name.empty()) {
     return nullptr;
   }
@@ -128,6 +163,7 @@ void* OpenAndroidCustomVulkanDriver(const std::filesystem::path& drivers_root) {
     return nullptr;
   }
   REXLOG_INFO("Custom GPU driver {}: loaded {} through adrenotools", name, library);
+  g_loaded_driver = name;
   return handle;
 }
 
