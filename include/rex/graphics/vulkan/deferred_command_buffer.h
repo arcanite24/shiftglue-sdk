@@ -213,6 +213,17 @@ class DeferredCommandBuffer {
                 regions, sizeof(VkBufferImageCopy) * region_count);
   }
 
+  void CmdVkCopyImage(VkImage src_image, VkImageLayout src_image_layout, VkImage dst_image,
+                      VkImageLayout dst_image_layout, const VkImageCopy& region) {
+    auto& args = *reinterpret_cast<ArgsVkCopyImage*>(
+        WriteCommand(Command::kVkCopyImage, sizeof(ArgsVkCopyImage)));
+    args.src_image = src_image;
+    args.src_image_layout = src_image_layout;
+    args.dst_image = dst_image;
+    args.dst_image_layout = dst_image_layout;
+    args.region = region;
+  }
+
   void CmdVkCopyImageToBuffer(VkImage src_image, VkImageLayout src_image_layout,
                               VkBuffer dst_buffer, const VkBufferImageCopy& region) {
     auto& args = *reinterpret_cast<ArgsVkCopyImageToBuffer*>(
@@ -421,6 +432,7 @@ class DeferredCommandBuffer {
     kVkClearColorImage,
     kVkCopyBuffer,
     kVkCopyBufferToImage,
+    kVkCopyImage,
     kVkCopyImageToBuffer,
     kVkCopyQueryPoolResults,
     kVkDispatch,
@@ -546,6 +558,14 @@ class DeferredCommandBuffer {
     uint32_t region_count;
     // Followed by aligned VkBufferImageCopy[].
     static_assert(alignof(VkBufferImageCopy) <= alignof(uintmax_t));
+  };
+
+  struct ArgsVkCopyImage {
+    VkImage src_image;
+    VkImageLayout src_image_layout;
+    VkImage dst_image;
+    VkImageLayout dst_image_layout;
+    VkImageCopy region;
   };
 
   struct ArgsVkCopyImageToBuffer {

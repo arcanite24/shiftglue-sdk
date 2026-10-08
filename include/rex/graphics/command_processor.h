@@ -480,6 +480,23 @@ class CommandProcessor {
 
   uint64_t bin_select_ = 0xFFFFFFFFull;
   uint64_t bin_mask_ = 0xFFFFFFFFull;
+ public:
+  // gpu_trace_bins_vblank: swaps decoded, to trace one whole frame.
+  uint32_t trace_swaps_ = 0;
+  // Untiled predicated tiling (the Vulkan FH1 executor): the first tile's
+  // predicated packets run as if every tile's bins were selected.
+  bool untile_tiling_ = false;
+  bool untile_select_all_ = false;
+  // A bin select of a predicated tiling pass: 0 the first tile (bins 0-1),
+  // 1 and up the later ones, -1 not a tiling pass.
+  int32_t TilingPassOfSelect() const {
+    const uint32_t select = uint32_t(bin_select_);
+    if (select == 0xFFFFFFFFu || !(select & 0x7FFFFFFFu)) return -1;
+    return int32_t(rex::tzcnt(select & 0x7FFFFFFFu) / 2);
+  }
+  // gpu_trace_bins_vblank: the indirect buffer nesting depth.
+  uint32_t trace_ib_depth_ = 0;
+ protected:
 
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;

@@ -43,6 +43,12 @@
 #include <rex/system/thread_state.h>
 #include <rex/system/user_module.h>
 
+REXCVAR_DEFINE_INT32(gpu_trace_bins_vblank, -1, "GPU",
+                     "Diagnostics: log the bin masks, bin selects, screen extent writes, draws, "
+                     "interrupts and indirect buffers of the frame after this many swaps, and "
+                     "with the Vulkan FH1 executor the tiling registers of its draws and "
+                     "resolves (-1: off)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 // FH1's race polls through WAIT_REG_MEM about 1.5 ms per frame on the GPU
 // commands thread, its bottleneck; yielding first ends those waits sooner
@@ -1444,6 +1450,11 @@ IbIdentityStats ib_stats;
 
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
+  ++trace_ib_depth_;
+  struct DepthGuard {
+    uint32_t& depth;
+    ~DepthGuard() { --depth; }
+  } depth_guard{trace_ib_depth_};
 
   const bool ib_stats_enabled = REXCVAR_GET(gpu_ib_identity_stats);
   const bool template_stats = record_split_ && REXCVAR_GET(gpu_template_stats);
@@ -1776,8 +1787,34 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   // & 1 == predicate - when set, we do bin check to see if we should execute
   // the packet. Only type 3 packets are affected.
   // We also skip predicated swaps, as they are never valid (probably?).
+  if (opcode == PM4_XE_SWAP) ++trace_swaps_;
+  const int32_t trace_bins_vblank = REXCVAR_GET(gpu_trace_bins_vblank);
+  const bool trace_bins = trace_bins_vblank >= 0 && trace_swaps_ == uint32_t(trace_bins_vblank);
+  if (trace_bins &&
+      (opcode == PM4_SET_BIN_MASK || opcode == PM4_SET_BIN_MASK_LO ||
+       opcode == PM4_SET_BIN_MASK_HI || opcode == PM4_SET_BIN_SELECT_LO ||
+       opcode == PM4_SET_BIN_SELECT_HI || opcode == PM4_EVENT_WRITE_EXT ||
+       opcode == PM4_DRAW_INDX || opcode == PM4_DRAW_INDX_2 || opcode == PM4_INTERRUPT ||
+       opcode == PM4_INDIRECT_BUFFER || opcode == PM4_INDIRECT_BUFFER_PFD)) {
+    const uint32_t* words =
+        reinterpret_cast<const uint32_t*>(reader->read_ptr());
+    REXGPU_INFO("BINTRACE vb {} d {} op {:02X} pred {} sel {:016X} mask {:016X} woff {:08X} w0 {:08X} w1 {:08X}",
+                counter_, trace_ib_depth_, opcode, packet & 1, bin_select_, bin_mask_,
+                register_file_->values[XE_GPU_REG_PA_SC_WINDOW_OFFSET],
+                count > 0 ? rex::byte_swap(words[0]) : 0u, count > 1 ? rex::byte_swap(words[1]) : 0u);
+  }
   if (packet & 1) {
-    bool any_pass = (bin_select_ & bin_mask_) != 0;
+    // Untiled, the first tile also runs the later tiles' objects; the packets
+    // predicated on a whole later tile set that tile's window offset,
+    // scissors and resolve destination, and stay with their tile.
+    const bool tile_state = (bin_mask_ & 0xFFFFFFFFu) == bin_mask_ &&
+                            (bin_mask_ & ~uint64_t(3)) &&
+                            (bin_mask_ == (uint64_t(3) << rex::tzcnt(uint32_t(bin_mask_)))) &&
+                            !(rex::tzcnt(uint32_t(bin_mask_)) & 1);
+    const uint64_t select = untile_select_all_ && TilingPassOfSelect() == 0 && !tile_state
+                                ? ~uint64_t(0)
+                                : bin_select_;
+    bool any_pass = (select & bin_mask_) != 0;
     if (!any_pass || opcode == PM4_XE_SWAP) {
       reader->AdvanceRead(count * sizeof(uint32_t));
       return true;

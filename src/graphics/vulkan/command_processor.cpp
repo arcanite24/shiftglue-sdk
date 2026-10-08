@@ -64,6 +64,21 @@ REXCVAR_DEFINE_INT32(vulkan_async_pipeline_wait_ms, REX_PLATFORM_ANDROID ? 0 : 2
     .range(0, 5000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
+REXCVAR_DECLARE(int32_t, gpu_trace_bins_vblank);
+REXCVAR_DEFINE_BOOL(fh1_untile_predicated_tiling, REX_PLATFORM_ANDROID, "GPU",
+                    "Render FH1's predicated tiling passes once: the first tile draws every "
+                    "tile's objects over the whole surface height and the later tiles only "
+                    "resolve their bands (Vulkan FH1 native executor; 3 ms a frame on the "
+                    "Odin 2 Portal)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(fh1_debug_untile, 0, "GPU",
+                     "fh1_untile_predicated_tiling diagnostics: 1 keeps the first tile's "
+                     "predication, 2 draws the later tiles too")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(fh1_untile_height, 720, "GPU",
+                     "The screen height in guest pixels the untiled first tile renders "
+                     "(fh1_untile_predicated_tiling)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(gpu_barrier_census, false, "GPU",
                     "Diagnostics: count pipeline barriers by stages, accesses and kind, logged "
                     "every 600 frames (Vulkan)")
@@ -193,6 +208,25 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                     "device (falls back to render passes otherwise)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+namespace {
+// gpu_trace_bins_vblank: one line of the registers that place a draw or a
+// resolve in predicated tiling.
+void TraceTiling(const char* what, const rex::graphics::RegisterFile& regs, uint64_t bin_select,
+                 uint64_t bin_mask, uint32_t vblank) {
+  using namespace rex::graphics;
+  REXGPU_INFO(
+      "TILETRACE vb {} {} woff {:08X} wsc {:08X}-{:08X} ssc {:08X}-{:08X} surf {:08X} c0 {:08X} "
+      "d {:08X} mode {:08X} sel {:X} mask {:X} copy {:08X} dst {:08X} dpitch {:08X} dinfo {:08X}",
+      vblank, what, regs.values[XE_GPU_REG_PA_SC_WINDOW_OFFSET],
+      regs.values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL], regs.values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR],
+      regs.values[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_TL], regs.values[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR],
+      regs.values[XE_GPU_REG_RB_SURFACE_INFO], regs.values[XE_GPU_REG_RB_COLOR_INFO],
+      regs.values[XE_GPU_REG_RB_DEPTH_INFO], regs.values[XE_GPU_REG_RB_MODECONTROL], bin_select,
+      bin_mask, regs.values[XE_GPU_REG_RB_COPY_CONTROL], regs.values[XE_GPU_REG_RB_COPY_DEST_BASE],
+      regs.values[XE_GPU_REG_RB_COPY_DEST_PITCH], regs.values[XE_GPU_REG_RB_COPY_DEST_INFO]);
+}
+}  // namespace
 
 namespace rex::graphics::vulkan {
 
@@ -2383,10 +2417,14 @@ bool VulkanCommandProcessor::CreateScaledComponents(uint32_t draw_resolution_sca
     native_config.memory = shared_memory_.get();
     native_config.textures = texture_cache_.get();
     native_config.render_targets = render_target_cache_.get();
+    native_config.untile_height =
+        REXCVAR_GET(fh1_untile_predicated_tiling) ? uint32_t(REXCVAR_GET(fh1_untile_height)) : 0;
     if (!fh1_native_executor_->Initialize(native_config)) {
       REXGPU_WARN("FH1 native executor unavailable; using the render target cache");
       fh1_native_executor_.reset();
     }
+    untile_tiling_ = fh1_native_executor_ && native_config.untile_height;
+    untile_select_all_ = untile_tiling_ && !(REXCVAR_GET(fh1_debug_untile) & 1);
   }
 
   // Frame dumps record and compare the 1x guest-memory mirror. One made
@@ -5270,6 +5308,24 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   Fh1DrawInfo fh1_draw;
   VulkanRenderTargetCache::RenderPassKey fh1_render_pass_key;
   if (fh1_native_executor_) {
+    {
+      const int32_t trace_vblank = REXCVAR_GET(gpu_trace_bins_vblank);
+      if (trace_vblank >= 0 && trace_swaps_ == uint32_t(trace_vblank)) {
+        TraceTiling("draw", regs, bin_select(), bin_mask(), trace_swaps_);
+      }
+      const auto window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+      if (untile_tiling_) {
+        if (window_offset.window_y_offset && TilingPassOfSelect() != 0 &&
+            !(REXCVAR_GET(fh1_debug_untile) & 2)) {
+          // The first tile drew these objects over the whole height.
+          fh1_native_executor_->CountEvent("untile_skipped_draw");
+          return true;
+        }
+        if (!window_offset.window_x_offset && !window_offset.window_y_offset) {
+          fh1_native_executor_->EndUntiledTiling();
+        }
+      }
+    }
     fh1_draw.memexport = memexport_writes_possible;
     fh1_draw.occlusion_query_active = active_occlusion_query_.valid;
     fh1_draw.rasterization_done = is_rasterization_done;
@@ -5988,6 +6044,10 @@ bool VulkanCommandProcessor::IssueCopy() {
     frame_dump_->RecordCopyInputs();
   }
   if (fh1_native_executor_) {
+    const int32_t trace_vblank = REXCVAR_GET(gpu_trace_bins_vblank);
+    if (trace_vblank >= 0 && trace_swaps_ == uint32_t(trace_vblank)) {
+      TraceTiling("resolve", *register_file_, bin_select(), bin_mask(), trace_swaps_);
+    }
     uint32_t written_address, written_length;
     return fh1_native_executor_->NativeResolve(written_address, written_length);
   }
@@ -7652,6 +7712,17 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
   }
   viewport.minDepth = viewport_info.z_min;
   viewport.maxDepth = viewport_info.z_max;
+  // Untiled tiling: a draw still made in a later tile's pass renders where
+  // its window offset puts it on screen, the untiled surface's rows; the
+  // first tile's draws cover the whole screen height.
+  int32_t untile_rows = 0;
+  bool untile_first_tile = false;
+  if (untile_tiling_) {
+    untile_rows = -pa_sc_window_offset.window_y_offset;
+    untile_first_tile = untile_select_all_ && TilingPassOfSelect() == 0;
+    viewport.x -= float(pa_sc_window_offset.window_x_offset * int32_t(draw_resolution_scale_x));
+    viewport.y += float(untile_rows * int32_t(draw_resolution_scale_y));
+  }
   SetViewport(viewport);
 
   // Scissor.
@@ -7661,6 +7732,19 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
   scissor.offset[1] *= draw_resolution_scale_y;
   scissor.extent[0] *= draw_resolution_scale_x;
   scissor.extent[1] *= draw_resolution_scale_y;
+  if (untile_tiling_) {
+    scissor.offset[0] = uint32_t(int32_t(scissor.offset[0]) -
+                                 pa_sc_window_offset.window_x_offset *
+                                     int32_t(draw_resolution_scale_x));
+    scissor.offset[1] =
+        uint32_t(int32_t(scissor.offset[1]) + untile_rows * int32_t(draw_resolution_scale_y));
+    if (untile_first_tile) {
+      const uint32_t bottom = uint32_t(REXCVAR_GET(fh1_untile_height)) * draw_resolution_scale_y;
+      if (bottom > scissor.offset[1] + scissor.extent[1]) {
+        scissor.extent[1] = bottom - scissor.offset[1];
+      }
+    }
+  }
   VkRect2D scissor_rect;
   scissor_rect.offset.x = int32_t(scissor.offset[0]);
   scissor_rect.offset.y = int32_t(scissor.offset[1]);

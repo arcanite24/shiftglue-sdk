@@ -382,6 +382,7 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   config_ = config;
   if (!config_.memory || !config_.textures || !config_.render_targets) return false;
   scale_ = config_.textures->draw_resolution_scale_x();
+  untile_height_ = config_.untile_height;
   single_sample_msaa_ = (scale_ >= 2 && REXCVAR_GET(fh1_scaled_msaa_single_sample)) ||
                         REXCVAR_GET(fh1_msaa_single_sample);
   stencil_export_ = REXCVAR_GET(fh1_native_stencil_export) &&
@@ -673,7 +674,7 @@ void Fh1NativeExecutor::BeginSurfaceRendering(Surface& surface, bool uint_view) 
   attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   VkRenderingInfo info = {};
   info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-  info.renderArea.extent = {surface.width * scale_, surface.height * scale_};
+  info.renderArea.extent = {surface.width * scale_, surface.image_height * scale_};
   info.layerCount = 1;
   if (surface.key.is_depth) {
     info.pDepthAttachment = &attachment;
@@ -691,6 +692,28 @@ void Fh1NativeExecutor::BeginSurfaceRendering(Surface& surface, bool uint_view) 
   command_processor_.SubmitBarriersAndBeginFh1Rendering(info, id);
 }
 
+void Fh1NativeExecutor::EndUntiledTiling() {
+  if (untile_bands_.empty()) return;
+  for (const auto& [packed, band] : untile_bands_) {
+    Surface* surface = FindSurface(packed);
+    if (!surface || band >= untile_height_) continue;
+    // The last tile's band, from its screen rows to the EDRAM rows 0 on.
+    Transition(*surface, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+               VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    command_processor_.SubmitBarriers(true);
+    VkImageCopy region = {};
+    region.srcSubresource = {AspectMask(*surface), 0, 0, 1};
+    region.dstSubresource = region.srcSubresource;
+    region.srcOffset = {0, int32_t(band * scale_), 0};
+    // Rows past the band would overlap their own destination.
+    region.extent = {surface->width * scale_, std::min(untile_height_ - band, band) * scale_, 1};
+    command_processor_.deferred_command_buffer().CmdVkCopyImage(
+        surface->image, VK_IMAGE_LAYOUT_GENERAL, surface->image, VK_IMAGE_LAYOUT_GENERAL, region);
+    Count("untile_copy_down");
+  }
+  untile_bands_.clear();
+}
+
 Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceKey& key) {
   const uint32_t packed = key.Pack();
   if (Surface* existing = FindSurface(packed)) return existing;
@@ -702,6 +725,7 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
   surface.key = key;
   surface.width = key.pitch_tiles * (xenos::kEdramTileWidthSamples >> msaa_x_log2);
   surface.height = SurfaceHeight(key.pitch_tiles, key.msaa);
+  surface.image_height = std::max(surface.height, untile_height_);
   surface.samples = single_sample_msaa_ ? 1u
                     : key.msaa == uint32_t(xenos::MsaaSamples::k2X) && !config_.msaa_2x_supported
                         ? 4u
@@ -725,14 +749,17 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
                          : 0;
   image_info.imageType = VK_IMAGE_TYPE_2D;
   image_info.format = surface.format;
-  image_info.extent = {surface.width * scale_, surface.height * scale_, 1};
+  image_info.extent = {surface.width * scale_, surface.image_height * scale_, 1};
   image_info.mipLevels = 1;
   image_info.arrayLayers = 1;
   image_info.samples = VkSampleCountFlagBits(surface.samples);
   image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
   image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT |
                      (key.is_depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
-                                   : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+                                   : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
+                     (untile_height_ ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                           VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                                     : 0);
   image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   if (!ui::vulkan::util::CreateDedicatedAllocationImage(vulkan_device, image_info,
@@ -781,7 +808,7 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
   VkClearAttachment clear = {};
   clear.aspectMask = AspectMask(stored);
   VkClearRect clear_rect = {};
-  clear_rect.rect.extent = {stored.width * scale_, stored.height * scale_};
+  clear_rect.rect.extent = {stored.width * scale_, stored.image_height * scale_};
   clear_rect.layerCount = 1;
   command_processor_.deferred_command_buffer().CmdVkClearAttachments(1, &clear, 1, &clear_rect);
   Count("surface_created");
@@ -1866,7 +1893,7 @@ void Fh1NativeExecutor::BeginDrawRendering() {
       if (!bound[i]) continue;
       clears |= !bound[i]->pending_clears.empty();
       clear_width = std::min(clear_width, bound[i]->width * scale_);
-      clear_height = std::min(clear_height, bound[i]->height * scale_);
+      clear_height = std::min(clear_height, bound[i]->image_height * scale_);
     }
     if (clears) {
       FoldPendingClears(bound, clear_width, clear_height, nullptr, nullptr, true);
@@ -1908,7 +1935,7 @@ void Fh1NativeExecutor::BeginDrawRendering() {
     attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     if (i) color_count = i;
     width = std::min(width, surface->width * scale_);
-    height = std::min(height, surface->height * scale_);
+    height = std::min(height, surface->image_height * scale_);
   }
   if (width == UINT32_MAX) {
     // No attachments: the surface pitch bounds the draw.
@@ -2388,6 +2415,13 @@ void LogResolvedRangeAccess(void*, uint32_t physical_address, uint32_t length, b
 
 bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_length) {
   const RegisterFile& regs = register_file_;
+  // Untiled tiling: a later tile's band is at its screen rows of the
+  // surfaces, past the EDRAM rows its window offset maps it to.
+  const uint32_t untile_band =
+      untile_height_ ? uint32_t(std::max(0, -int32_t(regs.Get<reg::PA_SC_WINDOW_OFFSET>()
+                                                         .window_y_offset)))
+                     : 0u;
+  if (untile_height_ && !untile_band) EndUntiledTiling();
   CopyPlan plan;
   if (!PlanCopy(plan)) {
     if (plan.empty) {
@@ -2527,8 +2561,13 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
                                      .Pack())) {
         Count("resolve_through_alias");
       }
+      if (untile_band) {
+        uint32_t& band = untile_bands_[source.surface->key.Pack()];
+        band = std::max(band, untile_band);
+      }
       if (!ResolveToMemory(
-              source, plan.resolve_key, plan.sample_select, plan.dest_info, dest_base,
+              source, plan.resolve_key, plan.sample_select | (untile_band << 16), plan.dest_info,
+              dest_base,
               plan.dest_pitch, target, target_offset, target_range, false, direct_resolve_view,
               direct_resolve_targets_.empty() ? 0 : direct_resolve_targets_[0].row_offset,
               direct_resolve_targets_.empty()
@@ -2560,7 +2599,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
           continue;
         }
         unscaled_complete &= ResolveToMemory(
-            source, plan.resolve_key, plan.sample_select, plan.dest_info,
+            source, plan.resolve_key, plan.sample_select | (untile_band << 16), plan.dest_info,
             uint32_t(plan.dest_base - offset), plan.dest_pitch, config_.memory->buffer(), offset,
             range, true);
       }
@@ -2648,7 +2687,14 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
       }
     }
     FlushTransfers();
-    ClearSurfaceRect(*surface, rect, value, value_lo);
+    Rect clear_rect = rect;
+    if (untile_band) {
+      clear_rect.top += int32_t(untile_band);
+      clear_rect.bottom += int32_t(untile_band);
+      uint32_t& band = untile_bands_[key.Pack()];
+      band = std::max(band, untile_band);
+    }
+    ClearSurfaceRect(*surface, clear_rect, value, value_lo);
     Count(key.is_depth ? "clear_depth" : "clear_color");
   };
   if (resolve_info.IsClearingColor()) {

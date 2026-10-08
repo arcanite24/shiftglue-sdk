@@ -86,6 +86,9 @@ static float fh1_fixed16_scale = 32.0f;
 // source's guest pixel, as both surfaces are at the same scale).
 #define FH1_FLAG_SCALE_SHIFT 12u  // transfer flags: resolution scale - 1, 12:13
 static uint fh1_scale = 1u;
+// Untiled predicated tiling: a later tile's band is this many guest rows below
+// the EDRAM rows of the source surface.
+static uint fh1_source_row_offset = 0u;
 static uint2 fh1_subpixel = uint2(0u, 0u);
 void SetScaledPixel(inout uint2 pixel, uint scale) {
   fh1_scale = scale;
@@ -347,7 +350,8 @@ uint LoadSourceWord(uint reader_layout, uint2 pixel, uint sample, uint half,
   uint sy = source_row * 16u + tile_y;
   uint smx = source_msaa >= 2u ? 1u : 0u;
   uint smy = source_msaa >= 1u ? 1u : 0u;
-  int2 source_pixel = int2(sx >> smx, sy >> smy) * int(fh1_scale) + int2(fh1_subpixel);
+  int2 source_pixel = int2(sx >> smx, (sy >> smy) + fh1_source_row_offset) * int(fh1_scale) +
+                     int2(fh1_subpixel);
   uint guest_sample = (sx & smx) | ((sy & smy) << smx);
   uint host_sample =
       HostSample(guest_sample, source_msaa, LayoutHostSampleMode(source_layout));

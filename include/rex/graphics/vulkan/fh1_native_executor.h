@@ -36,6 +36,8 @@ class VulkanTextureCache;
 
 // Host configuration the executor shares with the pipelines it draws with.
 struct Fh1VulkanExecutorConfig {
+  // fh1_untile_predicated_tiling: the screen height in guest pixels, or 0.
+  uint32_t untile_height = 0;
   bool msaa_2x_supported = true;
   bool gamma_as_unorm16 = false;
   bool depth_float24_round = false;
@@ -68,6 +70,10 @@ class Fh1NativeExecutor {
   void Shutdown();
   // Counts an event in the rendering stats (such as occlusion query ends).
   void CountEvent(const char* stat) { Count(stat); }
+  // fh1_untile_predicated_tiling: after the last tile, the bands the later
+  // tiles resolved are copied down to the EDRAM rows of their surfaces, where
+  // the last tile leaves them on the console.
+  void EndUntiledTiling();
 
   // Before the targets are bound for a draw: derives the surfaces the draw
   // writes and takes their EDRAM tiles, transferring the previous owners'
@@ -147,7 +153,10 @@ class Fh1NativeExecutor {
     bool stencil_nonzero = false;
     uint32_t samples = 1;
     uint32_t width = 0;
+    // The EDRAM addressing period's height; the image may be taller
+    // (fh1_untile_predicated_tiling), its rows past the period host-only.
     uint32_t height = 0;
+    uint32_t image_height = 0;
     // The image's memory requirement.
     uint64_t bytes = 0;
     // Clears not recorded yet (fh1_fold_clears), in order: folded into the
@@ -311,6 +320,10 @@ class Fh1NativeExecutor {
   };
   SurfaceFront surface_front_[16];
   uint32_t scale_ = 1;
+  // fh1_untile_predicated_tiling: the screen height the images hold, and the
+  // last later-tile band resolved from each surface since the tiling began.
+  uint32_t untile_height_ = 0;
+  std::unordered_map<uint32_t, uint32_t> untile_bands_;
   bool initialized_ = false;
 
   // Descriptor set layouts (set 0): source images (bindings 16 and 17) with

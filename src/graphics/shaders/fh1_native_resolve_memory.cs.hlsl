@@ -184,11 +184,14 @@ void main(uint3 thread : SV_DispatchThreadID) {
   }
 
   uint first_sample, sample_count;
-  switch (fh1_sample_select) {
+  // The upper half: untiled predicated tiling's source row offset.
+  fh1_source_row_offset = fh1_sample_select >> 16u;
+  uint sample_select = fh1_sample_select & 0xFFFFu;
+  switch (sample_select) {
     case 4u: first_sample = 0u; sample_count = 2u; break;  // 01
     case 5u: first_sample = 2u; sample_count = 2u; break;  // 23
     case 6u: first_sample = 0u; sample_count = 4u; break;  // 0123
-    default: first_sample = fh1_sample_select; sample_count = 1u; break;
+    default: first_sample = sample_select; sample_count = 1u; break;
   }
 
   if (pack == 4u) {
