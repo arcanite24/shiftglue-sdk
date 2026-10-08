@@ -1448,7 +1448,8 @@ Fh1ShaderPack::Config VulkanPipelineCache::Fh1ShaderPackConfig() const {
           (uint32_t(features.fragment_shader_sample_interlock) << 9) |
           (uint32_t(features.demote_to_helper_invocation) << 10) |
           (uint32_t(features.sample_rate_shading) << 11) |
-          (uint32_t(render_target_cache_.msaa_2x_no_attachments_supported()) << 12)};
+          (uint32_t(render_target_cache_.msaa_2x_no_attachments_supported()) << 12) |
+          (uint32_t(features.bindless_textures) << 13)};
   Fh1ShaderPack::Config config;
   config.translator_version = SpirvShaderTranslator::Modification::kVersion;
   config.backend = Fh1ShaderPack::Backend::kVulkan;
@@ -1491,7 +1492,9 @@ void VulkanPipelineCache::ObserveTranslation(const VulkanShader& shader,
   observation.translator_version = config.translator_version;
   observation.backend = uint32_t(config.backend);
   observation.device_features = config.device_features;
-  observation.bindless_resources = false;
+  observation.bindless_resources = SpirvShaderTranslator::Features(
+                                       command_processor_.GetVulkanDevice())
+                                       .bindless_textures;
   observation.edram_rov = (config.flags & 2) != 0;
   observation.gamma_render_target_as_unorm8 = (config.flags & 4) != 0;
   observation.msaa_2x = (config.flags & 8) != 0;

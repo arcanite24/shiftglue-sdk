@@ -180,6 +180,20 @@ class VulkanDevice {
 
     bool presentId = false;
     bool presentWait = false;
+
+    // Descriptor indexing (promoted to 1.2), for bindless textures
+    // (RECORDER_PER_DRAW_BACKLOG PD-4). Enabled only on Vulkan 1.2+ devices.
+
+    bool shaderSampledImageArrayDynamicIndexing = false;
+    bool runtimeDescriptorArray = false;
+    bool descriptorBindingSampledImageUpdateAfterBind = false;
+    bool descriptorBindingPartiallyBound = false;
+    bool descriptorBindingUpdateUnusedWhilePending = false;
+    uint32_t maxDescriptorSetUpdateAfterBindSampledImages = 0;
+    uint32_t maxDescriptorSetUpdateAfterBindSamplers = 0;
+    uint32_t maxPerStageDescriptorUpdateAfterBindSampledImages = 0;
+    uint32_t maxPerStageDescriptorUpdateAfterBindSamplers = 0;
+    uint32_t maxUpdateAfterBindDescriptorsInAllPools = 0;
   };
 
   // Properties of the core API and enabled extensions, and enabled features.

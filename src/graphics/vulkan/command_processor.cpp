@@ -820,6 +820,12 @@ void VulkanCommandProcessor::DrawCostFrame() {
                   "{:.1f} %",
                   calls, calls ? 100.0 * double(hits) / double(calls) : 0.0);
     }
+    if (bindless_indices_draws_) {
+      REXGPU_INFO("Bindless indices (PD-4) over 600 frames: computed for {:.1f} % of {} draws",
+                  100.0 * double(bindless_indices_computed_) / double(bindless_indices_draws_),
+                  bindless_indices_draws_);
+      bindless_indices_computed_ = bindless_indices_draws_ = 0;
+    }
     if (constants_set_last_ + constants_set_table_ + constants_set_new_) {
       REXGPU_INFO("Constants set (PD-3.3) over 600 frames: {} same as the last draw, {} from "
                   "the frame table, {} new",
@@ -4388,6 +4394,12 @@ VkDescriptorSetLayout VulkanCommandProcessor::GetTextureDescriptorSetLayout(bool
 const VulkanPipelineCache::PipelineLayoutProvider* VulkanCommandProcessor::GetPipelineLayout(
     size_t texture_count_pixel, size_t sampler_count_pixel, size_t texture_count_vertex,
     size_t sampler_count_vertex) {
+  // PD-4: with bindless textures one layout serves every shader, the bindless
+  // set in place of the vertex texture set and an empty pixel texture set.
+  const bool bindless = texture_cache_ && texture_cache_->bindless();
+  if (bindless) {
+    texture_count_pixel = sampler_count_pixel = texture_count_vertex = sampler_count_vertex = 0;
+  }
   PipelineLayoutKey pipeline_layout_key;
   pipeline_layout_key.texture_count_pixel = uint16_t(texture_count_pixel);
   pipeline_layout_key.sampler_count_pixel = uint16_t(sampler_count_pixel);
@@ -4401,7 +4413,8 @@ const VulkanPipelineCache::PipelineLayoutProvider* VulkanCommandProcessor::GetPi
   }
 
   VkDescriptorSetLayout descriptor_set_layout_textures_vertex =
-      GetTextureDescriptorSetLayout(true, texture_count_vertex, sampler_count_vertex);
+      bindless ? texture_cache_->bindless_descriptor_set_layout()
+               : GetTextureDescriptorSetLayout(true, texture_count_vertex, sampler_count_vertex);
   if (descriptor_set_layout_textures_vertex == VK_NULL_HANDLE) {
     REXGPU_ERROR(
         "Failed to obtain a Vulkan descriptor set layout for {} sampled images "
@@ -5088,6 +5101,11 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
           shader_sampler = texture_cache_->UseSampler(shader_sampler_pair.first, sampler_overflowed);
           if (draw_cost_.enabled) ++sampler_census_.use_sampler;
           cached.sampler = shader_sampler;
+          const uint32_t bindless_slot =
+              texture_cache_->bindless() ? texture_cache_->GetSamplerBindlessIndex(shader_sampler)
+                                         : 0;
+          bindless_sampler_generation_ += cached.bindless_slot != bindless_slot;
+          cached.bindless_slot = bindless_slot;
           cached.submission = GetCurrentSubmission();
         }
         shader_sampler_pair.second = shader_sampler;
@@ -8343,6 +8361,56 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   // Write the new constant buffers.
   constexpr uint32_t kAllConstantBuffersMask =
       (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferCount) - 1;
+  const bool bindless = texture_cache_->bindless();
+  bindless_indices_draws_ += bindless && draw_cost_.enabled;
+  if (bindless && (bindless_indices_vertex_shader_ != vertex_shader ||
+                   bindless_indices_pixel_shader_ != pixel_shader ||
+                   bindless_indices_bindings_generation_ != texture_cache_->bindings_generation() ||
+                   bindless_indices_sampler_generation_ != bindless_sampler_generation_)) {
+    bindless_indices_vertex_shader_ = vertex_shader;
+    bindless_indices_pixel_shader_ = pixel_shader;
+    bindless_indices_bindings_generation_ = texture_cache_->bindings_generation();
+    bindless_indices_sampler_generation_ = bindless_sampler_generation_;
+    bindless_indices_computed_ += draw_cost_.enabled;
+    // PD-4: the draw's texture and sampler slots, uploaded after the fetch
+    // constants when one changed.
+    bool indices_changed = false;
+    auto set_index = [&](uint32_t position, uint32_t slot) {
+      indices_changed |= bindless_indices_[position] != slot;
+      bindless_indices_[position] = slot;
+    };
+    for (uint32_t stage = 0; stage < 2; ++stage) {
+      const VulkanShader* shader = stage ? pixel_shader : vertex_shader;
+      if (!shader) {
+        continue;
+      }
+      const uint32_t base = stage * SpirvShaderTranslator::kBindlessIndicesPerStage;
+      const std::vector<VulkanShader::TextureBinding>& textures =
+          shader->GetTextureBindingsAfterTranslation();
+      const size_t texture_count =
+          std::min(textures.size(), size_t(SpirvShaderTranslator::kBindlessSamplerIndexBase));
+      for (size_t k = 0; k < texture_count; ++k) {
+        const VulkanShader::TextureBinding& texture = textures[k];
+        set_index(base + uint32_t(k),
+                  texture_cache_->GetActiveBindingBindlessIndex(
+                      texture.fetch_constant, texture.dimension, bool(texture.is_signed)));
+      }
+      const std::vector<SamplerCacheEntry>& samplers =
+          stage ? sampler_cache_pixel_ : sampler_cache_vertex_;
+      const size_t sampler_count = std::min(
+          shader->GetSamplerBindingsAfterTranslation().size(),
+          size_t(SpirvShaderTranslator::kBindlessIndicesPerStage -
+                 SpirvShaderTranslator::kBindlessSamplerIndexBase));
+      for (size_t k = 0; k < sampler_count && k < samplers.size(); ++k) {
+        set_index(base + SpirvShaderTranslator::kBindlessSamplerIndexBase + uint32_t(k),
+                  samplers[k].bindless_slot);
+      }
+    }
+    if (indices_changed) {
+      current_constant_buffers_up_to_date_ &=
+          ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch);
+    }
+  }
   assert_zero(current_constant_buffers_up_to_date_ & ~kAllConstantBuffersMask);
   if ((current_constant_buffers_up_to_date_ & kAllConstantBuffersMask) != kAllConstantBuffersMask) {
     current_graphics_descriptor_set_values_up_to_date_ &=
@@ -8443,14 +8511,20 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       VkDescriptorBufferInfo& buffer_info =
           current_constant_buffer_infos_[SpirvShaderTranslator::kConstantBufferFetch];
       constexpr size_t kFetchConstantsSize = sizeof(uint32_t) * 6 * 32;
-      uint8_t* mapping = uniform_buffer_pool_->Request(frame_current_, kFetchConstantsSize,
+      const size_t fetch_buffer_size =
+          kFetchConstantsSize + (bindless ? SpirvShaderTranslator::kBindlessIndicesBytes : 0);
+      uint8_t* mapping = uniform_buffer_pool_->Request(frame_current_, fetch_buffer_size,
                                                        uniform_buffer_alignment, buffer_info.buffer,
                                                        buffer_info.offset);
       if (!mapping) {
         return false;
       }
-      buffer_info.range = VkDeviceSize(kFetchConstantsSize);
+      buffer_info.range = VkDeviceSize(fetch_buffer_size);
       std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], kFetchConstantsSize);
+      if (bindless) {
+        std::memcpy(mapping + kFetchConstantsSize, bindless_indices_,
+                    SpirvShaderTranslator::kBindlessIndicesBytes);
+      }
       if (constant_census_enabled_) {
         CountConstantUpload(4, mapping, kFetchConstantsSize);
       }
@@ -8481,6 +8555,16 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     textures_pixel = nullptr;
     sampler_count_pixel = 0;
     texture_count_pixel = 0;
+  }
+  if (bindless) {
+    // PD-4: no per-draw texture sets, writes or pushes; the bindless set is
+    // bound like the shared memory set.
+    texture_count_vertex = sampler_count_vertex = 0;
+    texture_count_pixel = sampler_count_pixel = 0;
+    current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetBindless] =
+        texture_cache_->bindless_descriptor_set();
+    current_graphics_descriptor_set_values_up_to_date_ |=
+        UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetBindless;
   }
   // Texture and sampler descriptor sets are rebuilt only when their contents
   // change: within a frame, the last set written for a stage with the same
@@ -8738,7 +8822,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   DrawCostMark(kCostDescriptorUpdate);
   // Bind the new descriptor sets.
   uint32_t descriptor_sets_needed = (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetCount) - 1;
-  if (!texture_count_vertex && !sampler_count_vertex) {
+  if (!texture_count_vertex && !sampler_count_vertex && !bindless) {
     descriptor_sets_needed &= ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex);
   }
   if ((!texture_count_pixel && !sampler_count_pixel) || push_pixel_textures) {

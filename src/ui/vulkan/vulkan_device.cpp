@@ -533,6 +533,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDevicePortabilitySubsetFeaturesKHR,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR>
       features_KHR_portability_subset;
+  VkPhysicalDeviceVulkan12Properties properties_1_2 = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
   VkPhysicalDeviceDriverPropertiesKHR properties_1_2_KHR_driver_properties = {
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
   VkPhysicalDeviceFloatControlsProperties properties_1_2_KHR_shader_float_controls = {
@@ -590,6 +592,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (ext_1_2_KHR_driver_properties) {
       properties_1_2_KHR_driver_properties.pNext = properties_2.pNext;
       properties_2.pNext = &properties_1_2_KHR_driver_properties;
+    }
+    if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+      properties_1_2.pNext = properties_2.pNext;
+      properties_2.pNext = &properties_1_2;
     }
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
       properties_1_1_subgroup.pNext = properties_2.pNext;
@@ -888,6 +894,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_FEATURE(shaderCullDistance)
     XE_UI_VULKAN_FEATURE(sparseBinding)
     XE_UI_VULKAN_FEATURE(sparseResidencyBuffer)
+    XE_UI_VULKAN_FEATURE(shaderSampledImageArrayDynamicIndexing)
   }
 
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -895,6 +902,15 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
       XE_UI_VULKAN_FEATURE_2(features_1_2, uniformBufferStandardLayout);
       XE_UI_VULKAN_FEATURE_2(features_1_2, scalarBlockLayout);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, runtimeDescriptorArray);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingSampledImageUpdateAfterBind);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingPartiallyBound);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingUpdateUnusedWhilePending);
+      XE_UI_VULKAN_PROPERTY_2(properties_1_2, maxDescriptorSetUpdateAfterBindSampledImages);
+      XE_UI_VULKAN_PROPERTY_2(properties_1_2, maxDescriptorSetUpdateAfterBindSamplers);
+      XE_UI_VULKAN_PROPERTY_2(properties_1_2, maxPerStageDescriptorUpdateAfterBindSampledImages);
+      XE_UI_VULKAN_PROPERTY_2(properties_1_2, maxPerStageDescriptorUpdateAfterBindSamplers);
+      XE_UI_VULKAN_PROPERTY_2(properties_1_2, maxUpdateAfterBindDescriptorsInAllPools);
     }
   } else {
     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {

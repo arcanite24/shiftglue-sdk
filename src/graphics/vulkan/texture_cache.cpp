@@ -455,6 +455,7 @@ VulkanTextureCache::~VulkanTextureCache() {
   const VkDevice device = vulkan_device->device();
 
   ClearSamplers();
+  ShutdownBindless();
 
   ShutdownScaledResolveBuffer();
 
@@ -641,6 +642,233 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
   }
 }
 
+uint32_t VulkanTextureCache::AllocateBindlessSlot(uint32_t array) {
+  std::vector<uint32_t>& free_slots = bindless_.free[array];
+  if (!free_slots.empty()) {
+    const uint32_t slot = free_slots.back();
+    free_slots.pop_back();
+    return slot;
+  }
+  if (bindless_.next[array] < bindless_.capacity[array]) {
+    return bindless_.next[array]++;
+  }
+  if (!bindless_.overflows++) {
+    REXGPU_ERROR("VulkanTextureCache: Bindless array {} is full ({} slots); views drawn as null",
+                 array, bindless_.capacity[array]);
+  }
+  return 0;
+}
+
+void VulkanTextureCache::WriteBindlessImage(uint32_t array, uint32_t slot, VkImageView view) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  VkDescriptorImageInfo image_info = {};
+  image_info.imageView = view;
+  image_info.imageLayout =
+      view != VK_NULL_HANDLE ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+  VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  write.dstSet = bindless_.set;
+  write.dstBinding = array;
+  write.dstArrayElement = slot;
+  write.descriptorCount = 1;
+  write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  write.pImageInfo = &image_info;
+  vulkan_device->functions().vkUpdateDescriptorSets(vulkan_device->device(), 1, &write, 0,
+                                                    nullptr);
+}
+
+void VulkanTextureCache::WriteBindlessSampler(uint32_t slot, VkSampler sampler) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  VkDescriptorImageInfo image_info = {};
+  image_info.sampler = sampler;
+  VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  write.dstSet = bindless_.set;
+  write.dstBinding = SpirvShaderTranslator::kBindlessBindingSamplers;
+  write.dstArrayElement = slot;
+  write.descriptorCount = 1;
+  write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+  write.pImageInfo = &image_info;
+  vulkan_device->functions().vkUpdateDescriptorSets(vulkan_device->device(), 1, &write, 0,
+                                                    nullptr);
+}
+
+uint32_t VulkanTextureCache::BindlessViewSlot(VkImageView view, uint32_t array) {
+  if (view == VK_NULL_HANDLE) {
+    return 0;
+  }
+  auto it = bindless_view_slots_.find(view);
+  if (it != bindless_view_slots_.end()) {
+    return it->second.second;
+  }
+  const uint32_t slot = AllocateBindlessSlot(array);
+  if (slot) {
+    WriteBindlessImage(array, slot, view);
+  }
+  bindless_view_slots_.emplace(view, std::make_pair(array, slot));
+  return slot;
+}
+
+void VulkanTextureCache::ReleaseBindlessView(VkImageView view) {
+  if (!bindless()) {
+    return;
+  }
+  auto it = bindless_view_slots_.find(view);
+  if (it == bindless_view_slots_.end()) {
+    return;
+  }
+  if (it->second.second) {
+    bindless_.free[it->second.first].push_back(it->second.second);
+  }
+  bindless_view_slots_.erase(it);
+}
+
+uint32_t VulkanTextureCache::GetSamplerBindlessIndex(VkSampler sampler) const {
+  auto it = bindless_sampler_slots_.find(sampler);
+  return it != bindless_sampler_slots_.end() ? it->second : 0;
+}
+
+uint32_t VulkanTextureCache::GetActiveBindingBindlessIndexSlow(uint32_t fetch_constant_index,
+                                                               xenos::FetchOpDimension dimension,
+                                                               bool is_signed) {
+  // 3D as 2D views, null views and views not known yet.
+  uint32_t array;
+  switch (dimension) {
+    case xenos::FetchOpDimension::k3DOrStacked:
+      array = SpirvShaderTranslator::kBindlessBindingImages3D;
+      break;
+    case xenos::FetchOpDimension::kCube:
+      array = SpirvShaderTranslator::kBindlessBindingImagesCube;
+      break;
+    default:
+      array = SpirvShaderTranslator::kBindlessBindingImages2DArray;
+      break;
+  }
+  return BindlessViewSlot(GetActiveBindingOrNullImageView(fetch_constant_index, dimension, is_signed),
+                          array);
+}
+
+bool VulkanTextureCache::InitializeBindless() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  const ui::vulkan::VulkanDevice::Properties& properties = vulkan_device->properties();
+  // 3D and cube views are few; 2D array views take the rest of the limit.
+  const uint32_t image_limit =
+      std::min({properties.maxPerStageDescriptorUpdateAfterBindSampledImages,
+                properties.maxDescriptorSetUpdateAfterBindSampledImages,
+                properties.maxUpdateAfterBindDescriptorsInAllPools / 2, UINT32_C(65536) + 8192});
+  bindless_.capacity[SpirvShaderTranslator::kBindlessBindingImages3D] = 4096;
+  bindless_.capacity[SpirvShaderTranslator::kBindlessBindingImagesCube] = 4096;
+  bindless_.capacity[SpirvShaderTranslator::kBindlessBindingImages2DArray] =
+      image_limit > 8192 ? image_limit - 8192 : 0;
+  bindless_.capacity[SpirvShaderTranslator::kBindlessBindingSamplers] =
+      std::min({properties.maxPerStageDescriptorUpdateAfterBindSamplers,
+                properties.maxDescriptorSetUpdateAfterBindSamplers, sampler_max_count_ + 1});
+  if (bindless_.capacity[SpirvShaderTranslator::kBindlessBindingImages2DArray] < 4096 ||
+      bindless_.capacity[SpirvShaderTranslator::kBindlessBindingSamplers] < 256) {
+    REXGPU_WARN("VulkanTextureCache: Device limits too small for bindless textures");
+    return false;
+  }
+  VkDescriptorSetLayoutBinding bindings[SpirvShaderTranslator::kBindlessBindingCount];
+  VkDescriptorBindingFlags binding_flags[SpirvShaderTranslator::kBindlessBindingCount];
+  for (uint32_t i = 0; i < SpirvShaderTranslator::kBindlessBindingCount; ++i) {
+    bindings[i].binding = i;
+    bindings[i].descriptorType = i == SpirvShaderTranslator::kBindlessBindingSamplers
+                                     ? VK_DESCRIPTOR_TYPE_SAMPLER
+                                     : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    bindings[i].descriptorCount = bindless_.capacity[i];
+    bindings[i].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
+    bindings[i].pImmutableSamplers = nullptr;
+    binding_flags[i] = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+                       VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+                       VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
+  }
+  VkDescriptorSetLayoutBindingFlagsCreateInfo binding_flags_info = {
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+  binding_flags_info.bindingCount = SpirvShaderTranslator::kBindlessBindingCount;
+  binding_flags_info.pBindingFlags = binding_flags;
+  VkDescriptorSetLayoutCreateInfo layout_info = {
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  layout_info.pNext = &binding_flags_info;
+  layout_info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+  layout_info.bindingCount = SpirvShaderTranslator::kBindlessBindingCount;
+  layout_info.pBindings = bindings;
+  if (dfn.vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &bindless_.layout) !=
+      VK_SUCCESS) {
+    REXGPU_ERROR("VulkanTextureCache: Failed to create the bindless descriptor set layout");
+    return false;
+  }
+  VkDescriptorPoolSize pool_sizes[2];
+  pool_sizes[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  pool_sizes[0].descriptorCount =
+      bindless_.capacity[0] + bindless_.capacity[1] + bindless_.capacity[2];
+  pool_sizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
+  pool_sizes[1].descriptorCount = bindless_.capacity[SpirvShaderTranslator::kBindlessBindingSamplers];
+  VkDescriptorPoolCreateInfo pool_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+  pool_info.maxSets = 1;
+  pool_info.poolSizeCount = 2;
+  pool_info.pPoolSizes = pool_sizes;
+  if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &bindless_.pool) != VK_SUCCESS) {
+    REXGPU_ERROR("VulkanTextureCache: Failed to create the bindless descriptor pool");
+    return false;
+  }
+  VkDescriptorSetAllocateInfo allocate_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  allocate_info.descriptorPool = bindless_.pool;
+  allocate_info.descriptorSetCount = 1;
+  allocate_info.pSetLayouts = &bindless_.layout;
+  VkDescriptorSet set;
+  if (dfn.vkAllocateDescriptorSets(device, &allocate_info, &set) != VK_SUCCESS) {
+    REXGPU_ERROR("VulkanTextureCache: Failed to allocate the bindless descriptor set");
+    return false;
+  }
+  bindless_.set = set;
+  // Slot 0: null views (true null descriptors when supported) and a default
+  // sampler.
+  WriteBindlessImage(SpirvShaderTranslator::kBindlessBindingImages2DArray, 0,
+                     null_image_view_2d_array_);
+  WriteBindlessImage(SpirvShaderTranslator::kBindlessBindingImages3D, 0, null_image_view_3d_);
+  WriteBindlessImage(SpirvShaderTranslator::kBindlessBindingImagesCube, 0, null_image_view_cube_);
+  VkSamplerCreateInfo sampler_info = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+  sampler_info.magFilter = VK_FILTER_NEAREST;
+  sampler_info.minFilter = VK_FILTER_NEAREST;
+  sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sampler_info.maxLod = VK_LOD_CLAMP_NONE;
+  if (dfn.vkCreateSampler(device, &sampler_info, nullptr, &bindless_.default_sampler) !=
+      VK_SUCCESS) {
+    REXGPU_ERROR("VulkanTextureCache: Failed to create the bindless default sampler");
+    return false;
+  }
+  WriteBindlessSampler(0, bindless_.default_sampler);
+  for (uint32_t i = 0; i < SpirvShaderTranslator::kBindlessBindingCount; ++i) {
+    bindless_.next[i] = 1;
+  }
+  REXGPU_INFO(
+      "VulkanTextureCache: Bindless textures (PD-4): {} 2D array, {} 3D, {} cube views, {} "
+      "samplers",
+      bindless_.capacity[0], bindless_.capacity[1], bindless_.capacity[2], bindless_.capacity[3]);
+  return true;
+}
+
+void VulkanTextureCache::ShutdownBindless() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (bindless_.default_sampler != VK_NULL_HANDLE) {
+    dfn.vkDestroySampler(device, bindless_.default_sampler, nullptr);
+  }
+  if (bindless_.pool != VK_NULL_HANDLE) {
+    dfn.vkDestroyDescriptorPool(device, bindless_.pool, nullptr);
+  }
+  if (bindless_.layout != VK_NULL_HANDLE) {
+    dfn.vkDestroyDescriptorSetLayout(device, bindless_.layout, nullptr);
+  }
+  bindless_ = {};
+  bindless_view_slots_.clear();
+  bindless_sampler_slots_.clear();
+}
+
 VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,
                                                                 xenos::FetchOpDimension dimension,
                                                                 bool is_signed) {
@@ -825,6 +1053,16 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
         --custom_border_color_sampler_count_;
       }
     }
+    if (bindless()) {
+      auto slot_it = bindless_sampler_slots_.find(sampler_used_first_->second.sampler);
+      if (slot_it != bindless_sampler_slots_.end()) {
+        if (slot_it->second) {
+          bindless_.free[SpirvShaderTranslator::kBindlessBindingSamplers].push_back(
+              slot_it->second);
+        }
+        bindless_sampler_slots_.erase(slot_it);
+      }
+    }
     dfn.vkDestroySampler(device, sampler_used_first_->second.sampler, nullptr);
     if (sampler_used_first_->second.used_next) {
       sampler_used_first_->second.used_next->second.used_previous =
@@ -964,6 +1202,14 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
             .first);
   COUNT_profile_set("gpu/texture_cache/vulkan/samplers", samplers_.size());
   new_sampler.second.sampler = vulkan_sampler;
+  if (bindless()) {
+    const uint32_t slot = AllocateBindlessSlot(SpirvShaderTranslator::kBindlessBindingSamplers);
+    if (slot) {
+      WriteBindlessSampler(slot, vulkan_sampler);
+    }
+    new_sampler.second.bindless_slot = slot;
+    bindless_sampler_slots_[vulkan_sampler] = slot;
+  }
   new_sampler.second.uses_custom_border_color = uses_custom_border_color;
   new_sampler.second.last_usage_submission = submission_current;
   new_sampler.second.used_previous = sampler_used_last_;
@@ -1005,8 +1251,13 @@ void VulkanTextureCache::ClearSamplers() {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   for (const std::pair<const SamplerParameters, Sampler>& sampler_pair : samplers_) {
+    if (sampler_pair.second.bindless_slot) {
+      bindless_.free[SpirvShaderTranslator::kBindlessBindingSamplers].push_back(
+          sampler_pair.second.bindless_slot);
+    }
     dfn.vkDestroySampler(device, sampler_pair.second.sampler, nullptr);
   }
+  bindless_sampler_slots_.clear();
   samplers_.clear();
   custom_border_color_sampler_count_ = 0;
   COUNT_profile_set("gpu/texture_cache/vulkan/samplers", 0);
@@ -2075,6 +2326,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
 }
 
 void VulkanTextureCache::UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) {
+  ++bindings_generation_;
   uint32_t bindings_remaining = fetch_constant_mask;
   uint32_t binding_index;
   while (rex::bit_scan_forward(bindings_remaining, &binding_index)) {
@@ -2117,6 +2369,34 @@ void VulkanTextureCache::UpdateTextureBindingsImpl(uint32_t fetch_constant_mask)
         }
       }
     }
+    if (bindless()) {
+      // The views' array by the texture's dimension, as the shader declares
+      // the fetch that uses them.
+      uint32_t array;
+      switch (binding->key.dimension) {
+        case xenos::DataDimension::k3D:
+          array = SpirvShaderTranslator::kBindlessBindingImages3D;
+          break;
+        case xenos::DataDimension::kCube:
+          array = SpirvShaderTranslator::kBindlessBindingImagesCube;
+          break;
+        default:
+          array = SpirvShaderTranslator::kBindlessBindingImages2DArray;
+          break;
+      }
+      const bool separate = IsSignedVersionSeparateForFormat(binding->key);
+      VulkanTexture* texture_unsigned = static_cast<VulkanTexture*>(binding->texture);
+      VulkanTexture* texture_signed =
+          static_cast<VulkanTexture*>(separate ? binding->texture_signed : binding->texture);
+      if (vulkan_binding.image_view_unsigned != VK_NULL_HANDLE && texture_unsigned) {
+        vulkan_binding.bindless_slot_unsigned = texture_unsigned->GetBindlessSlot(
+            false, vulkan_binding.image_view_unsigned, array);
+      }
+      if (vulkan_binding.image_view_signed != VK_NULL_HANDLE && texture_signed) {
+        vulkan_binding.bindless_slot_signed =
+            texture_signed->GetBindlessSlot(true, vulkan_binding.image_view_signed, array);
+      }
+    }
   }
 }
 
@@ -2146,7 +2426,9 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
                                     key().base_page << 12, key().GetWidth(), key().GetHeight(),
                                     bool(key().scaled_resolve), uint64_t(image_), views));
   }
+  VulkanTextureCache& mutable_cache = const_cast<VulkanTextureCache&>(vulkan_texture_cache);
   for (const auto& view_pair : views_) {
+    mutable_cache.ReleaseBindlessView(view_pair.second);
     dfn.vkDestroyImageView(device, view_pair.second, nullptr);
   }
   if (copy_view_ != VK_NULL_HANDLE) {
@@ -2156,9 +2438,11 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
     dfn.vkDestroyImageView(device, copy_view_2d_, nullptr);
   }
   if (image_view_3d_as_2d_unsigned_ != VK_NULL_HANDLE) {
+    mutable_cache.ReleaseBindlessView(image_view_3d_as_2d_unsigned_);
     dfn.vkDestroyImageView(device, image_view_3d_as_2d_unsigned_, nullptr);
   }
   if (image_view_3d_as_2d_signed_ != VK_NULL_HANDLE) {
+    mutable_cache.ReleaseBindlessView(image_view_3d_as_2d_signed_);
     dfn.vkDestroyImageView(device, image_view_3d_as_2d_signed_, nullptr);
   }
   vmaDestroyImage(vulkan_texture_cache.vma_allocator_, image_, allocation_);
@@ -2175,8 +2459,24 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t 
   if (view != VK_NULL_HANDLE) {
     last_view.arguments = arguments;
     last_view.view = view;
+    last_view.bindless_slot = UINT32_MAX;
   }
   return view;
+}
+
+uint32_t VulkanTextureCache::VulkanTexture::GetBindlessSlot(bool is_signed, VkImageView view,
+                                                            uint32_t array) {
+  LastView& last_view = last_views_[is_signed];
+  if (last_view.view == view && last_view.bindless_slot != UINT32_MAX) {
+    return last_view.bindless_slot;
+  }
+  const uint32_t slot =
+      const_cast<VulkanTextureCache&>(static_cast<const VulkanTextureCache&>(texture_cache()))
+          .BindlessViewSlot(view, array);
+  if (last_view.view == view) {
+    last_view.bindless_slot = slot;
+  }
+  return slot;
 }
 
 VkImageView VulkanTextureCache::VulkanTexture::GetViewUncached(bool is_signed,
@@ -3533,6 +3833,13 @@ bool VulkanTextureCache::Initialize() {
                   std::min(16.0f, std::max(1.0f, device_properties.maxSamplerAnisotropy))))));
   } else {
     max_anisotropy_ = xenos::AnisoFilter::kDisabled;
+  }
+
+  if (SpirvShaderTranslator::Features(vulkan_device).bindless_textures && !InitializeBindless()) {
+    // The translator is configured from the same features, so a failure here
+    // leaves shaders expecting the set: fail the cache.
+    ShutdownBindless();
+    return false;
   }
 
   return true;

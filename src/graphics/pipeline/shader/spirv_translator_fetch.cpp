@@ -647,6 +647,17 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         StoreResult(instr.result, const_float_vectors_0_[used_result_component_count - 1]);
         return;
       }
+      if (features_.bindless_textures) {
+        sampler = LoadBindlessSampler(sampler_index);
+        image_2d_array_or_cube_unsigned = LoadBindlessTexture(image_2d_array_or_cube_unsigned_index);
+        image_2d_array_or_cube_signed = LoadBindlessTexture(image_2d_array_or_cube_signed_index);
+        if (image_3d_unsigned_index != SIZE_MAX) {
+          image_3d_unsigned = LoadBindlessTexture(image_3d_unsigned_index);
+        }
+        if (image_3d_signed_index != SIZE_MAX) {
+          image_3d_signed = LoadBindlessTexture(image_3d_signed_index);
+        }
+      } else {
       sampler = builder_->createLoad(sampler_bindings_[sampler_index].variable, spv::NoPrecision);
       const TextureBinding& image_2d_array_or_cube_unsigned_binding =
           texture_bindings_[image_2d_array_or_cube_unsigned_index];
@@ -665,6 +676,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
       if (image_3d_signed_index != SIZE_MAX) {
         const TextureBinding& image_3d_signed_binding = texture_bindings_[image_3d_signed_index];
         image_3d_signed = builder_->createLoad(image_3d_signed_binding.variable, spv::NoPrecision);
+      }
       }
     }
 
@@ -2121,6 +2133,18 @@ size_t SpirvShaderTranslator::FindOrAddTextureBinding(uint32_t fetch_constant,
   // TODO(Triang3l): Limit the total count to that actually supported by the
   // implementation.
   size_t new_texture_binding_index = texture_bindings_.size();
+  if (features_.bindless_textures) {
+    // PD-4: an index position, no variable.
+    if (new_texture_binding_index >= kBindlessSamplerIndexBase) {
+      return SIZE_MAX;
+    }
+    TextureBinding& new_texture_binding = texture_bindings_.emplace_back();
+    new_texture_binding.fetch_constant = fetch_constant;
+    new_texture_binding.dimension = dimension;
+    new_texture_binding.is_signed = is_signed;
+    new_texture_binding.variable = spv::NoResult;
+    return new_texture_binding_index;
+  }
   TextureBinding& new_texture_binding = texture_bindings_.emplace_back();
   new_texture_binding.fetch_constant = fetch_constant;
   new_texture_binding.dimension = dimension;
@@ -2181,12 +2205,20 @@ size_t SpirvShaderTranslator::FindOrAddSamplerBinding(uint32_t fetch_constant,
   // TODO(Triang3l): Limit the total count to that actually supported by the
   // implementation.
   size_t new_sampler_binding_index = sampler_bindings_.size();
+  if (features_.bindless_textures &&
+      new_sampler_binding_index >= kBindlessIndicesPerStage - kBindlessSamplerIndexBase) {
+    return SIZE_MAX;
+  }
   SamplerBinding& new_sampler_binding = sampler_bindings_.emplace_back();
   new_sampler_binding.fetch_constant = fetch_constant;
   new_sampler_binding.mag_filter = mag_filter;
   new_sampler_binding.min_filter = min_filter;
   new_sampler_binding.mip_filter = mip_filter;
   new_sampler_binding.aniso_filter = aniso_filter;
+  if (features_.bindless_textures) {
+    new_sampler_binding.variable = spv::NoResult;
+    return new_sampler_binding_index;
+  }
   std::ostringstream name;
   static const char kFilterSuffixes[] = {'p', 'l', 'b', 'f'};
   name << "xe_sampler" << fetch_constant << '_' << kFilterSuffixes[uint32_t(mag_filter)]
@@ -2210,6 +2242,89 @@ size_t SpirvShaderTranslator::FindOrAddSamplerBinding(uint32_t fetch_constant,
     main_interface_.push_back(new_sampler_binding.variable);
   }
   return new_sampler_binding_index;
+}
+
+spv::Id SpirvShaderTranslator::GetBindlessArray(BindlessBinding binding) {
+  spv::Id& array = bindless_arrays_[binding];
+  if (array != spv::NoResult) {
+    return array;
+  }
+  spv::Id element_type;
+  const char* name;
+  switch (binding) {
+    case kBindlessBindingImages3D:
+      element_type = builder_->makeImageType(type_float_, spv::Dim3D, false, false, false, 1,
+                                             spv::ImageFormatUnknown);
+      name = "xe_bindless_textures_3d";
+      break;
+    case kBindlessBindingImagesCube:
+      element_type = builder_->makeImageType(type_float_, spv::DimCube, false, false, false, 1,
+                                             spv::ImageFormatUnknown);
+      name = "xe_bindless_textures_cube";
+      break;
+    case kBindlessBindingSamplers:
+      element_type = builder_->makeSamplerType();
+      name = "xe_bindless_samplers";
+      break;
+    default:
+      element_type = builder_->makeImageType(type_float_, spv::Dim2D, false, true, false, 1,
+                                             spv::ImageFormatUnknown);
+      name = "xe_bindless_textures_2d";
+      break;
+  }
+  builder_->addCapability(spv::CapabilityRuntimeDescriptorArray);
+  builder_->addCapability(spv::CapabilitySampledImageArrayDynamicIndexing);
+  array = builder_->createVariable(spv::NoPrecision, spv::StorageClassUniformConstant,
+                                   builder_->makeRuntimeArray(element_type), name);
+  builder_->addDecoration(array, spv::DecorationDescriptorSet, int(kDescriptorSetBindless));
+  builder_->addDecoration(array, spv::DecorationBinding, int(binding));
+  if (features_.spirv_version >= spv::Spv_1_4) {
+    main_interface_.push_back(array);
+  }
+  return array;
+}
+
+spv::Id SpirvShaderTranslator::LoadBindlessIndex(uint32_t position) {
+  const uint32_t index = (is_pixel_shader() ? kBindlessIndicesPerStage : 0) + position;
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(builder_->makeIntConstant(1));
+  id_vector_temp_.push_back(builder_->makeIntConstant(int(index >> 2)));
+  id_vector_temp_.push_back(builder_->makeIntConstant(int(index & 3)));
+  return builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
+                                                         uniform_fetch_constants_, id_vector_temp_),
+                              spv::NoPrecision);
+}
+
+spv::Id SpirvShaderTranslator::LoadBindlessTexture(size_t texture_binding_index) {
+  BindlessBinding binding;
+  switch (texture_bindings_[texture_binding_index].dimension) {
+    case xenos::FetchOpDimension::k3DOrStacked:
+      binding = kBindlessBindingImages3D;
+      break;
+    case xenos::FetchOpDimension::kCube:
+      binding = kBindlessBindingImagesCube;
+      break;
+    default:
+      binding = kBindlessBindingImages2DArray;
+      break;
+  }
+  spv::Id array = GetBindlessArray(binding);
+  spv::Id index = LoadBindlessIndex(uint32_t(texture_binding_index));
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(index);
+  return builder_->createLoad(
+      builder_->createAccessChain(spv::StorageClassUniformConstant, array, id_vector_temp_),
+      spv::NoPrecision);
+}
+
+spv::Id SpirvShaderTranslator::LoadBindlessSampler(size_t sampler_binding_index) {
+  spv::Id array = GetBindlessArray(kBindlessBindingSamplers);
+  spv::Id index = LoadBindlessIndex(kBindlessSamplerIndexBase + uint32_t(sampler_binding_index));
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(index);
+  return builder_->createLoad(
+      builder_->createAccessChain(spv::StorageClassUniformConstant, array, id_vector_temp_),
+      spv::NoPrecision);
 }
 
 void SpirvShaderTranslator::SampleTexture(spv::Builder::TextureParameters& texture_parameters,

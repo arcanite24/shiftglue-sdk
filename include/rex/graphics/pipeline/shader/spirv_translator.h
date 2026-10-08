@@ -361,7 +361,28 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kDescriptorSetTexturesPixel,
 
     kDescriptorSetCount,
+
+    // PD-4 bindless textures: one long-lived set in place of the vertex
+    // texture set, holding every image view and sampler; the pixel texture
+    // set is unused.
+    kDescriptorSetBindless = kDescriptorSetTexturesVertex,
   };
+  // The bindless set's bindings: image views by type, then samplers.
+  enum BindlessBinding : uint32_t {
+    kBindlessBindingImages2DArray,
+    kBindlessBindingImages3D,
+    kBindlessBindingImagesCube,
+    kBindlessBindingSamplers,
+    kBindlessBindingCount,
+  };
+  // Per stage, the bindless indices a draw's shaders read: texture binding i
+  // at i, sampler binding j at kBindlessSamplerIndexBase + j; the vertex
+  // shader's block first, then the pixel shader's. They follow the fetch
+  // constants in their uniform buffer.
+  static constexpr uint32_t kBindlessIndicesPerStage = 64;
+  static constexpr uint32_t kBindlessSamplerIndexBase = 48;
+  static constexpr uint32_t kFetchConstantsBytes = sizeof(uint32_t) * 6 * 32;
+  static constexpr uint32_t kBindlessIndicesBytes = sizeof(uint32_t) * kBindlessIndicesPerStage * 2;
   static_assert(kDescriptorSetCount <= 4,
                 "The number of descriptor sets used by translated shaders must be within "
                 "the minimum Vulkan maxBoundDescriptorSets requirement of 4, which is "
@@ -401,6 +422,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
     bool sample_rate_shading;
     // Quad operations in fragment shaders (SPIR-V 1.3).
     bool quad_operations_fragment;
+    // PD-4: textures and samplers from the bindless set, indexed by the
+    // indices after the fetch constants (vulkan_bindless_textures and the
+    // device's descriptor indexing).
+    bool bindless_textures;
   };
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,
@@ -888,6 +913,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id uniform_float_constants_;
   spv::Id uniform_bool_loop_constants_;
   spv::Id uniform_fetch_constants_;
+  // PD-4: the bindless arrays (2D array, 3D, cube images; samplers), created
+  // on first use.
+  spv::Id bindless_arrays_[kBindlessBindingCount] = {};
+  spv::Id LoadBindlessTexture(size_t texture_binding_index);
+  spv::Id LoadBindlessSampler(size_t sampler_binding_index);
+  spv::Id LoadBindlessIndex(uint32_t position);
+  spv::Id GetBindlessArray(BindlessBinding binding);
 
   spv::Id buffers_shared_memory_;
   spv::Id buffer_edram_;

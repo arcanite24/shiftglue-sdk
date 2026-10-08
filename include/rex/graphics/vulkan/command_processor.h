@@ -702,6 +702,17 @@ class VulkanCommandProcessor : public CommandProcessor {
     std::vector<uint8_t> last[5];
   } constant_census_;
   bool constant_census_enabled_ = false;
+  // PD-4: the bindless indices last written after the fetch constants
+  // (vertex block, then pixel block).
+  uint32_t bindless_indices_[SpirvShaderTranslator::kBindlessIndicesPerStage * 2] = {};
+  // The inputs of the last computed indices: when the shaders, the texture
+  // bindings and the sampler slots are the same, so are the indices.
+  const void* bindless_indices_vertex_shader_ = nullptr;
+  const void* bindless_indices_pixel_shader_ = nullptr;
+  uint64_t bindless_indices_bindings_generation_ = UINT64_MAX;
+  uint64_t bindless_indices_sampler_generation_ = UINT64_MAX;
+  uint64_t bindless_sampler_generation_ = 0;
+  uint64_t bindless_indices_computed_ = 0, bindless_indices_draws_ = 0;
   // PD-3.3 census, with the cost model: constants set lookups by outcome.
   uint64_t constants_set_last_ = 0, constants_set_table_ = 0, constants_set_new_ = 0;
   uint64_t prepare_calls_at_window_ = 0, prepare_hits_at_window_ = 0;
@@ -1240,6 +1251,8 @@ class VulkanCommandProcessor : public CommandProcessor {
     VulkanTextureCache::SamplerParameters parameters;
     VkSampler sampler = VK_NULL_HANDLE;
     uint64_t submission = 0;
+    // PD-4: the sampler's bindless slot, taken when the sampler is.
+    uint32_t bindless_slot = 0;
   };
   std::vector<SamplerCacheEntry> sampler_cache_vertex_;
   // Sampler parameters by fetch words, binding filters and the filtering

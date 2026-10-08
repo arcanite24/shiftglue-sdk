@@ -28,6 +28,11 @@
 #include <rex/math.h>
 #include <rex/string/buffer.h>
 
+REXCVAR_DEFINE_BOOL(vulkan_bindless_textures, false, "GPU/Vulkan",
+                    "Bind textures and samplers from one long-lived descriptor set indexed by "
+                    "per-draw indices instead of per-draw descriptor sets and pushes, on devices "
+                    "with Vulkan 1.2 descriptor indexing (RECORDER_PER_DRAW_BACKLOG PD-4)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(spirv_fast_pixel_math, false, "GPU",
                     "Vulkan: translate pixel shaders without the Direct3D 9 multiply rule "
                     "(0 * anything = 0) and let the driver fuse multiply-adds. Less pixel "
@@ -58,7 +63,8 @@ SpirvShaderTranslator::Features::Features(bool all)
       fragment_shader_sample_interlock(all),
       demote_to_helper_invocation(all),
       sample_rate_shading(all),
-      quad_operations_fragment(all) {}
+      quad_operations_fragment(all),
+      bindless_textures(false) {}
 
 SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const vulkan_device)
     : max_storage_buffer_range(vulkan_device->properties().maxStorageBufferRange),
@@ -90,6 +96,21 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
   if (spirv_version < spv::Spv_1_3) {
     quad_operations_fragment = false;
   }
+  const auto& device_properties = vulkan_device->properties();
+  bindless_textures = REXCVAR_GET(vulkan_bindless_textures) &&
+                      vulkan_api_version >= VK_MAKE_API_VERSION(0, 1, 2, 0) &&
+                      device_properties.shaderSampledImageArrayDynamicIndexing &&
+                      device_properties.runtimeDescriptorArray &&
+                      device_properties.descriptorBindingSampledImageUpdateAfterBind &&
+                      device_properties.descriptorBindingPartiallyBound &&
+                      device_properties.descriptorBindingUpdateUnusedWhilePending &&
+                      // The sizes VulkanTextureCache::InitializeBindless needs.
+                      device_properties.maxPerStageDescriptorUpdateAfterBindSampledImages >=
+                          12288 &&
+                      device_properties.maxDescriptorSetUpdateAfterBindSampledImages >= 12288 &&
+                      device_properties.maxUpdateAfterBindDescriptorsInAllPools >= 24576 &&
+                      device_properties.maxPerStageDescriptorUpdateAfterBindSamplers >= 256 &&
+                      device_properties.maxDescriptorSetUpdateAfterBindSamplers >= 256;
 }
 
 uint64_t SpirvShaderTranslator::GetDefaultVertexShaderModification(
@@ -424,6 +445,9 @@ void SpirvShaderTranslator::StartTranslation() {
       main_interface_.push_back(uniform_bool_loop_constants_);
     }
 
+    for (spv::Id& bindless_array : bindless_arrays_) {
+      bindless_array = spv::NoResult;
+    }
     // Common uniform buffer - fetch constants (32 x 6 uints packed in std140 as
     // 4-component vectors).
     id_vector_temp_.clear();
@@ -431,9 +455,22 @@ void SpirvShaderTranslator::StartTranslation() {
         type_uint4_, builder_->makeUintConstant(32 * 6 / 4), sizeof(uint32_t) * 4));
     builder_->addDecoration(id_vector_temp_.back(), spv::DecorationArrayStride,
                             sizeof(uint32_t) * 4);
+    if (features_.bindless_textures) {
+      // PD-4: the draw's bindless indices follow the fetch constants.
+      id_vector_temp_.push_back(builder_->makeArrayType(
+          type_uint4_, builder_->makeUintConstant(kBindlessIndicesBytes / (sizeof(uint32_t) * 4)),
+          sizeof(uint32_t) * 4));
+      builder_->addDecoration(id_vector_temp_.back(), spv::DecorationArrayStride,
+                              sizeof(uint32_t) * 4);
+    }
     spv::Id type_fetch_constants = builder_->makeStructType(id_vector_temp_, "XeFetchConstants");
     builder_->addMemberName(type_fetch_constants, 0, "fetch_constants");
     builder_->addMemberDecoration(type_fetch_constants, 0, spv::DecorationOffset, 0);
+    if (features_.bindless_textures) {
+      builder_->addMemberName(type_fetch_constants, 1, "bindless_indices");
+      builder_->addMemberDecoration(type_fetch_constants, 1, spv::DecorationOffset,
+                                    int(kFetchConstantsBytes));
+    }
     builder_->addDecoration(type_fetch_constants, spv::DecorationBlock);
     uniform_fetch_constants_ =
         builder_->createVariable(spv::NoPrecision, spv::StorageClassUniform, type_fetch_constants,
@@ -1276,9 +1313,11 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
     // set.
     size_t texture_binding_count = texture_bindings_.size();
     size_t sampler_binding_count = sampler_bindings_.size();
-    for (size_t i = 0; i < sampler_binding_count; ++i) {
-      builder_->addDecoration(sampler_bindings_[i].variable, spv::DecorationBinding,
-                              int(texture_binding_count + i));
+    if (!features_.bindless_textures) {
+      for (size_t i = 0; i < sampler_binding_count; ++i) {
+        builder_->addDecoration(sampler_bindings_[i].variable, spv::DecorationBinding,
+                                int(texture_binding_count + i));
+      }
     }
   }
 

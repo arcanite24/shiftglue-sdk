@@ -89,6 +89,36 @@ class VulkanTextureCache final : public TextureCache {
   VkImageView GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,
                                               xenos::FetchOpDimension dimension, bool is_signed);
 
+  // PD-4 bindless textures: every sampled image view and sampler has a slot
+  // in one long-lived descriptor set for its whole life (it is written once,
+  // and freed only when the view or sampler is destroyed, after its last
+  // submission completed). Slot 0 of each array is the null view or a default
+  // sampler.
+  bool bindless() const { return bindless_.set != VK_NULL_HANDLE; }
+  // Bumped whenever texture bindings were updated (their views and slots).
+  uint64_t bindings_generation() const { return bindings_generation_; }
+  VkDescriptorSetLayout bindless_descriptor_set_layout() const { return bindless_.layout; }
+  VkDescriptorSet bindless_descriptor_set() const { return bindless_.set; }
+  // The binding's cached slot inline; 3D as 2D, null and new views out of line.
+  uint32_t GetActiveBindingBindlessIndex(uint32_t fetch_constant_index,
+                                         xenos::FetchOpDimension dimension, bool is_signed) {
+    const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+    if (binding && AreDimensionsCompatible(dimension, binding->key.dimension) &&
+        !(binding->key.dimension == xenos::DataDimension::k3D &&
+          (dimension == xenos::FetchOpDimension::k1D ||
+           dimension == xenos::FetchOpDimension::k2D))) {
+      const VulkanTextureBinding& vulkan_binding = vulkan_texture_bindings_[fetch_constant_index];
+      const uint32_t slot =
+          is_signed ? vulkan_binding.bindless_slot_signed : vulkan_binding.bindless_slot_unsigned;
+      if (slot != UINT32_MAX) {
+        return slot;
+      }
+    }
+    return GetActiveBindingBindlessIndexSlow(fetch_constant_index, dimension, is_signed);
+  }
+  uint32_t GetActiveBindingBindlessIndexSlow(uint32_t fetch_constant_index,
+                                             xenos::FetchOpDimension dimension, bool is_signed);
+
   SamplerParameters GetSamplerParameters(const VulkanShader::SamplerBinding& binding) const;
 
   // Must be called for every used sampler at least once in a single submission,
@@ -109,6 +139,8 @@ class VulkanTextureCache final : public TextureCache {
   // Destroys every sampler, so UseSampler creates them again with the current
   // texture_mip_lod_bias. No submission may still use them.
   void ClearSamplers();
+  // With bindless, also the sampler's slot (0 when there is no sampler).
+  uint32_t GetSamplerBindlessIndex(VkSampler sampler) const;
 
   // Returns the 2D view of the front buffer texture (for fragment shader
   // reading - the barrier will be pushed in the command processor if needed),
@@ -226,6 +258,9 @@ class VulkanTextureCache final : public TextureCache {
     uint32_t copy_words() const { return copy_words_; }
     void set_copy_words(uint32_t words) { copy_words_ = words; }
     VkImageView GetCopyView();
+    // PD-4: the bindless slot of a view GetView returned, remembered with the
+    // last view of the signedness.
+    uint32_t GetBindlessSlot(bool is_signed, VkImageView view, uint32_t array);
     // The same format's 2D view of level 0 and layer 0, for the FH1 resolve
     // writing the texture directly (a storage image declared 2D, which a 2D
     // array view does not match).
@@ -294,6 +329,8 @@ class VulkanTextureCache final : public TextureCache {
     struct LastView {
       uint32_t arguments = UINT32_MAX;
       VkImageView view = VK_NULL_HANDLE;
+      // PD-4: the view's bindless slot once known.
+      uint32_t bindless_slot = UINT32_MAX;
     };
     LastView last_views_[2];
     std::unique_ptr<VulkanTexture> texture_3d_as_2d_;
@@ -304,17 +341,23 @@ class VulkanTextureCache final : public TextureCache {
   struct VulkanTextureBinding {
     VkImageView image_view_unsigned;
     VkImageView image_view_signed;
+    // Bindless slots of the views (UINT32_MAX when not known yet).
+    uint32_t bindless_slot_unsigned;
+    uint32_t bindless_slot_signed;
 
     VulkanTextureBinding() { Reset(); }
 
     void Reset() {
       image_view_unsigned = VK_NULL_HANDLE;
       image_view_signed = VK_NULL_HANDLE;
+      bindless_slot_unsigned = UINT32_MAX;
+      bindless_slot_signed = UINT32_MAX;
     }
   };
 
   struct Sampler {
     VkSampler sampler;
+    uint32_t bindless_slot = 0;
     bool uses_custom_border_color;
     uint64_t last_usage_submission;
     std::pair<const SamplerParameters, Sampler>* used_previous;
@@ -403,6 +446,34 @@ class VulkanTextureCache final : public TextureCache {
   bool null_images_cleared_ = false;
 
   std::array<VulkanTextureBinding, xenos::kTextureFetchConstantCount> vulkan_texture_bindings_;
+
+  // PD-4 bindless set: arrays by SpirvShaderTranslator::BindlessBinding.
+  struct Bindless {
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkSampler default_sampler = VK_NULL_HANDLE;
+    uint32_t capacity[4] = {};
+    uint32_t next[4] = {};
+    std::vector<uint32_t> free[4];
+    uint64_t overflows = 0;
+  } bindless_;
+  uint64_t bindings_generation_ = 0;
+  // Views given slots outside the per-binding cache (3D as 2D, null views):
+  // view to (array, slot).
+  std::unordered_map<VkImageView, std::pair<uint32_t, uint32_t>> bindless_view_slots_;
+  std::unordered_map<VkSampler, uint32_t> bindless_sampler_slots_;
+  bool InitializeBindless();
+  void ShutdownBindless();
+  uint32_t AllocateBindlessSlot(uint32_t array);
+  void WriteBindlessImage(uint32_t array, uint32_t slot, VkImageView view);
+  void WriteBindlessSampler(uint32_t slot, VkSampler sampler);
+  // The view's slot, allocated and written on first use.
+  uint32_t BindlessViewSlot(VkImageView view, uint32_t array);
+ public:
+  // Called by VulkanTexture for each view it destroys.
+  void ReleaseBindlessView(VkImageView view);
+ private:
 
   // Unsupported texture formats used during this frame (for research and
   // testing).
