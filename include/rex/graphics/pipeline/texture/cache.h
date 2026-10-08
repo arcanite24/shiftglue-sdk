@@ -611,6 +611,13 @@ class TextureCache {
   void CompleteDirectResolve(const std::vector<DirectResolveTarget>& targets);
 
  protected:
+  // Diagnostics: the textures whose base is at this guest address.
+  std::vector<Texture*> TexturesAtBase(uint32_t base_address) const {
+    std::vector<Texture*> textures;
+    auto range = textures_by_base_.equal_range(base_address);
+    for (auto it = range.first; it != range.second; ++it) textures.push_back(it->second);
+    return textures;
+  }
   // Converts a texture fetch constant to a texture key, normalizing and
   // validating the values, or creating an invalid key, and also gets the
   // post-guest-swizzle signedness.

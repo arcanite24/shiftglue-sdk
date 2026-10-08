@@ -156,6 +156,12 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                 rex::align(sizeof(ArgsVkCopyBufferToImage), alignof(VkBufferImageCopy))));
       } break;
 
+      case Command::kVkCopyImageToBuffer: {
+        auto& args = *reinterpret_cast<const ArgsVkCopyImageToBuffer*>(stream);
+        dfn.vkCmdCopyImageToBuffer(command_buffer, args.src_image, args.src_image_layout,
+                                   args.dst_buffer, 1, &args.region);
+      } break;
+
       case Command::kVkCopyQueryPoolResults: {
         auto& args = *reinterpret_cast<const ArgsVkCopyQueryPoolResults*>(stream);
         dfn.vkCmdCopyQueryPoolResults(command_buffer, args.query_pool, args.first_query,

@@ -60,6 +60,9 @@ class Fh1NativeExecutor {
                     memory::Memory& memory);
   ~Fh1NativeExecutor();
 
+  // Writes these guest bytes, as the GPU has them now, to fh1_resolve_dump_dir.
+  void DumpResolveOutput(uint32_t address, uint32_t length);
+
   bool Initialize(const Fh1VulkanExecutorConfig& config);
   void Shutdown();
   // Counts an event in the rendering stats (such as occlusion query ends).
@@ -254,7 +257,6 @@ class Fh1NativeExecutor {
   uint32_t pending_clear_surfaces_ = 0;
   bool IsOneOffResolve(uint32_t address, uint32_t length);
   void QueueResolveReadback(uint32_t address, uint32_t length);
-  void DumpResolveOutput(uint32_t address, uint32_t length);
 
   // Dynamic rendering into one surface for transfers and clears.
   void BeginSurfaceRendering(Surface& surface, bool uint_view);

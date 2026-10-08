@@ -13,6 +13,7 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <fstream>
 #include <utility>
 
 #include <rex/assert.h>
@@ -867,6 +868,65 @@ void VulkanTextureCache::ShutdownBindless() {
   bindless_ = {};
   bindless_view_slots_.clear();
   bindless_sampler_slots_.clear();
+}
+
+void VulkanTextureCache::DebugDumpTextures(uint32_t base_address, const std::string& path) {
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  uint32_t n = 0;
+  for (Texture* base_texture : TexturesAtBase(base_address)) {
+    auto& texture = static_cast<VulkanTexture&>(*base_texture);
+    const TextureKey& key = texture.key();
+    const uint32_t width = key.GetWidth(), height = key.GetHeight();
+    const VkDeviceSize size = VkDeviceSize(width) * height * 16;
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            ui::vulkan::util::MemoryPurpose::kReadback, buffer, memory)) {
+      continue;
+    }
+    VkPipelineStageFlags stage_mask;
+    VkAccessFlags access_mask;
+    VkImageLayout layout;
+    const VulkanTexture::Usage usage = texture.SetUsage(VulkanTexture::Usage::kUndefined);
+    texture.SetUsage(usage);
+    GetTextureUsageMasks(usage, stage_mask, access_mask, layout);
+    command_processor_.PushImageMemoryBarrier(
+        texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+        stage_mask ? stage_mask : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        access_mask, VK_ACCESS_TRANSFER_READ_BIT, layout, VK_IMAGE_LAYOUT_GENERAL);
+    command_processor_.SubmitBarriers(true);
+    VkBufferImageCopy region = {};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {width, height, 1};
+    command_processor_.deferred_command_buffer().CmdVkCopyImageToBuffer(
+        texture.image(), VK_IMAGE_LAYOUT_GENERAL, buffer, region);
+    command_processor_.PushImageMemoryBarrier(
+        texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        stage_mask ? stage_mask : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        access_mask, VK_IMAGE_LAYOUT_GENERAL, layout == VK_IMAGE_LAYOUT_UNDEFINED
+                                                  ? VK_IMAGE_LAYOUT_GENERAL
+                                                  : layout);
+    command_processor_.Fh1AwaitAllQueueOperations();
+    void* mapped = nullptr;
+    if (dfn.vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS) {
+      VkMappedMemoryRange mapped_range = {};
+      mapped_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+      mapped_range.memory = memory;
+      mapped_range.size = VK_WHOLE_SIZE;
+      dfn.vkInvalidateMappedMemoryRanges(device, 1, &mapped_range);
+      std::ofstream(fmt::format("{}-{}-f{}-{}x{}.bin", path, n, uint32_t(key.format), width, height),
+                    std::ios::binary)
+          .write(static_cast<const char*>(mapped), std::streamsize(size));
+      dfn.vkUnmapMemory(device, memory);
+    }
+    dfn.vkDestroyBuffer(device, buffer, nullptr);
+    dfn.vkFreeMemory(device, memory, nullptr);
+    ++n;
+  }
 }
 
 VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,

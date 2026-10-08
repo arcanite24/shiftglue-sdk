@@ -63,6 +63,12 @@ REXCVAR_DEFINE_INT32(vulkan_async_pipeline_wait_ms, REX_PLATFORM_ANDROID ? 0 : 2
                      "as menu backgrounds")
     .range(0, 5000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
+REXCVAR_DEFINE_STRING(fh1_debug_dump_range, "", "GPU",
+                      "Diagnostics: <draw>:<hex address>:<hex length> - before that draw of "
+                      "every frame, write those guest bytes as the GPU has them to "
+                      "fh1_resolve_dump_dir (frame replays)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_cached_uniform_memory, true, "GPU/Vulkan",
                     "Put the per-draw uniform (constant) upload pages in host-cached memory "
                     "rather than write-combined memory")
@@ -4644,6 +4650,21 @@ Shader* VulkanCommandProcessor::LoadShaderHashed(xenos::ShaderType shader_type,
 bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
+  static const auto dump_range = [] {
+    uint32_t draw = UINT32_MAX, address = 0, length = 0;
+    const std::string value = REXCVAR_GET(fh1_debug_dump_range);
+    if (value.empty() || std::sscanf(value.c_str(), "%u:%x:%x", &draw, &address, &length) != 3) {
+      draw = UINT32_MAX;
+    }
+    return std::make_tuple(draw, address, length);
+  }();
+  if (std::get<0>(dump_range) != UINT32_MAX && fh1_native_executor_ &&
+      debug_frame_draw_index_ == std::get<0>(dump_range) + 1) {
+    fh1_native_executor_->DumpResolveOutput(std::get<1>(dump_range), std::get<2>(dump_range));
+    texture_cache_->DebugDumpTextures(
+        std::get<1>(dump_range),
+        fmt::format("{}/texture-{:08X}", REXCVAR_GET(fh1_resolve_dump_dir), std::get<1>(dump_range)));
+  }
   draw_cost_.enabled = REXCVAR_GET(gpu_draw_cost_model);
   const uint64_t issue_start = draw_cost_.enabled ? DrawCostNow() : 0;
   const bool issued =

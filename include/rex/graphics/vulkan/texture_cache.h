@@ -86,6 +86,9 @@ class VulkanTextureCache final : public TextureCache {
   // preceding host GPU work.
   void RequestTextures(uint32_t used_texture_mask) override;
 
+  // Diagnostics: writes level 0 of the textures based at this address, as
+  // the GPU has them now (waiting for it), to <path>-<n>.bin.
+  void DebugDumpTextures(uint32_t base_address, const std::string& path);
   VkImageView GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,
                                               xenos::FetchOpDimension dimension, bool is_signed);
 
