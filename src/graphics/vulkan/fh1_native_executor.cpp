@@ -2561,6 +2561,15 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
                                      .Pack())) {
         Count("resolve_through_alias");
       }
+      // The screen's shadow mask: 1x 8888 color at EDRAM tile 720, a 1280x720
+      // copy without clears (fh1_shadow_mask, read by a title hook).
+      if (!plan.copying_depth && msaa == 0 && pitch_tiles == 16 &&
+          color_info.color_base == 720 &&
+          color_info.color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 && x0 == 0 &&
+          y0 == 0 && x1 == 1280 && y1 == 720 &&
+          !regs.Get<reg::RB_COPY_CONTROL>().color_clear_enable) {
+        command_processor_.set_fh1_shadow_mask(extent_start, extent_length);
+      }
       if (untile_band) {
         uint32_t& band = untile_bands_[source.surface->key.Pack()];
         band = std::max(band, untile_band);

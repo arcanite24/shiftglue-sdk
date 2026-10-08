@@ -198,6 +198,10 @@ class IGraphicsSystem {
   virtual bool HasNativeGuestOutputRenderer() const { return false; }
   // The draw resolution scale the renderer uses, 0 when unknown.
   virtual uint32_t draw_resolution_scale() const { return 0; }
+  // FH1: the guest memory of the screen's shadow mask texture, once the GPU
+  // backend has resolved it (the Vulkan FH1 executor), for a title hook that
+  // replaces the shadow passes with a lit mask.
+  virtual bool fh1_shadow_mask(uint32_t* base, uint32_t* length) const { return false; }
 
   // Guest GPU services reached from the xboxkrnl Vd* exports.
   virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data) {

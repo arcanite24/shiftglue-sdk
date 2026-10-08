@@ -471,6 +471,10 @@ uint32_t GraphicsSystem::draw_resolution_scale() const {
   return command_processor_ ? command_processor_->draw_resolution_scale() : 0;
 }
 
+bool GraphicsSystem::fh1_shadow_mask(uint32_t* base, uint32_t* length) const {
+  return command_processor_ && command_processor_->fh1_shadow_mask(base, length);
+}
+
 void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                              uint32_t title_id, bool blocking) {
   // A requested frame replay runs once the title's shader storage is ready.
