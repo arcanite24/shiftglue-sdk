@@ -5010,6 +5010,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
               std::memcmp(cached.fetch.data(), fetch, sizeof(cached.fetch)) ||
               cached.anisotropic_override != anisotropic_override ||
               cached.force_trilinear != force_trilinear) {
+            const uint32_t previous_parameters = cached.parameters.value;
             std::memcpy(cached.fetch.data(), fetch, sizeof(cached.fetch));
             cached.binding = binding;
             cached.anisotropic_override = anisotropic_override;
@@ -5039,7 +5040,11 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
               memo.force_trilinear = force_trilinear;
               memo.parameters = cached.parameters;
             }
-            cached.sampler = VK_NULL_HANDLE;
+            // The VkSampler depends only on the parameters: a slot whose new
+            // fetch gives the same parameters keeps it (PD-3.4).
+            if (cached.parameters.value != previous_parameters) {
+              cached.sampler = VK_NULL_HANDLE;
+            }
           } else {
             if (draw_cost_.enabled) ++sampler_census_.slot_hits;
             if (fetch_key_verify &&
