@@ -38,9 +38,12 @@
 #include <rex/ui/vulkan/util.h>
 
 REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
-// Off on Android: storage-capable images may lose the tiled GPUs' framebuffer
-// compression (UBWC on Adreno), and those GPUs have no copy engine to avoid.
-REXCVAR_DEFINE_BOOL(vulkan_texture_load_compute_copy, !REX_PLATFORM_ANDROID, "GPU/Vulkan",
+// On Android too: the raw-bits view it gives large textures also lets
+// resolves write them directly (fh1_resolve_to_textures) instead of reloading
+// them. On the Odin 2 Portal (Adreno 740) a 1x drive's GPU frame falls from
+// 36 to 32 ms, texture reloads from 3.6 to 2.3 ms, whatever the storage
+// usage costs the framebuffer compression.
+REXCVAR_DEFINE_BOOL(vulkan_texture_load_compute_copy, true, "GPU/Vulkan",
                     "Write loaded texture data into large single-level 2D textures with a compute "
                     "shader instead of a buffer-to-image copy, which NVIDIA runs on the copy "
                     "engine serialized with the frame")

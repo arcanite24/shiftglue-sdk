@@ -26,6 +26,7 @@
 
 #include <rex/cvar.h>
 #include <rex/math.h>
+#include <rex/platform.h>
 #include <rex/string/buffer.h>
 
 REXCVAR_DEFINE_BOOL(vulkan_bindless_textures, false, "GPU/Vulkan",
@@ -33,7 +34,9 @@ REXCVAR_DEFINE_BOOL(vulkan_bindless_textures, false, "GPU/Vulkan",
                     "per-draw indices instead of per-draw descriptor sets and pushes, on devices "
                     "with Vulkan 1.2 descriptor indexing (RECORDER_PER_DRAW_BACKLOG PD-4)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_BOOL(spirv_fast_pixel_math, false, "GPU",
+// On Android: the Odin 2 Portal's 1x drive GPU frame falls about 4 ms (36 to
+// 32), with only scattered pixels of foliage and shadow noise changing.
+REXCVAR_DEFINE_BOOL(spirv_fast_pixel_math, REX_PLATFORM_ANDROID, "GPU",
                     "Vulkan: translate pixel shaders without the Direct3D 9 multiply rule "
                     "(0 * anything = 0) and let the driver fuse multiply-adds. Less pixel "
                     "shader work at high scales; shaders that rely on 0 * Inf = 0 may show "
