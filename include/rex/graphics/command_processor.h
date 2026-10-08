@@ -213,6 +213,8 @@ class CommandProcessor {
   std::unique_ptr<RecordCensus> record_census_;
   static uint32_t RecordRunClass(uint32_t start_index);
   std::atomic<uint64_t> decode_source_runs_{0}, decode_sub_runs_{0};
+  std::atomic<uint64_t> decode_shader_loads_{0}, decode_shader_loads_skipped_{0};
+  std::atomic<uint64_t> decode_scratch_writes_{0}, decode_scratch_recorded_{0};
   // gpu_template_stats (DR-4.2's first stage, recorder thread): each draw's
   // signature (register state, shaders, the fetch constants it uses, the draw
   // packet) in the indirect buffer execution it belongs to, compared at the
@@ -522,6 +524,24 @@ class CommandProcessor {
     const char* opcode_name;
   };
   static constexpr uint32_t kRecordDraw = 3;
+  // PD-1.2: an IM_LOAD as data (type, guest address, dword count, microcode
+  // pointer and hash, 64 bits each) instead of a closure.
+  static constexpr uint32_t kRecordLoadShader = 4;
+  static constexpr size_t kLoadShaderRecordWords = 7;
+  void ExecuteLoadShaderRecord(const uint32_t* words);
+  // The decoder's last recorded hashed load by shader type (vertex, pixel):
+  // a load repeating it would set the same active shader, so it is not
+  // recorded. Reset by an immediate load of the type.
+  struct LastShaderLoad {
+    bool valid = false;
+    uint64_t hash = 0;
+    uint32_t dword_count = 0;
+  } decode_last_shader_load_[2];
+  // PD-1.6: scratch registers whose writes do not write back (their
+  // SCRATCH_UMSK bit is clear) are recorded once, with their latest value,
+  // before anything that could observe them.
+  uint32_t decode_pending_scratch_ = 0;
+  void FlushPendingScratchWrites();
   static constexpr size_t kDrawRecordWords = (sizeof(DrawRecord) + 3) / 4;
   // The draw half of a draw packet (registers already written): the backend
   // draw and its failure reporting.
@@ -552,6 +572,11 @@ class CommandProcessor {
   std::vector<std::unique_ptr<RecordBatch>> record_free_;
   uint64_t record_published_ = 0;
   uint64_t record_completed_ = 0;
+  // PD-1.5, under record_mutex_: whether the recorder sleeps on record_ready_
+  // and how many RecordSync callers wait on record_done_, so each side
+  // notifies only when someone waits.
+  bool record_recorder_waiting_ = false;
+  uint32_t record_sync_waiters_ = 0;
   bool record_stop_ = false;
   system::object_ref<system::XHostThread> record_thread_;
 

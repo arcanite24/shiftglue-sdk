@@ -791,6 +791,16 @@ void VulkanCommandProcessor::DrawCostFrame() {
                                  e.runs[k] ? double(e.run_registers[k]) / double(e.runs[k])
                                            : 0.0);
       }
+      const uint64_t loads = decode_shader_loads_.exchange(0, std::memory_order_relaxed);
+      const uint64_t loads_skipped =
+          decode_shader_loads_skipped_.exchange(0, std::memory_order_relaxed);
+      const uint64_t scratch_writes = decode_scratch_writes_.exchange(0, std::memory_order_relaxed);
+      const uint64_t scratch_recorded =
+          decode_scratch_recorded_.exchange(0, std::memory_order_relaxed);
+      REXGPU_INFO("Decoder (PD-1.2, PD-1.6) a draw: shader loads {:.2f}, {:.2f} skipped as "
+                  "repeats; scratch writes {:.2f}, {:.2f} recorded",
+                  double(loads) / d, double(loads_skipped) / d, double(scratch_writes) / d,
+                  double(scratch_recorded) / d);
       const uint64_t source = decode_source_runs_.exchange(0, std::memory_order_relaxed);
       const uint64_t sub = decode_sub_runs_.exchange(0, std::memory_order_relaxed);
       REXGPU_INFO("Entry census (PD-0.2) a draw: single registers {:.2f} (top:{}); runs{} "

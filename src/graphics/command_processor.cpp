@@ -68,6 +68,16 @@ REXCVAR_DEFINE_BOOL(gpu_record_fused_draw_registers, true, "GPU",
                     "VGT_DRAW_INITIATOR, VGT_DMA_BASE and VGT_DMA_SIZE instead of the decoder "
                     "recording them as single-register entries (RECORDER_PER_DRAW_BACKLOG PD-1.1)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_record_shader_load_entries, true, "GPU",
+                    "With gpu_record_thread, IM_LOAD is recorded as a data entry rather than a "
+                    "closure, and not at all when it repeats the type's last hashed load "
+                    "(RECORDER_PER_DRAW_BACKLOG PD-1.2)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_record_coalesce_scratch, true, "GPU",
+                    "With gpu_record_thread, scratch register writes that do not write back are "
+                    "recorded once with their latest value before the next batch, call, scratch "
+                    "range run or scratch control write (RECORDER_PER_DRAW_BACKLOG PD-1.6)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(gpu_record_merge_constant_runs, true, "GPU",
                     "With gpu_record_thread, the decoder extends the last recorded float "
                     "constant run over a gap of up to 16 registers (their current values) "
@@ -482,21 +492,42 @@ void CommandProcessor::RecordThreadMain() {
     cpu_read_ns = cpu_ns;
     cpu_read_time = now;
   };
+  // A finished batch goes back to the free list and the next one is taken
+  // under one lock (PD-1.5).
+  std::unique_ptr<RecordBatch> batch;
   for (;;) {
-    std::unique_ptr<RecordBatch> batch;
+    bool notify_done = false;
     {
       std::unique_lock<std::mutex> lock(record_mutex_);
+      if (batch) {
+        record_free_.push_back(std::move(batch));
+        ++record_completed_;
+        notify_done = record_sync_waiters_ != 0;
+      }
       if (record_queue_.empty() && !record_stop_) {
         lock.unlock();
+        if (notify_done) {
+          record_done_.notify_all();
+          notify_done = false;
+        }
         read_cpu(std::chrono::steady_clock::now());
         lock.lock();
+        record_recorder_waiting_ = true;
+        record_ready_.wait(lock, [this]() { return record_stop_ || !record_queue_.empty(); });
+        record_recorder_waiting_ = false;
       }
-      record_ready_.wait(lock, [this]() { return record_stop_ || !record_queue_.empty(); });
       if (record_queue_.empty()) {
+        lock.unlock();
+        if (notify_done) {
+          record_done_.notify_all();
+        }
         return;
       }
       batch = std::move(record_queue_.front());
       record_queue_.pop_front();
+    }
+    if (notify_done) {
+      record_done_.notify_all();
     }
     const auto busy_start = std::chrono::steady_clock::now();
     ExecuteRecordBatch(*batch);
@@ -510,12 +541,6 @@ void CommandProcessor::RecordThreadMain() {
     }
     batch->words.clear();
     batch->fns.clear();
-    {
-      std::lock_guard<std::mutex> lock(record_mutex_);
-      record_free_.push_back(std::move(batch));
-      ++record_completed_;
-    }
-    record_done_.notify_all();
   }
 }
 
@@ -548,6 +573,10 @@ void CommandProcessor::ExecuteRecordBatch(RecordBatch& batch) {
         ExecuteDrawRecord(record);
         i += 1 + kDrawRecordWords;
       } break;
+      case kRecordLoadShader:
+        ExecuteLoadShaderRecord(words + i + 1);
+        i += 1 + kLoadShaderRecordWords;
+        break;
       default:
         assert_always();
         return;
@@ -626,6 +655,12 @@ void CommandProcessor::ExecuteRecordBatchTimed(RecordBatch& batch) {
         record_draws_ns_ += elapsed(start);
         ++census->draws;
       } break;
+      case kRecordLoadShader:
+        ExecuteLoadShaderRecord(words + i + 1);
+        i += 1 + kLoadShaderRecordWords;
+        record_calls_ns_ += elapsed(start);
+        ++census->calls;
+        break;
       default:
         assert_always();
         return;
@@ -646,10 +681,47 @@ bool RegisterWriteAlwaysMatters(uint32_t index) {
 }
 }  // namespace
 
+void CommandProcessor::FlushPendingScratchWrites() {
+  uint32_t pending = decode_pending_scratch_;
+  if (!pending) {
+    return;
+  }
+  decode_pending_scratch_ = 0;
+  std::vector<uint32_t>& words = record_batch_->words;
+  uint32_t scratch;
+  while (rex::bit_scan_forward(pending, &scratch)) {
+    pending &= ~(UINT32_C(1) << scratch);
+    const uint32_t index = XE_GPU_REG_SCRATCH_REG0 + scratch;
+    words.push_back(kRecordOne);
+    words.push_back(index);
+    words.push_back(decode_register_file_->values[index]);
+    decode_scratch_recorded_.store(decode_scratch_recorded_.load(std::memory_order_relaxed) + 1,
+                                   std::memory_order_relaxed);
+  }
+}
+
 void CommandProcessor::PacketWriteRegister(uint32_t index, uint32_t value) {
   if (!record_split_) {
     WriteRegister(index, value);
     return;
+  }
+  if (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) {
+    const uint32_t scratch = index - XE_GPU_REG_SCRATCH_REG0;
+    decode_scratch_writes_.store(decode_scratch_writes_.load(std::memory_order_relaxed) + 1,
+                                 std::memory_order_relaxed);
+    if (REXCVAR_GET(gpu_record_coalesce_scratch) &&
+        !((decode_register_file_->values[XE_GPU_REG_SCRATCH_UMSK] >> scratch) & 1)) {
+      // No write back: only the register holds it, and nothing on the
+      // recorder reads it before the pending value is recorded.
+      decode_register_file_->values[index] = value;
+      decode_pending_scratch_ |= UINT32_C(1) << scratch;
+      return;
+    }
+    FlushPendingScratchWrites();
+    decode_scratch_recorded_.store(decode_scratch_recorded_.load(std::memory_order_relaxed) + 1,
+                                   std::memory_order_relaxed);
+  } else if (index == XE_GPU_REG_SCRATCH_UMSK || index == XE_GPU_REG_SCRATCH_ADDR) {
+    FlushPendingScratchWrites();
   }
   if (elide_unchanged_registers_ && index < RegisterFile::kRegisterCount &&
       decode_register_file_->values[index] == value && !RegisterWriteAlwaysMatters(index)) {
@@ -680,6 +752,10 @@ void CommandProcessor::PacketWriteRegistersFromMem(uint32_t start_index, const u
   if (!record_split_) {
     WriteRegistersFromMem(start_index, const_cast<uint32_t*>(base), num_registers);
     return;
+  }
+  if (decode_pending_scratch_ && start_index <= XE_GPU_REG_SCRATCH_REG7 &&
+      uint64_t(start_index) + num_registers > XE_GPU_REG_SCRATCH_UMSK) {
+    FlushPendingScratchWrites();
   }
   if (uint64_t(start_index) + num_registers > RegisterFile::kRegisterCount) {
     // Out of the register file: one at a time, as the unsplit path does.
@@ -781,6 +857,8 @@ void CommandProcessor::RecordCall(std::function<void()> fn) {
     fn();
     return;
   }
+  // A call may read any register.
+  FlushPendingScratchWrites();
   RecordBatch& batch = *record_batch_;
   batch.words.push_back(kRecordCall);
   batch.words.push_back(uint32_t(batch.fns.size()));
@@ -792,11 +870,18 @@ void CommandProcessor::RecordCall(std::function<void()> fn) {
 }
 
 void CommandProcessor::PublishRecordBatch() {
-  if (!record_split_ || record_batch_->words.empty()) {
+  if (!record_split_) {
+    return;
+  }
+  // The recorder's register file holds every scratch value by the end of a
+  // batch, so RecordSync's readers see them.
+  FlushPendingScratchWrites();
+  if (record_batch_->words.empty()) {
     return;
   }
   last_constant_run_batch_ = nullptr;
   std::unique_ptr<RecordBatch> next;
+  bool wake = false;
   {
     std::lock_guard<std::mutex> lock(record_mutex_);
     record_queue_.push_back(std::move(record_batch_));
@@ -805,8 +890,11 @@ void CommandProcessor::PublishRecordBatch() {
       next = std::move(record_free_.back());
       record_free_.pop_back();
     }
+    wake = record_recorder_waiting_;
   }
-  record_ready_.notify_one();
+  if (wake) {
+    record_ready_.notify_one();
+  }
   record_batch_ = next ? std::move(next) : std::make_unique<RecordBatch>();
   record_batch_draws_ = 0;
 }
@@ -817,7 +905,9 @@ void CommandProcessor::RecordSync() {
   }
   PublishRecordBatch();
   std::unique_lock<std::mutex> lock(record_mutex_);
+  ++record_sync_waiters_;
   record_done_.wait(lock, [this]() { return record_completed_ == record_published_; });
+  --record_sync_waiters_;
 }
 
 void CommandProcessor::Pause() {
@@ -2773,6 +2863,35 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
   const uint32_t* ucode = memory_->TranslatePhysical<uint32_t*>(addr);
   // Hashing the microcode is most of a shader load; the decoder has time.
   const uint64_t ucode_hash = record_split_ ? HashShaderMicrocode(ucode, size_dwords) : 0;
+  if (record_split_ && REXCVAR_GET(gpu_record_shader_load_entries)) {
+    decode_shader_loads_.store(decode_shader_loads_.load(std::memory_order_relaxed) + 1,
+                               std::memory_order_relaxed);
+    LastShaderLoad& last = decode_last_shader_load_[shader_type == xenos::ShaderType::kPixel];
+    if (last.valid && last.hash == ucode_hash && last.dword_count == size_dwords) {
+      // The recorder would look up the same shader and set it again.
+      decode_shader_loads_skipped_.store(
+          decode_shader_loads_skipped_.load(std::memory_order_relaxed) + 1,
+          std::memory_order_relaxed);
+      return true;
+    }
+    last.valid = true;
+    last.hash = ucode_hash;
+    last.dword_count = size_dwords;
+    FlushPendingScratchWrites();
+    std::vector<uint32_t>& words = record_batch_->words;
+    const size_t offset = words.size();
+    words.resize(offset + 1 + kLoadShaderRecordWords);
+    uint32_t* entry = words.data() + offset;
+    entry[0] = kRecordLoadShader;
+    entry[1] = uint32_t(shader_type);
+    entry[2] = addr;
+    entry[3] = size_dwords;
+    const uint64_t ucode_pointer = uint64_t(reinterpret_cast<uintptr_t>(ucode));
+    std::memcpy(entry + 4, &ucode_pointer, sizeof(ucode_pointer));
+    std::memcpy(entry + 6, &ucode_hash, sizeof(ucode_hash));
+    return true;
+  }
+  decode_last_shader_load_[shader_type == xenos::ShaderType::kPixel].valid = false;
   RecordCall([this, shader_type, addr, ucode, size_dwords, ucode_hash]() {
     auto shader = ucode_hash ? LoadShaderHashed(shader_type, addr, ucode, size_dwords, ucode_hash)
                              : LoadShader(shader_type, addr, ucode, size_dwords);
@@ -2783,6 +2902,20 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
     }
   });
   return true;
+}
+
+void CommandProcessor::ExecuteLoadShaderRecord(const uint32_t* words) {
+  const auto shader_type = xenos::ShaderType(words[0]);
+  uint64_t ucode_pointer, ucode_hash;
+  std::memcpy(&ucode_pointer, words + 3, sizeof(ucode_pointer));
+  std::memcpy(&ucode_hash, words + 5, sizeof(ucode_hash));
+  const uint32_t* ucode = reinterpret_cast<const uint32_t*>(uintptr_t(ucode_pointer));
+  Shader* shader = LoadShaderHashed(shader_type, words[1], ucode, words[2], ucode_hash);
+  if (shader_type == xenos::ShaderType::kVertex) {
+    active_vertex_shader_ = shader;
+  } else {
+    active_pixel_shader_ = shader;
+  }
 }
 
 bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer* reader,
@@ -2815,6 +2948,7 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer* 
   } else {
     // The microcode is in the ring, which the title may reuse once this
     // thread moves on: the recorder gets a copy.
+    decode_last_shader_load_[shader_type == xenos::ShaderType::kPixel].valid = false;
     std::vector<uint32_t> ucode(size_dwords);
     std::memcpy(ucode.data(), reinterpret_cast<const void*>(reader->read_ptr()),
                 size_dwords * sizeof(uint32_t));
