@@ -81,6 +81,9 @@ class Fh1NativeExecutor {
   bool BindTargets(VulkanRenderTargetCache::RenderPassKey& key_out);
   // Enters dynamic rendering with the bound surfaces (after all barriers).
   void BeginDrawRendering();
+  // After BindTargets: the draw has no depth, stencil or color target to use.
+  bool BoundNothing() const { return bound_bits_ == 0; }
+  void CountDrawSkippedWithoutEffect() { Count("draw_skipped_without_effect"); }
   void NativeDrawIssued(const Fh1DrawInfo& draw);
   // In place of the render target cache's resolve.
   bool NativeResolve(uint32_t& written_address, uint32_t& written_length);

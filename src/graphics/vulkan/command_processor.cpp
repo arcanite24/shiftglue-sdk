@@ -69,6 +69,10 @@ REXCVAR_DEFINE_STRING(fh1_debug_dump_range, "", "GPU",
                       "every frame, write those guest bytes as the GPU has them to "
                       "fh1_resolve_dump_dir (frame replays)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_skip_draws_without_effect, true, "GPU",
+                    "Skip FH1 draws that write no surface, outside occlusion queries and "
+                    "without memory export (FH1 native executor, Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(vulkan_cached_uniform_memory, true, "GPU/Vulkan",
                     "Put the per-draw uniform (constant) upload pages in host-cached memory "
                     "rather than write-combined memory")
@@ -5211,6 +5215,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   VulkanRenderTargetCache::RenderPassKey fh1_render_pass_key;
   if (fh1_native_executor_) {
     fh1_draw.memexport = memexport_writes_possible;
+    fh1_draw.occlusion_query_active = active_occlusion_query_.valid;
     fh1_draw.rasterization_done = is_rasterization_done;
     fh1_draw.normalized_depth_control = normalized_depth_control;
     fh1_draw.normalized_color_mask = normalized_color_mask;
@@ -5220,6 +5225,15 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     fh1_native_executor_->PrepareTargets(fh1_draw);
     if (!fh1_native_executor_->BindTargets(fh1_render_pass_key)) {
       return draw_fail("fh1_bind_targets");
+    }
+    // No surface written, no samples counted, no memory exported: the draw
+    // has no effect (FH1 issues about 140 such a frame).
+    if (!fh1_draw.memexport && !fh1_draw.occlusion_query_active &&
+        fh1_native_executor_->BoundNothing() &&
+        REXCVAR_GET(fh1_skip_draws_without_effect)) {
+      fh1_native_executor_->CountDrawSkippedWithoutEffect();
+      fh1_native_executor_->NativeDrawIssued(fh1_draw);
+      return true;
     }
   } else if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                            normalized_color_mask, *vertex_shader)) {
