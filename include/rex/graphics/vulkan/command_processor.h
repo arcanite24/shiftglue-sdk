@@ -396,7 +396,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
-  bool SupportsRecordThread() const override { return true; }
+  // The split recorder writes nothing into descriptor sets itself, while
+  // texture sets (where textures are not pushed, on Adreno) are written at
+  // decode time; with the recorder their draws intermittently sampled other
+  // textures (frame-to-frame noise on FH1's foliage, flags and signs).
+  bool SupportsRecordThread() const override { return push_pixel_texture_descriptors_; }
 
  private:
   struct CommandBuffer {
