@@ -29,7 +29,10 @@
 #include <rex/platform.h>
 #include <rex/string/buffer.h>
 
-REXCVAR_DEFINE_BOOL(vulkan_bindless_textures, false, "GPU/Vulkan",
+// On Android: Adreno has no pushed pixel textures (see the command processor),
+// so each change allocated and wrote a set; on the Odin 2 Portal bindless takes
+// the recorder's CPU from 9.25 and 9.05 to 7.67 and 7.81 ms a frame (two pairs).
+REXCVAR_DEFINE_BOOL(vulkan_bindless_textures, REX_PLATFORM_ANDROID, "GPU/Vulkan",
                     "Bind textures and samplers from one long-lived descriptor set indexed by "
                     "per-draw indices instead of per-draw descriptor sets and pushes, on devices "
                     "with Vulkan 1.2 descriptor indexing (RECORDER_PER_DRAW_BACKLOG PD-4)")
