@@ -2754,6 +2754,16 @@ void Fh1NativeExecutor::GpuMarkRendering(uint32_t label) {
   gpu_rendering_begin_ = label == UINT32_MAX ? UINT32_MAX : GpuBegin();
 }
 
+void Fh1NativeExecutor::GpuRenderingEnded(const char* ender) {
+  if (gpu_query_pool_ == VK_NULL_HANDLE || gpu_rendering_label_ == UINT32_MAX) return;
+  std::string name = ender;
+  if (name.size() > 60) name = name.substr(0, 60);
+  ++gpu_label_enders_[{gpu_rendering_label_, name}];
+  GpuEnd(GpuPhase(kGpuPhases + gpu_rendering_label_), gpu_rendering_begin_);
+  gpu_rendering_label_ = UINT32_MAX;
+  gpu_rendering_begin_ = UINT32_MAX;
+}
+
 void Fh1NativeExecutor::GpuEndFrame() {
   if (gpu_query_pool_ == VK_NULL_HANDLE) return;
   GpuMarkRendering(UINT32_MAX);

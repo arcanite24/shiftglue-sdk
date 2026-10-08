@@ -107,6 +107,9 @@ class Fh1NativeExecutor {
     if (gpu_query_pool_ != VK_NULL_HANDLE) GpuBegin();
   }
   void GpuFrameSwapped() { GpuEndFrame(); }
+  // fh1_native_gpu_profile: a draw rendering's span ends with the rendering,
+  // so the work between renderings is not counted in it.
+  void GpuRenderingEnded(const char* ender);
   // fh1_native_gpu_profile: other work's time by label (outside renderings).
   uint64_t BeginLabelGpuTiming(const char* label) {
     if (gpu_query_pool_ == VK_NULL_HANDLE) return UINT64_MAX;

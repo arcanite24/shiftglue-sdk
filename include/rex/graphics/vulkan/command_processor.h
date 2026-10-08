@@ -1189,6 +1189,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::array<uint64_t, kFh1RenderingCauseCount> fh1_rendering_causes_{};
   std::map<const char*, uint64_t> fh1_rendering_enders_;
   const char* last_rendering_ender_ = "";
+  VkDescriptorSet last_constants_bound_debug_ = VK_NULL_HANDLE;
+  // gpu_barrier_census: pipeline barriers by caller, stages, accesses, kind.
+  std::unordered_map<std::string, uint64_t> barrier_census_;
   struct ActiveOcclusionQuery {
     uint32_t sample_count_address = 0;
     uint32_t host_index = UINT32_MAX;

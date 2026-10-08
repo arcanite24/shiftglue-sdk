@@ -64,6 +64,14 @@ REXCVAR_DEFINE_INT32(vulkan_async_pipeline_wait_ms, REX_PLATFORM_ANDROID ? 0 : 2
     .range(0, 5000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
+REXCVAR_DEFINE_BOOL(gpu_barrier_census, false, "GPU",
+                    "Diagnostics: count pipeline barriers by stages, accesses and kind, logged "
+                    "every 600 frames (Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_debug_keep_constant_binds, false, "GPU",
+                    "Diagnostics: do not rebind the constants set when only its offsets change "
+                    "(wrong constants), to bound what the per-draw binds cost (Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_debug_tiny_draws, false, "GPU",
                     "Diagnostics: draw only the first triangle of every draw, keeping all "
                     "state changes (wrong image), to bound per-draw overhead (Vulkan)")
@@ -751,6 +759,16 @@ void VulkanCommandProcessor::DrawCostFrame() {
   m.entries_at_frame = record_entries_;
   record_cost_enabled_ = REXCVAR_GET(gpu_draw_cost_model);
   constant_census_enabled_ = REXCVAR_GET(gpu_constant_census);
+  if (system_constants_memo_frames_ + 1 >= 600 && !barrier_census_.empty()) {
+    std::vector<std::pair<uint64_t, std::string>> top;
+    for (const auto& [key, count] : barrier_census_) top.emplace_back(count, key);
+    std::sort(top.begin(), top.end(), std::greater<>());
+    for (size_t i = 0; i < top.size() && i < 24; ++i) {
+      REXGPU_INFO("Barrier census: {:.1f} a frame: {}", double(top[i].first) / 600.0,
+                  top[i].second);
+    }
+    barrier_census_.clear();
+  }
   if (++system_constants_memo_frames_ >= 600) {
     if (system_constants_memo_calls_ &&
         (REXCVAR_GET(gpu_system_constants_memo_verify) || REXCVAR_GET(gpu_draw_cost_model))) {
@@ -4008,6 +4026,35 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass,
   }
   EndRenderPass(caller);
   barrier_batch_count_ += pending_barriers_.size();
+  if (REXCVAR_GET(gpu_barrier_census)) {
+    for (auto it = pending_barriers_.cbegin(); it != pending_barriers_.cend(); ++it) {
+      auto it_next = std::next(it);
+      const bool last = it_next == pending_barriers_.cend();
+      const size_t buffer_end =
+          last ? pending_barriers_buffer_memory_barriers_.size() : it_next->buffer_memory_barriers_offset;
+      const size_t image_end =
+          last ? pending_barriers_image_memory_barriers_.size() : it_next->image_memory_barriers_offset;
+      uint32_t src_access = 0, dst_access = 0;
+      for (size_t i = it->buffer_memory_barriers_offset; i < buffer_end; ++i) {
+        src_access |= pending_barriers_buffer_memory_barriers_[i].srcAccessMask;
+        dst_access |= pending_barriers_buffer_memory_barriers_[i].dstAccessMask;
+      }
+      for (size_t i = it->image_memory_barriers_offset; i < image_end; ++i) {
+        src_access |= pending_barriers_image_memory_barriers_[i].srcAccessMask;
+        dst_access |= pending_barriers_image_memory_barriers_[i].dstAccessMask;
+      }
+      std::string caller_name = caller.function_name();
+      const size_t paren = caller_name.find('(');
+      if (paren != std::string::npos) caller_name.resize(paren);
+      const size_t space = caller_name.rfind(' ');
+      if (space != std::string::npos) caller_name.erase(0, space + 1);
+      ++barrier_census_[fmt::format("{} stages {:X}>{:X} access {:X}>{:X} buffers {} images {}",
+                                    caller_name, uint32_t(it->src_stage_mask),
+                                    uint32_t(it->dst_stage_mask), src_access, dst_access,
+                                    buffer_end - it->buffer_memory_barriers_offset,
+                                    image_end - it->image_memory_barriers_offset)];
+    }
+  }
   for (auto it = pending_barriers_.cbegin(); it != pending_barriers_.cend(); ++it) {
     auto it_next = std::next(it);
     bool is_last = it_next == pending_barriers_.cend();
@@ -4324,6 +4371,7 @@ void VulkanCommandProcessor::EndRenderPass(std::source_location caller) {
   current_render_pass_ = VK_NULL_HANDLE;
   current_framebuffer_ = nullptr;
   in_render_pass_ = false;
+  if (fh1_native_executor_) fh1_native_executor_->GpuRenderingEnded(last_rendering_ender_);
 }
 
 VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
@@ -8837,8 +8885,12 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetConstants] =
         constants_descriptor_set;
     // New offsets need a new bind even for the same set.
-    current_graphics_descriptor_sets_bound_up_to_date_ &=
-        ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants);
+    if (!REXCVAR_GET(fh1_debug_keep_constant_binds) ||
+        last_constants_bound_debug_ != constants_descriptor_set) {
+      current_graphics_descriptor_sets_bound_up_to_date_ &=
+          ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants);
+      last_constants_bound_debug_ = constants_descriptor_set;
+    }
   }
   DrawCostMark(kCostConstantsSet);
   // Vertex shader textures and samplers.
