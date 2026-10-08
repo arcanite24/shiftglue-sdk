@@ -69,6 +69,7 @@ REXCVAR_DEFINE_STRING(fh1_debug_skip_transfers, "", "GPU",
                       "Diagnostics: skip transfers between these surfaces, as "
                       "<source>=<destination> descriptions (wrong image if they are needed)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DECLARE(bool, fh1_texture_reload_probe);
 REXCVAR_DEFINE_BOOL(fh1_debug_skip_clears, false, "GPU",
                     "Diagnostics: skip every EDRAM clear (wrong image), to bound what clears "
                     "cost")
@@ -2522,6 +2523,15 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     }
     // Invalidates textures over the range (and marks it scaled at scale).
     config_.textures->MarkRangeAsResolved(extent_start, extent_length);
+    if (REXCVAR_GET(fh1_texture_reload_probe)) {
+      REXGPU_INFO("FH1 resolve dest {:08X}+{:X} pack {} rect {},{}-{},{} pitch {} direct {:08X} {}",
+                  plan.dest_base, extent_length, pack, plan.x0, plan.y0, plan.x1, plan.y1,
+                  plan.dest_pitch,
+                  direct_resolve_targets_.empty()
+                      ? 0u
+                      : uint32_t(direct_resolve_targets_[0].texture->key().base_page << 12),
+                  complete ? "complete" : "incomplete");
+    }
     if (complete && !direct_resolve_targets_.empty()) {
       config_.textures->CompleteDirectResolve(direct_resolve_targets_);
       counters_.Count("resolve_to_texture", direct_resolve_targets_.size());

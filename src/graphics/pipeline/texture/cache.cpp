@@ -1487,9 +1487,11 @@ void TextureCache::FindDirectResolveTargets(uint32_t dest_base, uint32_t extent_
   struct TraceEnd {
     bool trace;
     std::vector<DirectResolveTarget>& out;
+    std::string misses;
     ~TraceEnd() {
       if (!trace) return;
       ++reasons[out.empty() ? "result none" : out.size() == 1 ? "result one" : "result several"];
+      if (out.empty() && !misses.empty()) ++reasons["miss" + misses];
       if (++calls % 5000 == 0) {
         std::string text;
         for (const auto& [reason, count] : reasons) text += fmt::format(" {}={};", reason, count);
@@ -1520,6 +1522,14 @@ void TextureCache::FindDirectResolveTargets(uint32_t dest_base, uint32_t extent_
                   uint64_t(extent_start) + extent_length > uint64_t(base) + texture.GetGuestBaseSize()
               ? "placement"
               : "candidate";
+      if (key.format == format) {
+        trace_end.misses += fmt::format(" [{} {}x{} mips{} res {}x{} origin{} off{} pitch{}/{}]",
+                                        reason, key.GetWidth(), key.GetHeight(),
+                                        key.mip_max_level, dest_width, dest_height,
+                                        int(from_origin), dest_base - base,
+                                        layout.base.row_pitch_bytes,
+                                        pitch_aligned * bytes_per_block);
+      }
       ++reasons[std::string(reason) + (key.format != format
                                            ? fmt::format(" {}<-{}", uint32_t(key.format),
                                                          uint32_t(format))
