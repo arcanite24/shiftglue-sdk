@@ -262,7 +262,8 @@ class Fh1NativeExecutor {
                        uint32_t dest_pitch, VkBuffer buffer, VkDeviceSize memory_offset,
                        VkDeviceSize memory_range, bool unscaled_dest = false,
                        VkImageView image_view = VK_NULL_HANDLE, uint32_t image_row = 0,
-                       uint32_t image_endian = 0);
+                       uint32_t image_endian = 0, VkImageView image2_view = VK_NULL_HANDLE,
+                       uint32_t image2_endian = 0);
   void ClearSurfaceRect(Surface& surface, const Rect& guest_rect, uint32_t clear_value,
                         uint32_t clear_value_lo);
   // Records the surface's pending clears in a rendering of their own.
@@ -328,6 +329,8 @@ class Fh1NativeExecutor {
   // [source kind][msaa]
   VkPipeline image_pipelines_[3][2] = {};
   std::vector<TextureCache::DirectResolveTarget> direct_resolve_targets_;
+  std::vector<TextureCache::DirectResolveTarget> direct_resolve_candidates_;
+  std::vector<uint32_t> direct_resolve_conversions_;
   // A descriptor pool per frame in flight, reset when the frame reopens.
   static constexpr uint32_t kDescriptorPoolFrames = 3;
   std::array<std::vector<VkDescriptorPool>, kDescriptorPoolFrames> descriptor_pools_;

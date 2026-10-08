@@ -70,6 +70,10 @@ REXCVAR_DEFINE_STRING(fh1_debug_skip_transfers, "", "GPU",
                       "<source>=<destination> descriptions (wrong image if they are needed)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DECLARE(bool, fh1_texture_reload_probe);
+REXCVAR_DEFINE_BOOL(fh1_resolve_two_textures, true, "GPU",
+                    "Resolves write up to two textures over their destination directly (such as "
+                    "a depth texture and an 8_8_8_8 one reading the same words), not one")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_debug_skip_clears, false, "GPU",
                     "Diagnostics: skip every EDRAM clear (wrong image), to bound what clears "
                     "cost")
@@ -184,6 +188,7 @@ constexpr uint32_t kBindingSource = 16;
 constexpr uint32_t kBindingStencil = 17;
 constexpr uint32_t kBindingMemory = 32;
 constexpr uint32_t kBindingImage = 33;
+constexpr uint32_t kBindingImage2 = 34;
 constexpr uint32_t kComputeConstantCount = 8;
 constexpr uint32_t kTransferConstantCount = 3;
 
@@ -436,15 +441,17 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
                  VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
   bindings[1] = {kBindingStencil, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
                  VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-  const VkDescriptorSetLayoutBinding image_bindings[4] = {
+  const VkDescriptorSetLayoutBinding image_bindings[5] = {
       {kBindingSource, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
       {kBindingStencil, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT,
        nullptr},
       {kBindingMemory, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT,
        nullptr},
       {kBindingImage, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT,
+       nullptr},
+      {kBindingImage2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT,
        nullptr}};
-  if (!create_set_layout(image_bindings, 4, image_set_layout_)) return false;
+  if (!create_set_layout(image_bindings, 5, image_set_layout_)) return false;
 
   auto create_pipeline_layout = [&](VkDescriptorSetLayout set_layout, VkShaderStageFlags stage,
                                     uint32_t constant_count, VkPipelineLayout& layout_out) {
@@ -464,7 +471,7 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
       !create_pipeline_layout(words_set_layout_, VK_SHADER_STAGE_FRAGMENT_BIT,
                               kTransferConstantCount, words_pipeline_layout_) ||
       !create_pipeline_layout(image_set_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
-                              kComputeConstantCount + 2, image_pipeline_layout_)) {
+                              kComputeConstantCount + 3, image_pipeline_layout_)) {
     return false;
   }
   tiles_.Reset();
@@ -962,7 +969,7 @@ VkDescriptorSet Fh1NativeExecutor::AllocateDescriptorSet(VkDescriptorSetLayout l
     if (current >= pools.size()) {
       const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024},
                                             {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 512},
-                                            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256}};
+                                            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 512}};
       VkDescriptorPoolCreateInfo info = {};
       info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
       info.maxSets = 512;
@@ -2103,7 +2110,8 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
                                         VkBuffer buffer, VkDeviceSize memory_offset,
                                         VkDeviceSize memory_range, bool unscaled_dest,
                                         VkImageView image_view, uint32_t image_row,
-                                        uint32_t image_endian) {
+                                        uint32_t image_endian, VkImageView image2_view,
+                                        uint32_t image2_endian) {
   GpuTimer gpu_timer(*this, kGpuResolves);
   command_processor_.Checkpoint(VulkanCommandProcessor::CheckpointKind::kResolve);
   Surface& surface = *source.surface;
@@ -2157,8 +2165,12 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
   VkDescriptorBufferInfo buffer_info = {buffer, memory_offset, memory_range};
   const VkDescriptorImageInfo image_info = {VK_NULL_HANDLE, image_view, VK_IMAGE_LAYOUT_GENERAL};
-  VkWriteDescriptorSet writes[4] = {};
-  for (uint32_t w = 0; w < 4; ++w) {
+  // Without a second texture the binding repeats the first, never written.
+  const VkDescriptorImageInfo image2_info = {
+      VK_NULL_HANDLE, image2_view != VK_NULL_HANDLE ? image2_view : image_view,
+      VK_IMAGE_LAYOUT_GENERAL};
+  VkWriteDescriptorSet writes[5] = {};
+  for (uint32_t w = 0; w < 5; ++w) {
     writes[w].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[w].dstSet = set;
     writes[w].descriptorCount = 1;
@@ -2175,12 +2187,15 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   writes[3].dstBinding = kBindingImage;
   writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
   writes[3].pImageInfo = &image_info;
+  writes[4].dstBinding = kBindingImage2;
+  writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  writes[4].pImageInfo = &image2_info;
   vulkan_device->functions().vkUpdateDescriptorSets(
-      vulkan_device->device(), image_view != VK_NULL_HANDLE ? 4 : 3, writes, 0, nullptr);
+      vulkan_device->device(), image_view != VK_NULL_HANDLE ? 5 : 3, writes, 0, nullptr);
   const SurfaceKey& owner = surface.key;
   const uint32_t host_sample_mode = HostSampleMode(surface);
   const Rect rect = unscaled_dest ? source.rect : HostRect(source.rect);
-  uint32_t constants[kComputeConstantCount + 2];
+  uint32_t constants[kComputeConstantCount + 3];
   constants[0] = uint32_t(rect.left) | (uint32_t(rect.top) << 16);
   constants[1] = uint32_t(rect.right - rect.left) | (uint32_t(rect.bottom - rect.top) << 16);
   constants[2] = PackLayout(resolve_key.base_tiles, resolve_key.pitch_tiles, resolve_key.msaa,
@@ -2194,13 +2209,14 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   constants[7] = dest_pitch;
   constants[8] = image_row * scale_;
   constants[9] = image_endian;
+  constants[10] = image2_view != VK_NULL_HANDLE ? image2_endian | (1u << 5) : 0u;
   auto& command_buffer = command_processor_.deferred_command_buffer();
   command_processor_.BindExternalComputePipeline(pipeline);
   command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1,
                                          &set, 0, nullptr);
   command_buffer.CmdVkPushConstants(
       pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-      uint32_t(sizeof(uint32_t)) * (image_view != VK_NULL_HANDLE ? kComputeConstantCount + 2
+      uint32_t(sizeof(uint32_t)) * (image_view != VK_NULL_HANDLE ? kComputeConstantCount + 3
                                                                  : kComputeConstantCount),
       constants);
   command_processor_.BeginDebugLabel(image_view != VK_NULL_HANDLE ? "fh1 resolve and texture"
@@ -2447,21 +2463,45 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
           : pack == 2 ? xenos::TextureFormat::k_32_FLOAT
                       : xenos::TextureFormat::k_24_8,
           xenos::TextureFormat::k_24_8_FLOAT};
-      for (uint32_t i = 0; i < (pack == 4 ? 2u : 1u) && direct_resolve_targets_.empty(); ++i) {
+      // Depth words also go to 8_8_8_8 textures as they are (FH1 reads its
+      // depth that way too).
+      const bool two_targets = REXCVAR_GET(fh1_resolve_two_textures);
+      const uint32_t format_count = pack != 4 ? 1u : two_targets ? 3u : 2u;
+      direct_resolve_conversions_.clear();
+      for (uint32_t i = 0; i < format_count && direct_resolve_targets_.size() < 2; ++i) {
         config_.textures->FindDirectResolveTargets(
-            plan.dest_base, extent_start, extent_length, formats[i], plan.dest_pitch,
-            uint32_t(plan.x1), uint32_t(plan.y1), scale_ > 1, direct_resolve_targets_,
+            plan.dest_base, extent_start, extent_length,
+            i < 2 ? formats[i] : xenos::TextureFormat::k_8_8_8_8, plan.dest_pitch,
+            uint32_t(plan.x1), uint32_t(plan.y1), scale_ > 1, direct_resolve_candidates_,
             plan.x0 == 0 && plan.y0 == 0);
-        if (pack == 4) direct_resolve_conversion = i + 1;
+        for (const TextureCache::DirectResolveTarget& candidate : direct_resolve_candidates_) {
+          if (direct_resolve_targets_.size() >= (two_targets ? 2u : 1u)) break;
+          // A second texture shares the rows of the first.
+          if (!direct_resolve_targets_.empty() &&
+              candidate.row_offset != direct_resolve_targets_[0].row_offset) {
+            continue;
+          }
+          direct_resolve_targets_.push_back(candidate);
+          direct_resolve_conversions_.push_back(pack == 4 && i < 2 ? i + 1 : 0);
+        }
+      }
+      if (!direct_resolve_conversions_.empty()) {
+        direct_resolve_conversion = direct_resolve_conversions_[0];
       }
     }
-    // One texture, written by the resolve's own dispatch; any others reload.
-    VkImageView direct_resolve_view = VK_NULL_HANDLE;
+    // Up to two textures, written by the resolve's own dispatch; any others
+    // reload.
+    VkImageView direct_resolve_view = VK_NULL_HANDLE, direct_resolve_view2 = VK_NULL_HANDLE;
     if (!direct_resolve_targets_.empty()) {
-      direct_resolve_targets_.resize(1);
       direct_resolve_view =
           config_.textures->PrepareDirectResolveWrite(*direct_resolve_targets_[0].texture);
-      if (direct_resolve_view == VK_NULL_HANDLE) direct_resolve_targets_.clear();
+      if (direct_resolve_view == VK_NULL_HANDLE) {
+        direct_resolve_targets_.clear();
+      } else if (direct_resolve_targets_.size() > 1) {
+        direct_resolve_view2 =
+            config_.textures->PrepareDirectResolveWrite(*direct_resolve_targets_[1].texture);
+        if (direct_resolve_view2 == VK_NULL_HANDLE) direct_resolve_targets_.resize(1);
+      }
     }
     bool complete = true;
     for (const SourceRect& source : plan.sources) {
@@ -2494,7 +2534,12 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
               direct_resolve_targets_.empty()
                   ? 0
                   : uint32_t(direct_resolve_targets_[0].texture->key().endianness) |
-                        (direct_resolve_conversion << 3))) {
+                        (direct_resolve_conversion << 3),
+              direct_resolve_view2,
+              direct_resolve_targets_.size() > 1
+                  ? uint32_t(direct_resolve_targets_[1].texture->key().endianness) |
+                        (direct_resolve_conversions_[1] << 3)
+                  : 0)) {
         complete = false;
       }
     }

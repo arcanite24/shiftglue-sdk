@@ -43,6 +43,9 @@ FH1_PUSH_CONSTANTS cbuffer Fh1NativeResolveMemoryConstants FH1_CONSTANTS_REGISTE
   // The texture's xenos::Endian 0:2; its load's conversion 3:4 (0: none, 1:
   // 24-bit unorm depth to float, 2: 20e4 depth to float).
   uint fh1_image_endian;
+  // The same for a second texture over the same memory and rows (bit 5: it
+  // exists), such as an 8_8_8_8 texture reading a depth resolve's words.
+  uint fh1_image2_endian;
 #endif
 };
 
@@ -54,6 +57,10 @@ RWByteAddressBuffer fh1_memory : register(u0);
 [[vk::image_format("r32ui")]]
 #endif
 RWTexture2D<uint> fh1_image : register(u1);
+#ifdef FH1_SPIRV
+[[vk::image_format("r32ui")]]
+#endif
+RWTexture2D<uint> fh1_image2 : register(u2);
 #endif
 
 
@@ -92,12 +99,12 @@ uint EndianSwap32(uint value, uint endian) {
   return value;
 }
 
-// Stores a 32-bit destination word (already in the guest memory's byte order).
-void StoreWord(uint address, uint2 host_pixel, uint word) {
-  fh1_memory.Store(address, word);
 #ifdef FH1_DEST_IMAGE
-  uint texel = EndianSwap32(word, fh1_image_endian & 7u);
-  uint conversion = (fh1_image_endian >> 3u) & 3u;
+// The word as a texture's load leaves it: swapped by its endianness and, for
+// depth textures, converted to float.
+uint ImageTexel(uint word, uint endian_and_conversion) {
+  uint texel = EndianSwap32(word, endian_and_conversion & 7u);
+  uint conversion = (endian_and_conversion >> 3u) & 3u;
   if (conversion == 1u) {
     // As texture_load_depth_unorm: (d + (d >> 23)) * 2^-24.
     uint depth = texel >> 8u;
@@ -105,13 +112,27 @@ void StoreWord(uint address, uint2 host_pixel, uint word) {
   } else if (conversion == 2u) {
     texel = asuint(Float20e4To32(texel >> 8u));
   }
+  return texel;
+}
+#endif
+
+// Stores a 32-bit destination word (already in the guest memory's byte order).
+void StoreWord(uint address, uint2 host_pixel, uint word) {
+  fh1_memory.Store(address, word);
+#ifdef FH1_DEST_IMAGE
   // A resolve's area may be larger than a small texture it writes (an 8x8
   // resolve into a 4x4 texture's memory): texels outside it are not stored.
   uint2 image_size;
   fh1_image.GetDimensions(image_size.x, image_size.y);
   uint2 image_pixel = host_pixel + uint2(0u, fh1_image_row);
   if (all(image_pixel < image_size)) {
-    fh1_image[image_pixel] = texel;
+    fh1_image[image_pixel] = ImageTexel(word, fh1_image_endian);
+  }
+  if ((fh1_image2_endian >> 5u) & 1u) {
+    fh1_image2.GetDimensions(image_size.x, image_size.y);
+    if (all(image_pixel < image_size)) {
+      fh1_image2[image_pixel] = ImageTexel(word, fh1_image2_endian);
+    }
   }
 #endif
 }
