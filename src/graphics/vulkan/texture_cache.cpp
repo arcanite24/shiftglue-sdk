@@ -577,33 +577,16 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
 
   TextureCache::RequestTextures(used_texture_mask);
 
-  // Pre-create 3D-as-2D wrappers while still in texture request phase.
-  if (REXCVAR_GET(gpu_3d_to_2d_texture)) {
-    uint32_t textures_3d = used_texture_mask;
-    uint32_t index_3d;
-    while (rex::bit_scan_forward(textures_3d, &index_3d)) {
-      textures_3d &= ~(uint32_t(1) << index_3d);
-      const TextureBinding* binding = GetValidTextureBinding(index_3d);
-      if (!binding || binding->key.dimension != xenos::DataDimension::k3D) {
-        continue;
-      }
-      VulkanTexture* texture = static_cast<VulkanTexture*>(binding->texture);
-      if (texture) {
-        texture->GetOrCreate3DAs2DImageView(false, binding->host_swizzle);
-      }
-      VulkanTexture* texture_signed = static_cast<VulkanTexture*>(binding->texture_signed);
-      if (texture_signed) {
-        texture_signed->GetOrCreate3DAs2DImageView(true, binding->host_swizzle);
-      }
-    }
-  }
-
   // Transition the textures into the needed usage.
   VkPipelineStageFlags dst_stage_mask;
   VkAccessFlags dst_access_mask;
   VkImageLayout new_layout;
   GetTextureUsageMasks(VulkanTexture::Usage::kGuestShaderSampled, dst_stage_mask, dst_access_mask,
                        new_layout);
+  // One pass over the used textures (PD-2.4): 3D-as-2D wrappers are
+  // pre-created while still in the texture request phase, then the textures
+  // are marked as used and transitioned.
+  const bool create_3d_as_2d = REXCVAR_GET(gpu_3d_to_2d_texture);
   uint32_t textures_remaining = used_texture_mask;
   uint32_t index;
   while (rex::bit_scan_forward(textures_remaining, &index)) {
@@ -611,6 +594,16 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
     const TextureBinding* binding = GetValidTextureBinding(index);
     if (!binding) {
       continue;
+    }
+    if (create_3d_as_2d && binding->key.dimension == xenos::DataDimension::k3D) {
+      if (binding->texture) {
+        static_cast<VulkanTexture*>(binding->texture)
+            ->GetOrCreate3DAs2DImageView(false, binding->host_swizzle);
+      }
+      if (binding->texture_signed) {
+        static_cast<VulkanTexture*>(binding->texture_signed)
+            ->GetOrCreate3DAs2DImageView(true, binding->host_swizzle);
+      }
     }
     VulkanTexture* binding_texture = static_cast<VulkanTexture*>(binding->texture);
     if (binding_texture != nullptr) {
