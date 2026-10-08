@@ -79,6 +79,12 @@ REXCVAR_DEFINE_INT32(fh1_untile_height, 720, "GPU",
                      "The screen height in guest pixels the untiled first tile renders "
                      "(fh1_untile_predicated_tiling)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_stable_alpha_to_coverage, true, "GPU",
+                    "Where FH1's MSAA surfaces have fewer host samples (MSAA OFF or 2X), "
+                    "alpha to coverage uses one threshold instead of the console's per-pixel "
+                    "dither, which shimmers on foliage and sign edges without the samples to "
+                    "average it")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(gpu_barrier_census, false, "GPU",
                     "Diagnostics: count pipeline barriers by stages, accesses and kind, logged "
                     "every 600 frames (Vulkan)")
@@ -8158,9 +8164,13 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   if (draw_util::IsPrimitiveLine(regs)) {
     flags |= SpirvShaderTranslator::kSysFlag_PrimitiveLine;
   }
-  // MSAA sample count.
-  flags |= uint32_t(rb_surface_info.msaa_samples)
-           << SpirvShaderTranslator::kSysFlag_MsaaSamples_Shift;
+  // MSAA sample count: the host's, where the FH1 executor stores the guest's
+  // surfaces with fewer samples (alpha to coverage and per-sample shading
+  // address host samples).
+  const xenos::MsaaSamples host_msaa_samples =
+      fh1_native_executor_ ? fh1_native_executor_->HostMsaaSamples(rb_surface_info.msaa_samples)
+                           : rb_surface_info.msaa_samples;
+  flags |= uint32_t(host_msaa_samples) << SpirvShaderTranslator::kSysFlag_MsaaSamples_Shift;
   // Depth format.
   if (rb_depth_info.depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
     flags |= SpirvShaderTranslator::kSysFlag_DepthFloat24;
@@ -8330,6 +8340,14 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   system_constants_.alpha_test_reference = rb_alpha_ref;
   uint32_t alpha_to_mask =
       rb_colorcontrol.alpha_to_mask_enable ? (rb_colorcontrol.value >> 24) | (UINT32_C(1) << 8) : 0;
+  // With fewer host samples than the guest's, the guest's per-pixel dither
+  // offsets have no samples to average over and become a pattern that
+  // crawls on foliage and cut-out sign edges as the camera moves: every
+  // pixel gets the middle offset, a steady threshold (0.5 at 1x).
+  if (alpha_to_mask && host_msaa_samples < rb_surface_info.msaa_samples &&
+      REXCVAR_GET(fh1_stable_alpha_to_coverage)) {
+    alpha_to_mask = 0xAA | (UINT32_C(1) << 8);
+  }
   dirty |= system_constants_.alpha_to_mask != alpha_to_mask;
   system_constants_.alpha_to_mask = alpha_to_mask;
 

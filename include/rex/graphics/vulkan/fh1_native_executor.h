@@ -74,6 +74,13 @@ class Fh1NativeExecutor {
   // tiles resolved are copied down to the EDRAM rows of their surfaces, where
   // the last tile leaves them on the console.
   void EndUntiledTiling();
+  // The host sample count of surfaces the guest renders with this many
+  // samples (fh1_msaa_single_sample, fh1_msaa_2x).
+  xenos::MsaaSamples HostMsaaSamples(xenos::MsaaSamples guest) const {
+    if (guest == xenos::MsaaSamples::k1X || single_sample_msaa_) return xenos::MsaaSamples::k1X;
+    return two_sample_msaa_ && guest == xenos::MsaaSamples::k4X ? xenos::MsaaSamples::k2X
+                                                                 : guest;
+  }
 
   // Before the targets are bound for a draw: derives the surfaces the draw
   // writes and takes their EDRAM tiles, transferring the previous owners'
