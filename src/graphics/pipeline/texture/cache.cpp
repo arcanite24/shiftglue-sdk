@@ -1462,6 +1462,11 @@ REXCVAR_DEFINE_BOOL(fh1_direct_resolve_outdated, true, "GPU",
                     "Resolves also write outdated textures directly when they cover all of "
                     "them, instead of the textures reloading")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(fh1_resolve_bounded_image_writes, true, "GPU",
+                    "Resolves also write textures smaller than their area directly (their "
+                    "image stores skip texels outside the texture) instead of the textures "
+                    "reloading")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_trace_direct_resolves, false, "GPU",
                     "Diagnostics: count why textures over a resolve's destination are not "
                     "written by it directly, logged every 5000 resolves")
@@ -1561,9 +1566,12 @@ void TextureCache::FindDirectResolveTargets(uint32_t dest_base, uint32_t extent_
       continue;
     }
     // The texels the resolve writes (its source pixels from the destination's
-    // first row) must lie inside the texture.
+    // first row) must lie inside the texture, unless the resolve's image
+    // stores skip texels outside it (a small texture under a resolve of at
+    // least 8x8 texels, its memory still inside the texture's).
     const uint32_t row_offset = offset / macro_row_bytes * 32;
-    if (dest_width > key.GetWidth() || row_offset + dest_height > key.GetHeight()) {
+    if (!REXCVAR_GET(fh1_resolve_bounded_image_writes) &&
+        (dest_width > key.GetWidth() || row_offset + dest_height > key.GetHeight())) {
       continue;
     }
     // An outdated texture (its memory written since its load, such as by

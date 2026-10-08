@@ -105,7 +105,14 @@ void StoreWord(uint address, uint2 host_pixel, uint word) {
   } else if (conversion == 2u) {
     texel = asuint(Float20e4To32(texel >> 8u));
   }
-  fh1_image[host_pixel + uint2(0u, fh1_image_row)] = texel;
+  // A resolve's area may be larger than a small texture it writes (an 8x8
+  // resolve into a 4x4 texture's memory): texels outside it are not stored.
+  uint2 image_size;
+  fh1_image.GetDimensions(image_size.x, image_size.y);
+  uint2 image_pixel = host_pixel + uint2(0u, fh1_image_row);
+  if (all(image_pixel < image_size)) {
+    fh1_image[image_pixel] = texel;
+  }
 #endif
 }
 
