@@ -72,6 +72,10 @@ REXCVAR_DEFINE_BOOL(texture_key_unused_packed_mips, true, "GPU",
                     "Treat textures whose stored levels are all above the packed mip tail as "
                     "the same texture whether their fetch constant packs mips or not")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(fh1_debug_skip_resolve_reloads_format, 0, "GPU",
+                     "Diagnostics: with fh1_debug_skip_resolve_reloads, skip only textures of "
+                     "this xenos::TextureFormat (0: all)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_debug_skip_resolve_reloads, false, "GPU",
                     "Diagnostics: never reload textures from resolved memory (stale images), "
                     "to bound what the remaining reloads cost")
@@ -573,7 +577,9 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
     }
   }
 
-  if (pending_load.resolve_sourced && REXCVAR_GET(fh1_debug_skip_resolve_reloads)) {
+  if (pending_load.resolve_sourced && REXCVAR_GET(fh1_debug_skip_resolve_reloads) &&
+      (!REXCVAR_GET(fh1_debug_skip_resolve_reloads_format) ||
+       uint32_t(texture.key().format) == uint32_t(REXCVAR_GET(fh1_debug_skip_resolve_reloads_format)))) {
     texture.CompleteLoad(global_critical_region_.Acquire(), pending_load.load_base,
                          pending_load.load_mips);
     return true;
