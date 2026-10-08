@@ -46,6 +46,15 @@ REXCVAR_DEFINE_BOOL(spirv_fast_pixel_math, REX_PLATFORM_ANDROID, "GPU",
                     "NaN pixels")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// On Android: the Odin 2 Portal's 1x drive frame falls about 3 ms (6 %) when
+// the texture sign switches fold away.
+REXCVAR_DEFINE_BOOL(spirv_specialize_texture_signs, REX_PLATFORM_ANDROID, "GPU",
+                    "Vulkan: make each texture fetch's signedness (unsigned, signed, biased, "
+                    "gamma) a specialization constant set from the bound textures when the "
+                    "pipeline is created, so drivers fold the per-fetch switch away; pipelines "
+                    "made without it read the signedness at run time as before")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(spirv_implicit_lod_2d, false, "GPU",
                     "Vulkan: sample 2D textures whose level the pixel shader computes with "
                     "implicit level of detail plus the bias, as cube maps already are, "
@@ -53,6 +62,26 @@ REXCVAR_DEFINE_BOOL(spirv_implicit_lod_2d, false, "GPU",
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics {
+
+spv::Id SpirvShaderTranslator::TextureSignsWord(uint32_t fetch_constant_index,
+                                                spv::Id system_constant_word) {
+  if (!REXCVAR_GET(spirv_specialize_texture_signs)) {
+    return system_constant_word;
+  }
+  const uint32_t word = (fetch_constant_index >> 2) & 7;
+  if (spec_texture_signs_[word] == spv::NoResult) {
+    spv::Id spec = builder_->makeUintConstant(kTextureSignsDynamic, true);
+    builder_->addDecoration(spec, spv::DecorationSpecId,
+                            int(kSpecConstantTextureSignsFirst + word));
+    spec_texture_signs_[word] = spec;
+  }
+  spv::Id spec = spec_texture_signs_[word];
+  return builder_->createTriOp(
+      spv::OpSelect, type_uint_,
+      builder_->createBinOp(spv::OpINotEqual, type_bool_, spec,
+                            builder_->makeUintConstant(kTextureSignsDynamic)),
+      spec, system_constant_word);
+}
 
 SpirvShaderTranslator::Features::Features(bool all)
     : spirv_version(all ? spv::Spv_1_5 : spv::Spv_1_0),
@@ -226,6 +255,7 @@ void SpirvShaderTranslator::StartTranslation() {
   fast_pixel_math_ = REXCVAR_GET(spirv_fast_pixel_math) && is_pixel_shader() &&
                      !current_shader().writes_depth();
   builder_->allow_contraction = fast_pixel_math_;
+  std::fill(std::begin(spec_texture_signs_), std::end(spec_texture_signs_), spv::NoResult);
 
   builder_->addCapability(IsSpirvTessEvalShader() ? spv::CapabilityTessellation
                                                   : spv::CapabilityShader);

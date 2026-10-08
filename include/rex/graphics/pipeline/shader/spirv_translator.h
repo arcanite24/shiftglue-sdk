@@ -992,6 +992,17 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id main_system_constant_flags_;
   // bool.
   spv::Id var_main_predicate_;
+  // spirv_specialize_texture_signs: per word of the swizzled signs system
+  // constant (4 fetch constants each), a specialization constant that holds
+  // the word, or kTextureSignsDynamic to read the system constant.
+  spv::Id spec_texture_signs_[8];
+  spv::Id TextureSignsWord(uint32_t fetch_constant_index, spv::Id system_constant_word);
+
+ public:
+  static constexpr uint32_t kSpecConstantTextureSignsFirst = 64;
+  static constexpr uint32_t kTextureSignsDynamic = 0xFFFFFFFFu;
+
+ private:
   // uint4.
   spv::Id var_main_loop_count_;
   // int4.

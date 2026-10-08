@@ -290,6 +290,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Submits the open submission, waits for every queue operation and reopens
   // the submission if one was open (FH1 resolve read-backs).
   void Fh1AwaitAllQueueOperations();
+  const VulkanTextureCache& texture_cache() const { return *texture_cache_; }
   // fh1_frame_replay: replays a frame dump (recorded on D3D12) on Vulkan and
   // ends the process.
   void RunRequestedFrameReplay() override;

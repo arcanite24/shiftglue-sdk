@@ -278,6 +278,9 @@ class VulkanPipelineCache {
     VkShaderModule geometry_shader = VK_NULL_HANDLE;
     // VK_NULL_HANDLE when dynamic rendering is used.
     VkRenderPass render_pass = VK_NULL_HANDLE;
+    // spirv_specialize_texture_signs: the signs words given to the shaders.
+    bool specialize_texture_signs = false;
+    std::array<uint32_t, 8> texture_signs{};
   };
   struct PipelineCreationArgumentsPriorityComparator {
     bool operator()(const PipelineCreationArguments& a, const PipelineCreationArguments& b) const {
@@ -437,6 +440,25 @@ class VulkanPipelineCache {
   VkShaderModule depth_float24_round_fragment_shader_ = VK_NULL_HANDLE;
 
   std::unordered_map<PipelineDescription, Pipeline, PipelineDescription::Hasher> pipelines_;
+  // Pipelines with their texture signs specialized, by the description and
+  // the signs of the textures their shaders use; never stored.
+  struct SpecializedKey {
+    PipelineDescription description;
+    std::array<uint32_t, 8> texture_signs;
+    bool operator==(const SpecializedKey& other) const {
+      return description == other.description && texture_signs == other.texture_signs;
+    }
+  };
+  struct SpecializedKeyHasher {
+    size_t operator()(const SpecializedKey& key) const {
+      return size_t(key.description.GetHash() ^
+                    XXH3_64bits(key.texture_signs.data(), sizeof(key.texture_signs)));
+    }
+  };
+  std::unordered_map<SpecializedKey,
+                     std::unique_ptr<std::pair<const PipelineDescription, Pipeline>>,
+                     SpecializedKeyHasher>
+      specialized_pipelines_;
 
   // Previously used pipeline, to avoid lookups if the state wasn't changed.
   const std::pair<const PipelineDescription, Pipeline>* last_pipeline_ = nullptr;

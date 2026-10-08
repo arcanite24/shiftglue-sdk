@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -51,6 +52,7 @@
 #include <rex/types.h>
 #include <rex/ui/vulkan/util.h>
 
+REXCVAR_DECLARE(bool, spirv_specialize_texture_signs);
 REXCVAR_DEFINE_BOOL(vulkan_pipeline_cache_persist, true, "GPU/Vulkan",
                     "Keep the driver's pipeline cache on disk beside the shader storage, so "
                     "pipelines are not compiled again at every start")
@@ -978,6 +980,13 @@ void VulkanPipelineCache::Shutdown() {
     }
   }
   pipelines_.clear();
+  for (const auto& [key, pipeline_pair] : specialized_pipelines_) {
+    VkPipeline pipeline = pipeline_pair->second.pipeline.load(std::memory_order_acquire);
+    if (pipeline != VK_NULL_HANDLE) {
+      dfn.vkDestroyPipeline(device, pipeline, nullptr);
+    }
+  }
+  specialized_pipelines_.clear();
 
   // Destroy all internal shaders.
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
@@ -1248,6 +1257,74 @@ bool VulkanPipelineCache::ConfigurePipeline(
         uint32_t(primitive_processing_result.host_primitive_reset_enabled), render_pass_key.key);
     return false;
   }
+  if (REXCVAR_GET(spirv_specialize_texture_signs)) {
+    // The signs of the textures the shaders use, as the system constant
+    // holds them.
+    SpecializedKey key{description, {}};
+    uint32_t used_textures =
+        static_cast<const VulkanShader&>(vertex_shader->shader()).GetUsedTextureMaskAfterTranslation();
+    if (pixel_shader) {
+      used_textures |= static_cast<const VulkanShader&>(pixel_shader->shader())
+                           .GetUsedTextureMaskAfterTranslation();
+    }
+    const VulkanTextureCache& texture_cache = command_processor_.texture_cache();
+    for (uint32_t mask = used_textures; mask; mask &= mask - 1) {
+      const uint32_t index = uint32_t(std::countr_zero(mask));
+      key.texture_signs[index >> 2] |= uint32_t(texture_cache.GetActiveTextureSwizzledSigns(index))
+                                       << ((index & 3) * 8);
+    }
+    const bool use_async_specialized = REXCVAR_GET(async_shader_compilation) &&
+                                       !creation_threads_.empty() &&
+                                       REXCVAR_GET(vulkan_async_pipeline_no_placeholder) &&
+                                       pipeline_handle_out;
+    auto [entry, inserted] = specialized_pipelines_.try_emplace(key);
+    if (inserted) {
+      entry->second = std::make_unique<std::pair<const PipelineDescription, Pipeline>>(
+          description, Pipeline());
+      PipelineCreationArguments creation_arguments;
+      if (!TryGetPipelineCreationArgumentsForDescription(description, entry->second.get(),
+                                                         creation_arguments)) {
+        specialized_pipelines_.erase(entry);
+        return false;
+      }
+      creation_arguments.specialize_texture_signs = true;
+      creation_arguments.texture_signs = key.texture_signs;
+      if (use_async_specialized) {
+        uint32_t bound_rts =
+            pipeline_util::GetBoundRTMaskFromNormalizedColorMask(normalized_color_mask);
+        uint32_t shader_writes_color_targets =
+            pixel_shader ? pixel_shader->shader().writes_color_targets() : 0;
+        bool shader_writes_depth = pixel_shader ? pixel_shader->shader().writes_depth()
+                                                : normalized_depth_control.z_write_enable != 0;
+        creation_arguments.priority = pipeline_util::CalculatePipelinePriority(
+            bound_rts, shader_writes_color_targets, shader_writes_depth);
+        entry->second->second.is_placeholder.store(true, std::memory_order_release);
+        {
+          std::lock_guard<std::mutex> lock(creation_request_lock_);
+          creation_queue_.push(creation_arguments);
+        }
+        creation_request_cond_.notify_one();
+      } else if (!EnsurePipelineCreated(creation_arguments)) {
+        specialized_pipelines_.erase(entry);
+        return false;
+      }
+    }
+    Pipeline& specialized = entry->second->second;
+    last_pipeline_ = nullptr;
+    pipeline_out = specialized.pipeline.load(std::memory_order_acquire);
+    pipeline_layout_out = specialized.pipeline_layout.load(std::memory_order_acquire);
+    if (pipeline_handle_out) {
+      *pipeline_handle_out = &specialized;
+    }
+    if (pipeline_out == VK_NULL_HANDLE && use_async_specialized &&
+        specialized.is_placeholder.load(std::memory_order_acquire)) {
+      // A worker is still building it: the caller skips the draw.
+      pipeline_layout_out = nullptr;
+      return true;
+    }
+    return pipeline_out != VK_NULL_HANDLE && pipeline_layout_out != nullptr;
+  }
+
   if (last_pipeline_ && last_pipeline_->first == description) {
     VkPipeline last_pipeline = last_pipeline_->second.pipeline.load(std::memory_order_acquire);
     const PipelineLayoutProvider* last_pipeline_layout =
@@ -3377,6 +3454,16 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   bool tessellated = description.primitive_topology == PipelinePrimitiveTopology::kPatchList;
 
   std::array<VkPipelineShaderStageCreateInfo, 5> shader_stages;
+  std::array<VkSpecializationMapEntry, 8> texture_signs_entries;
+  for (uint32_t i = 0; i < 8; ++i) {
+    texture_signs_entries[i] = {SpirvShaderTranslator::kSpecConstantTextureSignsFirst + i,
+                                uint32_t(sizeof(uint32_t) * i), sizeof(uint32_t)};
+  }
+  VkSpecializationInfo texture_signs_specialization = {
+      uint32_t(texture_signs_entries.size()), texture_signs_entries.data(),
+      sizeof(creation_arguments.texture_signs), creation_arguments.texture_signs.data()};
+  const VkSpecializationInfo* guest_specialization =
+      creation_arguments.specialize_texture_signs ? &texture_signs_specialization : nullptr;
   uint32_t shader_stage_count = 0;
 
   // Vertex or tessellation evaluation shader (plus helper stages for tessellation).
@@ -3398,7 +3485,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
     shader_stage_vertex.stage = VK_SHADER_STAGE_VERTEX_BIT;
     shader_stage_vertex.module = creation_arguments.tessellation_vertex_shader;
     shader_stage_vertex.pName = "main";
-    shader_stage_vertex.pSpecializationInfo = nullptr;
+    shader_stage_vertex.pSpecializationInfo = guest_specialization;
 
     VkPipelineShaderStageCreateInfo& shader_stage_tess_control =
         shader_stages[shader_stage_count++];
@@ -3428,7 +3515,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
     shader_stage_vertex.module = creation_arguments.vertex_shader->shader_module();
     assert_true(shader_stage_vertex.module != VK_NULL_HANDLE);
     shader_stage_vertex.pName = "main";
-    shader_stage_vertex.pSpecializationInfo = nullptr;
+    shader_stage_vertex.pSpecializationInfo = guest_specialization;
   }
   // Geometry shader.
   if (creation_arguments.geometry_shader != VK_NULL_HANDLE) {
@@ -3452,7 +3539,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   shader_stage_fragment.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
   shader_stage_fragment.module = VK_NULL_HANDLE;
   shader_stage_fragment.pName = "main";
-  shader_stage_fragment.pSpecializationInfo = nullptr;
+  shader_stage_fragment.pSpecializationInfo = guest_specialization;
   if (fragment_shader_override != VK_NULL_HANDLE) {
     shader_stage_fragment.module = fragment_shader_override;
   } else if (creation_arguments.pixel_shader) {
