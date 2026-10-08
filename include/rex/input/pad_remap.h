@@ -41,4 +41,8 @@ std::string FormatPadRemap(const PadRemap& remap);
 // Rewrites `pad` through the pad_remap and pad_invert_right_stick_y cvars.
 void ApplyPadRemap(X_INPUT_GAMEPAD& pad);
 
+// The button bits of a chord such as "LS+RS" (names as in pad_remap; the
+// triggers have no bits and are ignored); 0 when empty or unknown.
+uint16_t PadChordButtons(std::string_view text);
+
 }  // namespace rex::input

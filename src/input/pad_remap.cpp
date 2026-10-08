@@ -53,6 +53,21 @@ std::string Trim(std::string_view text) {
 
 }  // namespace
 
+uint16_t PadChordButtons(std::string_view text) {
+  uint16_t buttons = 0;
+  size_t start = 0;
+  while (start <= text.size()) {
+    const size_t plus = text.find('+', start);
+    const auto control = PadControlFromName(
+        text.substr(start, plus == std::string_view::npos ? std::string_view::npos : plus - start));
+    if (!control) return 0;
+    buttons |= kBits[size_t(*control)];
+    if (plus == std::string_view::npos) break;
+    start = plus + 1;
+  }
+  return buttons;
+}
+
 std::string_view PadControlName(PadControl control) {
   return control < PadControl::kCount ? kNames[size_t(control)] : std::string_view();
 }

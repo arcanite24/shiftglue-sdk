@@ -208,6 +208,35 @@ void UnregisterBind(std::string_view name) {
   }
 }
 
+static std::function<void(std::function<void()>)> g_bind_dispatcher;
+
+void SetBindDispatcher(std::function<void(std::function<void()>)> dispatcher) {
+  std::lock_guard lock(g_binds_mutex);
+  g_bind_dispatcher = std::move(dispatcher);
+}
+
+bool TriggerBind(std::string_view name) {
+  std::function<void()> callback;
+  std::function<void(std::function<void()>)> dispatcher;
+  {
+    std::lock_guard lock(g_binds_mutex);
+    for (auto& entry : g_binds) {
+      if (entry.name == name && entry.callback) {
+        callback = entry.callback;
+        break;
+      }
+    }
+    dispatcher = g_bind_dispatcher;
+  }
+  if (!callback) return false;
+  if (dispatcher) {
+    dispatcher(std::move(callback));
+  } else {
+    callback();
+  }
+  return true;
+}
+
 bool ProcessKeyEvent(KeyEvent& e) {
   std::lock_guard lock(g_binds_mutex);
   for (auto& entry : g_binds) {

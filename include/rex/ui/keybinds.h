@@ -82,4 +82,16 @@ void UnregisterBind(std::string_view name);
  */
 bool ProcessKeyEvent(KeyEvent& e);
 
+/**
+ * Run a registered bind's callback as its key would, for shortcuts from
+ * other devices (controller chords). The callback runs through the
+ * dispatcher set with SetBindDispatcher (the app's UI thread), or at once
+ * without one.
+ * @return  False when no bind of that name is registered.
+ */
+bool TriggerBind(std::string_view name);
+
+/** How TriggerBind runs callbacks; the app passes its UI thread's queue. */
+void SetBindDispatcher(std::function<void(std::function<void()>)> dispatcher);
+
 }  // namespace rex::ui

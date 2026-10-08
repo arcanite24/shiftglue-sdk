@@ -469,6 +469,10 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
   // gated eager font upload in SetImmediateDrawer is skipped (font uploads
   // lazily on the first Draw instead).
   imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, drawer);
+  // Controller chords (pad_chord_*) trigger binds from the input thread.
+  rex::ui::SetBindDispatcher([this](std::function<void()> callback) {
+    app_context().CallInUIThreadDeferred(std::move(callback));
+  });
   rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
     if (debug_overlay_) {
       debug_overlay_.reset();

@@ -24,11 +24,17 @@
 #include <rex/input/state_merge.h>
 #include <rex/input/xinput/xinput_input_driver.h>
 #include <rex/logging.h>
+#include <rex/ui/keybinds.h>
 
 REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput")
     .allowed({"sdl", "xinput"});
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
+REXCVAR_DEFINE_STRING(pad_chord_debug_overlay, "LS+RS", "Input",
+                      "Controller buttons held together that toggle the debug overlay (F3), "
+                      "names as in pad_remap joined by '+'; empty turns the chord off. The "
+                      "title does not see them while the chord is held")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(pad_rumble_strength, 100, "Input",
                      "Controller rumble strength in percent of what the title asks for (0 turns "
                      "it off)")
@@ -230,6 +236,33 @@ X_RESULT InputSystem::GetHostPadState(uint32_t user_index, X_INPUT_STATE* out_st
   return result;
 }
 
+namespace {
+// Host shortcuts on controllers: a chord held together runs a bind once, and
+// the title does not see the chord's buttons until all are released.
+struct PadChord {
+  const char* bind;
+  bool held[4] = {};
+};
+PadChord g_pad_chord_debug_overlay = {"bind_debug_overlay"};
+
+void ApplyPadChord(PadChord& chord, const std::string& text, uint32_t user_index,
+                   X_INPUT_GAMEPAD& pad) {
+  const uint16_t buttons = PadChordButtons(text);
+  if (!buttons || user_index >= 4) return;
+  bool& held = chord.held[user_index];
+  if ((pad.buttons & buttons) == buttons) {
+    if (!held) {
+      REXLOG_INFO("Controller chord {} on pad {}: {}", text, user_index, chord.bind);
+      rex::ui::TriggerBind(chord.bind);
+    }
+    held = true;
+  } else if (!(pad.buttons & buttons)) {
+    held = false;
+  }
+  if (held) pad.buttons = uint16_t(pad.buttons & ~buttons);
+}
+}  // namespace
+
 X_RESULT InputSystem::GetMergedState(uint32_t user_index, bool host_pads_only,
                                      X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
@@ -257,6 +290,8 @@ X_RESULT InputSystem::GetMergedState(uint32_t user_index, bool host_pads_only,
     // The title reads remapped controllers; host menus keep the physical
     // layout so a remap can never lock the player out of the remap screen.
     if (!host_pads_only && !driver->is_keyboard_and_mouse()) {
+      ApplyPadChord(g_pad_chord_debug_overlay, REXCVAR_GET(pad_chord_debug_overlay), user_index,
+                    state.gamepad);
       ApplyPadRemap(state.gamepad);
     }
     if (!any) {
