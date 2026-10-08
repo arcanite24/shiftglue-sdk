@@ -69,8 +69,8 @@ REXCVAR_DEFINE_BOOL(fh1_untile_predicated_tiling, REX_PLATFORM_ANDROID, "GPU",
                     "Render FH1's predicated tiling passes once: the first tile draws every "
                     "tile's objects over the whole surface height and the later tiles only "
                     "resolve their bands (Vulkan FH1 native executor; 3 ms a frame on the "
-                    "Odin 2 Portal)")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+                    "Odin 2 Portal). A change rebuilds the renderer between frames")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(fh1_debug_untile, 0, "GPU",
                      "fh1_untile_predicated_tiling diagnostics: 1 keeps the first tile's "
                      "predication, 2 draws the later tiles too")
@@ -2501,7 +2501,11 @@ void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
   TextureCache::GetConfigDrawResolutionScale(scale_x, scale_y);
   const uint32_t previous_scale_x = texture_cache_->draw_resolution_scale_x();
   const uint32_t previous_scale_y = texture_cache_->draw_resolution_scale_y();
-  if (scale_x == previous_scale_x && scale_y == previous_scale_y) {
+  // fh1_untile_predicated_tiling sizes the FH1 executor's surfaces, so a
+  // change rebuilds the same components as a scale switch, at the same scale.
+  const bool untile_changed =
+      fh1_native_executor_ && REXCVAR_GET(fh1_untile_predicated_tiling) != untile_tiling_;
+  if (scale_x == previous_scale_x && scale_y == previous_scale_y && !untile_changed) {
     declined_draw_resolution_scale_ = 0;
     return;
   }
