@@ -62,7 +62,14 @@ bool VulkanSharedMemory::Initialize() {
   buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   buffer_create_info.queueFamilyIndexCount = 0;
   buffer_create_info.pQueueFamilyIndices = nullptr;
-  if (REXCVAR_GET(vulkan_sparse_shared_memory) &&
+  // Turnip (Mesa, loaded on Android through android_gpu_driver) advertises
+  // sparse residency, but resolves written into the sparse buffer read back
+  // as zeros on the Adreno 740, so the whole frame came out black.
+  const bool sparse_broken = vulkan_device->properties().driverID == VK_DRIVER_ID_MESA_TURNIP;
+  if (sparse_broken && REXCVAR_GET(vulkan_sparse_shared_memory)) {
+    REXGPU_INFO("Shared memory: not using sparse residency on Turnip");
+  }
+  if (REXCVAR_GET(vulkan_sparse_shared_memory) && !sparse_broken &&
       vulkan_device->properties().sparseResidencyBuffer) {
     if (dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &buffer_) == VK_SUCCESS) {
       VkMemoryRequirements buffer_memory_requirements;
