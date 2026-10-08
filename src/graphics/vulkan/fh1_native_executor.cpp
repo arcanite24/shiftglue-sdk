@@ -1914,6 +1914,14 @@ void Fh1NativeExecutor::BeginDrawRendering() {
   }
   if (clears) FoldPendingClears(bound, clear_width, clear_height, colors, &depth, true);
   rendering_id_ = id;
+  if (gpu_query_pool_ != VK_NULL_HANDLE) {
+    std::string label;
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (bound_bits_ & (1u << i)) label += (label.empty() ? "" : "+") + pending_keys_[i].Describe();
+    }
+    if (label.empty()) label = "none";
+    GpuMarkRendering(GpuLabel(label));
+  }
   command_processor_.SubmitBarriersAndBeginFh1Rendering(info, id);
   if (clears) FoldPendingClears(bound, clear_width, clear_height, nullptr, nullptr, false);
 }
@@ -2073,6 +2081,19 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   GpuTimer gpu_timer(*this, kGpuResolves);
   command_processor_.Checkpoint(VulkanCommandProcessor::CheckpointKind::kResolve);
   Surface& surface = *source.surface;
+  struct LabelTimer {
+    Fh1NativeExecutor& executor;
+    uint32_t label = UINT32_MAX, begin = UINT32_MAX;
+    ~LabelTimer() {
+      if (begin != UINT32_MAX) executor.GpuEnd(GpuPhase(kGpuPhases + label), begin);
+    }
+  } label_timer{*this};
+  if (gpu_query_pool_ != VK_NULL_HANDLE) {
+    label_timer.label = GpuLabel(fmt::format("R {} {}x{}", surface.key.Describe(),
+                                             source.rect.right - source.rect.left,
+                                             source.rect.bottom - source.rect.top));
+    label_timer.begin = GpuBegin();
+  }
   const bool depth = surface.key.is_depth;
   const bool msaa = surface.samples > 1;
   const uint32_t kind = SourceKind(depth, surface.key.format);
@@ -2562,7 +2583,6 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
 
 void Fh1NativeExecutor::OnSwap(uint64_t frame) {
   if (!initialized_) return;
-  GpuEndFrame();
   GpuDrain();
   frame_ = frame;
   if (frame % 600 == 0) LogStats(frame);
@@ -2583,6 +2603,31 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
         gpu_frames_, gpu_ticks_[kGpuFrame] * scale, gpu_ticks_[kGpuTransfers] * scale,
         gpu_ticks_[kGpuResolves] * scale, gpu_ticks_[kGpuClears] * scale,
         gpu_ticks_[kGpuTextureReloads] * scale, gpu_ticks_[kGpuTextureLoads] * scale);
+    std::vector<std::pair<uint64_t, uint32_t>> heavy;
+    for (uint32_t i = 0; i < gpu_label_ticks_.size(); ++i) heavy.emplace_back(gpu_label_ticks_[i], i);
+    std::sort(heavy.begin(), heavy.end(), std::greater<>());
+    std::string top;
+    for (size_t i = 0; i < heavy.size() && i < 24; ++i) {
+      top += fmt::format("{}{} {:.2f}ms x{:.1f}", i ? "; " : "", gpu_labels_[heavy[i].second],
+                         heavy[i].first * scale,
+                         double(gpu_label_counts_[heavy[i].second]) / double(gpu_frames_));
+    }
+    REXGPU_INFO("FH1 native executor (Vulkan) gpu ms/frame by draw rendering: {}", top);
+    if (!heavy.empty()) {
+      std::vector<std::pair<uint64_t, std::string>> enders;
+      for (const auto& [key, count] : gpu_label_enders_) {
+        if (key.first == heavy[0].second) enders.emplace_back(count, key.second);
+      }
+      std::sort(enders.begin(), enders.end(), std::greater<>());
+      std::string list;
+      for (size_t i = 0; i < enders.size() && i < 8; ++i) {
+        list += fmt::format("{}{:.1f} {}", i ? "; " : "", double(enders[i].first) / double(gpu_frames_), enders[i].second);
+      }
+      REXGPU_INFO("FH1 native executor (Vulkan) heaviest rendering ended by, per frame: {}", list);
+    }
+    gpu_label_enders_.clear();
+    std::fill(gpu_label_ticks_.begin(), gpu_label_ticks_.end(), 0);
+    std::fill(gpu_label_counts_.begin(), gpu_label_counts_.end(), 0);
     gpu_ticks_ = {};
     gpu_frames_ = 0;
   }
@@ -2658,8 +2703,34 @@ void Fh1NativeExecutor::GpuEnd(GpuPhase phase, uint32_t begin) {
   slot.spans.push_back({uint32_t(phase), begin, query});
 }
 
+uint32_t Fh1NativeExecutor::GpuLabel(const std::string& label) {
+  auto [it, inserted] = gpu_label_ids_.try_emplace(label, uint32_t(gpu_labels_.size()));
+  if (inserted) {
+    gpu_labels_.push_back(label);
+    gpu_label_ticks_.push_back(0);
+    gpu_label_counts_.push_back(0);
+  }
+  return it->second;
+}
+
+void Fh1NativeExecutor::GpuMarkRendering(uint32_t label) {
+  // Outside any rendering: the timestamp before it begins.
+  if (gpu_rendering_label_ != UINT32_MAX) {
+    std::string ender = command_processor_.last_rendering_ender();
+    if (ender.size() > 60) ender = ender.substr(0, 60);
+    ++gpu_label_enders_[{gpu_rendering_label_, ender}];
+  }
+  command_processor_.SubmitBarriers(true);
+  if (gpu_rendering_label_ != UINT32_MAX) {
+    GpuEnd(GpuPhase(kGpuPhases + gpu_rendering_label_), gpu_rendering_begin_);
+  }
+  gpu_rendering_label_ = label;
+  gpu_rendering_begin_ = label == UINT32_MAX ? UINT32_MAX : GpuBegin();
+}
+
 void Fh1NativeExecutor::GpuEndFrame() {
   if (gpu_query_pool_ == VK_NULL_HANDLE) return;
+  GpuMarkRendering(UINT32_MAX);
   GpuProfileSlot& slot = gpu_slots_[gpu_slot_];
   if (slot.pending || !slot.used || slot.used >= kGpuProfileQueries) return;
   const uint32_t query = slot.used++;
@@ -2686,7 +2757,13 @@ void Fh1NativeExecutor::GpuDrain() {
             ticks.size() * sizeof(uint64_t), ticks.data(), sizeof(uint64_t),
             VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
       for (const auto& [phase, begin, end] : slot.spans) {
-        if (ticks[end] > ticks[begin]) gpu_ticks_[phase] += ticks[end] - ticks[begin];
+        if (ticks[end] <= ticks[begin]) continue;
+        if (phase < kGpuPhases) {
+          gpu_ticks_[phase] += ticks[end] - ticks[begin];
+        } else if (phase - kGpuPhases < gpu_label_ticks_.size()) {
+          gpu_label_ticks_[phase - kGpuPhases] += ticks[end] - ticks[begin];
+          ++gpu_label_counts_[phase - kGpuPhases];
+        }
       }
       ++gpu_frames_;
     }

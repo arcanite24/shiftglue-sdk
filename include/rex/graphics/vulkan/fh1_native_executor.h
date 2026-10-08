@@ -5,6 +5,7 @@
 #include <map>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #include <rex/graphics/fh1_depth_overwrite.h>
@@ -97,6 +98,21 @@ class Fh1NativeExecutor {
   uint32_t BeginTextureLoadGpuTiming() { return GpuBegin(); }
   void EndTextureLoadGpuTiming(uint32_t begin, bool resolve_sourced) {
     GpuEnd(resolve_sourced ? kGpuTextureReloads : kGpuTextureLoads, begin);
+  }
+  // fh1_native_gpu_profile: the frame from its opening to its swap's end.
+  void GpuFrameOpened() {
+    if (gpu_query_pool_ != VK_NULL_HANDLE) GpuBegin();
+  }
+  void GpuFrameSwapped() { GpuEndFrame(); }
+  // fh1_native_gpu_profile: other work's time by label (outside renderings).
+  uint64_t BeginLabelGpuTiming(const char* label) {
+    if (gpu_query_pool_ == VK_NULL_HANDLE) return UINT64_MAX;
+    const uint32_t id = GpuLabel(label);
+    return (uint64_t(id) << 32) | GpuBegin();
+  }
+  void EndLabelGpuTiming(uint64_t token) {
+    if (token == UINT64_MAX || uint32_t(token) == UINT32_MAX) return;
+    GpuEnd(GpuPhase(kGpuPhases + uint32_t(token >> 32)), uint32_t(token));
   }
 
  private:
@@ -389,8 +405,8 @@ class Fh1NativeExecutor {
     kGpuFrame,
     kGpuPhases
   };
-  static constexpr uint32_t kGpuProfileSlots = 4;
-  static constexpr uint32_t kGpuProfileQueries = 2048;
+  static constexpr uint32_t kGpuProfileSlots = 16;
+  static constexpr uint32_t kGpuProfileQueries = 8192;
   struct GpuProfileSlot {
     uint32_t used = 0;
     uint64_t submission = 0;
@@ -417,6 +433,17 @@ class Fh1NativeExecutor {
   std::array<GpuProfileSlot, kGpuProfileSlots> gpu_slots_;
   uint32_t gpu_slot_ = 0;
   std::array<uint64_t, kGpuPhases> gpu_ticks_{};
+  // With the profile, the time from each draw rendering's start to the next
+  // one's, by the rendering's surfaces (spans with phase kGpuPhases + label).
+  std::vector<std::string> gpu_labels_;
+  std::unordered_map<std::string, uint32_t> gpu_label_ids_;
+  std::vector<uint64_t> gpu_label_ticks_;
+  std::vector<uint64_t> gpu_label_counts_;
+  uint32_t gpu_rendering_label_ = UINT32_MAX;
+  uint32_t gpu_rendering_begin_ = UINT32_MAX;
+  std::map<std::pair<uint32_t, std::string>, uint64_t> gpu_label_enders_;
+  void GpuMarkRendering(uint32_t label);
+  uint32_t GpuLabel(const std::string& label);
   uint64_t gpu_frames_ = 0;
   uint64_t draws_ = 0;
   uint64_t resolves_ = 0;

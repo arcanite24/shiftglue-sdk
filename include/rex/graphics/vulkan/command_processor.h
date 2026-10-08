@@ -246,6 +246,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // For kFh1RenderingEndedElsewhere: the functions that ended the previous
   // rendering, with counts. Keyed by the source_location function name, a
   // static string, so counting allocates nothing.
+  const char* last_rendering_ender() const { return in_render_pass_ ? "(open)" : last_rendering_ender_; }
   std::map<const char*, uint64_t> TakeFh1RenderingEnders() {
     return std::exchange(fh1_rendering_enders_, {});
   }

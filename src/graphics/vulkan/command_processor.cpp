@@ -3161,6 +3161,17 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
     REXGPU_ERROR("XELOG_GPU PRESENT: BeginSubmission FAILED");
     return;
   }
+  struct SwapGpuTiming {
+    Fh1NativeExecutor* executor;
+    uint64_t token;
+    void End() {
+      if (executor) executor->EndLabelGpuTiming(token);
+      executor = nullptr;
+    }
+    ~SwapGpuTiming() { End(); }
+  } swap_gpu_timing{fh1_native_executor_.get(),
+                    fh1_native_executor_ ? fh1_native_executor_->BeginLabelGpuTiming("swap")
+                                         : UINT64_MAX};
 
   if (async_submission_ && REXCVAR_GET(vulkan_present_on_submission_worker) &&
       present_deferred_presenter_ != presenter) {
@@ -3189,6 +3200,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
           "Skipping Vulkan frame presentation due to async placeholder draw "
           "usage in this frame");
     }
+    swap_gpu_timing.End();
+    if (fh1_native_executor_) fh1_native_executor_->GpuFrameSwapped();
     EndSubmission(true);
     return;
   }
@@ -3844,6 +3857,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
 
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
+  swap_gpu_timing.End();
+    if (fh1_native_executor_) fh1_native_executor_->GpuFrameSwapped();
   EndSubmission(true);
 }
 
@@ -6690,6 +6705,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // Completed frames' timestamps first, so their slots are free for reuse.
     ReadFrameGpuTiming();
     BeginFrameGpuTiming();
+    if (fh1_native_executor_) fh1_native_executor_->GpuFrameOpened();
 
     frame_open_ = true;
     frame_used_async_placeholder_pipeline_ = false;

@@ -19,6 +19,7 @@
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/shared_memory.h>
+#include <rex/graphics/vulkan/fh1_native_executor.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
@@ -281,6 +282,16 @@ bool VulkanSharedMemory::UploadRanges(
                       upload_page_ranges.front().first)
                          << page_size_log2()));
   command_processor_.SubmitBarriers(true);
+  Fh1NativeExecutor* const gpu_profile_executor = command_processor_.GetFh1NativeExecutor();
+  const uint64_t gpu_timing =
+      gpu_profile_executor ? gpu_profile_executor->BeginLabelGpuTiming("upload") : UINT64_MAX;
+  struct EndTiming {
+    Fh1NativeExecutor* executor;
+    uint64_t token;
+    ~EndTiming() {
+      if (executor) executor->EndLabelGpuTiming(token);
+    }
+  } end_timing{gpu_profile_executor, gpu_timing};
   command_processor_.BeginDebugLabel("shared memory upload");
   struct EndLabel {
     VulkanCommandProcessor& processor;
