@@ -896,10 +896,18 @@ class VulkanCommandProcessor : public CommandProcessor {
   struct ConstantsDescriptorSetKey {
     VkBuffer buffers[SpirvShaderTranslator::kConstantBufferCount] = {};
     uint32_t ranges[SpirvShaderTranslator::kConstantBufferCount] = {};
+    // Five ranges leave the key 4 bytes short of its alignment: an explicit
+    // member keeps operator==, which compares the bytes, off indeterminate
+    // padding (which made equal keys miss, PD-3.3).
+    uint32_t padding = 0;
     bool operator==(const ConstantsDescriptorSetKey& other) const {
       return std::memcmp(this, &other, sizeof(*this)) == 0;
     }
   };
+  static_assert(sizeof(ConstantsDescriptorSetKey) ==
+                    sizeof(VkBuffer) * SpirvShaderTranslator::kConstantBufferCount +
+                        sizeof(uint32_t) * (SpirvShaderTranslator::kConstantBufferCount + 1),
+                "ConstantsDescriptorSetKey must have no padding");
   struct ConstantsDescriptorSetKeyHasher {
     size_t operator()(const ConstantsDescriptorSetKey& key) const {
       size_t hash = 0;
