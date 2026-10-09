@@ -2915,10 +2915,18 @@ void Fh1NativeExecutor::GpuDrain() {
     GpuProfileSlot& slot = gpu_slots_[index];
     if (!slot.pending || slot.submission > completed) continue;
     ticks.resize(slot.used);
-    if (vulkan_device->functions().vkGetQueryPoolResults(
-            vulkan_device->device(), gpu_query_pool_, index * kGpuProfileQueries, slot.used,
-            ticks.size() * sizeof(uint64_t), ticks.data(), sizeof(uint64_t),
-            VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+    const VkResult result = vulkan_device->functions().vkGetQueryPoolResults(
+        vulkan_device->device(), gpu_query_pool_, index * kGpuProfileQueries, slot.used,
+        ticks.size() * sizeof(uint64_t), ticks.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+    if (result != VK_SUCCESS) {
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        REXGPU_WARN("FH1 native executor (Vulkan): GPU profile results failed ({}), {} queries",
+                    int(result), slot.used);
+      }
+    }
+    if (result == VK_SUCCESS) {
       for (const auto& [phase, begin, end] : slot.spans) {
         if (ticks[end] <= ticks[begin]) continue;
         if (phase < kGpuPhases) {
