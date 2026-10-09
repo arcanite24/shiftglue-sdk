@@ -240,6 +240,10 @@ bool HasNonDefaultValue(std::string_view name);
 std::vector<std::string> ListModifiedFlags();
 std::string SerializeToTOML();
 std::string SerializeToTOML(std::string_view category);
+/// `existing` with each registered flag's top-level line set to its current
+/// value and modified flags without a line appended. Comments, tables and
+/// keys that are not flags (such as a host's schema version) are kept.
+std::string MergeIntoTOML(std::string_view existing);
 
 /// Callback invoked when a CVAR value changes
 /// @param name The CVAR name

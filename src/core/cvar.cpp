@@ -12,6 +12,7 @@
 #include <charconv>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include <optional>
 #include <string_view>
@@ -573,6 +574,83 @@ std::string SerializeToTOML(std::string_view category) {
   return result;
 }
 
+std::string MergeIntoTOML(std::string_view existing) {
+  std::lock_guard lock(GetRegistryMutex());
+  const auto literal = [](const FlagEntry& entry) {
+    return entry.type == FlagType::String ? "\"" + entry.getter() + "\"" : entry.getter();
+  };
+  const std::string newline = existing.find("\r\n") != std::string_view::npos ? "\r\n" : "\n";
+  std::string result;
+  std::unordered_map<std::string, bool> written;
+  bool top_level = true;
+  size_t begin = 0;
+  while (begin < existing.size()) {
+    size_t end = existing.find('\n', begin);
+    const size_t next = end == std::string_view::npos ? existing.size() : end + 1;
+    std::string_view line = existing.substr(begin, next - begin);
+    begin = next;
+    std::string_view content = line;
+    while (!content.empty() && (content.back() == '\n' || content.back() == '\r')) {
+      content.remove_suffix(1);
+    }
+    size_t at = content.find_first_not_of(" \t");
+    if (at != std::string_view::npos && content[at] == '[') {
+      top_level = false;
+    }
+    if (top_level && at != std::string_view::npos) {
+      size_t key_end = at;
+      while (key_end < content.size() &&
+             (std::isalnum(static_cast<unsigned char>(content[key_end])) || content[key_end] == '_')) {
+        ++key_end;
+      }
+      size_t equals = content.find_first_not_of(" \t", key_end);
+      if (key_end > at && equals != std::string_view::npos && content[equals] == '=') {
+        const std::string key(content.substr(at, key_end - at));
+        auto it = GetRegistryIndex().find(key);
+        if (it != GetRegistryIndex().end() && !written[key]) {
+          written[key] = true;
+          result += std::string(content.substr(0, at)) + key + " = " +
+                    literal(GetRegistryStorage()[it->second]) + newline;
+          continue;
+        }
+      }
+    }
+    result += line;
+  }
+  std::string appended;
+  for (const auto& entry : GetRegistryStorage()) {
+    if (!written[entry.name] && entry.getter() != entry.default_value) {
+      appended += entry.name + " = " + literal(entry) + newline;
+    }
+  }
+  if (!appended.empty()) {
+    if (!result.empty() && result.back() != '\n') {
+      result += newline;
+    }
+    // Keys after a table header would belong to that table.
+    if (!top_level) {
+      appended = "# Saved from the settings overlay" + newline + appended;
+      size_t first_table = std::string::npos;
+      for (size_t at = 0; at < result.size();) {
+        size_t line_end = result.find('\n', at);
+        size_t start = result.find_first_not_of(" \t", at);
+        if (start != std::string::npos && start < line_end && result[start] == '[') {
+          first_table = at;
+          break;
+        }
+        if (line_end == std::string::npos) {
+          break;
+        }
+        at = line_end + 1;
+      }
+      result.insert(first_table == std::string::npos ? result.size() : first_table, appended);
+    } else {
+      result += appended;
+    }
+  }
+  return result;
+}
+
 void RegisterChangeCallback(std::string_view name, ChangeCallback callback) {
   std::lock_guard lock(GetRegistryMutex());
   GetCallbackStorage()[std::string(name)].push_back(std::move(callback));
@@ -699,20 +777,39 @@ bool IsFinalized() {
 }
 
 void SaveConfig(const std::filesystem::path& config_path) {
-  std::string content = SerializeToTOML();
-  if (content.empty()) {
-    REXLOG_DEBUG("SaveConfig: no modified flags to save");
+  // Merge into the file rather than replace it: a host keeps its own keys
+  // (a schema version, settings its launcher wrote) in the same file, and
+  // rewriting it with only the modified flags lost them.
+  std::string existing;
+  {
+    std::ifstream input(config_path, std::ios::binary);
+    if (input) {
+      existing.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    }
+  }
+  if (existing.starts_with("\xEF\xBB\xBF")) {
+    existing.erase(0, 3);
+  }
+  if (existing.empty()) {
+    existing = "# Auto-generated cvar configuration\n";
+  }
+  const std::string content = MergeIntoTOML(existing);
+  if (content == existing) {
+    REXLOG_DEBUG("SaveConfig: nothing changed");
     return;
   }
 
   try {
-    std::ofstream file(config_path);
-    if (!file) {
-      REXLOG_ERROR("SaveConfig: failed to open {}", config_path.string());
-      return;
+    std::filesystem::path temporary = config_path;
+    temporary += ".tmp";
+    {
+      std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+      if (!file || !file.write(content.data(), std::streamsize(content.size())) || !file.flush()) {
+        REXLOG_ERROR("SaveConfig: failed to write {}", temporary.string());
+        return;
+      }
     }
-    file << "# Auto-generated cvar configuration\n";
-    file << content;
+    std::filesystem::rename(temporary, config_path);
     REXLOG_INFO("Saved config to {}", config_path.string());
   } catch (const std::exception& e) {
     REXLOG_ERROR("SaveConfig: {}", e.what());
