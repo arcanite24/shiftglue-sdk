@@ -737,8 +737,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
       pthread_attr_destroy(&attr);
       return false;
     }
-#if !REX_PLATFORM_ANDROID
-    // Android apps may not use SCHED_FIFO; set_priority maps to nice there.
+#if !REX_PLATFORM_LINUX
+    // Linux maps priorities to nice values in set_priority: Android apps may
+    // not use SCHED_FIFO, and a desktop process rarely may (no CAP_SYS_NICE),
+    // while a guest priority of 0 or below is invalid for it anyway.
     if (params.initial_priority != 0) {
       sched_param sched{};
       sched.sched_priority = params.initial_priority + 1;
@@ -918,13 +920,24 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
   void set_priority(int new_priority) {
     WaitStarted();
-#if REX_PLATFORM_ANDROID
-    // Real-time policies are refused to apps, but Android lets an app lower
-    // its threads' nice value; the guest's priorities (THREAD_PRIORITY_*,
-    // up to 15 for time critical) map to nice -10 (most urgent) .. +4.
+#if REX_PLATFORM_LINUX
+    // Real-time policies need privileges neither an Android app nor a desktop
+    // process normally has, so the guest's priorities (THREAD_PRIORITY_*, up
+    // to 15 for time critical) map to nice -10 (most urgent) .. +4. Android
+    // lets an app lower its threads' nice value; elsewhere raising one needs
+    // RLIMIT_NICE or CAP_SYS_NICE, and without them the thread stays at 0.
     const int nice = std::clamp(-2 * new_priority, -10, 4);
-    if (setpriority(PRIO_PROCESS, pthread_gettid_np(thread_), nice) != 0) {
-      REXSYS_WARN("set_priority: setpriority({}) failed ({})", nice, errno);
+#if REX_PLATFORM_ANDROID
+    const pid_t tid = pthread_gettid_np(thread_);
+#else
+    const pid_t tid = tid_;
+#endif
+    if (setpriority(PRIO_PROCESS, tid, nice) != 0) {
+      static std::atomic<bool> warned{false};
+      if (!warned.exchange(true)) {
+        REXSYS_WARN("set_priority: setpriority({}) failed ({}); further failures are not logged",
+                    nice, errno);
+      }
     }
     return;
 #endif
@@ -1136,6 +1149,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
 #endif
   }
   pthread_t thread_;
+#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
+  pid_t tid_ = 0;  // Kernel thread id for setpriority; set before the start signal.
+#endif
   bool reaped_ = false;
   bool signaled_;
   int exit_code_;
@@ -1542,6 +1558,9 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
   current_thread_condition_ = &thread->handle_;
   {
     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
+#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
+    thread->handle_.tid_ = static_cast<pid_t>(syscall(SYS_gettid));
+#endif
     thread->handle_.state_ = create_suspended ? State::kSuspended : State::kRunning;
     // Arm the suspend counter in the SAME critical section that publishes the
     // started state. Resume() only waits for state_ != kUninitialized, so if it
