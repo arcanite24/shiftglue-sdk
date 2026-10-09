@@ -3921,7 +3921,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
     color_blend_state.pAttachments = color_blend_attachments;
   }
 
-  std::array<VkDynamicState, 7> dynamic_states;
+  std::array<VkDynamicState, 8> dynamic_states;
   VkPipelineDynamicStateCreateInfo dynamic_state;
   dynamic_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
   dynamic_state.pNext = nullptr;
@@ -3940,6 +3940,10 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
     dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK;
     dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_STENCIL_WRITE_MASK;
     dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_STENCIL_REFERENCE;
+  }
+  if (command_processor_.GetVulkanDevice()->properties().pipelineFragmentShadingRate) {
+    // fh1_coarse_shading, per draw.
+    dynamic_states[dynamic_state.dynamicStateCount++] = VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR;
   }
 
   VkPipelineTessellationStateCreateInfo tessellation_state = {};

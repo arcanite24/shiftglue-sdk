@@ -345,6 +345,16 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
         dfn.vkCmdSetBlendConstants(command_buffer, args.blend_constants);
       } break;
 
+      case Command::kVkSetFragmentShadingRateKHR: {
+        auto& args = *reinterpret_cast<const ArgsVkSetFragmentShadingRateKHR*>(stream);
+        // Shaded once per block, the block's rate kept whatever the
+        // primitive or an attachment would choose.
+        const VkFragmentShadingRateCombinerOpKHR combiner_ops[2] = {
+            VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR,
+            VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR};
+        dfn.vkCmdSetFragmentShadingRateKHR(command_buffer, &args.fragment_size, combiner_ops);
+      } break;
+
       case Command::kVkSetDepthBias: {
         auto& args = *reinterpret_cast<const ArgsVkSetDepthBias*>(stream);
         dfn.vkCmdSetDepthBias(command_buffer, args.depth_bias_constant_factor,

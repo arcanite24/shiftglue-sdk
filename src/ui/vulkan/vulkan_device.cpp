@@ -36,6 +36,10 @@ REXCVAR_DEFINE_BOOL(vulkan_pipeline_statistics, false, "UI/Vulkan",
                     "spills) for every graphics pipeline, where the driver reports them "
                     "through VK_KHR_pipeline_executable_properties")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(vulkan_fragment_shading_rate, REX_PLATFORM_ANDROID, "UI/Vulkan",
+                    "Enable VK_KHR_fragment_shading_rate where the device has it, so chosen "
+                    "passes may be shaded once per 2x2 pixels (fh1_coarse_shading)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
                     "required for Vulkan GPU emulation")
@@ -472,6 +476,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       // #237.
       XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_spirv_1_4, 1, 2)
     }
+    if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0) &&
+        REXCVAR_GET(vulkan_fragment_shading_rate)) {
+      // #227, for coarse shading of chosen passes (needs
+      // VK_KHR_create_renderpass2, core in 1.2).
+      XE_UI_VULKAN_STRUCT_EXTENSION(KHR_fragment_shading_rate)
+    }
   }
 
 #undef XE_UI_VULKAN_STRUCT_EXTENSION
@@ -579,6 +589,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR>
       features_KHR_pipeline_executable_properties;
+  VulkanFeatures<VkPhysicalDeviceFragmentShadingRateFeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR>
+      features_KHR_fragment_shading_rate;
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -639,6 +652,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (device->extensions_.ext_KHR_pipeline_executable_properties) {
       features_KHR_pipeline_executable_properties.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_KHR_fragment_shading_rate) {
+      features_KHR_fragment_shading_rate.Link(supported_features_2, device_create_info);
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
@@ -1021,6 +1037,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (device->extensions_.ext_KHR_pipeline_executable_properties) {
     XE_UI_VULKAN_FEATURE_2(features_KHR_pipeline_executable_properties, pipelineExecutableInfo)
   }
+  if (device->extensions_.ext_KHR_fragment_shading_rate) {
+    XE_UI_VULKAN_FEATURE_2(features_KHR_fragment_shading_rate, pipelineFragmentShadingRate)
+  }
 
 #undef XE_UI_VULKAN_LIMIT
 #undef XE_UI_VULKAN_ENUM_LIMIT
@@ -1101,6 +1120,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
   if (device->extensions_.ext_KHR_present_wait) {
 #include <rex/ui/vulkan/functions/device_khr_present_wait.inc>
+  }
+  if (device->extensions_.ext_KHR_fragment_shading_rate) {
+#include <rex/ui/vulkan/functions/device_khr_fragment_shading_rate.inc>
   }
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 

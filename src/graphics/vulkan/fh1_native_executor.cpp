@@ -83,6 +83,11 @@ REXCVAR_DEFINE_BOOL(fh1_resolve_two_textures, true, "GPU",
                     "Resolves write up to two textures over their destination directly (such as "
                     "a depth texture and an 8_8_8_8 one reading the same words), not one")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(fh1_coarse_shading, "", "GPU",
+                      "Draw renderings shaded once per block of pixels where the device has "
+                      "VK_KHR_fragment_shading_rate (vulkan_fragment_shading_rate), as "
+                      "comma-separated rendering=WxH entries, the rendering named as in the GPU "
+                      "profile (such as 0/16/1x/d1+720/16/1x/c0=2x2)");
 REXCVAR_DEFINE_BOOL(fh1_debug_skip_clears, false, "GPU",
                     "Diagnostics: skip every EDRAM clear (wrong image), to bound what clears "
                     "cost")
@@ -392,6 +397,7 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   if (!config_.memory || !config_.textures || !config_.render_targets) return false;
   scale_ = config_.textures->draw_resolution_scale_x();
   untile_height_ = config_.untile_height;
+  UpdateCoarseShading();
   single_sample_msaa_ = (scale_ >= 2 && REXCVAR_GET(fh1_scaled_msaa_single_sample)) ||
                         REXCVAR_GET(fh1_msaa_single_sample);
   stencil_export_ = REXCVAR_GET(fh1_native_stencil_export) &&
@@ -1959,7 +1965,49 @@ bool Fh1NativeExecutor::BindTargets(VulkanRenderTargetCache::RenderPassKey& key_
   }
   key_out.depth_and_color_used = bound_bits_;
   if (!used_bits) Count("draw_writes_nothing");
+  draw_shading_rate_ = {1, 1};
+  if (!coarse_shading_.empty()) {
+    const uint64_t id = DrawRenderingId(bound_bits_);
+    auto it = shading_rate_by_rendering_.find(id);
+    if (it == shading_rate_by_rendering_.end()) {
+      std::string label;
+      for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+        if (bound_bits_ & (1u << i)) label += (label.empty() ? "" : "+") + keys[i].Describe();
+      }
+      VkExtent2D rate = {1, 1};
+      for (const auto& [rendering, entry_rate] : coarse_shading_) {
+        if (rendering == label) rate = entry_rate;
+      }
+      it = shading_rate_by_rendering_.emplace(id, rate).first;
+    }
+    draw_shading_rate_ = it->second;
+  }
   return true;
+}
+
+void Fh1NativeExecutor::UpdateCoarseShading() {
+  const std::string spec = command_processor_.GetVulkanDevice()->properties().pipelineFragmentShadingRate
+                               ? REXCVAR_GET(fh1_coarse_shading)
+                               : std::string();
+  if (spec == coarse_shading_spec_) return;
+  coarse_shading_spec_ = spec;
+  coarse_shading_.clear();
+  shading_rate_by_rendering_.clear();
+  size_t start = 0;
+  while (start < spec.size()) {
+    size_t end = spec.find(',', start);
+    if (end == std::string::npos) end = spec.size();
+    const std::string entry = spec.substr(start, end - start);
+    start = end + 1;
+    const size_t equals = entry.rfind('=');
+    const size_t times = entry.rfind('x');
+    if (equals == std::string::npos || times == std::string::npos || times < equals) continue;
+    const uint32_t width = uint32_t(std::atoi(entry.c_str() + equals + 1));
+    const uint32_t height = uint32_t(std::atoi(entry.c_str() + times + 1));
+    auto valid = [](uint32_t size) { return size == 1 || size == 2 || size == 4; };
+    if (!valid(width) || !valid(height)) continue;
+    coarse_shading_.emplace_back(entry.substr(0, equals), VkExtent2D{width, height});
+  }
 }
 
 uint64_t Fh1NativeExecutor::DrawRenderingId(uint32_t used_bits) const {
@@ -2854,6 +2902,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
 
 void Fh1NativeExecutor::OnSwap(uint64_t frame) {
   if (!initialized_) return;
+  UpdateCoarseShading();
   GpuDrain();
   frame_ = frame;
   if (frame % 600 == 0) LogStats(frame);

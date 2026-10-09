@@ -4697,6 +4697,8 @@ void VulkanCommandProcessor::BindExternalGraphicsPipeline(VkPipeline pipeline,
     dynamic_stencil_reference_front_update_needed_ = true;
     dynamic_stencil_reference_back_update_needed_ = true;
   }
+  // External pipelines have a static shading rate.
+  dynamic_fragment_shading_rate_update_needed_ = true;
   if (current_external_graphics_pipeline_ == pipeline) {
     return;
   }
@@ -5537,6 +5539,13 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     viewport_memo.hud_squeeze = hud_squeeze;
     viewport_memo.info = viewport_info;
   }
+
+  // fh1_coarse_shading leaves draws whose coverage the shader decides at full
+  // rate: shaded per block, Turnip turns alpha-tested foliage into dithered
+  // ghosts.
+  draw_coverage_from_shader_ =
+      pixel_shader && (pixel_shader->kills_pixels() ||
+                       draw_util::DoesCoverageDependOnAlpha(regs.Get<reg::RB_COLORCONTROL>()));
 
   // Update dynamic graphics pipeline state.
   UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control);
@@ -6841,6 +6850,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     dynamic_stencil_write_mask_back_update_needed_ = true;
     dynamic_stencil_reference_front_update_needed_ = true;
     dynamic_stencil_reference_back_update_needed_ = true;
+    dynamic_fragment_shading_rate_update_needed_ = true;
     current_render_pass_ = VK_NULL_HANDLE;
     current_framebuffer_ = nullptr;
     in_render_pass_ = false;
@@ -7911,6 +7921,21 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
       }
       dynamic_stencil_reference_front_update_needed_ = false;
       dynamic_stencil_reference_back_update_needed_ = false;
+    }
+  }
+
+  // Fragment shading rate (fh1_coarse_shading).
+  if (GetVulkanDevice()->properties().pipelineFragmentShadingRate) {
+    const VkExtent2D rate = fh1_native_executor_ && !draw_coverage_from_shader_
+                                ? fh1_native_executor_->draw_shading_rate()
+                                : VkExtent2D{1, 1};
+    dynamic_fragment_shading_rate_update_needed_ |=
+        dynamic_fragment_shading_rate_.width != rate.width ||
+        dynamic_fragment_shading_rate_.height != rate.height;
+    if (dynamic_fragment_shading_rate_update_needed_) {
+      dynamic_fragment_shading_rate_ = rate;
+      deferred_command_buffer_.CmdVkSetFragmentShadingRateKHR(rate);
+      dynamic_fragment_shading_rate_update_needed_ = false;
     }
   }
 

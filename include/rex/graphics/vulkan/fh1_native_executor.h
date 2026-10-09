@@ -92,6 +92,9 @@ class Fh1NativeExecutor {
   // The render pass key the draw's pipeline is created for (formats and
   // samples of the surfaces PrepareTargets derived). False skips the draw.
   bool BindTargets(VulkanRenderTargetCache::RenderPassKey& key_out);
+  // After BindTargets: the draw's fragment shading rate, coarser than 1x1 in
+  // the renderings fh1_coarse_shading names.
+  VkExtent2D draw_shading_rate() const { return draw_shading_rate_; }
   // Enters dynamic rendering with the bound surfaces (after all barriers).
   void BeginDrawRendering();
   // After BindTargets: the draw has no depth, stencil or color target to use.
@@ -389,6 +392,12 @@ class Fh1NativeExecutor {
   uint32_t pending_used_bits_ = 0;
   SurfaceKey pending_keys_[1 + xenos::kMaxColorRenderTargets];
   uint32_t bound_bits_ = 0;
+  // fh1_coarse_shading, parsed at swaps, and the rate of each draw rendering.
+  void UpdateCoarseShading();
+  std::string coarse_shading_spec_;
+  std::vector<std::pair<std::string, VkExtent2D>> coarse_shading_;
+  std::unordered_map<uint64_t, VkExtent2D> shading_rate_by_rendering_;
+  VkExtent2D draw_shading_rate_ = {1, 1};
   // Identifies the attachments of the current dynamic rendering scope for the
   // command processor (0: none).
   uint64_t rendering_id_ = 0;

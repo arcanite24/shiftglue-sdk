@@ -186,6 +186,11 @@ class VulkanDevice {
 
     bool pipelineExecutableInfo = false;
 
+    // VK_KHR_fragment_shading_rate (#227), only the pipeline (and dynamic)
+    // rate, with vulkan_fragment_shading_rate.
+
+    bool pipelineFragmentShadingRate = false;
+
     // Descriptor indexing (promoted to 1.2), for bindless textures
     // (RECORDER_PER_DRAW_BACKLOG PD-4). Enabled only on Vulkan 1.2+ devices.
 
@@ -238,6 +243,8 @@ class VulkanDevice {
     bool ext_KHR_present_wait = false;  // #249
     // Only with vulkan_pipeline_statistics.
     bool ext_KHR_pipeline_executable_properties = false;  // #270
+    // Has optional features not implied by this being true.
+    bool ext_KHR_fragment_shading_rate = false;  // #227
   };
 
   const Extensions& extensions() const { return extensions_; }
@@ -265,6 +272,8 @@ class VulkanDevice {
 #include <rex/ui/vulkan/functions/device_khr_push_descriptor.inc>
     // VK_KHR_present_wait (#249)
 #include <rex/ui/vulkan/functions/device_khr_present_wait.inc>
+    // VK_KHR_fragment_shading_rate (#227)
+#include <rex/ui/vulkan/functions/device_khr_fragment_shading_rate.inc>
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 #undef XE_UI_VULKAN_FUNCTION
   };

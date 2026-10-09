@@ -369,6 +369,12 @@ class DeferredCommandBuffer {
     std::memcpy(args.blend_constants, blend_constants, sizeof(float) * 4);
   }
 
+  void CmdVkSetFragmentShadingRateKHR(VkExtent2D fragment_size) {
+    auto& args = *reinterpret_cast<ArgsVkSetFragmentShadingRateKHR*>(WriteCommand(
+        Command::kVkSetFragmentShadingRateKHR, sizeof(ArgsVkSetFragmentShadingRateKHR)));
+    args.fragment_size = fragment_size;
+  }
+
   void CmdVkSetDepthBias(float depth_bias_constant_factor, float depth_bias_clamp,
                          float depth_bias_slope_factor) {
     auto& args = *reinterpret_cast<ArgsVkSetDepthBias*>(
@@ -452,6 +458,7 @@ class DeferredCommandBuffer {
     kVkEndDebugLabel,
     kVkSetBlendConstants,
     kVkSetDepthBias,
+    kVkSetFragmentShadingRateKHR,
     kVkSetScissor,
     kVkSetStencilCompareMask,
     kVkSetStencilReference,
@@ -664,6 +671,10 @@ class DeferredCommandBuffer {
 
   struct ArgsVkSetBlendConstants {
     float blend_constants[4];
+  };
+
+  struct ArgsVkSetFragmentShadingRateKHR {
+    VkExtent2D fragment_size;
   };
 
   struct ArgsVkSetDepthBias {

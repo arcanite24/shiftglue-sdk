@@ -1243,6 +1243,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool dynamic_stencil_write_mask_back_update_needed_;
   bool dynamic_stencil_reference_front_update_needed_;
   bool dynamic_stencil_reference_back_update_needed_;
+  VkExtent2D dynamic_fragment_shading_rate_ = {1, 1};
+  bool dynamic_fragment_shading_rate_update_needed_ = true;
+  // The draw's pixel shader kills pixels or its coverage depends on alpha.
+  bool draw_coverage_from_shader_ = false;
 
   // Currently used samplers.
   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_vertex_;
