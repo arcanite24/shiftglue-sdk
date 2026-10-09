@@ -249,6 +249,13 @@ class BaseHeap {
   // AcquireHostPageReconcileLock.
   bool SyncHostPageAccess(uint32_t start_page_number, uint32_t end_page_number);
 
+  // The access a host page needs for the guest pages it holds, from the guest
+  // page table alone (no watch state). Where guest pages are smaller than host
+  // pages (4 KiB guest pages on Apple silicon's 16 KiB), this is the union over
+  // every committed guest page in it: going by the first one alone would make a
+  // committed neighbour of an uncommitted page fault on every read.
+  rex::memory::PageAccess HostPageGuestAccess(uint32_t host_page_number) const;
+
   // Acquires the global critical region for operations that will run the host
   // page reconcile pass, which reads watch state guarded by it.
   //
