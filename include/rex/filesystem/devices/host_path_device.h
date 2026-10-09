@@ -36,6 +36,12 @@ class HostPathDevice : public Device {
   // and read-only devices leave it off (see a5c3a963 ghost-file fix).
   bool allow_share_delete() const { return allow_share_delete_; }
   const std::filesystem::path& host_path() const { return host_path_; }
+  // Lists the files and directories of another host tree that this device
+  // does not have (compared ignoring case) as if they were its own, so that
+  // enumerating a directory shows them; opening them reads the other tree.
+  // Mod overlays use it to add files to the game's directories. Existing
+  // entries are kept. Returns how many entries were added.
+  size_t MergeTree(const std::filesystem::path& other_root);
 
   const std::string& name() const override { return name_; }
   uint32_t attributes() const override { return 0; }
@@ -48,6 +54,7 @@ class HostPathDevice : public Device {
 
  private:
   void PopulateEntry(HostPathEntry* parent_entry);
+  size_t MergeEntry(HostPathEntry* entry, const std::filesystem::path& other_directory);
 
   std::string name_;
   std::filesystem::path host_path_;

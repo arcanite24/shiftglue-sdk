@@ -113,6 +113,40 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
   return current_entry;
 }
 
+size_t HostPathDevice::MergeTree(const std::filesystem::path& other_root) {
+  auto global_lock = global_critical_region_.Acquire();
+  if (!root_entry_) {
+    return 0;
+  }
+  return MergeEntry(static_cast<HostPathEntry*>(root_entry_.get()), other_root);
+}
+
+size_t HostPathDevice::MergeEntry(HostPathEntry* entry,
+                                  const std::filesystem::path& other_directory) {
+  size_t added = 0;
+  for (auto& info : rex::filesystem::ListFiles(other_directory)) {
+    const auto other_path = other_directory / info.name;
+    auto* existing = static_cast<HostPathEntry*>(entry->GetChild(rex::path_to_utf8(info.name)));
+    const bool directory = info.type == rex::filesystem::FileInfo::Type::kDirectory;
+    if (existing) {
+      if (directory && (existing->attributes() & kFileAttributeDirectory)) {
+        added += MergeEntry(existing, other_path);
+      }
+      continue;
+    }
+    auto* child = HostPathEntry::Create(this, entry, other_path, info);
+    if (!child) {
+      continue;
+    }
+    entry->children_.push_back(std::unique_ptr<Entry>(child));
+    ++added;
+    if (directory) {
+      PopulateEntry(child);
+    }
+  }
+  return added;
+}
+
 void HostPathDevice::PopulateEntry(HostPathEntry* parent_entry) {
   auto child_infos = rex::filesystem::ListFiles(parent_entry->host_path());
   for (auto& child_info : child_infos) {
