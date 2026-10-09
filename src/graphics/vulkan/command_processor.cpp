@@ -144,6 +144,7 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
 
 // Defined by the backend-independent command processor.
 REXCVAR_DECLARE(bool, gpu_template_stats);
+REXCVAR_DECLARE(bool, spirv_specialize_texture_signs);
 #if REX_HAS_D3D12
 REXCVAR_DECLARE(double, fh1_hud_squeeze);
 #else
@@ -5372,6 +5373,19 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       fh1_native_executor_ ? fh1_render_pass_key
                            : render_target_cache_->last_update_render_pass_key();
   last_pipeline_render_pass_key_ = pipeline_render_pass_key.key;
+  // With spirv_specialize_texture_signs the pipeline also depends on the
+  // signs of the bound textures, which live in the fetch constants that the
+  // memo state leaves out: two draws in the same state may bind textures of
+  // different signedness (FH1's terrain layers), and reusing the other one's
+  // variant samples a gamma texture as linear or the reverse.
+  uint32_t memo_texture_signs[8] = {};
+  if (REXCVAR_GET(spirv_specialize_texture_signs)) {
+    for (uint32_t mask = used_texture_mask; mask; mask &= mask - 1) {
+      const uint32_t index = uint32_t(std::countr_zero(mask));
+      memo_texture_signs[index >> 2] |=
+          uint32_t(texture_cache_->GetActiveTextureSwizzledSigns(index)) << ((index & 3) * 8);
+    }
+  }
   PipelineMemo& memo = pipeline_memos_[StateMemoSlot(
       memo_state, uint64_t(uintptr_t(vertex_shader_translation)),
       uint64_t(uintptr_t(pixel_shader_translation)) ^
@@ -5385,7 +5399,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
           primitive_processing_result.host_primitive_reset_enabled &&
       memo.normalized_depth_control == normalized_depth_control.value &&
       memo.normalized_color_mask == normalized_color_mask &&
-      memo.render_pass_key == pipeline_render_pass_key.key) {
+      memo.render_pass_key == pipeline_render_pass_key.key &&
+      !std::memcmp(memo.texture_signs, memo_texture_signs, sizeof(memo_texture_signs))) {
     // The description would be the same: the register state it reads has not
     // changed, nor have the shaders, primitive or render pass.
     pipeline = memo.pipeline;
@@ -5409,6 +5424,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     memo.normalized_depth_control = normalized_depth_control.value;
     memo.normalized_color_mask = normalized_color_mask;
     memo.render_pass_key = pipeline_render_pass_key.key;
+    std::memcpy(memo.texture_signs, memo_texture_signs, sizeof(memo_texture_signs));
     memo.pipeline = pipeline;
     memo.layout = pipeline_layout_provider;
     memo.handle = pipeline_handle;
