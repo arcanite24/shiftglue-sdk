@@ -151,6 +151,19 @@ std::filesystem::path ContentManager::ResolvePackageHeaderPath(const std::string
          final_name;
 }
 
+bool ContentManager::IsHiddenPackage(const XCONTENT_AGGREGATE_DATA& data) const {
+  if (data.content_type != XContentType::kMarketplaceContent) {
+    return false;
+  }
+  const std::string name = data.file_name();
+  for (const auto& hidden : hidden_marketplace_packages_) {
+    if (rex::string::compare_case(hidden.c_str(), name.c_str()) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device_id, uint64_t xuid,
                                                                  XContentType content_type,
                                                                  uint32_t title_id) {
@@ -173,7 +186,9 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
     XCONTENT_AGGREGATE_DATA content_data;
     if (XSUCCEEDED(ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id,
                                          content_type, content_data))) {
-      result.emplace_back(std::move(content_data));
+      if (!IsHiddenPackage(content_data)) {
+        result.emplace_back(std::move(content_data));
+      }
     } else {
       content_data.device_id = device_id;
       content_data.content_type = content_type;
@@ -181,7 +196,9 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
       content_data.set_file_name(rex::path_to_utf8(file_info.name));
       content_data.title_id = title_id;
       content_data.xuid = xuid;
-      result.emplace_back(std::move(content_data));
+      if (!IsHiddenPackage(content_data)) {
+        result.emplace_back(std::move(content_data));
+      }
     }
   }
 
@@ -191,7 +208,7 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
 std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
     const std::string_view root_name, uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
   auto package_path = ResolvePackagePath(xuid, data);
-  if (!std::filesystem::exists(package_path)) {
+  if (IsHiddenPackage(data) || !std::filesystem::exists(package_path)) {
     return nullptr;
   }
   auto package = std::make_unique<ContentPackage>(kernel_state_, root_name, data, package_path);
@@ -199,6 +216,9 @@ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
 }
 
 bool ContentManager::ContentExists(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
+  if (IsHiddenPackage(data)) {
+    return false;
+  }
   auto path = ResolvePackagePath(xuid, data);
   return std::filesystem::exists(path);
 }
