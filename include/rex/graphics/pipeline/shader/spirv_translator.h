@@ -429,6 +429,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // 2D fetches in pixel shaders with the LOD computed from the pixel's
     // derivatives sample with implicit LOD (spirv_implicit_lod_2d).
     bool implicit_lod_2d;
+    // The same, only for fetches every pixel of the quad runs
+    // (spirv_implicit_lod_2d_uniform_turnip).
+    bool implicit_lod_2d_uniform;
   };
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,
@@ -1115,6 +1118,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // If the instruction-level predicate conditional is open, block after it (not
   // added to the function yet).
   spv::Block* cf_instruction_predicate_merge_;
+  // Loops entered and not yet left in the translation order (a predicated
+  // break may leave some pixels of a quad behind).
+  uint32_t cf_loop_depth_ = 0;
   // When cf_exec_conditional_merge_ is not null:
   // If the current exec conditional is based on a bool constant: the number of
   // the bool constant.

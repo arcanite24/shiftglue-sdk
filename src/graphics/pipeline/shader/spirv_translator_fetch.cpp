@@ -1475,11 +1475,19 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         // spirv_implicit_lod_2d does the same for 2D fetches in pixel
         // shaders: explicit gradients are slower than implicit LOD on tiled
         // mobile GPUs (Adreno, Mali), and differ only at level transitions.
+        // Every pixel of the quad runs this fetch: no per-pixel predicate
+        // around it, no loop and no jumps in the program.
+        const bool quad_uniform =
+            !cf_instruction_predicate_merge_ &&
+            !(cf_exec_conditional_merge_ &&
+              cf_exec_bool_constant_or_predicate_ == kCfExecBoolConstantPredicate) &&
+            !cf_loop_depth_ && current_shader().label_addresses().empty();
         bool cube_implicit_lod =
             use_computed_lod && !instr.attributes.use_register_gradients &&
             (instr.dimension == xenos::FetchOpDimension::kCube ||
              (instr.dimension == xenos::FetchOpDimension::k2D && is_pixel_shader() &&
-              features_.implicit_lod_2d));
+              (features_.implicit_lod_2d ||
+               (features_.implicit_lod_2d_uniform && quad_uniform))));
 
         // Calculate the gradients for sampling the texture if needed.
         // 2D vectors for k1D (because 1D images are emulated as 2D arrays),

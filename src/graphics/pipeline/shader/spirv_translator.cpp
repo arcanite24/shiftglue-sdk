@@ -68,6 +68,16 @@ REXCVAR_DEFINE_BOOL(spirv_implicit_lod_2d_turnip, false, "GPU",
                     "speckles that change every frame")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// The Turnip speckles came from fetches some pixels of a quad skip: in a
+// per-pixel predicated exec or instruction, a loop or a program with jumps,
+// implicit derivatives are undefined. The rest are safe, and FH1's full-screen
+// passes are among them.
+REXCVAR_DEFINE_BOOL(spirv_implicit_lod_2d_uniform_turnip, true, "GPU",
+                    "Vulkan: on Mesa Turnip, sample 2D textures in pixel shaders with implicit "
+                    "LOD where every pixel of the quad runs the fetch (no per-pixel predicate, "
+                    "loop or jump around it), as spirv_implicit_lod_2d does everywhere")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(spirv_implicit_lod_2d, false, "GPU",
                     "Vulkan: sample 2D textures whose level the pixel shader computes with "
                     "implicit level of detail plus the bias, as cube maps already are, "
@@ -113,7 +123,8 @@ SpirvShaderTranslator::Features::Features(bool all)
       sample_rate_shading(all),
       quad_operations_fragment(all),
       bindless_textures(false),
-      implicit_lod_2d(false) {}
+      implicit_lod_2d(false),
+      implicit_lod_2d_uniform(false) {}
 
 SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const vulkan_device)
     : max_storage_buffer_range(vulkan_device->properties().maxStorageBufferRange),
@@ -134,7 +145,10 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
       quad_operations_fragment(vulkan_device->properties().subgroupQuadFragment),
       implicit_lod_2d(REXCVAR_GET(spirv_implicit_lod_2d) ||
                       (REXCVAR_GET(spirv_implicit_lod_2d_turnip) &&
-                       vulkan_device->properties().driverID == VK_DRIVER_ID_MESA_TURNIP)) {
+                       vulkan_device->properties().driverID == VK_DRIVER_ID_MESA_TURNIP)),
+      implicit_lod_2d_uniform(REXCVAR_GET(spirv_implicit_lod_2d_uniform_turnip) &&
+                              vulkan_device->properties().driverID ==
+                                  VK_DRIVER_ID_MESA_TURNIP) {
   const uint32_t vulkan_api_version = vulkan_device->properties().apiVersion;
   if (vulkan_api_version >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
     spirv_version = spv::Spv_1_5;
@@ -256,6 +270,7 @@ void SpirvShaderTranslator::Reset() {
 
   cf_exec_conditional_merge_ = nullptr;
   cf_instruction_predicate_merge_ = nullptr;
+  cf_loop_depth_ = 0;
 }
 
 uint32_t SpirvShaderTranslator::GetModificationRegisterCount() const {
@@ -1462,6 +1477,7 @@ void SpirvShaderTranslator::ProcessExecInstructionEnd(const ParsedExecInstructio
 }
 
 void SpirvShaderTranslator::ProcessLoopStartInstruction(const ParsedLoopStartInstruction& instr) {
+  ++cf_loop_depth_;
   // loop il<idx>, L<idx> - loop with loop data il<idx>, end @ L<idx>
 
   // Loop control is outside execs - actually close the last exec.
@@ -1552,6 +1568,7 @@ void SpirvShaderTranslator::ProcessLoopStartInstruction(const ParsedLoopStartIns
 }
 
 void SpirvShaderTranslator::ProcessLoopEndInstruction(const ParsedLoopEndInstruction& instr) {
+  if (cf_loop_depth_) --cf_loop_depth_;
   // endloop il<idx>, L<idx> - end loop w/ data il<idx>, head @ L<idx>
 
   // Loop control is outside execs - actually close the last exec.
