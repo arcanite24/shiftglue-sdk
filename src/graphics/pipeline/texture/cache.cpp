@@ -1494,6 +1494,12 @@ REXCVAR_DEFINE_BOOL(fh1_direct_resolve_outdated, true, "GPU",
                     "Resolves also write outdated textures directly when they cover all of "
                     "them, instead of the textures reloading")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(fh1_direct_resolve_outdated_partial, REX_PLATFORM_ANDROID, "GPU",
+                    "Resolves from texel 0, 0 also write outdated textures they cover only in "
+                    "part, which keep their older texels elsewhere instead of reloading what "
+                    "other writes left in that memory (FH1's shadow cascades, resolved into "
+                    "the corner of textures whose memory later passes reuse)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_resolve_bounded_image_writes, true, "GPU",
                     "Resolves also write textures smaller than their area directly (their "
                     "image stores skip texels outside the texture) instead of the textures "
@@ -1612,7 +1618,8 @@ void TextureCache::FindDirectResolveTargets(uint32_t dest_base, uint32_t extent_
     // current again.
     if (texture.outdated_mask() &&
         !(REXCVAR_GET(fh1_direct_resolve_outdated) && from_origin && row_offset == 0 &&
-          dest_width >= key.GetWidth() && dest_height >= key.GetHeight())) {
+          ((dest_width >= key.GetWidth() && dest_height >= key.GetHeight()) ||
+           REXCVAR_GET(fh1_direct_resolve_outdated_partial)))) {
       continue;
     }
     targets_out.push_back({&texture, row_offset});
