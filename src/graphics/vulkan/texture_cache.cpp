@@ -1708,8 +1708,18 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   Fh1NativeExecutor* const gpu_profile_executor = command_processor_.GetFh1NativeExecutor();
   const uint32_t load_gpu_timing =
       gpu_profile_executor ? gpu_profile_executor->BeginTextureLoadGpuTiming() : UINT32_MAX;
+  // Resolve-sourced reloads are also timed by texture.
+  uint64_t label_timing = UINT64_MAX;
+  if (gpu_profile_executor && loading_resolve_sourced()) {
+    const TextureKey key = texture.key();
+    label_timing = gpu_profile_executor->BeginLabelGpuTiming(
+        fmt::format("L {:08X} f{} {}x{}", key.base_page << 12, uint32_t(key.format),
+                    key.GetWidth(), key.GetHeight())
+            .c_str());
+  }
   const bool loaded = LoadTextureDataFromResidentMemoryUntimed(texture, load_base, load_mips);
   if (gpu_profile_executor) {
+    gpu_profile_executor->EndLabelGpuTiming(label_timing);
     gpu_profile_executor->EndTextureLoadGpuTiming(load_gpu_timing, loading_resolve_sourced());
   }
   return loaded;
