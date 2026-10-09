@@ -53,6 +53,10 @@
 #include <rex/ui/vulkan/util.h>
 
 REXCVAR_DECLARE(bool, spirv_specialize_texture_signs);
+REXCVAR_DEFINE_BOOL(vulkan_debug_discard_rasterization, false, "GPU/Vulkan",
+                    "Diagnostics: discard every guest draw's primitives after vertex shading "
+                    "(wrong image), to bound what rasterization and pixel shading cost")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_debug_flat_pixel_shaders, false, "GPU/Vulkan",
                     "Diagnostics: replace every guest pixel shader with one writing a constant "
                     "color (wrong image), to bound what pixel shading costs")
@@ -3753,7 +3757,9 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
 
   VkPipelineRasterizationStateCreateInfo rasterization_state = {};
   rasterization_state.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-  rasterization_state.rasterizerDiscardEnable = description.rasterizer_discard ? VK_TRUE : VK_FALSE;
+  rasterization_state.rasterizerDiscardEnable =
+      description.rasterizer_discard || REXCVAR_GET(vulkan_debug_discard_rasterization) ? VK_TRUE
+                                                                                         : VK_FALSE;
   rasterization_state.depthClampEnable = description.depth_clamp_enable ? VK_TRUE : VK_FALSE;
   switch (description.polygon_mode) {
     case PipelinePolygonMode::kFill:

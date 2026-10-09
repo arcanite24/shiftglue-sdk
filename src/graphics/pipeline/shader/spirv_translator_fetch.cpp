@@ -25,6 +25,11 @@
 
 
 
+REXCVAR_DEFINE_BOOL(spirv_debug_skip_vertex_fetch, false, "GPU",
+                    "Diagnostics: vertex fetches return constants (wrong image), to bound "
+                    "what fetching vertices costs")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::graphics {
 
 void SpirvShaderTranslator::ProcessVertexFetchInstruction(
@@ -45,6 +50,10 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
   }
 
   EnsureBuildPointAvailable();
+  if (REXCVAR_GET(spirv_debug_skip_vertex_fetch)) {
+    StoreResult(instr.result, spv::NoResult);
+    return;
+  }
 
   uint32_t fetch_constant_word_0_index = instr.operands[1].storage_index << 1;
 
