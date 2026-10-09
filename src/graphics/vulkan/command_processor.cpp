@@ -3230,8 +3230,13 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
     fh1_native_executor_->OnSwap(frame_current_);
   }
 
-  if (!graphics_system_)
+  if (!graphics_system_) {
+    // Frame replays: still a frame, for the GPU profile and the frames in
+    // flight.
+    if (fh1_native_executor_) fh1_native_executor_->GpuFrameSwapped();
+    EndSubmission(true);
     return;
+  }
   ui::Presenter* presenter = graphics_system_->presenter();
   if (!presenter) {
     REXGPU_ERROR("XELOG_GPU PRESENT: NO PRESENTER");
