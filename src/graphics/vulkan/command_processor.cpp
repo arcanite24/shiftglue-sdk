@@ -106,6 +106,10 @@ REXCVAR_DEFINE_STRING(fh1_debug_dump_range, "", "GPU",
                       "every frame, write those guest bytes as the GPU has them to "
                       "fh1_resolve_dump_dir (frame replays)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_coarse_shading_alpha_test, false, "GPU",
+                    "fh1_coarse_shading also shades alpha-tested and killing draws (foliage) "
+                    "per block; alpha to coverage stays per pixel")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_skip_draws_without_effect, true, "GPU",
                     "Skip FH1 draws that write no surface, outside occlusion queries and "
                     "without memory export (FH1 native executor, Vulkan)")
@@ -5543,9 +5547,15 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   // fh1_coarse_shading leaves draws whose coverage the shader decides at full
   // rate: shaded per block, Turnip turns alpha-tested foliage into dithered
   // ghosts.
+  // With fh1_coarse_shading_alpha_test, only alpha to coverage stays at full
+  // rate: alpha-tested and killing draws are shaded per block too, their
+  // edges in steps of the block.
   draw_coverage_from_shader_ =
-      pixel_shader && (pixel_shader->kills_pixels() ||
-                       draw_util::DoesCoverageDependOnAlpha(regs.Get<reg::RB_COLORCONTROL>()));
+      pixel_shader &&
+      (REXCVAR_GET(fh1_coarse_shading_alpha_test)
+           ? bool(regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable)
+           : (pixel_shader->kills_pixels() ||
+              draw_util::DoesCoverageDependOnAlpha(regs.Get<reg::RB_COLORCONTROL>())));
 
   // Update dynamic graphics pipeline state.
   UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control);
