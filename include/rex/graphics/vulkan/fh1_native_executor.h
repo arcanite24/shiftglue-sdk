@@ -303,6 +303,10 @@ class Fh1NativeExecutor {
   VkDescriptorSet AllocateDescriptorSet(VkDescriptorSetLayout layout);
   VkPipeline GetTransferPipeline(const TransferPipelineKey& key);
   VkPipeline GetComputePipeline(bool words, uint32_t source_kind, bool msaa);
+  // A resolve pipeline specialized for the constants' format, MSAA, sample,
+  // pack and endian bits, or null to use the generic one.
+  VkPipeline GetSpecializedResolvePipeline(bool image, uint32_t source_kind, bool msaa,
+                                           const uint32_t* constants);
   VkShaderModule GetShaderModule(const uint32_t* code, size_t size_bytes);
 
   void Skip(const char* reason) { counters_.Skip(reason); }
@@ -360,6 +364,8 @@ class Fh1NativeExecutor {
   std::map<TransferPipelineKey, VkPipeline> transfer_pipelines_;
   // [words][source kind][msaa]
   VkPipeline compute_pipelines_[2][3][2] = {};
+  // Specialized resolves by {image, source kind, msaa, specialization constants}.
+  std::map<std::array<uint32_t, 9>, VkPipeline> specialized_resolve_pipelines_;
 
   VkBuffer transfer_words_ = VK_NULL_HANDLE;
   VkDeviceMemory transfer_words_memory_ = VK_NULL_HANDLE;

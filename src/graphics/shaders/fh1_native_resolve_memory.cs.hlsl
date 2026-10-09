@@ -24,8 +24,9 @@ FH1_PUSH_CONSTANTS cbuffer Fh1NativeResolveMemoryConstants FH1_CONSTANTS_REGISTE
   // Layouts: base_tiles 0:10, pitch_tiles (32bpp) 11:18, msaa 19:20,
   // is_64bpp 21, is_depth 22, guest format 23:26 (color or depth format).
   uint fh1_resolve_layout;
-  uint fh1_owner_layout;    // + host sample mode 27:28 (0: as guest, 1: native 2x,
-                            // 2: 2x stored as 4x)
+  uint fh1_owner_layout;    // + host sample mode 27:29 (0: as guest, 1: native 2x,
+                            // 2: 2x stored as 4x, 3: single-sampled, 4: 4x as 2x),
+                            // same place 30 (fh1_native_edram.hlsli)
   uint fh1_sample_select;   // sanitized xenos::CopySampleSelect
   // pack 0:2 (0: 8_8_8_8, 1: 2_10_10_10, 2: 32_FLOAT, 3: 16_16_16_16_FLOAT,
   // 4: raw 32-bit word), endian 3:5, swap red/blue 6, float24 rounding 7,
@@ -48,6 +49,40 @@ FH1_PUSH_CONSTANTS cbuffer Fh1NativeResolveMemoryConstants FH1_CONSTANTS_REGISTE
   uint fh1_image2_endian;
 #endif
 };
+
+
+// Vulkan pipelines may be specialized for one kind of resolve: with fh1_spec
+// 1 the format, MSAA, sample, pack and endian bits come from the constants
+// below instead of the push constants (which still carry the rectangle, tile
+// bases, pitches and addresses), and the compiler drops every other kind's
+// code - which it otherwise runs flattened into selects, most of the cost.
+#ifdef FH1_SPIRV
+[[vk::constant_id(0)]] const uint fh1_spec = 0u;
+[[vk::constant_id(1)]] const uint fh1_spec_resolve_layout = 0u;  // Bits 19:31.
+[[vk::constant_id(2)]] const uint fh1_spec_owner_layout = 0u;    // Bits 19:31.
+[[vk::constant_id(3)]] const uint fh1_spec_sample_select = 0u;   // Bits 0:15.
+[[vk::constant_id(4)]] const uint fh1_spec_dest_info = 0u;     // All but 8:15, 31.
+[[vk::constant_id(5)]] const uint fh1_spec_image_endian = 0u;
+[[vk::constant_id(6)]] const uint fh1_spec_image2_endian = 0u;
+#else
+static const uint fh1_spec = 0u;
+static const uint fh1_spec_resolve_layout = 0u;
+static const uint fh1_spec_owner_layout = 0u;
+static const uint fh1_spec_sample_select = 0u;
+static const uint fh1_spec_dest_info = 0u;
+static const uint fh1_spec_image_endian = 0u;
+static const uint fh1_spec_image2_endian = 0u;
+#endif
+#define FH1_SPEC_LAYOUT(push, spec)   (fh1_spec != 0u ? ((push) & 0x7FFFFu) | (spec) : (push))
+#define FH1_RESOLVE_LAYOUT FH1_SPEC_LAYOUT(fh1_resolve_layout, fh1_spec_resolve_layout)
+#define FH1_OWNER_LAYOUT FH1_SPEC_LAYOUT(fh1_owner_layout, fh1_spec_owner_layout)
+#define FH1_SAMPLE_SELECT   (fh1_spec != 0u ? (fh1_sample_select & 0xFFFF0000u) | fh1_spec_sample_select                   : fh1_sample_select)
+// The exponent bias (8:15) always comes from the push constants.
+#define FH1_DEST_INFO   (fh1_spec != 0u ? (fh1_dest_info & 0xFF00u) | fh1_spec_dest_info : fh1_dest_info)
+// Specialized, bit 31 of the destination info says the exponent bias is 0.
+#define FH1_EXP_BIAS_IS_ZERO   (fh1_spec != 0u ? (fh1_spec_dest_info >> 31u) != 0u : (fh1_dest_info & 0xFF00u) == 0u)
+#define FH1_IMAGE_ENDIAN (fh1_spec != 0u ? fh1_spec_image_endian : fh1_image_endian)
+#define FH1_IMAGE2_ENDIAN (fh1_spec != 0u ? fh1_spec_image2_endian : fh1_image2_endian)
 
 #include "fh1_native_edram.hlsli"
 
@@ -126,27 +161,27 @@ void StoreWord(uint address, uint2 host_pixel, uint word) {
   fh1_image.GetDimensions(image_size.x, image_size.y);
   uint2 image_pixel = host_pixel + uint2(0u, fh1_image_row);
   if (all(image_pixel < image_size)) {
-    fh1_image[image_pixel] = ImageTexel(word, fh1_image_endian);
+    fh1_image[image_pixel] = ImageTexel(word, FH1_IMAGE_ENDIAN);
   }
-  if ((fh1_image2_endian >> 5u) & 1u) {
+  if ((FH1_IMAGE2_ENDIAN >> 5u) & 1u) {
     fh1_image2.GetDimensions(image_size.x, image_size.y);
     if (all(image_pixel < image_size)) {
-      fh1_image2[image_pixel] = ImageTexel(word, fh1_image2_endian);
+      fh1_image2[image_pixel] = ImageTexel(word, FH1_IMAGE2_ENDIAN);
     }
   }
 #endif
 }
 
 uint LoadOwnerWord(uint2 pixel, uint sample, uint half) {
-  uint flags = (((fh1_dest_info >> 7u) & 1u) ? FH1_FLAG_FLOAT24_ROUND : 0u) |
-               (((fh1_dest_info >> 18u) & 1u) ? FH1_FLAG_GAMMA_UNORM16 : 0u);
-  return LoadSourceWord(fh1_resolve_layout, pixel, sample, half, fh1_owner_layout, flags);
+  uint flags = (((FH1_DEST_INFO >> 7u) & 1u) ? FH1_FLAG_FLOAT24_ROUND : 0u) |
+               (((FH1_DEST_INFO >> 18u) & 1u) ? FH1_FLAG_GAMMA_UNORM16 : 0u);
+  return LoadSourceWord(FH1_RESOLVE_LAYOUT, pixel, sample, half, FH1_OWNER_LAYOUT, flags);
 }
 
 float4 LoadOwnerColor(uint2 pixel, uint sample, uint format) {
   uint low = LoadOwnerWord(pixel, sample, 0u);
   float4 color;
-  [branch] if (LayoutIs64bpp(fh1_resolve_layout) != 0u) {
+  [branch] if (LayoutIs64bpp(FH1_RESOLVE_LAYOUT) != 0u) {
     color = DecodeColor64(uint2(low, LoadOwnerWord(pixel, sample, 1u)), format);
   } else {
     color = DecodeColor(low, format);
@@ -162,18 +197,18 @@ void main(uint3 thread : SV_DispatchThreadID) {
   }
   uint2 pixel = uint2(fh1_rect_origin & 0xFFFFu, fh1_rect_origin >> 16u) + thread.xy;
   uint2 host_pixel = pixel;
-  fh1_fixed16_scale = ((fh1_dest_info >> 19u) & 1u) != 0u ? 32.0f : 1.0f;
-  uint scale = ((fh1_dest_info >> 20u) & 3u) + 1u;
-  bool unscaled_dest = ((fh1_dest_info >> 22u) & 1u) != 0u;
+  fh1_fixed16_scale = ((FH1_DEST_INFO >> 19u) & 1u) != 0u ? 32.0f : 1.0f;
+  uint scale = ((FH1_DEST_INFO >> 20u) & 3u) + 1u;
+  bool unscaled_dest = ((FH1_DEST_INFO >> 22u) & 1u) != 0u;
   if (unscaled_dest) {
     fh1_scale = scale;
   } else {
     SetScaledPixel(pixel, scale);
   }
 
-  uint pack = fh1_dest_info & 7u;
-  uint endian = (fh1_dest_info >> 3u) & 7u;
-  uint bpb_log2 = (fh1_dest_info >> 16u) & 3u;
+  uint pack = FH1_DEST_INFO & 7u;
+  uint endian = (FH1_DEST_INFO >> 3u) & 7u;
+  uint bpb_log2 = (FH1_DEST_INFO >> 16u) & 3u;
   uint address;
   [branch] if (scale > 1u && !unscaled_dest) {
     address = fh1_dest_base * scale * scale +
@@ -185,8 +220,8 @@ void main(uint3 thread : SV_DispatchThreadID) {
 
   uint first_sample, sample_count;
   // The upper half: untiled predicated tiling's source row offset.
-  fh1_source_row_offset = fh1_sample_select >> 16u;
-  uint sample_select = fh1_sample_select & 0xFFFFu;
+  fh1_source_row_offset = FH1_SAMPLE_SELECT >> 16u;
+  uint sample_select = FH1_SAMPLE_SELECT & 0xFFFFu;
   switch (sample_select) {
     case 4u: first_sample = 0u; sample_count = 2u; break;  // 01
     case 5u: first_sample = 2u; sample_count = 2u; break;  // 23
@@ -200,15 +235,27 @@ void main(uint3 thread : SV_DispatchThreadID) {
     return;
   }
 
+  uint format = LayoutFormat(FH1_RESOLVE_LAYOUT);
+  // One sample packed in its own unorm format, unbiased and unswapped: the
+  // decoded value encodes back to the same EDRAM word (k / 255 * 255 + 0.5
+  // truncates to k), so store the word.
+  if (sample_count == 1u && FH1_EXP_BIAS_IS_ZERO && ((FH1_DEST_INFO >> 6u) & 1u) == 0u &&
+      LayoutIs64bpp(FH1_RESOLVE_LAYOUT) == 0u &&
+      ((pack == 0u && (format == FORMAT_8_8_8_8 || format == FORMAT_8_8_8_8_GAMMA)) ||
+       (pack == 1u && (format == FORMAT_2_10_10_10 ||
+                       format == FORMAT_2_10_10_10_AS_10_10_10_10)))) {
+    StoreWord(address, host_pixel, EndianSwap32(LoadOwnerWord(pixel, first_sample, 0u), endian));
+    return;
+  }
+
   float4 color = 0.0f;
-  uint format = LayoutFormat(fh1_resolve_layout);
   for (uint i = 0u; i < sample_count; ++i) {
     color += LoadOwnerColor(pixel, first_sample + i, format);
   }
   color *= 1.0f / float(sample_count);
-  int exp_bias = int(fh1_dest_info << 16u) >> 24;
+  int exp_bias = int(FH1_DEST_INFO << 16u) >> 24;
   color *= asfloat(uint(127 + exp_bias) << 23u);
-  if ((fh1_dest_info >> 6u) & 1u) {
+  if ((FH1_DEST_INFO >> 6u) & 1u) {
     color = color.bgra;
   }
 

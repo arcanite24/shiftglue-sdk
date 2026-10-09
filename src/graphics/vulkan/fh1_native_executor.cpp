@@ -36,6 +36,9 @@ REXCVAR_DEFINE_BOOL(fh1_msaa_2x, false, "GPU",
                     "sample pairs each in one): smoother edges than fh1_msaa_single_sample "
                     "for about half the cost of 4x (Vulkan FH1 native executor)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_specialize_resolves, true, "GPU",
+                    "Vulkan FH1 resolves use pipelines specialized for each format, MSAA and "
+                    "sample selection; GPUs otherwise run every format's code per pixel");
 REXCVAR_DEFINE_BOOL(fh1_msaa_single_sample, true, "GPU",
                     "Keep the guest's 2x and 4x MSAA surfaces as single-sampled images at any "
                     "resolution scale (Vulkan): at 1x the game renders without MSAA - harder "
@@ -544,6 +547,10 @@ void Fh1NativeExecutor::Shutdown() {
       pipeline = VK_NULL_HANDLE;
     }
   }
+  for (auto& [key, pipeline] : specialized_resolve_pipelines_) {
+    if (pipeline) dfn.vkDestroyPipeline(device, pipeline, nullptr);
+  }
+  specialized_resolve_pipelines_.clear();
   for (VkPipelineLayout* layout : {&compute_pipeline_layout_, &transfer_pipeline_layout_,
                                    &words_pipeline_layout_, &image_pipeline_layout_}) {
     if (*layout) dfn.vkDestroyPipelineLayout(device, *layout, nullptr);
@@ -988,6 +995,47 @@ VkPipeline Fh1NativeExecutor::GetComputePipeline(bool words, uint32_t source_kin
   pipeline = ui::vulkan::util::CreateComputePipeline(command_processor_.GetVulkanDevice(),
                                                      compute_pipeline_layout_, shader.code,
                                                      shader.size);
+  return pipeline;
+}
+
+VkPipeline Fh1NativeExecutor::GetSpecializedResolvePipeline(bool image, uint32_t source_kind,
+                                                           bool msaa,
+                                                           const uint32_t* constants) {
+  if (!REXCVAR_GET(fh1_specialize_resolves)) return VK_NULL_HANDLE;
+  // fh1_spec, then the bits fh1_native_resolve_memory.cs.hlsl takes from them.
+  const std::array<uint32_t, 7> values = {
+      1u,
+      constants[2] & ~0x7FFFFu,
+      constants[3] & ~0x7FFFFu,
+      constants[4] & 0xFFFFu,
+      (constants[5] & ~0xFF00u) | ((constants[5] & 0xFF00u) ? 0u : 1u << 31),
+      image ? constants[9] : 0u,
+      image ? constants[10] : 0u};
+  const std::array<uint32_t, 9> key = {uint32_t(image), source_kind, uint32_t(msaa),
+                                        values[1], values[2], values[3], values[4],
+                                        values[5], values[6]};
+  auto it = specialized_resolve_pipelines_.find(key);
+  if (it != specialized_resolve_pipelines_.end()) return it->second;
+  // Every kind the title resolves takes a few dozen; past the cap, generic.
+  if (specialized_resolve_pipelines_.size() >= 256) return VK_NULL_HANDLE;
+  const SpirvShader& shader =
+      image ? kImageShaders[source_kind][msaa] : kComputeShaders[false][source_kind][msaa];
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  if (shader.code) {
+    VkSpecializationMapEntry entries[7];
+    for (uint32_t i = 0; i < values.size(); ++i) {
+      entries[i] = {i, uint32_t(sizeof(uint32_t)) * i, sizeof(uint32_t)};
+    }
+    const VkSpecializationInfo info = {uint32_t(values.size()), entries,
+                                       sizeof(uint32_t) * values.size(), values.data()};
+    const VkShaderModule module = GetShaderModule(shader.code, shader.size);
+    if (module) {
+      pipeline = ui::vulkan::util::CreateComputePipeline(
+          command_processor_.GetVulkanDevice(),
+          image ? image_pipeline_layout_ : compute_pipeline_layout_, module, &info);
+    }
+  }
+  specialized_resolve_pipelines_.emplace(key, pipeline);
   return pipeline;
 }
 
@@ -2247,6 +2295,45 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   constants[3] = PackLayout(owner.base_tiles, owner.pitch_tiles, owner.msaa, owner.Is64bpp(),
                             owner.is_depth, owner.format) |
                  (host_sample_mode << 27);
+  // Reading the owner in its own layout, with the rectangle inside its pitch
+  // and EDRAM, every sample is the owner's own: the shader then skips the
+  // EDRAM relocation (two divisions by the pitch per sample on the GPU). 2x
+  // readers selecting samples 2 or 3 step into the next row and keep it.
+  {
+    const uint32_t msaa_x_log2 = uint32_t(owner.msaa >= uint32_t(xenos::MsaaSamples::k4X));
+    const uint32_t msaa_y_log2 = uint32_t(owner.msaa >= uint32_t(xenos::MsaaSamples::k2X));
+    const uint32_t columns = owner.pitch_tiles << uint32_t(owner.Is64bpp());
+    const uint32_t right_columns =
+        (uint32_t(source.rect.right) << msaa_x_log2) << uint32_t(owner.Is64bpp());
+    const uint32_t bottom_rows = uint32_t(source.rect.bottom) << msaa_y_log2;
+    const uint32_t select = sample_select & 0xFFFFu;
+    const bool select_in_pixel =
+        owner.msaa != uint32_t(xenos::MsaaSamples::k2X) ||
+        select == uint32_t(xenos::CopySampleSelect::k0) ||
+        select == uint32_t(xenos::CopySampleSelect::k1) ||
+        select == uint32_t(xenos::CopySampleSelect::k01);
+    if (resolve_key.base_tiles == owner.base_tiles &&
+        resolve_key.pitch_tiles == owner.pitch_tiles && resolve_key.msaa == owner.msaa &&
+        resolve_key.Is64bpp() == owner.Is64bpp() && resolve_key.is_depth == owner.is_depth &&
+        source.rect.left >= 0 && source.rect.top >= 0 && columns &&
+        right_columns <= columns * 80 &&
+        ((bottom_rows + 15) / 16) * columns <= 2048 && select_in_pixel) {
+      constants[3] |= 1u << 30;
+    }
+  }
+  // A single-sampled MSAA owner keeps one value for all of a pixel's guest
+  // samples, and a reader with its MSAA and width finds each of its pixel's
+  // samples in the same owner pixel: averaging 2 or 4 of them loads the same
+  // texel again for the same result (v * n / n is exact), so read one.
+  if (host_sample_mode == 3 && resolve_key.msaa == owner.msaa &&
+      resolve_key.Is64bpp() == owner.Is64bpp()) {
+    const uint32_t select = sample_select & 0xFFFFu;
+    if (select >= uint32_t(xenos::CopySampleSelect::k01) &&
+        select <= uint32_t(xenos::CopySampleSelect::k0123)) {
+      sample_select = (sample_select & ~0xFFFFu) |
+                      (select == uint32_t(xenos::CopySampleSelect::k23) ? 2u : 0u);
+    }
+  }
   constants[4] = sample_select;
   constants[5] = dest_info | ((scale_ - 1) << 20) | (unscaled_dest ? 1u << 22 : 0u);
   constants[6] = dest_base;
@@ -2254,6 +2341,10 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   constants[8] = image_row * scale_;
   constants[9] = image_endian;
   constants[10] = image2_view != VK_NULL_HANDLE ? image2_endian | (1u << 5) : 0u;
+  if (const VkPipeline specialized = GetSpecializedResolvePipeline(
+          image_view != VK_NULL_HANDLE, kind, msaa, constants)) {
+    pipeline = specialized;
+  }
   auto& command_buffer = command_processor_.deferred_command_buffer();
   command_processor_.BindExternalComputePipeline(pipeline);
   command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1,

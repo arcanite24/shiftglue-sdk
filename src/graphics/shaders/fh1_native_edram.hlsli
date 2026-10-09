@@ -98,7 +98,8 @@ void SetScaledPixel(inout uint2 pixel, uint scale) {
 
 // Layouts: base_tiles 0:10, pitch_tiles (32bpp) 11:18, msaa 19:20,
 // is_64bpp 21, is_depth 22, guest format 23:26 (color or depth format),
-// host sample mode 27:28 (0: as guest, 1: native 2x, 2: 2x stored as 4x).
+// host sample mode 27:29 (0: as guest, 1: native 2x, 2: 2x stored as 4x,
+// 3: single-sampled, 4: 4x stored as 2x), same place 30.
 uint LayoutBase(uint layout) { return layout & 0x7FFu; }
 uint LayoutPitch(uint layout) { return (layout >> 11u) & 0xFFu; }
 uint LayoutMsaa(uint layout) { return (layout >> 19u) & 3u; }
@@ -106,6 +107,9 @@ uint LayoutIs64bpp(uint layout) { return (layout >> 21u) & 1u; }
 uint LayoutIsDepth(uint layout) { return (layout >> 22u) & 1u; }
 uint LayoutFormat(uint layout) { return (layout >> 23u) & 0xFu; }
 uint LayoutHostSampleMode(uint layout) { return (layout >> 27u) & 7u; }
+// Source layouts, resolves only: the reader's pixels and samples are the
+// source's own ones, in place (same EDRAM layout, the rectangle inside it).
+uint LayoutSamePlace(uint layout) { return (layout >> 30u) & 1u; }
 
 // xenos::Float32To20e4.
 uint Float32To20e4(float f32, bool round_to_nearest_even) {
@@ -321,6 +325,18 @@ uint GuestSample(uint host_sample, uint msaa, uint host_mode) {
 // (0) or high (1) word of the sample.
 uint LoadSourceWord(uint reader_layout, uint2 pixel, uint sample, uint half,
                     uint source_layout, uint flags) {
+  int2 source_pixel;
+  uint host_sample;
+  uint source_half;
+  [branch] if (LayoutSamePlace(source_layout) != 0u) {
+    // The reader's samples are the source's own: no EDRAM relocation.
+    source_pixel = int2(pixel.x, pixel.y + fh1_source_row_offset) * int(fh1_scale) +
+                   int2(fh1_subpixel);
+    uint source_msaa = LayoutMsaa(source_layout);
+    host_sample = HostSample(source_msaa >= 2u ? sample : (source_msaa == 1u ? sample & 1u : 0u),
+                             source_msaa, LayoutHostSampleMode(source_layout));
+    source_half = half;
+  } else {
   uint reader_msaa = LayoutMsaa(reader_layout);
   uint rx = reader_msaa >= 2u ? 1u : 0u;
   uint ry = reader_msaa >= 1u ? 1u : 0u;
@@ -348,7 +364,7 @@ uint LoadSourceWord(uint reader_layout, uint2 pixel, uint sample, uint half,
   }
   uint source_msaa = LayoutMsaa(source_layout);
   uint sx = source_column * 80u + tile_x;
-  uint source_half = 0u;
+  source_half = 0u;
   if (LayoutIs64bpp(source_layout) != 0u) {
     source_half = sx & 1u;
     sx >>= 1u;
@@ -356,11 +372,11 @@ uint LoadSourceWord(uint reader_layout, uint2 pixel, uint sample, uint half,
   uint sy = source_row * 16u + tile_y;
   uint smx = source_msaa >= 2u ? 1u : 0u;
   uint smy = source_msaa >= 1u ? 1u : 0u;
-  int2 source_pixel = int2(sx >> smx, (sy >> smy) + fh1_source_row_offset) * int(fh1_scale) +
-                     int2(fh1_subpixel);
+  source_pixel = int2(sx >> smx, (sy >> smy) + fh1_source_row_offset) * int(fh1_scale) +
+                 int2(fh1_subpixel);
   uint guest_sample = (sx & smx) | ((sy & smy) << smx);
-  uint host_sample =
-      HostSample(guest_sample, source_msaa, LayoutHostSampleMode(source_layout));
+  host_sample = HostSample(guest_sample, source_msaa, LayoutHostSampleMode(source_layout));
+  }
 
 #ifdef FH1_SOURCE_DEPTH
 #ifdef FH1_SOURCE_MSAA
