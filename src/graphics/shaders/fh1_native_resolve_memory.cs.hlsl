@@ -196,7 +196,14 @@ float4 LoadOwnerColor(uint2 pixel, uint sample, uint format) {
   return color;
 }
 
+// Vulkan: 16x16. On the Adreno 740 (Turnip) the 8x8 groups' resolves took
+// 0.8 ms more of the frame-600 replay (15.0 against 14.2 ms); 32x32 gains
+// nothing more, and four pixels a thread lose 0.2 ms.
+#ifdef FH1_SPIRV
+[numthreads(16, 16, 1)]
+#else
 [numthreads(8, 8, 1)]
+#endif
 void main(uint3 thread : SV_DispatchThreadID) {
   uint2 rect_size = uint2(fh1_rect_size & 0xFFFFu, fh1_rect_size >> 16u);
   if (any(thread.xy >= rect_size)) {

@@ -2435,9 +2435,10 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
       constants);
   command_processor_.BeginDebugLabel(image_view != VK_NULL_HANDLE ? "fh1 resolve and texture"
                                                                   : "fh1 resolve");
+  // 16x16 groups, as fh1_native_resolve_memory.cs.hlsl's Vulkan variants.
   if (!REXCVAR_GET(fh1_debug_skip_resolve_dispatches)) {
-    command_buffer.CmdVkDispatch((uint32_t(rect.right - rect.left) + 7) / 8,
-                                 (uint32_t(rect.bottom - rect.top) + 7) / 8, 1);
+    command_buffer.CmdVkDispatch((uint32_t(rect.right - rect.left) + 15) / 16,
+                                 (uint32_t(rect.bottom - rect.top) + 15) / 16, 1);
   }
   command_processor_.EndDebugLabel();
   return true;
