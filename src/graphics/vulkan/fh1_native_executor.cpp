@@ -92,6 +92,10 @@ REXCVAR_DEFINE_BOOL(fh1_debug_skip_clears, false, "GPU",
                     "Diagnostics: skip every EDRAM clear (wrong image), to bound what clears "
                     "cost")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_debug_skip_resolve_dispatches, false, "GPU",
+                    "Diagnostics: keep every resolve's barriers but not its compute dispatch "
+                    "(wrong image), to bound what the resolve shaders cost (Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 #if REX_HAS_D3D12
 REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
 REXCVAR_DECLARE(int32_t, fh1_resolve_dump_frame);
@@ -2431,8 +2435,10 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
       constants);
   command_processor_.BeginDebugLabel(image_view != VK_NULL_HANDLE ? "fh1 resolve and texture"
                                                                   : "fh1 resolve");
-  command_buffer.CmdVkDispatch((uint32_t(rect.right - rect.left) + 7) / 8,
-                               (uint32_t(rect.bottom - rect.top) + 7) / 8, 1);
+  if (!REXCVAR_GET(fh1_debug_skip_resolve_dispatches)) {
+    command_buffer.CmdVkDispatch((uint32_t(rect.right - rect.left) + 7) / 8,
+                                 (uint32_t(rect.bottom - rect.top) + 7) / 8, 1);
+  }
   command_processor_.EndDebugLabel();
   return true;
 }

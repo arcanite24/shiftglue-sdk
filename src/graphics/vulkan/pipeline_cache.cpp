@@ -57,6 +57,10 @@ REXCVAR_DEFINE_BOOL(vulkan_debug_discard_rasterization, false, "GPU/Vulkan",
                     "Diagnostics: discard every guest draw's primitives after vertex shading "
                     "(wrong image), to bound what rasterization and pixel shading cost")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(vulkan_debug_trivial_vertex_shaders, false, "GPU/Vulkan",
+                    "Diagnostics: replace every guest vertex shader with one writing a constant "
+                    "position (wrong image), to bound what vertex shaders cost per draw")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_debug_flat_pixel_shaders, false, "GPU/Vulkan",
                     "Diagnostics: replace every guest pixel shader with one writing a constant "
                     "color (wrong image), to bound what pixel shading costs")
@@ -3618,6 +3622,24 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
     assert_true(shader_stage_vertex.module != VK_NULL_HANDLE);
     shader_stage_vertex.pName = "main";
     shader_stage_vertex.pSpecializationInfo = guest_specialization;
+    static VkShaderModule trivial_vertex_shader = VK_NULL_HANDLE;
+    if (REXCVAR_GET(vulkan_debug_trivial_vertex_shaders)) {
+      if (trivial_vertex_shader == VK_NULL_HANDLE) {
+        std::vector<uint32_t> spirv;
+        std::string error;
+        if (command_processor_.CompileGlslToSpirv(
+                VK_SHADER_STAGE_VERTEX_BIT,
+                "#version 460\nvoid main() { gl_Position = vec4(0.0, 0.0, 0.0, 1.0); }\n", spirv,
+                error)) {
+          trivial_vertex_shader = ui::vulkan::util::CreateShaderModule(
+              command_processor_.GetVulkanDevice(), spirv.data(), spirv.size() * sizeof(uint32_t));
+        }
+      }
+      if (trivial_vertex_shader != VK_NULL_HANDLE) {
+        shader_stage_vertex.module = trivial_vertex_shader;
+        shader_stage_vertex.pSpecializationInfo = nullptr;
+      }
+    }
   }
   // Geometry shader.
   if (creation_arguments.geometry_shader != VK_NULL_HANDLE) {

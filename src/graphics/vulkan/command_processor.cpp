@@ -97,6 +97,10 @@ REXCVAR_DEFINE_BOOL(fh1_debug_tiny_draws, false, "GPU",
                     "Diagnostics: draw only the first triangle of every draw, keeping all "
                     "state changes (wrong image), to bound per-draw overhead (Vulkan)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_debug_skip_draw_calls, false, "GPU",
+                    "Diagnostics: record every draw's state but not its draw command (wrong "
+                    "image), to bound what the GPU spends per draw (Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_native_gpu_profile_draws, false, "GPU",
                     "Diagnostics: with fh1_native_gpu_profile, also time every draw by its "
                     "pixel shader (Vulkan)")
@@ -5825,7 +5829,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
       shader_32bit_index_dma) {
     ++pending_draw_calls_;
-    deferred_command_buffer_.CmdVkDraw(
+    if (!REXCVAR_GET(fh1_debug_skip_draw_calls)) deferred_command_buffer_.CmdVkDraw(
         REXCVAR_GET(fh1_debug_tiny_draws)
             ? std::min(primitive_processing_result.host_draw_vertex_count, uint32_t(3))
             : primitive_processing_result.host_draw_vertex_count,
@@ -5861,7 +5865,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
             ? VK_INDEX_TYPE_UINT16
             : VK_INDEX_TYPE_UINT32);
     ++pending_draw_calls_;
-    deferred_command_buffer_.CmdVkDrawIndexed(
+    if (!REXCVAR_GET(fh1_debug_skip_draw_calls)) deferred_command_buffer_.CmdVkDrawIndexed(
         REXCVAR_GET(fh1_debug_tiny_draws)
             ? std::min(primitive_processing_result.host_draw_vertex_count, uint32_t(3))
             : primitive_processing_result.host_draw_vertex_count,
