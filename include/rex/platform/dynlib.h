@@ -31,6 +31,9 @@ class DynamicLibrary {
   DynamicLibrary& operator=(DynamicLibrary&& other) noexcept;
 
   bool Load(const std::filesystem::path& path, SymbolResolution mode = SymbolResolution::kLazy);
+  // Takes a reference to a library that is already in the process and fails
+  // instead of loading it, for tools that inject themselves (RenderDoc).
+  bool Attach(const std::filesystem::path& path);
   // Takes ownership of a handle opened elsewhere (such as by libadrenotools).
   void Adopt(void* handle) {
     Close();
