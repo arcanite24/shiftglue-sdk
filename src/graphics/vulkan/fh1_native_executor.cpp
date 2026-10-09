@@ -36,9 +36,10 @@ REXCVAR_DEFINE_BOOL(fh1_msaa_2x, false, "GPU",
                     "sample pairs each in one): smoother edges than fh1_msaa_single_sample "
                     "for about half the cost of 4x (Vulkan FH1 native executor)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_BOOL(fh1_specialize_resolves, true, "GPU",
-                    "Vulkan FH1 resolves use pipelines specialized for each format, MSAA and "
-                    "sample selection; GPUs otherwise run every format's code per pixel");
+REXCVAR_DEFINE_BOOL(fh1_specialize_edram_passes, true, "GPU",
+                    "Vulkan FH1 resolves and EDRAM transfers use pipelines specialized for "
+                    "each kind (formats, MSAA, pitches); GPUs otherwise run every kind's code "
+                    "per pixel");
 REXCVAR_DEFINE_BOOL(fh1_msaa_single_sample, true, "GPU",
                     "Keep the guest's 2x and 4x MSAA surfaces as single-sampled images at any "
                     "resolution scale (Vulkan): at 1x the game renders without MSAA - harder "
@@ -513,6 +514,7 @@ void Fh1NativeExecutor::Shutdown() {
   surfaces_.clear();
   for (auto& [key, pipeline] : transfer_pipelines_) dfn.vkDestroyPipeline(device, pipeline, nullptr);
   transfer_pipelines_.clear();
+  specialized_transfer_pipelines_ = 0;
   for (auto& by_words : compute_pipelines_) {
     for (auto& by_kind : by_words) {
       for (VkPipeline& pipeline : by_kind) {
@@ -902,6 +904,17 @@ VkPipeline Fh1NativeExecutor::GetTransferPipeline(const TransferPipelineKey& key
   stages[1] = stages[0];
   stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
   stages[1].module = fragment_module;
+  // fh1_spec, then the constants fh1_native_transfer.ps.hlsl takes from it.
+  const uint32_t spec_values[4] = {1u, key.spec[0], key.spec[1], key.spec[2]};
+  VkSpecializationMapEntry spec_entries[4];
+  for (uint32_t i = 0; i < 4; ++i) {
+    spec_entries[i] = {i, uint32_t(sizeof(uint32_t)) * i, sizeof(uint32_t)};
+  }
+  const VkSpecializationInfo spec_info = {4, spec_entries, sizeof(spec_values), spec_values};
+  if (key.specialized) {
+    stages[1].pSpecializationInfo = &spec_info;
+    ++specialized_transfer_pipelines_;
+  }
   VkPipelineVertexInputStateCreateInfo vertex_input = {};
   vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
   VkPipelineInputAssemblyStateCreateInfo input_assembly = {};
@@ -998,15 +1011,27 @@ VkPipeline Fh1NativeExecutor::GetComputePipeline(bool words, uint32_t source_kin
   return pipeline;
 }
 
+void Fh1NativeExecutor::SpecializeTransfer(TransferPipelineKey& key,
+                                           const uint32_t* constants) {
+  if (!REXCVAR_GET(fh1_specialize_edram_passes)) return;
+  TransferPipelineKey specialized = key;
+  specialized.specialized = true;
+  specialized.spec = {constants[0] & ~0x7FFu, constants[1] & ~0x7FFu, constants[2]};
+  // Like resolves, a few dozen kinds; past the cap, generic.
+  if (specialized_transfer_pipelines_ < 256 || transfer_pipelines_.count(specialized)) {
+    key = specialized;
+  }
+}
+
 VkPipeline Fh1NativeExecutor::GetSpecializedResolvePipeline(bool image, uint32_t source_kind,
                                                            bool msaa,
                                                            const uint32_t* constants) {
-  if (!REXCVAR_GET(fh1_specialize_resolves)) return VK_NULL_HANDLE;
+  if (!REXCVAR_GET(fh1_specialize_edram_passes)) return VK_NULL_HANDLE;
   // fh1_spec, then the bits fh1_native_resolve_memory.cs.hlsl takes from them.
   const std::array<uint32_t, 7> values = {
       1u,
-      constants[2] & ~0x7FFFFu,
-      constants[3] & ~0x7FFFFu,
+      constants[2] & ~0x7FFu,
+      constants[3] & ~0x7FFu,
       constants[4] & 0xFFFFu,
       (constants[5] & ~0xFF00u) | ((constants[5] & 0xFF00u) ? 0u : 1u << 31),
       image ? constants[9] : 0u,
@@ -1293,6 +1318,9 @@ void Fh1NativeExecutor::FlushColorTransfers(Surface& dest, size_t first, size_t 
     key.sample_mask = sample_mask;
     key.source_kind = SourceKind(source->key.is_depth, source->key.format);
     key.source_msaa = source->samples > 1;
+    const uint32_t constants[kTransferConstantCount] = {LayoutConstant(dest),
+                                                        LayoutConstant(*source), flags};
+    SpecializeTransfer(key, constants);
     VkPipeline pipeline = GetTransferPipeline(key);
     if (!pipeline) {
       Skip("transfer_pipeline");
@@ -1302,8 +1330,6 @@ void Fh1NativeExecutor::FlushColorTransfers(Surface& dest, size_t first, size_t 
     command_processor_.BindExternalGraphicsPipeline(pipeline);
     command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                            transfer_pipeline_layout_, 0, 1, &set, 0, nullptr);
-    const uint32_t constants[kTransferConstantCount] = {LayoutConstant(dest),
-                                                        LayoutConstant(*source), flags};
     command_buffer.CmdVkPushConstants(transfer_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                       sizeof(constants), constants);
     for (; i < source_end; ++i) {
@@ -1375,6 +1401,9 @@ void Fh1NativeExecutor::FlushDepthTransfersExported(Surface& dest, size_t first,
     key.sample_mask = sample_mask;
     key.source_kind = SourceKind(source->key.is_depth, source->key.format);
     key.source_msaa = source->samples > 1;
+    const uint32_t constants[kTransferConstantCount] = {LayoutConstant(dest),
+                                                        LayoutConstant(*source), flags};
+    SpecializeTransfer(key, constants);
     VkPipeline pipeline = GetTransferPipeline(key);
     if (!pipeline) {
       Skip("transfer_pipeline");
@@ -1384,8 +1413,6 @@ void Fh1NativeExecutor::FlushDepthTransfersExported(Surface& dest, size_t first,
     command_processor_.BindExternalGraphicsPipeline(pipeline);
     command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                            transfer_pipeline_layout_, 0, 1, &set, 0, nullptr);
-    const uint32_t constants[kTransferConstantCount] = {LayoutConstant(dest),
-                                                        LayoutConstant(*source), flags};
     command_buffer.CmdVkPushConstants(transfer_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                       sizeof(constants), constants);
     for (; i < source_end; ++i) {

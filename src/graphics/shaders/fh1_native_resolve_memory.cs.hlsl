@@ -52,16 +52,19 @@ FH1_PUSH_CONSTANTS cbuffer Fh1NativeResolveMemoryConstants FH1_CONSTANTS_REGISTE
 
 
 // Vulkan pipelines may be specialized for one kind of resolve: with fh1_spec
-// 1 the format, MSAA, sample, pack and endian bits come from the constants
-// below instead of the push constants (which still carry the rectangle, tile
-// bases, pitches and addresses), and the compiler drops every other kind's
-// code - which it otherwise runs flattened into selects, most of the cost.
+// 1 the layouts but their base tiles, the sample selection, the destination
+// info but its exponent bias, and the texture endianness come from the
+// constants below instead of the push constants (which still carry the
+// rectangle, base tiles, exponent bias and addresses). The compiler then
+// keeps only that kind's code, which it otherwise runs flattened into
+// selects for every pixel - most of a resolve's cost on Adreno.
 #ifdef FH1_SPIRV
 [[vk::constant_id(0)]] const uint fh1_spec = 0u;
-[[vk::constant_id(1)]] const uint fh1_spec_resolve_layout = 0u;  // Bits 19:31.
-[[vk::constant_id(2)]] const uint fh1_spec_owner_layout = 0u;    // Bits 19:31.
+[[vk::constant_id(1)]] const uint fh1_spec_resolve_layout = 0u;  // Bits 11:31.
+[[vk::constant_id(2)]] const uint fh1_spec_owner_layout = 0u;    // Bits 11:31.
 [[vk::constant_id(3)]] const uint fh1_spec_sample_select = 0u;   // Bits 0:15.
-[[vk::constant_id(4)]] const uint fh1_spec_dest_info = 0u;     // All but 8:15, 31.
+// All but 8:15; bit 31 set when the exponent bias is 0.
+[[vk::constant_id(4)]] const uint fh1_spec_dest_info = 0u;
 [[vk::constant_id(5)]] const uint fh1_spec_image_endian = 0u;
 [[vk::constant_id(6)]] const uint fh1_spec_image2_endian = 0u;
 #else
@@ -73,14 +76,18 @@ static const uint fh1_spec_dest_info = 0u;
 static const uint fh1_spec_image_endian = 0u;
 static const uint fh1_spec_image2_endian = 0u;
 #endif
-#define FH1_SPEC_LAYOUT(push, spec)   (fh1_spec != 0u ? ((push) & 0x7FFFFu) | (spec) : (push))
+#define FH1_SPEC_LAYOUT(push, spec) \
+  (fh1_spec != 0u ? ((push) & 0x7FFu) | (spec) : (push))
 #define FH1_RESOLVE_LAYOUT FH1_SPEC_LAYOUT(fh1_resolve_layout, fh1_spec_resolve_layout)
 #define FH1_OWNER_LAYOUT FH1_SPEC_LAYOUT(fh1_owner_layout, fh1_spec_owner_layout)
-#define FH1_SAMPLE_SELECT   (fh1_spec != 0u ? (fh1_sample_select & 0xFFFF0000u) | fh1_spec_sample_select                   : fh1_sample_select)
-// The exponent bias (8:15) always comes from the push constants.
-#define FH1_DEST_INFO   (fh1_spec != 0u ? (fh1_dest_info & 0xFF00u) | fh1_spec_dest_info : fh1_dest_info)
-// Specialized, bit 31 of the destination info says the exponent bias is 0.
-#define FH1_EXP_BIAS_IS_ZERO   (fh1_spec != 0u ? (fh1_spec_dest_info >> 31u) != 0u : (fh1_dest_info & 0xFF00u) == 0u)
+#define FH1_SAMPLE_SELECT \
+  (fh1_spec != 0u ? (fh1_sample_select & 0xFFFF0000u) | fh1_spec_sample_select \
+                  : fh1_sample_select)
+#define FH1_DEST_INFO \
+  (fh1_spec != 0u ? (fh1_dest_info & 0xFF00u) | (fh1_spec_dest_info & 0x7FFFFFFFu) \
+                  : fh1_dest_info)
+#define FH1_EXP_BIAS_IS_ZERO \
+  (fh1_spec != 0u ? (fh1_spec_dest_info >> 31u) != 0u : (fh1_dest_info & 0xFF00u) == 0u)
 #define FH1_IMAGE_ENDIAN (fh1_spec != 0u ? fh1_spec_image_endian : fh1_image_endian)
 #define FH1_IMAGE2_ENDIAN (fh1_spec != 0u ? fh1_spec_image2_endian : fh1_image2_endian)
 

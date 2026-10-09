@@ -196,9 +196,12 @@ class Fh1NativeExecutor {
     uint32_t sample_mask;
     uint32_t source_kind;  // 0 color, 1 depth, 2 raw color bits, 3 EDRAM words
     bool source_msaa;
+    // Specialized for the constants: the layouts but their base tiles, flags.
+    bool specialized = false;
+    std::array<uint32_t, 3> spec = {};
     auto tie() const {
       return std::tie(dest_kind, dest_format, dest_samples, sample_mask, source_kind,
-                      source_msaa);
+                      source_msaa, specialized, spec);
     }
     bool operator<(const TransferPipelineKey& other) const { return tie() < other.tie(); }
   };
@@ -305,6 +308,9 @@ class Fh1NativeExecutor {
   VkPipeline GetComputePipeline(bool words, uint32_t source_kind, bool msaa);
   // A resolve pipeline specialized for the constants' format, MSAA, sample,
   // pack and endian bits, or null to use the generic one.
+  // Specializes a transfer pipeline key for its constants, unless off or
+  // past the cap of specialized pipelines.
+  void SpecializeTransfer(TransferPipelineKey& key, const uint32_t* constants);
   VkPipeline GetSpecializedResolvePipeline(bool image, uint32_t source_kind, bool msaa,
                                            const uint32_t* constants);
   VkShaderModule GetShaderModule(const uint32_t* code, size_t size_bytes);
@@ -366,6 +372,7 @@ class Fh1NativeExecutor {
   VkPipeline compute_pipelines_[2][3][2] = {};
   // Specialized resolves by {image, source kind, msaa, specialization constants}.
   std::map<std::array<uint32_t, 9>, VkPipeline> specialized_resolve_pipelines_;
+  uint32_t specialized_transfer_pipelines_ = 0;
 
   VkBuffer transfer_words_ = VK_NULL_HANDLE;
   VkDeviceMemory transfer_words_memory_ = VK_NULL_HANDLE;

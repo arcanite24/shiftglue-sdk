@@ -24,6 +24,27 @@ FH1_PUSH_CONSTANTS cbuffer Fh1NativeTransferConstants FH1_CONSTANTS_REGISTER {
   uint fh1_flags;          // FH1_FLAG_*, stencil bit index 8:10, scale - 1 12:13.
 };
 
+// Vulkan pipelines may be specialized for one kind of transfer: with fh1_spec
+// 1 the layouts but their base tiles, and the flags, come from the constants
+// below, and the compiler keeps only that kind's code, dividing by constant
+// pitches (see fh1_native_resolve_memory.cs.hlsl).
+#ifdef FH1_SPIRV
+[[vk::constant_id(0)]] const uint fh1_spec = 0u;
+[[vk::constant_id(1)]] const uint fh1_spec_dest_layout = 0u;    // Bits 11:31.
+[[vk::constant_id(2)]] const uint fh1_spec_source_layout = 0u;  // Bits 11:31.
+[[vk::constant_id(3)]] const uint fh1_spec_flags = 0u;
+#else
+static const uint fh1_spec = 0u;
+static const uint fh1_spec_dest_layout = 0u;
+static const uint fh1_spec_source_layout = 0u;
+static const uint fh1_spec_flags = 0u;
+#endif
+#define FH1_SPEC_LAYOUT(push, spec) \
+  (fh1_spec != 0u ? ((push) & 0x7FFu) | (spec) : (push))
+#define FH1_DEST_LAYOUT FH1_SPEC_LAYOUT(fh1_dest_layout, fh1_spec_dest_layout)
+#define FH1_SOURCE_LAYOUT FH1_SPEC_LAYOUT(fh1_source_layout, fh1_spec_source_layout)
+#define FH1_FLAGS (fh1_spec != 0u ? fh1_spec_flags : fh1_flags)
+
 #ifdef FH1_DEST_MSAA
 #define FH1_SAMPLE_INPUT , uint host_sample : SV_SampleIndex
 #else
@@ -31,12 +52,12 @@ FH1_PUSH_CONSTANTS cbuffer Fh1NativeTransferConstants FH1_CONSTANTS_REGISTER {
 #endif
 
 uint LoadWord(float4 position, uint host_sample, uint half) {
-  uint guest_sample = GuestSample(host_sample, LayoutMsaa(fh1_dest_layout),
-                                  LayoutHostSampleMode(fh1_dest_layout));
+  uint guest_sample = GuestSample(host_sample, LayoutMsaa(FH1_DEST_LAYOUT),
+                                  LayoutHostSampleMode(FH1_DEST_LAYOUT));
   uint2 pixel = uint2(position.xy);
-  SetScaledPixel(pixel, ((fh1_flags >> FH1_FLAG_SCALE_SHIFT) & 3u) + 1u);
-  return LoadSourceWord(fh1_dest_layout, pixel, guest_sample, half, fh1_source_layout,
-                        fh1_flags);
+  SetScaledPixel(pixel, ((FH1_FLAGS >> FH1_FLAG_SCALE_SHIFT) & 3u) + 1u);
+  return LoadSourceWord(FH1_DEST_LAYOUT, pixel, guest_sample, half, FH1_SOURCE_LAYOUT,
+                        FH1_FLAGS);
 }
 
 #if FH1_DEST_KIND == 0
@@ -44,10 +65,10 @@ float4 main(float4 position : SV_Position FH1_SAMPLE_INPUT) : SV_Target {
 #ifndef FH1_DEST_MSAA
   uint host_sample = 0u;
 #endif
-  uint format = LayoutFormat(fh1_dest_layout);
-  fh1_fixed16_scale = (fh1_flags & FH1_FLAG_FIXED16_FULL_RANGE) != 0u ? 32.0f : 1.0f;
+  uint format = LayoutFormat(FH1_DEST_LAYOUT);
+  fh1_fixed16_scale = (FH1_FLAGS & FH1_FLAG_FIXED16_FULL_RANGE) != 0u ? 32.0f : 1.0f;
   float4 color = DecodeColor(LoadWord(position, host_sample, 0u), format);
-  if (format == FORMAT_8_8_8_8_GAMMA && (fh1_flags & FH1_FLAG_GAMMA_UNORM16) != 0u) {
+  if (format == FORMAT_8_8_8_8_GAMMA && (FH1_FLAGS & FH1_FLAG_GAMMA_UNORM16) != 0u) {
     color.rgb = float3(PWLGammaToLinear(color.r), PWLGammaToLinear(color.g),
                        PWLGammaToLinear(color.b));
   }
@@ -56,7 +77,7 @@ float4 main(float4 position : SV_Position FH1_SAMPLE_INPUT) : SV_Target {
 #elif FH1_DEST_KIND == 1 || FH1_DEST_KIND == 4
 float WordDepth(uint word) {
   uint depth24 = word >> 8u;
-  if (LayoutFormat(fh1_dest_layout) == DEPTH_D24FS8) {
+  if (LayoutFormat(FH1_DEST_LAYOUT) == DEPTH_D24FS8) {
     // The host keeps float24 depth halved.
     return Float20e4To32(depth24) * 0.5f;
   }
@@ -93,7 +114,7 @@ void main(float4 position : SV_Position FH1_SAMPLE_INPUT) {
 #ifndef FH1_DEST_MSAA
   uint host_sample = 0u;
 #endif
-  if (!(LoadWord(position, host_sample, 0u) & (1u << ((fh1_flags >> 8u) & 7u)))) {
+  if (!(LoadWord(position, host_sample, 0u) & (1u << ((FH1_FLAGS >> 8u) & 7u)))) {
     discard;
   }
 }
@@ -103,9 +124,9 @@ uint4 main(float4 position : SV_Position FH1_SAMPLE_INPUT) : SV_Target {
   uint host_sample = 0u;
 #endif
   uint low = LoadWord(position, host_sample, 0u);
-  uint format = LayoutFormat(fh1_dest_layout);
+  uint format = LayoutFormat(FH1_DEST_LAYOUT);
   if (format == FORMAT_32_FLOAT) return uint4(low, 0u, 0u, 0u);
-  if (LayoutIs64bpp(fh1_dest_layout) == 0u) {
+  if (LayoutIs64bpp(FH1_DEST_LAYOUT) == 0u) {
     return uint4(low & 0xFFFFu, low >> 16u, 0u, 0u);
   }
   uint high = LoadWord(position, host_sample, 1u);
