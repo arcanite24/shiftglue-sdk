@@ -1313,6 +1313,9 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t normalized_depth_control = 0;
     uint32_t normalized_color_mask = 0;
     uint32_t render_pass_key = 0;
+    // spirv_specialize_texture_signs: the bound textures' signs the pipeline
+    // was specialized for (zero otherwise).
+    uint32_t texture_signs[8] = {};
     VkPipeline pipeline = VK_NULL_HANDLE;
     const VulkanPipelineCache::PipelineLayoutProvider* layout = nullptr;
     void* handle = nullptr;
