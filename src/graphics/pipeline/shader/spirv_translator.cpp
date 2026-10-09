@@ -38,12 +38,15 @@ REXCVAR_DEFINE_BOOL(vulkan_bindless_textures, REX_PLATFORM_ANDROID, "GPU/Vulkan"
                     "with Vulkan 1.2 descriptor indexing (RECORDER_PER_DRAW_BACKLOG PD-4)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 // On Android: the Odin 2 Portal's 1x drive GPU frame falls about 4 ms (36 to
-// 32), with only scattered pixels of foliage and shadow noise changing.
+// 32), with only scattered pixels of foliage and shadow noise changing. That
+// was with plain IEEE products, whose 0 * Inf = NaN smeared the scene (#403);
+// with the NaN check the Thor's parked scene pass is 10.4 ms, as with the full
+// rule, against 10.0 ms with plain products.
 REXCVAR_DEFINE_BOOL(spirv_fast_pixel_math, REX_PLATFORM_ANDROID, "GPU",
-                    "Vulkan: translate pixel shaders without the Direct3D 9 multiply rule "
-                    "(0 * anything = 0) and let the driver fuse multiply-adds. Less pixel "
-                    "shader work at high scales; shaders that rely on 0 * Inf = 0 may show "
-                    "NaN pixels")
+                    "Vulkan: in pixel shaders, apply the Direct3D 9 multiply rule (0 * anything "
+                    "= 0) only to products that come out NaN, and let the driver fuse "
+                    "multiply-adds. Less pixel shader work at high scales; a NaN operand times "
+                    "a nonzero one also gives 0")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 // On Android: the Odin 2 Portal's 1x drive frame falls about 3 ms (6 %) when

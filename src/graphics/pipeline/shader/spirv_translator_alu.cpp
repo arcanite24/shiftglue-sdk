@@ -25,11 +25,10 @@ namespace rex::graphics {
 spv::Id SpirvShaderTranslator::ZeroIfAnyOperandIsZero(spv::Id value, spv::Id operand_0_abs,
                                                       spv::Id operand_1_abs) {
   EnsureBuildPointAvailable();
-  if (fast_pixel_math_) {
-    // IEEE multiplication: 0 * Inf and 0 * NaN are NaN instead of 0.
-    return value;
-  }
   int num_components = builder_->getNumComponents(value);
+  if (fast_pixel_math_) {
+    return ZeroIfNan(value, num_components);
+  }
   assert_true(builder_->getNumComponents(operand_0_abs) == num_components);
   assert_true(builder_->getNumComponents(operand_1_abs) == num_components);
   return builder_->createTriOp(
@@ -40,6 +39,21 @@ spv::Id SpirvShaderTranslator::ZeroIfAnyOperandIsZero(spv::Id value, spv::Id ope
                                                            operand_0_abs, operand_1_abs),
                             const_float_vectors_0_[num_components - 1]),
       const_float_vectors_0_[num_components - 1], value);
+}
+
+spv::Id SpirvShaderTranslator::ZeroIfNan(spv::Id value, int num_components,
+                                         spv::Id replacement) {
+  // Fast pixel math: a NaN product stands for the 0 * Inf (or 0 * NaN) the
+  // multiply rule makes 0, so it is checked after the multiply instead of
+  // testing the operands before it, leaving multiply-adds free to fuse. It
+  // differs only where a nonzero operand is already NaN, which gives 0 too.
+  // Plain IEEE products turned one pass's 0 * Inf into NaN velocity, which
+  // the motion blur after it smeared over the distant scene (#403).
+  return builder_->createTriOp(
+      spv::OpSelect, type_float_vectors_[num_components - 1],
+      builder_->createUnaryOp(spv::OpIsNan, type_bool_vectors_[num_components - 1], value),
+      replacement != spv::NoResult ? replacement : const_float_vectors_0_[num_components - 1],
+      value);
 }
 
 void SpirvShaderTranslator::KillPixel(spv::Id condition,
@@ -276,10 +290,16 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
       if (instr.vector_opcode == ucode::AluVectorOpcode::kMad) {
         // Not replacing true `0 + term` with conditional selection of the term
         // because +0 + -0 should result in +0, not -0.
-        result = builder_->createNoContractionBinOp(
-            spv::OpFAdd, result_type, result,
-            GetOperandComponents(operand_storage[2], instr.vector_operands[2],
-                                 used_result_components));
+        spv::Id addend = GetOperandComponents(operand_storage[2], instr.vector_operands[2],
+                                              used_result_components);
+        result = builder_->createNoContractionBinOp(spv::OpFAdd, result_type, result, addend);
+        if (multiplicands_different && fast_pixel_math_) {
+          // After the add so the driver can still fuse it: a NaN sum from a
+          // 0 * Inf product is the addend alone.
+          result = ZeroIfNan(result, int(used_result_component_count), addend);
+        }
+      } else if (multiplicands_different && fast_pixel_math_) {
+        result = ZeroIfNan(result, int(used_result_component_count));
       }
       return result;
     }

@@ -666,6 +666,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // replaces the value with +0 if the minimum of the two operands is 0. This
   // must be called with absolute values of operands - use GetAbsoluteOperand!
   spv::Id ZeroIfAnyOperandIsZero(spv::Id value, spv::Id operand_0_abs, spv::Id operand_1_abs);
+  // The multiply rule under fast pixel math: replacement (+0 by default)
+  // where the product (or the multiply-add) is NaN.
+  spv::Id ZeroIfNan(spv::Id value, int num_components, spv::Id replacement = spv::NoResult);
   // Conditionally discard the current fragment. Changes the build point.
   void KillPixel(spv::Id condition, uint8_t memexport_eM_potentially_written_before);
   // Return type is a rex::bit_count(result.GetUsedResultComponents())-component
