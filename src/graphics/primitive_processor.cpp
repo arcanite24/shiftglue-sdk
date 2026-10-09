@@ -25,12 +25,16 @@
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/platform.h>
 #include <rex/types.h>
 
 REXCVAR_DEFINE_BOOL(force_convert_line_loops_to_strips, false, "GPU",
                     "Force convert line loops to strips");
 
-REXCVAR_DEFINE_BOOL(force_convert_quad_lists_to_triangle_lists, false, "GPU",
+// On Android, quad lists become indexed triangle lists instead of going
+// through a geometry shader, which Adreno runs slowly: about 1.2 ms of a
+// 25 ms FH1 frame on the Odin 2 Portal (Adreno 740, Turnip).
+REXCVAR_DEFINE_BOOL(force_convert_quad_lists_to_triangle_lists, REX_PLATFORM_ANDROID, "GPU",
                     "Force convert quad lists to triangle lists");
 
 REXCVAR_DEFINE_BOOL(force_convert_triangle_fans_to_lists, false, "GPU",
