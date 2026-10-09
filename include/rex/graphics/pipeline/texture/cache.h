@@ -127,6 +127,10 @@ class TextureCache {
     const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
     return binding ? binding->host_swizzle : xenos::XE_GPU_TEXTURE_SWIZZLE_0000;
   }
+  bool IsActiveTextureHostGamma(uint32_t fetch_constant_index) const {
+    const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+    return binding && binding->host_gamma;
+  }
   uint8_t GetActiveTextureSwizzledSigns(uint32_t fetch_constant_index) const {
     const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
     return binding ? binding->swizzled_signs : kSwizzledSignsUnsigned;
@@ -497,6 +501,10 @@ class TextureCache {
     // Whether the fetch requests normalized fixed-point output. Float texture
     // formats are excluded even though their num_format bit is normally zero.
     bool normalized_fixed_point;
+    // The host decodes the gamma (sRGB) components through the unsigned view,
+    // and swizzled_signs has them as unsigned: the fetch had X, Y and Z gamma
+    // and W not, in a format whose host image has an sRGB view.
+    bool host_gamma;
     // Unsigned version of the texture (or signed if they have the same data).
     Texture* texture;
     // Signed version of the texture if the data in the signed version is
@@ -533,6 +541,9 @@ class TextureCache {
   // the host than its unsigned version (for example, if it's a fixed-point
   // texture emulated with a larger host pixel format).
   virtual bool IsSignedVersionSeparateForFormat(TextureKey /*key*/) const { return false; }
+  // Whether gamma X, Y and Z of this texture may be decoded by the host sampler
+  // (an sRGB view) instead of the shader's piecewise linear conversion.
+  virtual bool IsHostGammaSupported(TextureKey /*key*/) const { return false; }
   // Parameters like whether the texture is tiled and its dimensions are checked
   // externally, the implementation should take only format-related parameters
   // such as the format itself and the signedness into account.
@@ -760,6 +771,7 @@ class TextureCache {
     uint32_t host_swizzle = 0;
     uint8_t swizzled_signs = 0;
     bool normalized_fixed_point = false;
+    bool host_gamma = false;
     Texture* texture = nullptr;
     Texture* texture_signed = nullptr;
   };

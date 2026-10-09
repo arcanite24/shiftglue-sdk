@@ -173,6 +173,7 @@ class VulkanTextureCache final : public TextureCache {
 
  protected:
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
+  bool IsHostGammaSupported(TextureKey key) const override;
   bool IsScaledResolveSupportedForFormat(TextureKey key) const override;
   uint32_t GetHostFormatSwizzle(TextureKey key) const override;
 
@@ -250,8 +251,12 @@ class VulkanTextureCache final : public TextureCache {
       return old_usage;
     }
 
-    VkImageView GetView(bool is_signed, uint32_t host_swizzle, bool is_array = true);
-    VkImageView GetViewUncached(bool is_signed, uint32_t host_swizzle, bool is_array);
+    // srgb: the unsigned view in the sRGB version of the format
+    // (texture_gamma_host_srgb, IsHostGammaSupported).
+    VkImageView GetView(bool is_signed, uint32_t host_swizzle, bool is_array = true,
+                        bool srgb = false);
+    VkImageView GetViewUncached(bool is_signed, uint32_t host_swizzle, bool is_array,
+                                bool srgb = false);
     VkImageView GetOrCreate3DAs2DImageView(bool is_signed, uint32_t host_swizzle);
 
     // Loads by compute (vulkan_texture_load_compute_copy): the image was
@@ -276,6 +281,7 @@ class VulkanTextureCache final : public TextureCache {
         uint32_t is_signed_separate_view : 1;
         uint32_t host_swizzle : 12;
         uint32_t is_array : 1;
+        uint32_t is_srgb : 1;
       };
 
       ViewKey() : key(0) { static_assert_size(*this, sizeof(key)); }

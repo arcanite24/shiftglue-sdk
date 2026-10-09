@@ -41,6 +41,7 @@
 // frame because only textures of 256x256 texels or more could be resolved
 // into directly.
 REXCVAR_DECLARE(bool, fh1_texture_reload_probe);
+REXCVAR_DECLARE(bool, texture_gamma_host_srgb);
 REXCVAR_DEFINE_BOOL(vulkan_small_texture_copy_views, true, "GPU/Vulkan",
                     "Give textures of any size with 4-byte texels the raw-bits view resolves "
                     "write directly through, not only those of 256x256 texels or more")
@@ -1437,6 +1438,48 @@ bool VulkanTextureCache::IsScaledResolveSupportedForFormat(TextureKey key) const
          load_pipelines_scaled_[load_shader] != VK_NULL_HANDLE;
 }
 
+namespace {
+// The sRGB version of an unsigned host format that has one, or undefined.
+VkFormat GetSrgbHostFormat(VkFormat format) {
+  switch (format) {
+    case VK_FORMAT_R8G8B8A8_UNORM:
+      return VK_FORMAT_R8G8B8A8_SRGB;
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+      return VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
+    case VK_FORMAT_BC2_UNORM_BLOCK:
+      return VK_FORMAT_BC2_SRGB_BLOCK;
+    case VK_FORMAT_BC3_UNORM_BLOCK:
+      return VK_FORMAT_BC3_SRGB_BLOCK;
+    default:
+      return VK_FORMAT_UNDEFINED;
+  }
+}
+}  // namespace
+
+bool VulkanTextureCache::IsHostGammaSupported(TextureKey key) const {
+  if (!REXCVAR_GET(texture_gamma_host_srgb) || key.dimension == xenos::DataDimension::k3D ||
+      key.signed_separate) {
+    return false;
+  }
+  const HostFormatPair& host_format_pair = GetHostFormatPair(key);
+  if (GetSrgbHostFormat(host_format_pair.format_unsigned.format) == VK_FORMAT_UNDEFINED) {
+    return false;
+  }
+  // The guest X, Y and Z must come from the host red, green and blue (which
+  // the sRGB view decodes) or be constant, and W from alpha or a constant.
+  for (uint32_t i = 0; i < 4; ++i) {
+    const uint32_t component = (host_format_pair.swizzle >> (3 * i)) & 0b111;
+    if (component == xenos::XE_GPU_TEXTURE_SWIZZLE_0 ||
+        component == xenos::XE_GPU_TEXTURE_SWIZZLE_1) {
+      continue;
+    }
+    if ((i == 3) != (component == xenos::XE_GPU_TEXTURE_SWIZZLE_A)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 uint32_t VulkanTextureCache::GetHostFormatSwizzle(TextureKey key) const {
   return GetHostFormatPair(key).swizzle;
 }
@@ -1579,8 +1622,13 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
       }
     }
   }
-  VkFormat view_formats[3] = {formats[0], formats[1], VK_FORMAT_UNDEFINED};
+  VkFormat view_formats[4] = {formats[0], formats[1], VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
   uint32_t view_format_count = formats[1] != VK_FORMAT_UNDEFINED ? 2 : 1;
+  // Gamma textures may be sampled through an sRGB view of the same image.
+  if (IsHostGammaSupported(key) && GetSrgbHostFormat(formats[0]) != VK_FORMAT_UNDEFINED) {
+    image_create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    view_formats[view_format_count++] = GetSrgbHostFormat(formats[0]);
+  }
   if (copy_words) {
     image_create_info.flags |=
         VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
@@ -2446,8 +2494,9 @@ void VulkanTextureCache::UpdateTextureBindingsImpl(uint32_t fetch_constant_mask)
     if (IsSignedVersionSeparateForFormat(binding->key)) {
       if (binding->texture && uses_unsigned &&
           host_format_pair.format_unsigned.format != VK_FORMAT_UNDEFINED) {
-        vulkan_binding.image_view_unsigned =
-            static_cast<VulkanTexture*>(binding->texture)->GetView(false, binding->host_swizzle);
+        vulkan_binding.image_view_unsigned = static_cast<VulkanTexture*>(binding->texture)
+                                                 ->GetView(false, binding->host_swizzle, true,
+                                                           binding->host_gamma);
       }
       if (binding->texture_signed && uses_signed &&
           host_format_pair.format_signed.format != VK_FORMAT_UNDEFINED) {
@@ -2458,7 +2507,8 @@ void VulkanTextureCache::UpdateTextureBindingsImpl(uint32_t fetch_constant_mask)
       VulkanTexture* texture = static_cast<VulkanTexture*>(binding->texture);
       if (texture) {
         if (uses_unsigned && host_format_pair.format_unsigned.format != VK_FORMAT_UNDEFINED) {
-          vulkan_binding.image_view_unsigned = texture->GetView(false, binding->host_swizzle);
+          vulkan_binding.image_view_unsigned =
+              texture->GetView(false, binding->host_swizzle, true, binding->host_gamma);
         }
         if (uses_signed && host_format_pair.format_signed.format != VK_FORMAT_UNDEFINED) {
           vulkan_binding.image_view_signed = texture->GetView(true, binding->host_swizzle);
@@ -2545,13 +2595,13 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
 }
 
 VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t host_swizzle,
-                                                       bool is_array) {
+                                                       bool is_array, bool srgb) {
   LastView& last_view = last_views_[is_signed];
-  const uint32_t arguments = (host_swizzle << 1) | uint32_t(is_array);
+  const uint32_t arguments = (uint32_t(srgb) << 13) | (host_swizzle << 1) | uint32_t(is_array);
   if (last_view.arguments == arguments) {
     return last_view.view;
   }
-  const VkImageView view = GetViewUncached(is_signed, host_swizzle, is_array);
+  const VkImageView view = GetViewUncached(is_signed, host_swizzle, is_array, srgb);
   if (view != VK_NULL_HANDLE) {
     last_view.arguments = arguments;
     last_view.view = view;
@@ -2577,7 +2627,7 @@ uint32_t VulkanTextureCache::VulkanTexture::GetBindlessSlot(bool is_signed, VkIm
 
 VkImageView VulkanTextureCache::VulkanTexture::GetViewUncached(bool is_signed,
                                                                uint32_t host_swizzle,
-                                                               bool is_array) {
+                                                               bool is_array, bool srgb) {
   xenos::DataDimension dimension = key().dimension;
   if (dimension == xenos::DataDimension::k3D || dimension == xenos::DataDimension::kCube) {
     is_array = false;
@@ -2593,6 +2643,10 @@ VkImageView VulkanTextureCache::VulkanTexture::GetViewUncached(bool is_signed,
       (is_signed ? host_format_pair.format_signed : host_format_pair.format_unsigned).format;
   if (format == VK_FORMAT_UNDEFINED) {
     return VK_NULL_HANDLE;
+  }
+  if (srgb && !is_signed && GetSrgbHostFormat(format) != VK_FORMAT_UNDEFINED) {
+    format = GetSrgbHostFormat(format);
+    view_key.is_srgb = 1;
   }
   // If not distinguishing between unsigned and signed formats for the same
   // image, don't create two views. As this happens within an image, no need to

@@ -41,6 +41,12 @@ REXCVAR_DEFINE_BOOL(texture_selective_binding_reset, true, "GPU",
                     "textures before the next draw instead of every binding and the binding "
                     "memo (a destroyed texture still resets them all)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(texture_gamma_host_srgb, false, "GPU",
+                    "Sample gamma textures (gamma color, linear alpha, 8-bit RGBA on the host) "
+                    "through sRGB views instead of converting with the Xenos piecewise linear "
+                    "curve in the shader: cheaper, with the sRGB curve and filtering after "
+                    "the conversion")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(android_allow_resolution_scale, false, "GPU",
                     "Android: allow internal resolution scales above 1x (each needs a "
                     "dedicated 512 MB x scale^2 resolve buffer)")
@@ -694,6 +700,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       // As the derivation below would do for these words.
       const bool changed =
           binding.key != memo->key || binding.host_swizzle != memo->host_swizzle ||
+          binding.host_gamma != memo->host_gamma ||
           texture_util::IsAnySignNotSigned(binding.swizzled_signs) !=
               texture_util::IsAnySignNotSigned(memo->swizzled_signs) ||
           texture_util::IsAnySignSigned(binding.swizzled_signs) !=
@@ -704,6 +711,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       binding.host_swizzle = memo->host_swizzle;
       binding.swizzled_signs = memo->swizzled_signs;
       binding.normalized_fixed_point = memo->normalized_fixed_point;
+      binding.host_gamma = memo->host_gamma;
       binding.texture = memo->texture;
       binding.texture_signed = memo->texture_signed;
       texture_bindings_in_sync_ |= index_bit;
@@ -721,6 +729,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(index);
     TextureKey old_key = binding.key;
     uint8_t old_swizzled_signs = binding.swizzled_signs;
+    bool old_host_gamma = binding.host_gamma;
     BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
     switch (fetch.format) {
       case xenos::TextureFormat::k_16_FLOAT:
@@ -742,6 +751,27 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
             fetch.num_format == 0 &&
             binding.swizzled_signs == kSwizzledSignsUnsigned;
         break;
+    }
+    // Gamma color with linear alpha is what an sRGB view decodes, so the
+    // shader can take those components as unsigned (the normalized fixed
+    // point check above still sees them as gamma).
+    binding.host_gamma = binding.key.is_valid && REXCVAR_GET(texture_gamma_host_srgb) &&
+                         fetch.sign_x == xenos::TextureSign::kGamma &&
+                         fetch.sign_y == xenos::TextureSign::kGamma &&
+                         fetch.sign_z == xenos::TextureSign::kGamma &&
+                         fetch.sign_w != xenos::TextureSign::kGamma &&
+                         IsHostGammaSupported(binding.key);
+    if (binding.host_gamma) {
+      for (uint32_t i = 0; i < 4; ++i) {
+        if (((binding.swizzled_signs >> (2 * i)) & 0b11) == uint32_t(xenos::TextureSign::kGamma)) {
+          binding.swizzled_signs = uint8_t(
+              (binding.swizzled_signs & ~(0b11 << (2 * i))) |
+              (uint32_t(xenos::TextureSign::kUnsigned) << (2 * i)));
+        }
+      }
+    }
+    if (binding.host_gamma != old_host_gamma) {
+      bindings_changed |= index_bit;
     }
     texture_bindings_in_sync_ |= index_bit;
     if (!binding.key.is_valid) {
@@ -816,6 +846,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       entry.host_swizzle = binding.host_swizzle;
       entry.swizzled_signs = binding.swizzled_signs;
       entry.normalized_fixed_point = binding.normalized_fixed_point;
+      entry.host_gamma = binding.host_gamma;
       entry.texture = binding.texture;
       entry.texture_signed = binding.texture_signed;
     }
