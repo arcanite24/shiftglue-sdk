@@ -117,6 +117,13 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                     (uint64_t)data->unk_10);
       return X_E_SUCCESS;
     }
+    case 0x0002B004: {
+      // Forza Horizon sends this once while quitting, after XMediaFacade
+      // loads, with no buffer; nothing reads the result and the exit
+      // completes either way (pinyon-shift #392).
+      REXKRNL_DEBUG("XamApp(0x0002B004)({:08X}, {})", buffer_ptr, buffer_length);
+      return X_E_SUCCESS;
+    }
   }
   REXKRNL_ERROR(
       "Unimplemented XAM message app={:08X}, msg={:08X}, arg1={:08X}, "
