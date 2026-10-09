@@ -1497,7 +1497,25 @@ bool VulkanCommandProcessor::SetupContext() {
   // Shared memory and EDRAM descriptor set layout.
   bool edram_fragment_shader_interlock =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
-  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[2];
+  const bool shared_memory_texel_buffer =
+      SpirvShaderTranslator::Features(GetVulkanDevice()).shared_memory_texel_buffer;
+  if (shared_memory_texel_buffer) {
+    VkBufferViewCreateInfo buffer_view_create_info;
+    buffer_view_create_info.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO;
+    buffer_view_create_info.pNext = nullptr;
+    buffer_view_create_info.flags = 0;
+    buffer_view_create_info.buffer = shared_memory_->buffer();
+    buffer_view_create_info.format = VK_FORMAT_R32_UINT;
+    buffer_view_create_info.offset = 0;
+    buffer_view_create_info.range = VK_WHOLE_SIZE;
+    if (dfn.vkCreateBufferView(device, &buffer_view_create_info, nullptr,
+                               &shared_memory_texel_buffer_view_) != VK_SUCCESS) {
+      REXGPU_ERROR("Failed to create the Vulkan texel buffer view of the shared memory");
+      return false;
+    }
+    REXGPU_INFO("Shared memory reads use one texel buffer");
+  }
+  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[3];
   shared_memory_and_edram_descriptor_set_layout_bindings[0].binding = 0;
   shared_memory_and_edram_descriptor_set_layout_bindings[0].descriptorType =
       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1525,6 +1543,16 @@ bool VulkanCommandProcessor::SetupContext() {
   } else {
     shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount = 1;
   }
+  if (shared_memory_texel_buffer) {
+    VkDescriptorSetLayoutBinding& texel_buffer_binding =
+        shared_memory_and_edram_descriptor_set_layout_bindings
+            [shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount++];
+    texel_buffer_binding.binding = SpirvShaderTranslator::kSharedMemoryTexelBufferBinding;
+    texel_buffer_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+    texel_buffer_binding.descriptorCount = 1;
+    texel_buffer_binding.stageFlags = guest_shader_stages;
+    texel_buffer_binding.pImmutableSamplers = nullptr;
+  }
   if (dfn.vkCreateDescriptorSetLayout(
           device, &shared_memory_and_edram_descriptor_set_layout_create_info, nullptr,
           &descriptor_set_layout_shared_memory_and_edram_) != VK_SUCCESS) {
@@ -1535,16 +1563,18 @@ bool VulkanCommandProcessor::SetupContext() {
   }
 
   // Shared memory and EDRAM common bindings.
-  VkDescriptorPoolSize descriptor_pool_sizes[1];
+  VkDescriptorPoolSize descriptor_pool_sizes[2];
   descriptor_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   descriptor_pool_sizes[0].descriptorCount =
       shared_memory_binding_count + uint32_t(edram_fragment_shader_interlock);
+  descriptor_pool_sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+  descriptor_pool_sizes[1].descriptorCount = 1;
   VkDescriptorPoolCreateInfo descriptor_pool_create_info;
   descriptor_pool_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   descriptor_pool_create_info.pNext = nullptr;
   descriptor_pool_create_info.flags = 0;
   descriptor_pool_create_info.maxSets = 1;
-  descriptor_pool_create_info.poolSizeCount = 1;
+  descriptor_pool_create_info.poolSizeCount = 1 + uint32_t(shared_memory_texel_buffer);
   descriptor_pool_create_info.pPoolSizes = descriptor_pool_sizes;
   if (dfn.vkCreateDescriptorPool(device, &descriptor_pool_create_info, nullptr,
                                  &shared_memory_and_edram_descriptor_pool_) != VK_SUCCESS) {
@@ -2469,7 +2499,8 @@ void VulkanCommandProcessor::WriteSharedMemoryAndEdramDescriptorSet() {
     shared_memory_descriptor_buffer_info.offset = shared_memory_binding_range * i;
     shared_memory_descriptor_buffer_info.range = shared_memory_binding_range;
   }
-  VkWriteDescriptorSet write_descriptor_sets[2];
+  VkWriteDescriptorSet write_descriptor_sets[3];
+  uint32_t write_descriptor_set_count = 1;
   VkWriteDescriptorSet& write_descriptor_set_shared_memory = write_descriptor_sets[0];
   write_descriptor_set_shared_memory.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   write_descriptor_set_shared_memory.pNext = nullptr;
@@ -2486,7 +2517,8 @@ void VulkanCommandProcessor::WriteSharedMemoryAndEdramDescriptorSet() {
     edram_descriptor_buffer_info.buffer = render_target_cache_->edram_buffer();
     edram_descriptor_buffer_info.offset = 0;
     edram_descriptor_buffer_info.range = VK_WHOLE_SIZE;
-    VkWriteDescriptorSet& write_descriptor_set_edram = write_descriptor_sets[1];
+    VkWriteDescriptorSet& write_descriptor_set_edram =
+        write_descriptor_sets[write_descriptor_set_count++];
     write_descriptor_set_edram.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     write_descriptor_set_edram.pNext = nullptr;
     write_descriptor_set_edram.dstSet = shared_memory_and_edram_descriptor_set_;
@@ -2498,9 +2530,23 @@ void VulkanCommandProcessor::WriteSharedMemoryAndEdramDescriptorSet() {
     write_descriptor_set_edram.pBufferInfo = &edram_descriptor_buffer_info;
     write_descriptor_set_edram.pTexelBufferView = nullptr;
   }
+  if (shared_memory_texel_buffer_view_ != VK_NULL_HANDLE) {
+    VkWriteDescriptorSet& write_descriptor_set_texel_buffer =
+        write_descriptor_sets[write_descriptor_set_count++];
+    write_descriptor_set_texel_buffer.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write_descriptor_set_texel_buffer.pNext = nullptr;
+    write_descriptor_set_texel_buffer.dstSet = shared_memory_and_edram_descriptor_set_;
+    write_descriptor_set_texel_buffer.dstBinding =
+        SpirvShaderTranslator::kSharedMemoryTexelBufferBinding;
+    write_descriptor_set_texel_buffer.dstArrayElement = 0;
+    write_descriptor_set_texel_buffer.descriptorCount = 1;
+    write_descriptor_set_texel_buffer.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+    write_descriptor_set_texel_buffer.pImageInfo = nullptr;
+    write_descriptor_set_texel_buffer.pBufferInfo = nullptr;
+    write_descriptor_set_texel_buffer.pTexelBufferView = &shared_memory_texel_buffer_view_;
+  }
   vulkan_device->functions().vkUpdateDescriptorSets(
-      vulkan_device->device(), 1 + uint32_t(edram_fragment_shader_interlock),
-      write_descriptor_sets, 0, nullptr);
+      vulkan_device->device(), write_descriptor_set_count, write_descriptor_sets, 0, nullptr);
 }
 
 void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
@@ -2826,6 +2872,8 @@ void VulkanCommandProcessor::ShutdownContext() {
 
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
                                          shared_memory_and_edram_descriptor_pool_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBufferView, device,
+                                         shared_memory_texel_buffer_view_);
 
   frame_dump_.reset();
   fh1_native_executor_.reset();

@@ -432,7 +432,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // The same, only for fetches every pixel of the quad runs
     // (spirv_implicit_lod_2d_uniform_turnip).
     bool implicit_lod_2d_uniform;
+    // Shared memory reads go through one R32_UINT uniform texel buffer over
+    // all 512 MB (binding kSharedMemoryTexelBufferBinding) instead of a
+    // switch over the storage buffer bindings
+    // (vulkan_shared_memory_texel_buffer).
+    bool shared_memory_texel_buffer;
   };
+  static constexpr uint32_t kSharedMemoryTexelBufferBinding = 2;
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,
                         bool native_2x_msaa_no_attachments, bool edram_fragment_shader_interlock,
@@ -931,6 +937,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id GetBindlessArray(BindlessBinding binding);
 
   spv::Id buffers_shared_memory_;
+  // Only with features_.shared_memory_texel_buffer.
+  spv::Id texel_buffer_shared_memory_;
   spv::Id buffer_edram_;
 
   // Not using combined images and samplers because

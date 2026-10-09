@@ -1058,6 +1058,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   double sampler_mip_lod_bias_ = 0.0;
 
   VkDescriptorPool shared_memory_and_edram_descriptor_pool_ = VK_NULL_HANDLE;
+  // R32_UINT over the whole shared memory (vulkan_shared_memory_texel_buffer).
+  VkBufferView shared_memory_texel_buffer_view_ = VK_NULL_HANDLE;
   VkDescriptorSet shared_memory_and_edram_descriptor_set_;
 
   // Bytes 0x0...0x3FF - 256-entry gamma ramp table with B10G10R10X2 data (read

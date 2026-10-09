@@ -84,6 +84,18 @@ REXCVAR_DEFINE_BOOL(spirv_implicit_lod_2d, false, "GPU",
                     "instead of explicit gradients - cheaper on tiled mobile GPUs")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// The Adreno 740's 128 MB storage buffer range split shared memory into four
+// bindings, and each vertex fetch word was a switch whose loads Turnip
+// serializes (548 instructions and about 470 stalled cycles in a typical FH1
+// vertex shader, 252 and 51 with one texel buffer). The Odin 2 Portal's
+// frame-600 replay: 16.65 to 15.01 ms at 1x, 20.48 to 18.9 at 4x, the image
+// bit-identical.
+REXCVAR_DEFINE_BOOL(vulkan_shared_memory_texel_buffer, REX_PLATFORM_ANDROID, "GPU/Vulkan",
+                    "Read shared memory (vertex fetches) through one R32_UINT uniform texel "
+                    "buffer over all 512 MB on devices whose storage buffer range is smaller, "
+                    "instead of a switch over several storage buffer bindings")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::graphics {
 
 spv::Id SpirvShaderTranslator::TextureSignsWord(uint32_t fetch_constant_index,
@@ -124,7 +136,8 @@ SpirvShaderTranslator::Features::Features(bool all)
       quad_operations_fragment(all),
       bindless_textures(false),
       implicit_lod_2d(false),
-      implicit_lod_2d_uniform(false) {}
+      implicit_lod_2d_uniform(false),
+      shared_memory_texel_buffer(false) {}
 
 SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const vulkan_device)
     : max_storage_buffer_range(vulkan_device->properties().maxStorageBufferRange),
@@ -177,6 +190,13 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
                       device_properties.maxUpdateAfterBindDescriptorsInAllPools >= 24576 &&
                       device_properties.maxPerStageDescriptorUpdateAfterBindSamplers >= 256 &&
                       device_properties.maxDescriptorSetUpdateAfterBindSamplers >= 256;
+  // R32_UINT uniform texel buffers are required by Vulkan, only the element
+  // count limit varies.
+  shared_memory_texel_buffer =
+      REXCVAR_GET(vulkan_shared_memory_texel_buffer) &&
+      GetSharedMemoryStorageBufferCountLog2(max_storage_buffer_range) != 0 &&
+      // 512 MB in dwords.
+      device_properties.maxTexelBufferElements >= (UINT32_C(1) << 27);
 }
 
 uint64_t SpirvShaderTranslator::GetDefaultVertexShaderModification(
@@ -582,6 +602,22 @@ void SpirvShaderTranslator::StartTranslation() {
     builder_->addDecoration(buffers_shared_memory_, spv::DecorationBinding, 0);
     if (features_.spirv_version >= spv::Spv_1_4) {
       main_interface_.push_back(buffers_shared_memory_);
+    }
+    texel_buffer_shared_memory_ = spv::NoResult;
+    if (features_.shared_memory_texel_buffer) {
+      builder_->addCapability(spv::CapabilitySampledBuffer);
+      texel_buffer_shared_memory_ = builder_->createVariable(
+          spv::NoPrecision, spv::StorageClassUniformConstant,
+          builder_->makeImageType(type_uint_, spv::DimBuffer, false, false, false, 1,
+                                  spv::ImageFormatUnknown),
+          "xe_shared_memory_texel_buffer");
+      builder_->addDecoration(texel_buffer_shared_memory_, spv::DecorationDescriptorSet,
+                              int(kDescriptorSetSharedMemoryAndEdram));
+      builder_->addDecoration(texel_buffer_shared_memory_, spv::DecorationBinding,
+                              int(kSharedMemoryTexelBufferBinding));
+      if (features_.spirv_version >= spv::Spv_1_4) {
+        main_interface_.push_back(texel_buffer_shared_memory_);
+      }
     }
   }
 
@@ -4243,6 +4279,19 @@ spv::Id SpirvShaderTranslator::LoadUint32FromSharedMemory(spv::Id address_dwords
   spv::StorageClass storage_class = features_.spirv_version >= spv::Spv_1_3
                                         ? spv::StorageClassStorageBuffer
                                         : spv::StorageClassUniform;
+
+  if (features_.shared_memory_texel_buffer) {
+    // One fetch, no branches: the storage buffer switch below serializes the
+    // loads of every word (four dependent fetches on Turnip).
+    spv::Id image = builder_->createLoad(texel_buffer_shared_memory_, spv::NoPrecision);
+    SpirvBuilder::TextureParameters fetch_parameters = {};
+    fetch_parameters.sampler = image;
+    fetch_parameters.coords = address_dwords_int;
+    return builder_->createCompositeExtract(
+        builder_->createTextureCall(spv::NoPrecision, type_uint4_, false, true, false, false,
+                                    false, fetch_parameters, spv::ImageOperandsMaskNone),
+        type_uint_, 0);
+  }
 
   uint32_t binding_count_log2 = GetSharedMemoryStorageBufferCountLog2();
 

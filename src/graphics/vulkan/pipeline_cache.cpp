@@ -1538,7 +1538,8 @@ Fh1ShaderPack::Config VulkanPipelineCache::Fh1ShaderPackConfig() const {
           (uint32_t(features.demote_to_helper_invocation) << 10) |
           (uint32_t(features.sample_rate_shading) << 11) |
           (uint32_t(render_target_cache_.msaa_2x_no_attachments_supported()) << 12) |
-          (uint32_t(features.bindless_textures) << 13)};
+          (uint32_t(features.bindless_textures) << 13) |
+          (uint32_t(features.shared_memory_texel_buffer) << 14)};
   Fh1ShaderPack::Config config;
   config.translator_version = SpirvShaderTranslator::Modification::kVersion;
   config.backend = Fh1ShaderPack::Backend::kVulkan;
