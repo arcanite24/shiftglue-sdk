@@ -57,6 +57,10 @@ REXCVAR_DEFINE_BOOL(vulkan_debug_flat_pixel_shaders, false, "GPU/Vulkan",
                     "Diagnostics: replace every guest pixel shader with one writing a constant "
                     "color (wrong image), to bound what pixel shading costs")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(vulkan_pipeline_ir_dump_dir, "", "GPU/Vulkan",
+                      "Diagnostics: with vulkan_pipeline_statistics, write each new pipeline's "
+                      "driver internal representations (such as ir3 assembly) to this directory")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_pipeline_cache_persist, true, "GPU/Vulkan",
                     "Keep the driver's pipeline cache on disk beside the shader storage, so "
                     "pipelines are not compiled again at every start")
@@ -3465,6 +3469,42 @@ void VulkanPipelineCache::LogPipelineStatistics(
     }
     REXGPU_INFO("Pipeline statistics vs={:016X} ps={:016X} {}: {}", vs, ps,
                 executables[i].name, text);
+    const std::string dump_dir = REXCVAR_GET(vulkan_pipeline_ir_dump_dir);
+    static const auto get_representations =
+        PFN_vkGetPipelineExecutableInternalRepresentationsKHR(ifn.vkGetDeviceProcAddr(
+            device, "vkGetPipelineExecutableInternalRepresentationsKHR"));
+    if (dump_dir.empty() || !get_representations) continue;
+    uint32_t representation_count = 0;
+    get_representations(device, &executable_info, &representation_count, nullptr);
+    std::vector<VkPipelineExecutableInternalRepresentationKHR> representations(
+        representation_count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR});
+    get_representations(device, &executable_info, &representation_count, representations.data());
+    std::vector<std::vector<char>> storage(representation_count);
+    for (uint32_t j = 0; j < representation_count; ++j) {
+      storage[j].resize(representations[j].dataSize + 1);
+      representations[j].pData = storage[j].data();
+    }
+    get_representations(device, &executable_info, &representation_count, representations.data());
+    std::string dump = text + "\n";
+    for (uint32_t j = 0; j < representation_count; ++j) {
+      dump += fmt::format("==== {}: {}\n", representations[j].name,
+                          representations[j].description);
+      if (representations[j].isText) {
+        dump += std::string(static_cast<const char*>(representations[j].pData),
+                            strnlen(static_cast<const char*>(representations[j].pData),
+                                    representations[j].dataSize));
+      }
+      dump += "\n";
+    }
+    std::error_code error;
+    std::filesystem::create_directories(dump_dir, error);
+    const auto path = std::filesystem::path(dump_dir) /
+                      fmt::format("{:016X}_{:016X}_{}_{}.txt", vs, ps, i,
+                                  reinterpret_cast<uintptr_t>(pipeline) & 0xFFFFFF);
+    if (FILE* file = rex::filesystem::OpenFile(path, "wb")) {
+      fwrite(dump.data(), 1, dump.size(), file);
+      fclose(file);
+    }
   }
 }
 
@@ -3970,6 +4010,9 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   const bool log_statistics = vulkan_device->properties().pipelineExecutableInfo;
   if (log_statistics) {
     pipeline_create_info.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+    if (!REXCVAR_GET(vulkan_pipeline_ir_dump_dir).empty()) {
+      pipeline_create_info.flags |= VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
+    }
   }
   VkResult create_result = dfn.vkCreateGraphicsPipelines(device, vk_pipeline_cache_, 1,
                                                          &pipeline_create_info, nullptr, &pipeline);
