@@ -22,6 +22,7 @@
 #include <rex/perf/counter.h>
 #include <rex/chrono/clock.h>
 #include <rex/platform.h>
+#include <rex/system/gpu_plugin.h>
 #include <rex/thread.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
@@ -295,7 +296,7 @@ namespace ui {
 
 void Presenter::FatalErrorHostGpuLossCallback([[maybe_unused]] bool is_responsible,
                                               [[maybe_unused]] bool statically_from_ui_thread) {
-  rex::FatalError("Graphics device lost (probably due to an internal error)");
+  rex::system::ReportHostGpuLoss();
 }
 
 Presenter::~Presenter() {

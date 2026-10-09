@@ -29,6 +29,7 @@
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
 #include <rex/stream.h>
+#include <rex/system/gpu_plugin.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
@@ -323,7 +324,7 @@ void GraphicsSystem::OnHostGpuLossFromAnyThread([[maybe_unused]] bool is_respons
   if (host_gpu_loss_reported_.test_and_set(std::memory_order_relaxed)) {
     return;
   }
-  rex::FatalError("Graphics device lost (probably due to an internal error)");
+  system::ReportHostGpuLoss();
 }
 
 uint32_t GraphicsSystem::ReadRegisterThunk(void* ppc_context, GraphicsSystem* gs, uint32_t addr) {

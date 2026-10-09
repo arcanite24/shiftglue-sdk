@@ -11,18 +11,35 @@
 
 #include <rex/system/gpu_plugin.h>
 
+#include <atomic>
 #include <filesystem>
 #include <string>
 #include <vector>
 
 #include <fmt/format.h>
 
+#include <rex/assert.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/platform/dynlib.h>
 
 namespace rex::system {
+
+namespace {
+std::atomic<HostGpuLossHandler> g_host_gpu_loss_handler{nullptr};
+}  // namespace
+
+void SetHostGpuLossHandler(HostGpuLossHandler handler) {
+  g_host_gpu_loss_handler.store(handler, std::memory_order_release);
+}
+
+void ReportHostGpuLoss() {
+  if (auto handler = g_host_gpu_loss_handler.load(std::memory_order_acquire)) {
+    handler();
+  }
+  rex::FatalError("Graphics device lost (probably due to an internal error)");
+}
 
 namespace {
 
