@@ -236,14 +236,18 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
   assert_true(index >= 0);
   REXAPU_DEBUG("AudioSystem::RegisterClient: using client index={} queued_frames={}", index,
                queued_frames_);
+  // Reserved while the driver opens the host device without the global
+  // critical region: that takes tens of milliseconds (an Android AAudio
+  // stream), which every guest thread would otherwise wait out.
+  clients_[index] = {nullptr, 0, 0, 0, true};
+  global_lock.unlock();
 
   auto client_semaphore = client_semaphores_[index].get();
-  auto ret = client_semaphore->Release(queued_frames_, nullptr);
-  assert_true(ret);
-
   AudioDriver* driver;
   auto result = CreateDriver(index, client_semaphore, &driver);
+  global_lock.lock();
   if (XFAILED(result)) {
+    clients_[index] = {nullptr, 0, 0, 0, false};
     return result;
   }
   assert_not_null(driver);
@@ -252,6 +256,10 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
   memory::store_and_swap<uint32_t>(memory()->TranslateVirtual(ptr), callback_arg);
 
   clients_[index] = {driver, callback, callback_arg, ptr, true};
+
+  // The worker pumps the client once per count, so only after it is complete.
+  auto ret = client_semaphore->Release(queued_frames_, nullptr);
+  assert_true(ret);
 
   if (out_index) {
     *out_index = index;
