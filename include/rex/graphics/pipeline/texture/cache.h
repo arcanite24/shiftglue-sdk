@@ -602,6 +602,11 @@ class TextureCache {
   // rows; end 0 means the whole texture.
   uint32_t loading_rows_first() const { return loading_rows_first_; }
   uint32_t loading_rows_end() const { return loading_rows_end_; }
+  // For a load of a tiled texture with several array layers: a mask of the
+  // layers that changed since its last load, all by GPU writes, in any of
+  // its levels. The implementation may load only those layers of each level
+  // it loads; 0 means every layer.
+  uint32_t loading_layers_mask() const { return loading_layers_mask_; }
 
  public:
   // A texture a resolve may write straight into instead of leaving it to
@@ -695,6 +700,9 @@ class TextureCache {
   // Sets loading_rows_first_ and loading_rows_end_ for a base-only reload.
   void FindReloadRowBand(const std::unique_lock<std::recursive_mutex>& global_lock,
                          const Texture& texture);
+  // Sets loading_layers_mask_.
+  void FindReloadLayers(const std::unique_lock<std::recursive_mutex>& global_lock,
+                        const Texture& texture);
 
   const RegisterFile& register_file_;
   SharedMemory& shared_memory_;
@@ -758,6 +766,7 @@ class TextureCache {
   bool loading_resolve_sourced_ = false;
   uint32_t loading_rows_first_ = 0;
   uint32_t loading_rows_end_ = 0;
+  uint32_t loading_layers_mask_ = 0;
 
   std::array<TextureBinding, xenos::kTextureFetchConstantCount> texture_bindings_;
   // Recent derivations per fetch constant: while no binding has been reset

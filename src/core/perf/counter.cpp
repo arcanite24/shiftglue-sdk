@@ -198,6 +198,7 @@ constexpr const char* kCounterNames[] = {
     "title_gpu_fence_wait_count",
     "title_gpu_fence_wait_ns",
     "texture_band_reloads",
+    "texture_layer_reloads",
     "memory_device_usage_mb",
     "memory_device_budget_mb",
     "fh1_surface_count",
@@ -295,6 +296,7 @@ constexpr bool kIsGauge[] = {
     false,  // kTitleGpuFenceWaitCount
     false,  // kTitleGpuFenceWaitNs
     false,  // kTextureBandReloads
+    false,  // kTextureLayerReloads
     true,   // kMemoryDeviceUsageMb
     true,   // kMemoryDeviceBudgetMb
     true,   // kFh1SurfaceCount

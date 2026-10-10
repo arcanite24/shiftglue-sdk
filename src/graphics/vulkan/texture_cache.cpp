@@ -1873,6 +1873,33 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
     band_end = loading_rows_end();
   }
   const bool band = band_end != 0;
+  // Only the array layers GPU writes changed since the last load
+  // (texture_layer_reloads), as runs of consecutive layers; the other
+  // layers keep their contents.
+  const uint32_t layers_mask =
+      array_size > 1 && !is_3d_tiling && !texture_key.scaled_resolve &&
+              load_shader_float_convert == kLoadShaderIndexUnknown
+          ? loading_layers_mask()
+          : 0;
+  std::array<std::pair<uint32_t, uint32_t>, 16> layer_runs;
+  uint32_t layer_run_count = 0;
+  if (layers_mask) {
+    for (uint32_t layer = 0; layer < array_size && layer_run_count < layer_runs.size();) {
+      if (!((layers_mask >> layer) & 1)) {
+        ++layer;
+        continue;
+      }
+      uint32_t layer_end = layer + 1;
+      while (layer_end < array_size && ((layers_mask >> layer_end) & 1)) {
+        ++layer_end;
+      }
+      layer_runs[layer_run_count++] = {layer, layer_end - layer};
+      layer = layer_end;
+    }
+    PERF_counter_inc(kTextureLayerReloads);
+  } else {
+    layer_runs[layer_run_count++] = {0, array_size};
+  }
 
   // The loop counter can mean two things depending on whether the packed mip
   // tail is stored as mip 0, because in this case, it would be ambiguous since
@@ -2197,6 +2224,11 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
         level_guest_layout.array_slice_stride_bytes *
         (texture_resolution_scale_x * texture_resolution_scale_y);
     for (uint32_t slice = 0; slice < array_size; ++slice) {
+      if (layers_mask && !((layers_mask >> slice) & 1)) {
+        load_constants.guest_offset += level_array_slice_stride_bytes_scaled;
+        load_constants.host_offset += uint32_t(level_host_layout.slice_size_bytes);
+        continue;
+      }
       if (slice != 0) {
         command_buffer.CmdVkPushConstants(load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
                                           offsetof(LoadConstants, guest_offset),
@@ -2321,7 +2353,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
   // Large single-level textures: written by compute through their raw-bits
   // view rather than copied by the copy engine.
   if (vulkan_texture.copy_words() && level_first == 0 && level_last == 0 && level_packed != 0 &&
-      !host_format.block_compressed) {
+      !host_format.block_compressed && !layers_mask) {
     const VkImageView copy_view = vulkan_texture.GetCopyView();
     const VkDescriptorSet copy_image_set =
         copy_view != VK_NULL_HANDLE
@@ -2414,9 +2446,9 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
   command_processor_.SubmitBarriers(true);
   VkBufferImageCopy* copy_regions = command_buffer.CmdCopyBufferToImageEmplace(
       scratch_buffer, vulkan_texture.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-      level_last - level_first + 1);
+      (level_last - level_first + 1) * layer_run_count);
   for (uint32_t level = level_first; level <= level_last; ++level) {
-    VkBufferImageCopy& copy_region = copy_regions[level - level_first];
+    VkBufferImageCopy& copy_region = copy_regions[(level - level_first) * layer_run_count];
     const HostLayout& level_host_layout =
         level != 0 ? host_layout_mips[std::min(level, level_packed)] : host_layout_base;
     copy_region.bufferOffset = level_host_layout.offset_bytes;
@@ -2463,6 +2495,13 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
       copy_region.imageExtent.height =
           std::min(copy_region.imageExtent.height,
                    std::max(height >> level, UINT32_C(1)) * texture_resolution_scale_y);
+    }
+    for (uint32_t run = layer_run_count; run-- > 0;) {
+      VkBufferImageCopy& run_region = copy_regions[(level - level_first) * layer_run_count + run];
+      run_region = copy_region;
+      run_region.bufferOffset += level_host_layout.slice_size_bytes * layer_runs[run].first;
+      run_region.imageSubresource.baseArrayLayer = layer_runs[run].first;
+      run_region.imageSubresource.layerCount = layer_runs[run].second;
     }
   }
 

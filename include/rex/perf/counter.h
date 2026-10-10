@@ -157,6 +157,8 @@ enum class CounterId : uint16_t {
 
   // Texture reloads limited to the rows GPU writes changed (DR-2.2).
   kTextureBandReloads,
+  // Texture reloads limited to the array layers GPU writes changed.
+  kTextureLayerReloads,
 
   // Memory (LS-0.4), sampled about once a second, in MiB: device-local heap
   // usage and budget (VK_EXT_memory_budget), the FH1 executor's native

@@ -36,6 +36,12 @@ REXCVAR_DEFINE_BOOL(texture_band_reloads, true, "GPU",
                     "(Vulkan with vulkan_texture_load_compute_copy), instead of the whole "
                     "texture")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(texture_layer_reloads, true, "GPU",
+                    "Reload only the array layers (cube faces) of a tiled texture that GPU "
+                    "writes (resolves) changed since its last load, when the backend can "
+                    "(Vulkan), instead of every layer (FH1 renders one face of its reflection "
+                    "cube at a time)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(texture_selective_binding_reset, true, "GPU",
                     "When a texture becomes outdated, re-derive only the bindings of outdated "
                     "textures before the next draw instead of every binding and the binding "
@@ -596,14 +602,17 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
     auto global_lock = global_critical_region_.Acquire();
     write_log_count = write_log_count_;
     loading_rows_first_ = loading_rows_end_ = 0;
+    loading_layers_mask_ = 0;
     if (pending_load.load_base && !pending_load.load_mips) {
       FindReloadRowBand(global_lock, texture);
     }
+    FindReloadLayers(global_lock, texture);
   }
   const auto load_start = std::chrono::steady_clock::now();
   const bool loaded = LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
                                                             pending_load.load_mips);
   loading_rows_first_ = loading_rows_end_ = 0;
+  loading_layers_mask_ = 0;
   if (loaded) {
     texture.set_loaded_write_log_count(write_log_count);
   }
@@ -1517,6 +1526,83 @@ void TextureCache::FindReloadRowBand(
   }
   loading_rows_first_ = first;
   loading_rows_end_ = end;
+}
+
+void TextureCache::FindReloadLayers(
+    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock,
+    const Texture& texture) {
+  loading_layers_mask_ = 0;
+  const TextureKey& key = texture.key();
+  const texture_util::TextureGuestLayout& layout = texture.guest_layout();
+  const uint32_t layers = key.GetDepthOrArraySize();
+  if (!REXCVAR_GET(texture_layer_reloads) || !key.tiled || key.scaled_resolve ||
+      key.dimension == xenos::DataDimension::k3D || layers < 2 || layers > 32 ||
+      layout.packed_level == 0) {
+    return;
+  }
+  const uint64_t since = texture.loaded_write_log_count();
+  if (!since || write_log_count_ - since > kWriteLogSize) {
+    return;
+  }
+  const uint32_t all = layers == 32 ? UINT32_MAX : (UINT32_C(1) << layers) - 1;
+  uint32_t mask = 0;
+  // Adds the layers of a level (from start, each stride bytes) that the
+  // bytes [first, end) touch, returning how many of those bytes are in it.
+  auto add = [&](uint32_t first, uint32_t end, uint32_t start, uint32_t stride) -> uint32_t {
+    const uint32_t level_end = start + stride * layers;
+    const uint32_t clipped_first = std::max(first, start);
+    const uint32_t clipped_end = std::min(end, level_end);
+    if (!stride || clipped_first >= clipped_end) {
+      return 0;
+    }
+    const uint32_t layer_first = (clipped_first - start) / stride;
+    const uint32_t layer_last = (clipped_end - 1 - start) / stride;
+    for (uint32_t layer = layer_first; layer <= layer_last; ++layer) {
+      mask |= UINT32_C(1) << layer;
+    }
+    return clipped_end - clipped_first;
+  };
+  const uint32_t base = key.base_page << 12;
+  const uint32_t base_size = texture.GetGuestBaseSize();
+  const uint32_t mips = key.mip_page << 12;
+  const uint32_t mips_size = key.mip_max_level ? texture.GetGuestMipsSize() : 0;
+  const uint32_t mip_last = std::min(uint32_t(key.mip_max_level), layout.packed_level);
+  for (uint64_t i = since; i < write_log_count_; ++i) {
+    const WriteLogEntry& entry = write_log_[i % kWriteLogSize];
+    const uint32_t first = entry.address_first;
+    const uint32_t end = entry.address_last + 1;
+    const bool in_base = base_size && first < base + base_size && base < end;
+    const bool in_mips = mips_size && first < mips + mips_size && mips < end;
+    if (!in_base && !in_mips) {
+      continue;
+    }
+    if (!entry.by_gpu) {
+      // A CPU write: anything may have changed.
+      return;
+    }
+    // Every touched byte must belong to a layer of a level, or the whole
+    // texture reloads.
+    if (in_base) {
+      const uint32_t touched = std::min(end, base + base_size) - std::max(first, base);
+      if (add(first, end, base, layout.base.array_slice_stride_bytes) != touched) {
+        return;
+      }
+    }
+    if (in_mips) {
+      const uint32_t touched = std::min(end, mips + mips_size) - std::max(first, mips);
+      uint32_t covered = 0;
+      for (uint32_t level = 1; level <= mip_last; ++level) {
+        covered += add(first, end, mips + layout.mip_offsets_bytes[level],
+                       layout.mips[level].array_slice_stride_bytes);
+      }
+      if (covered != touched) {
+        return;
+      }
+    }
+  }
+  if (mask && mask != all) {
+    loading_layers_mask_ = mask;
+  }
 }
 
 // FH1 resolves into memory shared by textures of several formats each frame,
