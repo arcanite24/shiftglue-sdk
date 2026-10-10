@@ -31,10 +31,13 @@
 REXCVAR_DEFINE_BOOL(force_convert_line_loops_to_strips, false, "GPU",
                     "Force convert line loops to strips");
 
-// On Android, quad lists become indexed triangle lists instead of going
-// through a geometry shader, which Adreno runs slowly: about 1.2 ms of a
-// 25 ms FH1 frame on the Odin 2 Portal (Adreno 740, Turnip).
-REXCVAR_DEFINE_BOOL(force_convert_quad_lists_to_triangle_lists, REX_PLATFORM_ANDROID, "GPU",
+// Quad lists become indexed triangle lists instead of going through a
+// geometry shader. Adreno runs that shader slowly: about 1.2 ms of a 25 ms
+// FH1 frame on the Odin 2 Portal (Adreno 740, Turnip). On desktops the gain
+// grows with the resolution scale: the FH1 frame-600 replay at 2x goes from
+// 6.24 to 6.04 ms on an RTX 4080 and from 29.9 to 28.3 ms on an M4 Pro
+// (MoltenVK), with a front buffer within 0.02/255 of the shader's.
+REXCVAR_DEFINE_BOOL(force_convert_quad_lists_to_triangle_lists, true, "GPU",
                     "Force convert quad lists to triangle lists");
 
 REXCVAR_DEFINE_BOOL(force_convert_triangle_fans_to_lists, false, "GPU",
