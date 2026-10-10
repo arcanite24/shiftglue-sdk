@@ -1,8 +1,14 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -18,6 +24,7 @@
 #include <rex/graphics/util/draw_extent_estimator.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/xenos.h>
+#include <rex/thread.h>
 #include <rex/ui/vulkan/api.h>
 
 namespace rex::memory {
@@ -308,6 +315,12 @@ class Fh1NativeExecutor {
 
   VkDescriptorSet AllocateDescriptorSet(VkDescriptorSetLayout layout);
   VkPipeline GetTransferPipeline(const TransferPipelineKey& key);
+  static uint32_t TransferKind(const TransferPipelineKey& key);
+  bool GetTransferModules(const TransferPipelineKey& key, VkShaderModule& vertex_module,
+                          VkShaderModule& fragment_module);
+  // Touches no executor state but the layouts, so a worker may call it.
+  VkPipeline CreateTransferPipeline(const TransferPipelineKey& key, VkShaderModule vertex_module,
+                                    VkShaderModule fragment_module) const;
   VkPipeline GetComputePipeline(bool words, uint32_t source_kind, bool msaa);
   // A resolve pipeline specialized for the constants' format, MSAA, sample,
   // pack and endian bits, or null to use the generic one.
@@ -317,6 +330,21 @@ class Fh1NativeExecutor {
   VkPipeline GetSpecializedResolvePipeline(bool image, uint32_t source_kind, bool msaa,
                                            const uint32_t* constants);
   VkShaderModule GetShaderModule(const uint32_t* code, size_t size_bytes);
+
+  // Specialized pipelines are built on a worker, and passes use the generic
+  // pipeline until theirs is ready: a cold driver cache took up to 100 ms a
+  // pipeline on a phone, hundreds of milliseconds a frame at a new scene.
+  struct SpecializeJob {
+    bool transfer = false;
+    std::array<uint32_t, 9> resolve_key = {};
+    TransferPipelineKey transfer_key = {};
+    std::function<VkPipeline()> create;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+  };
+  void QueueSpecialize(SpecializeJob job);
+  void CollectSpecialized();
+  void StopSpecializeThread();
+  void SpecializeThread();
 
   void Skip(const char* reason) { counters_.Skip(reason); }
   void Count(const char* stat) { counters_.Count(stat); }
@@ -376,6 +404,14 @@ class Fh1NativeExecutor {
   // Specialized resolves by {image, source kind, msaa, specialization constants}.
   std::map<std::array<uint32_t, 9>, VkPipeline> specialized_resolve_pipelines_;
   uint32_t specialized_transfer_pipelines_ = 0;
+  bool async_specialize_ = false;
+  std::unique_ptr<rex::thread::Thread> specialize_thread_;
+  std::mutex specialize_mutex_;
+  std::condition_variable specialize_cond_;
+  std::deque<SpecializeJob> specialize_queue_;
+  std::vector<SpecializeJob> specialize_done_;
+  std::atomic<bool> specialize_has_done_{false};
+  bool specialize_stop_ = false;
 
   VkBuffer transfer_words_ = VK_NULL_HANDLE;
   VkDeviceMemory transfer_words_memory_ = VK_NULL_HANDLE;

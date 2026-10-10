@@ -40,6 +40,12 @@ REXCVAR_DEFINE_BOOL(fh1_specialize_edram_passes, true, "GPU",
                     "Vulkan FH1 resolves and EDRAM transfers use pipelines specialized for "
                     "each kind (formats, MSAA, pitches); GPUs otherwise run every kind's code "
                     "per pixel");
+REXCVAR_DEFINE_BOOL(fh1_async_specialized_passes, true, "GPU",
+                    "With fh1_specialize_edram_passes, build each specialized pipeline on a "
+                    "worker and use the generic one until it is ready, instead of stopping the "
+                    "GPU commands thread for it (tens of milliseconds a pipeline on a cold "
+                    "driver cache)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_msaa_single_sample, true, "GPU",
                     "Keep the guest's 2x and 4x MSAA surfaces as single-sampled images at any "
                     "resolution scale (Vulkan): at 1x the game renders without MSAA - harder "
@@ -403,6 +409,7 @@ Fh1NativeExecutor::~Fh1NativeExecutor() { Shutdown(); }
 bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   config_ = config;
   if (!config_.memory || !config_.textures || !config_.render_targets) return false;
+  async_specialize_ = REXCVAR_GET(fh1_async_specialized_passes);
   scale_ = config_.textures->draw_resolution_scale_x();
   untile_height_ = config_.untile_height;
   UpdateCoarseShading();
@@ -524,6 +531,7 @@ void Fh1NativeExecutor::Shutdown() {
     command_processor_.Fh1AwaitAllQueueOperations();
   }
   initialized_ = false;
+  StopSpecializeThread();
   for (auto& [packed, surface] : surfaces_) DestroySurface(surface);
   surfaces_.clear();
   for (auto& [key, pipeline] : transfer_pipelines_) dfn.vkDestroyPipeline(device, pipeline, nullptr);
@@ -894,23 +902,41 @@ VkShaderModule Fh1NativeExecutor::GetShaderModule(const uint32_t* code, size_t s
 VkPipeline Fh1NativeExecutor::GetTransferPipeline(const TransferPipelineKey& key) {
   auto it = transfer_pipelines_.find(key);
   if (it != transfer_pipelines_.end()) return it->second;
+  VkShaderModule vertex_module, fragment_module;
+  if (!GetTransferModules(key, vertex_module, fragment_module)) return VK_NULL_HANDLE;
+  if (key.specialized) ++specialized_transfer_pipelines_;
+  VkPipeline pipeline = CreateTransferPipeline(key, vertex_module, fragment_module);
+  if (!pipeline) return VK_NULL_HANDLE;
+  return transfer_pipelines_.emplace(key, pipeline).first->second;
+}
+
+uint32_t Fh1NativeExecutor::TransferKind(const TransferPipelineKey& key) {
   // Depth with stencil exported by the shader has the depth pass's state; the
   // exported value takes the place of the stencil reference.
-  const bool exports_stencil = key.dest_kind == kTransferDestDepthStencil;
-  const uint32_t kind = exports_stencil                   ? 1
-                        : key.dest_kind == kTransferDestUint ? 3
-                                                             : std::min(key.dest_kind, 2u);
+  return key.dest_kind == kTransferDestDepthStencil ? 1
+         : key.dest_kind == kTransferDestUint        ? 3
+                                                     : std::min(key.dest_kind, 2u);
+}
+
+bool Fh1NativeExecutor::GetTransferModules(const TransferPipelineKey& key,
+                                           VkShaderModule& vertex_module,
+                                           VkShaderModule& fragment_module) {
+  const uint32_t kind = TransferKind(key);
   const SpirvShader& fragment =
-      exports_stencil
+      key.dest_kind == kTransferDestDepthStencil
           ? kTransferDepthStencilShaders[key.dest_samples > 1][key.source_kind][key.source_msaa]
       : key.source_kind == kTransferSourceWords
           ? kFromWordsShaders[kind == 1 ? 0 : 1][key.dest_samples > 1]
           : kTransferShaders[kind][key.dest_samples > 1][key.source_kind][key.source_msaa];
-  VkShaderModule vertex_module =
-      GetShaderModule(shaders::fullscreen_cw_vs, sizeof(shaders::fullscreen_cw_vs));
-  VkShaderModule fragment_module = GetShaderModule(fragment.code, fragment.size);
-  if (!vertex_module || !fragment_module) return VK_NULL_HANDLE;
+  vertex_module = GetShaderModule(shaders::fullscreen_cw_vs, sizeof(shaders::fullscreen_cw_vs));
+  fragment_module = GetShaderModule(fragment.code, fragment.size);
+  return vertex_module && fragment_module;
+}
 
+VkPipeline Fh1NativeExecutor::CreateTransferPipeline(const TransferPipelineKey& key,
+                                                     VkShaderModule vertex_module,
+                                                     VkShaderModule fragment_module) const {
+  const uint32_t kind = TransferKind(key);
   VkPipelineShaderStageCreateInfo stages[2] = {};
   stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
   stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -928,7 +954,6 @@ VkPipeline Fh1NativeExecutor::GetTransferPipeline(const TransferPipelineKey& key
   const VkSpecializationInfo spec_info = {4, spec_entries, sizeof(spec_values), spec_values};
   if (key.specialized) {
     stages[1].pSpecializationInfo = &spec_info;
-    ++specialized_transfer_pipelines_;
   }
   VkPipelineVertexInputStateCreateInfo vertex_input = {};
   vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
@@ -1013,7 +1038,7 @@ VkPipeline Fh1NativeExecutor::GetTransferPipeline(const TransferPipelineKey& key
           nullptr, &pipeline) != VK_SUCCESS) {
     return VK_NULL_HANDLE;
   }
-  return transfer_pipelines_.emplace(key, pipeline).first->second;
+  return pipeline;
 }
 
 VkPipeline Fh1NativeExecutor::GetComputePipeline(bool words, uint32_t source_kind, bool msaa) {
@@ -1032,10 +1057,32 @@ void Fh1NativeExecutor::SpecializeTransfer(TransferPipelineKey& key,
   TransferPipelineKey specialized = key;
   specialized.specialized = true;
   specialized.spec = {constants[0] & ~0x7FFu, constants[1] & ~0x7FFu, constants[2]};
-  // Like resolves, a few dozen kinds; past the cap, generic.
-  if (specialized_transfer_pipelines_ < 256 || transfer_pipelines_.count(specialized)) {
-    key = specialized;
+  if (!async_specialize_) {
+    // Like resolves, a few dozen kinds; past the cap, generic.
+    if (specialized_transfer_pipelines_ < 256 || transfer_pipelines_.count(specialized)) {
+      key = specialized;
+    }
+    return;
   }
+  CollectSpecialized();
+  auto it = transfer_pipelines_.find(specialized);
+  if (it != transfer_pipelines_.end()) {
+    // Null while the worker builds it, or if it failed: generic.
+    if (it->second) key = specialized;
+    return;
+  }
+  if (specialized_transfer_pipelines_ >= 256) return;
+  VkShaderModule vertex_module, fragment_module;
+  if (!GetTransferModules(specialized, vertex_module, fragment_module)) return;
+  ++specialized_transfer_pipelines_;
+  transfer_pipelines_.emplace(specialized, VK_NULL_HANDLE);
+  SpecializeJob job;
+  job.transfer = true;
+  job.transfer_key = specialized;
+  job.create = [this, specialized, vertex_module, fragment_module]() {
+    return CreateTransferPipeline(specialized, vertex_module, fragment_module);
+  };
+  QueueSpecialize(std::move(job));
 }
 
 VkPipeline Fh1NativeExecutor::GetSpecializedResolvePipeline(bool image, uint32_t source_kind,
@@ -1054,30 +1101,101 @@ VkPipeline Fh1NativeExecutor::GetSpecializedResolvePipeline(bool image, uint32_t
   const std::array<uint32_t, 9> key = {uint32_t(image), source_kind, uint32_t(msaa),
                                         values[1], values[2], values[3], values[4],
                                         values[5], values[6]};
+  if (async_specialize_) CollectSpecialized();
   auto it = specialized_resolve_pipelines_.find(key);
   if (it != specialized_resolve_pipelines_.end()) return it->second;
   // Every kind the title resolves takes a few dozen; past the cap, generic.
   if (specialized_resolve_pipelines_.size() >= 256) return VK_NULL_HANDLE;
   const SpirvShader& shader =
       image ? kImageShaders[source_kind][msaa] : kComputeShaders[false][source_kind][msaa];
-  VkPipeline pipeline = VK_NULL_HANDLE;
-  if (shader.code) {
+  const VkShaderModule module =
+      shader.code ? GetShaderModule(shader.code, shader.size) : VK_NULL_HANDLE;
+  const VkPipelineLayout layout = image ? image_pipeline_layout_ : compute_pipeline_layout_;
+  auto create = [this, values, module, layout]() -> VkPipeline {
+    if (!module) return VK_NULL_HANDLE;
     VkSpecializationMapEntry entries[7];
     for (uint32_t i = 0; i < values.size(); ++i) {
       entries[i] = {i, uint32_t(sizeof(uint32_t)) * i, sizeof(uint32_t)};
     }
     const VkSpecializationInfo info = {uint32_t(values.size()), entries,
                                        sizeof(uint32_t) * values.size(), values.data()};
-    const VkShaderModule module = GetShaderModule(shader.code, shader.size);
-    if (module) {
-      pipeline = ui::vulkan::util::CreateComputePipeline(
-          command_processor_.GetVulkanDevice(),
-          image ? image_pipeline_layout_ : compute_pipeline_layout_, module, &info, "main",
-          command_processor_.UsePersistentVkPipelineCache());
-    }
+    return ui::vulkan::util::CreateComputePipeline(
+        command_processor_.GetVulkanDevice(), layout, module, &info, "main",
+        command_processor_.UsePersistentVkPipelineCache());
+  };
+  if (async_specialize_ && module) {
+    // Generic until the worker has built it.
+    specialized_resolve_pipelines_.emplace(key, VK_NULL_HANDLE);
+    SpecializeJob job;
+    job.resolve_key = key;
+    job.create = std::move(create);
+    QueueSpecialize(std::move(job));
+    return VK_NULL_HANDLE;
   }
+  const VkPipeline pipeline = create();
   specialized_resolve_pipelines_.emplace(key, pipeline);
   return pipeline;
+}
+
+void Fh1NativeExecutor::QueueSpecialize(SpecializeJob job) {
+  if (!specialize_thread_) {
+    specialize_thread_ = rex::thread::Thread::Create({}, [this]() { SpecializeThread(); });
+    specialize_thread_->set_name("FH1 Pipelines");
+  }
+  {
+    std::lock_guard<std::mutex> lock(specialize_mutex_);
+    specialize_queue_.push_back(std::move(job));
+  }
+  specialize_cond_.notify_one();
+}
+
+void Fh1NativeExecutor::CollectSpecialized() {
+  if (!specialize_has_done_.load(std::memory_order_acquire)) return;
+  std::vector<SpecializeJob> done;
+  {
+    std::lock_guard<std::mutex> lock(specialize_mutex_);
+    done.swap(specialize_done_);
+    specialize_has_done_.store(false, std::memory_order_relaxed);
+  }
+  for (const SpecializeJob& job : done) {
+    if (job.transfer) {
+      transfer_pipelines_[job.transfer_key] = job.pipeline;
+    } else {
+      specialized_resolve_pipelines_[job.resolve_key] = job.pipeline;
+    }
+  }
+}
+
+void Fh1NativeExecutor::SpecializeThread() {
+  std::unique_lock<std::mutex> lock(specialize_mutex_);
+  while (true) {
+    specialize_cond_.wait(lock,
+                          [this] { return specialize_stop_ || !specialize_queue_.empty(); });
+    if (specialize_queue_.empty()) return;
+    SpecializeJob job = std::move(specialize_queue_.front());
+    specialize_queue_.pop_front();
+    lock.unlock();
+    job.pipeline = job.create();
+    job.create = nullptr;
+    lock.lock();
+    specialize_done_.push_back(std::move(job));
+    specialize_has_done_.store(true, std::memory_order_release);
+  }
+}
+
+void Fh1NativeExecutor::StopSpecializeThread() {
+  if (!specialize_thread_) return;
+  {
+    // The worker finishes what is queued, so every pipeline lands in a map
+    // that Shutdown destroys.
+    std::lock_guard<std::mutex> lock(specialize_mutex_);
+    specialize_stop_ = true;
+  }
+  specialize_cond_.notify_all();
+  rex::thread::Wait(specialize_thread_.get(), false);
+  specialize_thread_.reset();
+  specialize_stop_ = false;
+  CollectSpecialized();
 }
 
 VkDescriptorSet Fh1NativeExecutor::AllocateDescriptorSet(VkDescriptorSetLayout layout) {
