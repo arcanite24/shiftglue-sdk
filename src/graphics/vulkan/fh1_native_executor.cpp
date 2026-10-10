@@ -55,6 +55,10 @@ REXCVAR_DEFINE_BOOL(fh1_trace_resolve_cpu_accesses, false, "GPU",
                     "reads and writes of it (thread and link register), to find the resolves "
                     "the CPU reads (FH1 native executor, Vulkan)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(fh1_native_stats_frames, 600, "GPU",
+                     "Frames between the FH1 native executor's periodic stats and GPU profile "
+                     "logs (Vulkan); shorter windows separate heavy stretches of play")
+    .range(1, 100000);
 REXCVAR_DEFINE_BOOL(fh1_fold_clears, true, "GPU",
                     "Record EDRAM clears inside the next draw rendering on the surface (or as "
                     "its load op) instead of in a rendering of their own: on tiled GPUs each "
@@ -2912,7 +2916,7 @@ void Fh1NativeExecutor::OnSwap(uint64_t frame) {
   UpdateCoarseShading();
   GpuDrain();
   frame_ = frame;
-  if (frame % 600 == 0) LogStats(frame);
+  if (frame % uint64_t(REXCVAR_GET(fh1_native_stats_frames)) == 0) LogStats(frame);
 }
 
 void Fh1NativeExecutor::LogStats(uint64_t frame) {
