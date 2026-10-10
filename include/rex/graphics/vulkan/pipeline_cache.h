@@ -24,6 +24,7 @@
 #include <set>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -90,6 +91,12 @@ class VulkanPipelineCache {
 
   bool EnsureShadersTranslated(VulkanShader::VulkanTranslation* vertex_shader,
                                VulkanShader::VulkanTranslation* pixel_shader);
+  enum class TranslationRequest { kReady, kPending, kFailed };
+  // EnsureShadersTranslated, but with vulkan_async_shader_translation a
+  // shader not translated yet goes to a worker and the draw is skipped
+  // (kPending) until it is ready, as for a pipeline still being built.
+  TranslationRequest RequestShadersTranslated(VulkanShader::VulkanTranslation* vertex_shader,
+                                              VulkanShader::VulkanTranslation* pixel_shader);
   // TODO(Triang3l): Return a deferred creation handle.
   // The persistent driver pipeline cache (vulkan_pipeline_cache_persist), for
   // pipelines other subsystems create, or null. Each use counts a creation so
@@ -348,9 +355,23 @@ class VulkanPipelineCache {
   };
 
 
-  // Can be called from multiple threads.
   bool TranslateAnalyzedShader(SpirvShaderTranslator& translator,
                                VulkanShader::VulkanTranslation& translation);
+  // The two halves of TranslateAnalyzedShader: the binary and the module,
+  // which a worker may make, then the binding layouts and the observer, on
+  // the command processor thread.
+  bool TranslateShaderBinary(SpirvShaderTranslator& translator,
+                             VulkanShader::VulkanTranslation& translation, bool& observe);
+  void FinishShaderTranslation(VulkanShader::VulkanTranslation& translation, bool observe);
+  struct TranslationJob {
+    VulkanShader::VulkanTranslation* translation;
+    bool translated;
+    bool observe;
+  };
+  void TranslationThread();
+  void CollectTranslations();
+  // Waits for the queued translations and finishes them.
+  void StopTranslationThread();
 
   void WritePipelineRenderTargetDescription(reg::RB_BLENDCONTROL blend_control, uint32_t write_mask,
                                             PipelineRenderTarget& render_target_out) const;
@@ -403,6 +424,19 @@ class VulkanPipelineCache {
   string::StringBuffer ucode_disasm_buffer_;
   // Reusable shader translator on the command processor thread.
   std::unique_ptr<SpirvShaderTranslator> shader_translator_;
+  // vulkan_async_shader_translation: one worker, so that a shader's first
+  // translation, which sets its bindings, is never racing another one.
+  bool async_translation_ = false;
+  std::unique_ptr<SpirvShaderTranslator> async_shader_translator_;
+  std::unique_ptr<rex::thread::Thread> translation_thread_;
+  std::mutex translation_mutex_;
+  std::condition_variable translation_cond_;
+  std::deque<VulkanShader::VulkanTranslation*> translation_queue_;
+  std::vector<TranslationJob> translation_done_;
+  std::atomic<bool> translation_has_done_{false};
+  bool translation_stop_ = false;
+  // Queued or on the worker; only the command processor thread reads it.
+  std::unordered_set<const VulkanShader::VulkanTranslation*> translations_pending_;
   // FH1 precompiled SPIR-V (NP-12.6): translations looked up before the
   // translator runs; misses are translated as before.
   Fh1ShaderPack fh1_shader_pack_;

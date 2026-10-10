@@ -5169,9 +5169,17 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
           pixel_shader ? static_cast<VulkanShader::VulkanTranslation*>(
                              pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
                        : nullptr;
-      if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
-                                                    pixel_shader_translation)) {
+      const VulkanPipelineCache::TranslationRequest translation_request =
+          pipeline_cache_->RequestShadersTranslated(vertex_shader_translation,
+                                                    pixel_shader_translation);
+      if (translation_request != VulkanPipelineCache::TranslationRequest::kReady) {
         translation_memo.state_epoch = 0;
+        if (translation_request == VulkanPipelineCache::TranslationRequest::kPending) {
+          // A worker is translating a shader seen for the first time: skipped
+          // like a draw whose pipeline is still being built.
+          frame_used_async_placeholder_pipeline_ = true;
+          return true;
+        }
         return draw_fail("shader_translation");
       }
       translation_memo.state_epoch = memo_state;

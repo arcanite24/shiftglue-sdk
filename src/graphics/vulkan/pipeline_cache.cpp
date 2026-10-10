@@ -87,6 +87,12 @@ REXCVAR_DEFINE_BOOL(vulkan_async_pipeline_no_placeholder, REX_PLATFORM_ANDROID, 
                     "tens of milliseconds to compile, and building a placeholder and then waiting "
                     "for the real one at every submission froze new scenes for seconds")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(vulkan_async_shader_translation, true, "GPU/Vulkan",
+                    "With vulkan_async_pipeline_no_placeholder, translate a guest shader seen "
+                    "for the first time on a worker and skip its draws until it is ready, "
+                    "instead of stopping the GPU commands thread for it (hundreds of "
+                    "milliseconds when a new scene first appears on a phone)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -329,6 +335,9 @@ bool VulkanPipelineCache::Initialize() {
       render_target_cache_.msaa_2x_no_attachments_supported(), edram_fragment_shader_interlock,
       render_target_cache_.draw_resolution_scale_x(),
       render_target_cache_.draw_resolution_scale_y());
+  async_translation_ = REXCVAR_GET(vulkan_async_shader_translation) &&
+                       REXCVAR_GET(async_shader_compilation) &&
+                       REXCVAR_GET(vulkan_async_pipeline_no_placeholder);
 
   if (edram_fragment_shader_interlock) {
     std::vector<uint8_t> depth_only_fragment_shader_code =
@@ -671,6 +680,7 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
   }
 
   // Translate shader modifications needed for stored pipelines.
+  StopTranslationThread();
   for (const std::pair<uint64_t, uint64_t>& translation_needed : shader_translations_needed) {
     auto shader_it = shaders_.find(translation_needed.first);
     if (shader_it == shaders_.end()) {
@@ -1039,6 +1049,8 @@ void VulkanPipelineCache::EndSubmission() {
 }
 
 void VulkanPipelineCache::Shutdown() {
+  StopTranslationThread();
+  async_shader_translator_.reset();
   // Shut down creation threads before destroying any pipelines they may touch.
   if (!creation_threads_.empty()) {
     {
@@ -1303,6 +1315,109 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
     }
   }
   return true;
+}
+
+VulkanPipelineCache::TranslationRequest VulkanPipelineCache::RequestShadersTranslated(
+    VulkanShader::VulkanTranslation* vertex_shader, VulkanShader::VulkanTranslation* pixel_shader) {
+  if (async_translation_) {
+    CollectTranslations();
+    bool pending = false;
+    for (VulkanShader::VulkanTranslation* translation : {vertex_shader, pixel_shader}) {
+      if (!translation) {
+        continue;
+      }
+      if (translations_pending_.count(translation)) {
+        pending = true;
+        continue;
+      }
+      if (translation->is_translated()) {
+        continue;
+      }
+      translation->shader().AnalyzeUcode(ucode_disasm_buffer_);
+      if (!translation_thread_) {
+        if (!async_shader_translator_) {
+          async_shader_translator_ = std::make_unique<SpirvShaderTranslator>(
+              SpirvShaderTranslator::Features(command_processor_.GetVulkanDevice()),
+              render_target_cache_.msaa_2x_attachments_supported(),
+              render_target_cache_.msaa_2x_no_attachments_supported(),
+              render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock,
+              render_target_cache_.draw_resolution_scale_x(),
+              render_target_cache_.draw_resolution_scale_y());
+        }
+        translation_thread_ =
+            rex::thread::Thread::Create({}, [this]() { TranslationThread(); });
+        translation_thread_->set_name("Vulkan Shaders");
+      }
+      translations_pending_.insert(translation);
+      {
+        std::lock_guard<std::mutex> lock(translation_mutex_);
+        translation_queue_.push_back(translation);
+      }
+      translation_cond_.notify_one();
+      pending = true;
+    }
+    if (pending) {
+      return TranslationRequest::kPending;
+    }
+  }
+  return EnsureShadersTranslated(vertex_shader, pixel_shader) ? TranslationRequest::kReady
+                                                              : TranslationRequest::kFailed;
+}
+
+void VulkanPipelineCache::TranslationThread() {
+  std::unique_lock<std::mutex> lock(translation_mutex_);
+  while (true) {
+    translation_cond_.wait(lock,
+                           [this] { return translation_stop_ || !translation_queue_.empty(); });
+    if (translation_queue_.empty()) {
+      return;
+    }
+    TranslationJob job = {translation_queue_.front(), false, false};
+    translation_queue_.pop_front();
+    lock.unlock();
+    job.translated = TranslateShaderBinary(*async_shader_translator_, *job.translation, job.observe);
+    lock.lock();
+    translation_done_.push_back(job);
+    translation_has_done_.store(true, std::memory_order_release);
+  }
+}
+
+void VulkanPipelineCache::CollectTranslations() {
+  if (!translation_has_done_.load(std::memory_order_acquire)) {
+    return;
+  }
+  std::vector<TranslationJob> done;
+  {
+    std::lock_guard<std::mutex> lock(translation_mutex_);
+    done.swap(translation_done_);
+    translation_has_done_.store(false, std::memory_order_relaxed);
+  }
+  for (const TranslationJob& job : done) {
+    if (job.translated) {
+      FinishShaderTranslation(*job.translation, job.observe);
+    } else {
+      REXGPU_ERROR("Failed to translate the {} shader {:016X}!",
+                   job.translation->shader().type() == xenos::ShaderType::kVertex ? "vertex"
+                                                                                  : "pixel",
+                   job.translation->shader().ucode_data_hash());
+    }
+    translations_pending_.erase(job.translation);
+  }
+}
+
+void VulkanPipelineCache::StopTranslationThread() {
+  if (!translation_thread_) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(translation_mutex_);
+    translation_stop_ = true;
+  }
+  translation_cond_.notify_all();
+  rex::thread::Wait(translation_thread_.get(), false);
+  translation_thread_.reset();
+  translation_stop_ = false;
+  CollectTranslations();
 }
 
 bool VulkanPipelineCache::ConfigurePipeline(
@@ -1702,7 +1817,19 @@ void VulkanPipelineCache::ObserveTranslation(const VulkanShader& shader,
 
 bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& translator,
                                                   VulkanShader::VulkanTranslation& translation) {
+  bool observe;
+  if (!TranslateShaderBinary(translator, translation, observe)) {
+    return false;
+  }
+  FinishShaderTranslation(translation, observe);
+  return true;
+}
+
+bool VulkanPipelineCache::TranslateShaderBinary(SpirvShaderTranslator& translator,
+                                                VulkanShader::VulkanTranslation& translation,
+                                                bool& observe) {
   VulkanShader& shader = static_cast<VulkanShader&>(translation.shader());
+  observe = false;
 
   bool used_precompiled_shader = false;
   if (const Fh1ShaderPack::Entry* precompiled = fh1_shader_pack_.Find(
@@ -1755,15 +1882,21 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
                    shader.ucode_data_hash());
       return false;
     }
-    ObserveTranslation(shader, translation);
+    observe = true;
   }
   // As the D3D12 backend does, so a driver's failure on one translation can
   // be reproduced with spirv-val or replayed elsewhere.
   if (!REXCVAR_GET(dump_shaders).empty()) {
     translation.Dump(REXCVAR_GET(dump_shaders), "spirv");
   }
-  if (translation.GetOrCreateShaderModule() == VK_NULL_HANDLE) {
-    return false;
+  return translation.GetOrCreateShaderModule() != VK_NULL_HANDLE;
+}
+
+void VulkanPipelineCache::FinishShaderTranslation(VulkanShader::VulkanTranslation& translation,
+                                                  bool observe) {
+  VulkanShader& shader = static_cast<VulkanShader&>(translation.shader());
+  if (observe) {
+    ObserveTranslation(shader, translation);
   }
 
   // TODO(Triang3l): Log that the shader has been successfully translated in
@@ -1817,8 +1950,6 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
                   "UID is their count");
     shader.SetSamplerBindingLayoutUserUID(shader.GetSamplerBindingsAfterTranslation().size());
   }
-
-  return true;
 }
 
 void VulkanPipelineCache::WritePipelineRenderTargetDescription(
