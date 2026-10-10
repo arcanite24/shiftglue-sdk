@@ -553,10 +553,11 @@ void Fh1NativeExecutor::Shutdown() {
   transfer_words_size_ = 0;
   for (auto& [buffer, memory] : retired_buffers_) destroy_buffer(buffer, memory);
   retired_buffers_.clear();
-  for (PendingReadback& readback : pending_readbacks_) {
-    destroy_buffer(readback.buffer, readback.memory);
-  }
   pending_readbacks_.clear();
+  destroy_buffer(readback_buffer_, readback_memory_);
+  readback_mapped_ = nullptr;
+  readback_size_ = 0;
+  readback_used_ = 0;
   for (auto& by_kind : image_pipelines_) {
     for (VkPipeline& pipeline : by_kind) {
       if (pipeline) dfn.vkDestroyPipeline(device, pipeline, nullptr);
@@ -2535,17 +2536,40 @@ bool Fh1NativeExecutor::IsOneOffResolve(uint32_t address, uint32_t length) {
 }
 
 void Fh1NativeExecutor::QueueResolveReadback(uint32_t address, uint32_t length) {
-  PendingReadback readback = {address, length, VK_NULL_HANDLE, VK_NULL_HANDLE};
-  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-          command_processor_.GetVulkanDevice(), length, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-          ui::vulkan::util::MemoryPurpose::kReadback, readback.buffer, readback.memory)) {
-    return Skip("resolve_readback_buffer");
+  if (readback_used_ + length > readback_size_) {
+    // The pending copies target the current buffer.
+    FlushResolveReadbacks();
+    if (length > readback_size_) {
+      const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+      const auto& dfn = vulkan_device->functions();
+      const VkDevice device = vulkan_device->device();
+      if (readback_buffer_) dfn.vkDestroyBuffer(device, readback_buffer_, nullptr);
+      if (readback_memory_) dfn.vkFreeMemory(device, readback_memory_, nullptr);
+      readback_buffer_ = VK_NULL_HANDLE;
+      readback_memory_ = VK_NULL_HANDLE;
+      readback_mapped_ = nullptr;
+      readback_size_ = 0;
+      VkDeviceSize size = 8 << 20;
+      while (size < length) size *= 2;
+      void* mapped = nullptr;
+      if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+              vulkan_device, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+              ui::vulkan::util::MemoryPurpose::kReadback, readback_buffer_, readback_memory_) ||
+          dfn.vkMapMemory(device, readback_memory_, 0, VK_WHOLE_SIZE, 0, &mapped) !=
+              VK_SUCCESS) {
+        return Skip("resolve_readback_buffer");
+      }
+      readback_mapped_ = static_cast<const uint8_t*>(mapped);
+      readback_size_ = size;
+    }
   }
+  PendingReadback readback = {address, length, readback_used_};
+  readback_used_ += (VkDeviceSize(length) + 255) & ~VkDeviceSize(255);
   config_.memory->Use(VulkanSharedMemory::Usage::kRead);
   command_processor_.SubmitBarriers(true);
-  const VkBufferCopy region = {address, 0, length};
+  const VkBufferCopy region = {address, readback.offset, length};
   command_processor_.deferred_command_buffer().CmdVkCopyBuffer(config_.memory->buffer(),
-                                                               readback.buffer, 1, &region);
+                                                               readback_buffer_, 1, &region);
   pending_readbacks_.push_back(readback);
   Count("resolve_readback_one_off");
 }
@@ -2556,24 +2580,19 @@ void Fh1NativeExecutor::FlushResolveReadbacks() {
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
   const auto& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
+  VkMappedMemoryRange range = {};
+  range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+  range.memory = readback_memory_;
+  range.size = VK_WHOLE_SIZE;
+  dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
   // In order: a later resolve over the same bytes wins, as on the GPU.
   for (PendingReadback& pending : pending_readbacks_) {
-    uint8_t* destination = memory_.TranslatePhysical(pending.address);
-    void* mapped = nullptr;
-    if (destination &&
-        dfn.vkMapMemory(device, pending.memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS) {
-      VkMappedMemoryRange range = {};
-      range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-      range.memory = pending.memory;
-      range.size = VK_WHOLE_SIZE;
-      dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
-      std::memcpy(destination, mapped, pending.length);
-      dfn.vkUnmapMemory(device, pending.memory);
+    if (uint8_t* destination = memory_.TranslatePhysical(pending.address)) {
+      std::memcpy(destination, readback_mapped_ + pending.offset, pending.length);
     }
-    dfn.vkDestroyBuffer(device, pending.buffer, nullptr);
-    dfn.vkFreeMemory(device, pending.memory, nullptr);
   }
   pending_readbacks_.clear();
+  readback_used_ = 0;
   Count("resolve_readback_flush");
 }
 

@@ -217,8 +217,8 @@ class Fh1NativeExecutor {
   struct PendingReadback {
     uint32_t address;
     uint32_t length;
-    VkBuffer buffer;
-    VkDeviceMemory memory;
+    // In readback_buffer_.
+    VkDeviceSize offset;
   };
   struct ResolveReadback {
     uint64_t last_used_frame = 0;
@@ -385,6 +385,14 @@ class Fh1NativeExecutor {
 
   std::vector<PendingTransfer> pending_transfers_;
   std::vector<PendingReadback> pending_readbacks_;
+  // One persistently mapped buffer for all one-off readbacks: a dedicated
+  // allocation per readback cost milliseconds each on Android (KGSL zeroes
+  // new memory) in the bursts at gameplay start.
+  VkBuffer readback_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory readback_memory_ = VK_NULL_HANDLE;
+  VkDeviceSize readback_size_ = 0;
+  VkDeviceSize readback_used_ = 0;
+  const uint8_t* readback_mapped_ = nullptr;
   std::map<uint64_t, ResolveReadback> resolve_readbacks_;
 
   // Targets PrepareTargets derived for the draw BindTargets binds.
