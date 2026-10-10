@@ -206,7 +206,8 @@ static void LogComputePipelineStatistics(const VulkanDevice* const vulkan_device
 VkPipeline CreateComputePipeline(const VulkanDevice* const vulkan_device,
                                  const VkPipelineLayout layout, const VkShaderModule shader,
                                  const VkSpecializationInfo* const specialization_info,
-                                 const char* const entry_point) {
+                                 const char* const entry_point,
+                                 const VkPipelineCache pipeline_cache) {
   VkComputePipelineCreateInfo pipeline_create_info;
   pipeline_create_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
   pipeline_create_info.pNext = nullptr;
@@ -224,7 +225,7 @@ VkPipeline CreateComputePipeline(const VulkanDevice* const vulkan_device,
   pipeline_create_info.basePipelineHandle = VK_NULL_HANDLE;
   pipeline_create_info.basePipelineIndex = -1;
   VkPipeline pipeline;
-  if (vulkan_device->functions().vkCreateComputePipelines(vulkan_device->device(), VK_NULL_HANDLE,
+  if (vulkan_device->functions().vkCreateComputePipelines(vulkan_device->device(), pipeline_cache,
                                                           1, &pipeline_create_info, nullptr,
                                                           &pipeline) != VK_SUCCESS) {
     return VK_NULL_HANDLE;
@@ -235,14 +236,15 @@ VkPipeline CreateComputePipeline(const VulkanDevice* const vulkan_device,
 VkPipeline CreateComputePipeline(const VulkanDevice* const vulkan_device, VkPipelineLayout layout,
                                  const uint32_t* shader_code, size_t shader_code_size_bytes,
                                  const VkSpecializationInfo* specialization_info,
-                                 const char* entry_point) {
+                                 const char* entry_point, VkPipelineCache pipeline_cache) {
   const VkShaderModule shader =
       CreateShaderModule(vulkan_device, shader_code, shader_code_size_bytes);
   if (shader == VK_NULL_HANDLE) {
     return VK_NULL_HANDLE;
   }
   const VkPipeline pipeline =
-      CreateComputePipeline(vulkan_device, layout, shader, specialization_info, entry_point);
+      CreateComputePipeline(vulkan_device, layout, shader, specialization_info, entry_point,
+                            pipeline_cache);
   vulkan_device->functions().vkDestroyShaderModule(vulkan_device->device(), shader, nullptr);
   if (pipeline != VK_NULL_HANDLE && vulkan_device->properties().pipelineExecutableInfo) {
     LogComputePipelineStatistics(vulkan_device, pipeline, shader_code_size_bytes);

@@ -1007,9 +1007,9 @@ VkPipeline Fh1NativeExecutor::GetTransferPipeline(const TransferPipelineKey& key
                                                         : transfer_pipeline_layout_;
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
   VkPipeline pipeline;
-  if (vulkan_device->functions().vkCreateGraphicsPipelines(vulkan_device->device(),
-                                                           VK_NULL_HANDLE, 1, &info, nullptr,
-                                                           &pipeline) != VK_SUCCESS) {
+  if (vulkan_device->functions().vkCreateGraphicsPipelines(
+          vulkan_device->device(), command_processor_.UsePersistentVkPipelineCache(), 1, &info,
+          nullptr, &pipeline) != VK_SUCCESS) {
     return VK_NULL_HANDLE;
   }
   return transfer_pipelines_.emplace(key, pipeline).first->second;
@@ -1019,9 +1019,9 @@ VkPipeline Fh1NativeExecutor::GetComputePipeline(bool words, uint32_t source_kin
   VkPipeline& pipeline = compute_pipelines_[words][source_kind][msaa];
   if (pipeline) return pipeline;
   const SpirvShader& shader = kComputeShaders[words][source_kind][msaa];
-  pipeline = ui::vulkan::util::CreateComputePipeline(command_processor_.GetVulkanDevice(),
-                                                     compute_pipeline_layout_, shader.code,
-                                                     shader.size);
+  pipeline = ui::vulkan::util::CreateComputePipeline(
+      command_processor_.GetVulkanDevice(), compute_pipeline_layout_, shader.code, shader.size,
+      nullptr, "main", command_processor_.UsePersistentVkPipelineCache());
   return pipeline;
 }
 
@@ -1071,7 +1071,8 @@ VkPipeline Fh1NativeExecutor::GetSpecializedResolvePipeline(bool image, uint32_t
     if (module) {
       pipeline = ui::vulkan::util::CreateComputePipeline(
           command_processor_.GetVulkanDevice(),
-          image ? image_pipeline_layout_ : compute_pipeline_layout_, module, &info);
+          image ? image_pipeline_layout_ : compute_pipeline_layout_, module, &info, "main",
+          command_processor_.UsePersistentVkPipelineCache());
     }
   }
   specialized_resolve_pipelines_.emplace(key, pipeline);
@@ -2311,7 +2312,8 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
       kImageShaders[kind][msaa].code) {
     image_pipelines_[kind][msaa] = ui::vulkan::util::CreateComputePipeline(
         command_processor_.GetVulkanDevice(), image_pipeline_layout_,
-        kImageShaders[kind][msaa].code, kImageShaders[kind][msaa].size);
+        kImageShaders[kind][msaa].code, kImageShaders[kind][msaa].size, nullptr, "main",
+        command_processor_.UsePersistentVkPipelineCache());
   }
   if (image_view != VK_NULL_HANDLE && !image_pipelines_[kind][msaa]) {
     Skip("resolve_image_pipeline");

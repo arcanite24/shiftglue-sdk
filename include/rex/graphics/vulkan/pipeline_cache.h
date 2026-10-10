@@ -91,6 +91,14 @@ class VulkanPipelineCache {
   bool EnsureShadersTranslated(VulkanShader::VulkanTranslation* vertex_shader,
                                VulkanShader::VulkanTranslation* pixel_shader);
   // TODO(Triang3l): Return a deferred creation handle.
+  // The persistent driver pipeline cache (vulkan_pipeline_cache_persist), for
+  // pipelines other subsystems create, or null. Each use counts a creation so
+  // the cache is saved again.
+  VkPipelineCache UsePersistentVkPipelineCache() {
+    vk_pipeline_cache_creations_.fetch_add(1, std::memory_order_relaxed);
+    return vk_pipeline_cache_;
+  }
+
   bool ConfigurePipeline(
       VulkanShader::VulkanTranslation* vertex_shader, VulkanShader::VulkanTranslation* pixel_shader,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
@@ -234,6 +242,13 @@ class VulkanPipelineCache {
   REXPACKEDSTRUCT(PipelineStoredDescription, {
     uint64_t description_hash;
     PipelineDescription description;
+  });
+  // spirv_specialize_texture_signs: a pipeline with the texture signs its
+  // shaders were specialized for. The hash covers the description and signs.
+  REXPACKEDSTRUCT(SpecializedStoredDescription, {
+    uint64_t hash;
+    PipelineDescription description;
+    uint32_t texture_signs[8];
   });
 
   struct Pipeline {
@@ -492,6 +507,9 @@ class VulkanPipelineCache {
   // Pipeline storage output stream, for preload in the next emulator runs.
   FILE* pipeline_storage_file_ = nullptr;
   bool pipeline_storage_file_flush_needed_ = false;
+  // Specialized pipelines (SpecializedStoredDescription), flushed with the
+  // pipeline storage.
+  FILE* specialized_storage_file_ = nullptr;
 
   // Thread for asynchronous writing to the storage streams.
   void StorageWriteThread();
@@ -501,6 +519,7 @@ class VulkanPipelineCache {
   // thread is notified about its change via storage_write_request_cond_.
   std::deque<const Shader*> storage_write_shader_queue_;
   std::deque<PipelineStoredDescription> storage_write_pipeline_queue_;
+  std::deque<SpecializedStoredDescription> storage_write_specialized_queue_;
   bool storage_write_flush_shaders_ = false;
   bool storage_write_flush_pipelines_ = false;
   bool storage_write_thread_shutdown_ = false;

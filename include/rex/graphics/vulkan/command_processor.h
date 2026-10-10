@@ -311,6 +311,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkDescriptorSetLayout GetTextureDescriptorSetLayout(bool is_vertex, size_t texture_count,
                                                       size_t sampler_count);
   // The returned reference is valid until a cache clear.
+  // The persistent driver pipeline cache for pipelines created outside the
+  // pipeline cache (FH1 native executor transfers and resolves), or null.
+  VkPipelineCache UsePersistentVkPipelineCache() {
+    return pipeline_cache_ ? pipeline_cache_->UsePersistentVkPipelineCache() : VK_NULL_HANDLE;
+  }
   const VulkanPipelineCache::PipelineLayoutProvider* GetPipelineLayout(size_t texture_count_pixel,
                                                                        size_t sampler_count_pixel,
                                                                        size_t texture_count_vertex,

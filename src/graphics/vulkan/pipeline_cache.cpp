@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <memory>
 #include <set>
+#include <unordered_set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -486,6 +487,8 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     uint32_t magic_api;
     uint32_t version_swapped;
   } pipeline_storage_file_header;
+  // An "a+" stream may start at the end (bionic, BSD): read from the start.
+  rex::filesystem::Seek(pipeline_storage_file_, 0, SEEK_SET);
   if (fread(&pipeline_storage_file_header, sizeof(pipeline_storage_file_header), 1,
             pipeline_storage_file_) &&
       pipeline_storage_file_header.magic == pipeline_storage_magic &&
@@ -547,6 +550,60 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     }
   }
 
+  // Specialized pipelines (spirv_specialize_texture_signs) are stored beside,
+  // with the signs their shaders were specialized for.
+  std::vector<SpecializedStoredDescription> specialized_stored_descriptions;
+  const uint32_t specialized_storage_magic = 0x54504558;  // 'XEPT'
+  auto specialized_storage_file_path =
+      shader_storage_shareable_root /
+      fmt::format("{:08X}.{}.vk.signs.xpso", title_id,
+                  edram_fragment_shader_interlock ? "fsi" : "fbo");
+  specialized_storage_file_ = rex::filesystem::OpenFile(specialized_storage_file_path, "a+b");
+  if (specialized_storage_file_) {
+    struct {
+      uint32_t magic;
+      uint32_t version_swapped;
+    } header;
+    rex::filesystem::Seek(specialized_storage_file_, 0, SEEK_SET);
+    const bool valid = fread(&header, sizeof(header), 1, specialized_storage_file_) &&
+                       header.magic == specialized_storage_magic &&
+                       header.version_swapped == pipeline_storage_version_swapped;
+    std::unordered_set<uint64_t> loaded;
+    if (valid) {
+      SpecializedStoredDescription stored;
+      while (fread(&stored, sizeof(stored), 1, specialized_storage_file_)) {
+        if (XXH3_64bits(&stored.description, sizeof(stored) - sizeof(stored.hash)) !=
+            stored.hash) {
+          break;
+        }
+        if (!loaded.insert(stored.hash).second ||
+            !ArePipelineRequirementsMet(stored.description)) {
+          continue;
+        }
+        specialized_stored_descriptions.push_back(stored);
+        shader_translations_needed.emplace(stored.description.vertex_shader_hash,
+                                           stored.description.vertex_shader_modification);
+        if (stored.description.pixel_shader_hash) {
+          shader_translations_needed.emplace(stored.description.pixel_shader_hash,
+                                             stored.description.pixel_shader_modification);
+        }
+      }
+    }
+    // Rewritten with the valid, distinct records.
+    rex::filesystem::TruncateStdioFile(specialized_storage_file_, 0);
+    header.magic = specialized_storage_magic;
+    header.version_swapped = pipeline_storage_version_swapped;
+    fwrite(&header, sizeof(header), 1, specialized_storage_file_);
+    for (const SpecializedStoredDescription& stored : specialized_stored_descriptions) {
+      fwrite(&stored, sizeof(stored), 1, specialized_storage_file_);
+    }
+    fflush(specialized_storage_file_);
+    if (!specialized_stored_descriptions.empty()) {
+      REXGPU_INFO("VulkanPipelineCache: {} specialized pipeline descriptions in storage",
+                  specialized_stored_descriptions.size());
+    }
+  }
+
   // Initialize the Xenos shader storage stream.
   auto shader_storage_file_path =
       shader_storage_shareable_root / fmt::format("{:08X}.xsh", title_id);
@@ -568,6 +625,7 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
   } shader_storage_file_header;
   // 'XESH'.
   const uint32_t shader_storage_magic = 0x48534558;
+  rex::filesystem::Seek(shader_storage_file_, 0, SEEK_SET);
   if (fread(&shader_storage_file_header, sizeof(shader_storage_file_header), 1,
             shader_storage_file_) &&
       shader_storage_file_header.magic == shader_storage_magic &&
@@ -633,6 +691,11 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     }
   }
 
+  // The driver's cache first, so the stored pipelines below come from it.
+  shader_storage_cache_root_ = cache_root;
+  shader_storage_title_id_ = title_id;
+  LoadVkPipelineCache();
+
   // Create the pipelines.
   std::vector<PipelineCreationArguments> pipeline_creations;
   pipeline_creations.reserve(pipeline_stored_descriptions.size());
@@ -666,6 +729,25 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
                                    : pipeline_description.depth_write_enable != 0;
     creation_arguments.priority = pipeline_util::CalculatePipelinePriority(
         bound_rts, shader_writes_color_targets, shader_writes_depth);
+    pipeline_creations.push_back(creation_arguments);
+  }
+  for (const SpecializedStoredDescription& stored : specialized_stored_descriptions) {
+    SpecializedKey key{stored.description, {}};
+    std::memcpy(key.texture_signs.data(), stored.texture_signs, sizeof(stored.texture_signs));
+    auto [entry, inserted] = specialized_pipelines_.try_emplace(key);
+    if (!inserted) {
+      continue;
+    }
+    entry->second = std::make_unique<std::pair<const PipelineDescription, Pipeline>>(
+        stored.description, Pipeline());
+    PipelineCreationArguments creation_arguments;
+    if (!TryGetPipelineCreationArgumentsForDescription(stored.description, entry->second.get(),
+                                                       creation_arguments)) {
+      specialized_pipelines_.erase(entry);
+      continue;
+    }
+    creation_arguments.specialize_texture_signs = true;
+    creation_arguments.texture_signs = key.texture_signs;
     pipeline_creations.push_back(creation_arguments);
   }
 
@@ -750,8 +832,6 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
            pipeline_storage_file_);
   }
 
-  shader_storage_cache_root_ = cache_root;
-  shader_storage_title_id_ = title_id;
 
   // Start the storage writing thread.
   storage_write_flush_shaders_ = false;
@@ -760,8 +840,6 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
   storage_write_thread_ = rex::thread::Thread::Create({}, [this]() { StorageWriteThread(); });
   assert_not_null(storage_write_thread_);
   storage_write_thread_->set_name("Vulkan Storage writer");
-
-  LoadVkPipelineCache();
 }
 
 void VulkanPipelineCache::ShutdownShaderStorage() {
@@ -776,6 +854,12 @@ void VulkanPipelineCache::ShutdownShaderStorage() {
   }
   storage_write_shader_queue_.clear();
   storage_write_pipeline_queue_.clear();
+  storage_write_specialized_queue_.clear();
+
+  if (specialized_storage_file_) {
+    fclose(specialized_storage_file_);
+    specialized_storage_file_ = nullptr;
+  }
 
   if (pipeline_storage_file_) {
     fclose(pipeline_storage_file_);
@@ -1305,6 +1389,20 @@ bool VulkanPipelineCache::ConfigurePipeline(
       }
       creation_arguments.specialize_texture_signs = true;
       creation_arguments.texture_signs = key.texture_signs;
+      if (specialized_storage_file_) {
+        assert_not_null(storage_write_thread_);
+        pipeline_storage_file_flush_needed_ = true;
+        {
+          std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+          SpecializedStoredDescription& stored = storage_write_specialized_queue_.emplace_back();
+          std::memset(&stored, 0, sizeof(stored));
+          std::memcpy(&stored.description, &description, sizeof(description));
+          std::memcpy(stored.texture_signs, key.texture_signs.data(),
+                      sizeof(stored.texture_signs));
+          stored.hash = XXH3_64bits(&stored.description, sizeof(stored) - sizeof(stored.hash));
+        }
+        storage_write_request_cond_.notify_all();
+      }
       if (use_async_specialized) {
         uint32_t bound_rts =
             pipeline_util::GetBoundRTMaskFromNormalizedColorMask(normalized_color_mask);
@@ -4217,13 +4315,15 @@ void VulkanPipelineCache::StorageWriteThread() {
     }
     if (flush_pipelines) {
       flush_pipelines = false;
-      assert_not_null(pipeline_storage_file_);
-      fflush(pipeline_storage_file_);
+      if (pipeline_storage_file_) fflush(pipeline_storage_file_);
+      if (specialized_storage_file_) fflush(specialized_storage_file_);
     }
 
     const Shader* shader = nullptr;
     PipelineStoredDescription pipeline_description;
     bool write_pipeline = false;
+    SpecializedStoredDescription specialized_description;
+    bool write_specialized = false;
     {
       std::unique_lock<std::mutex> lock(storage_write_request_lock_);
       if (storage_write_thread_shutdown_) {
@@ -4241,11 +4341,15 @@ void VulkanPipelineCache::StorageWriteThread() {
                     sizeof(pipeline_description));
         storage_write_pipeline_queue_.pop_front();
         write_pipeline = true;
+      } else if (!storage_write_specialized_queue_.empty()) {
+        specialized_description = storage_write_specialized_queue_.front();
+        storage_write_specialized_queue_.pop_front();
+        write_specialized = true;
       } else if (storage_write_flush_pipelines_) {
         storage_write_flush_pipelines_ = false;
         flush_pipelines = true;
       }
-      if (!shader && !write_pipeline) {
+      if (!shader && !write_pipeline && !write_specialized) {
         storage_write_request_cond_.wait(lock);
         continue;
       }
@@ -4271,6 +4375,10 @@ void VulkanPipelineCache::StorageWriteThread() {
     if (write_pipeline) {
       assert_not_null(pipeline_storage_file_);
       fwrite(&pipeline_description, sizeof(pipeline_description), 1, pipeline_storage_file_);
+    }
+    if (write_specialized && specialized_storage_file_) {
+      fwrite(&specialized_description, sizeof(specialized_description), 1,
+             specialized_storage_file_);
     }
   }
 }
