@@ -37,6 +37,18 @@ REXCVAR_DEFINE_BOOL(vulkan_bindless_textures, REX_PLATFORM_ANDROID, "GPU/Vulkan"
                     "per-draw indices instead of per-draw descriptor sets and pushes, on devices "
                     "with Vulkan 1.2 descriptor indexing (RECORDER_PER_DRAW_BACKLOG PD-4)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// On Android: the rule was most of a typical FH1 vertex shader on the
+// Adreno 740 (a depth-only one: 81 multiplies, 88 compares, 94 selects and 81
+// minimums). Without it the Odin 2 Portal's frame-600 replay falls from 14.19
+// to 13.87 ms, and that frame, free roam, a race, photo mode and the title
+// replay byte-identical.
+REXCVAR_DEFINE_BOOL(spirv_ieee_vertex_math, REX_PLATFORM_ANDROID, "GPU",
+                    "Vulkan: vertex shaders multiply as IEEE floats, without the Direct3D 9 "
+                    "rule that 0 * anything = 0 (a compare and a select per product). "
+                    "Products stay unfused, so positions match between passes; a 0 * Inf "
+                    "vertex comes out NaN")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 // On Android: the Odin 2 Portal's 1x drive GPU frame falls about 4 ms (36 to
 // 32), with only scattered pixels of foliage and shadow noise changing. That
 // was with plain IEEE products, whose 0 * Inf = NaN smeared the scene (#403);
@@ -307,6 +319,7 @@ void SpirvShaderTranslator::StartTranslation() {
   fast_pixel_math_ = REXCVAR_GET(spirv_fast_pixel_math) && is_pixel_shader() &&
                      !current_shader().writes_depth();
   builder_->allow_contraction = fast_pixel_math_;
+  ieee_math_ = REXCVAR_GET(spirv_ieee_vertex_math) && is_vertex_shader();
   std::fill(std::begin(spec_texture_signs_), std::end(spec_texture_signs_), spv::NoResult);
 
   builder_->addCapability(IsSpirvTessEvalShader() ? spv::CapabilityTessellation

@@ -26,6 +26,9 @@ spv::Id SpirvShaderTranslator::ZeroIfAnyOperandIsZero(spv::Id value, spv::Id ope
                                                       spv::Id operand_1_abs) {
   EnsureBuildPointAvailable();
   int num_components = builder_->getNumComponents(value);
+  if (ieee_math_) {
+    return value;
+  }
   if (fast_pixel_math_) {
     return ZeroIfNan(value, num_components);
   }
@@ -208,8 +211,10 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
       spv::Id result = builder_->createNoContractionBinOp(spv::OpFMul, result_type,
                                                           multiplicands[0], multiplicands[1]);
       uint32_t multiplicands_different =
-          used_result_components &
-          ~instr.vector_operands[0].GetIdenticalComponents(instr.vector_operands[1]);
+          ieee_math_ ? 0u
+                     : used_result_components &
+                           ~instr.vector_operands[0].GetIdenticalComponents(
+                               instr.vector_operands[1]);
       if (multiplicands_different && !fast_pixel_math_) {
         // Shader Model 3: +0 or denormal * anything = +-0.
         spv::Id different_operands[2] = {multiplicands[0], multiplicands[1]};

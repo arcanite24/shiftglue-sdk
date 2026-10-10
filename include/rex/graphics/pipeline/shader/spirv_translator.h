@@ -806,6 +806,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   bool is_depth_only_fragment_shader_ = false;
   // spirv_fast_pixel_math for the current (pixel) shader.
   bool fast_pixel_math_ = false;
+  // spirv_ieee_vertex_math for the current (vertex) shader: no multiply rule.
+  bool ieee_math_ = false;
 
   std::unique_ptr<SpirvBuilder> builder_;
 
