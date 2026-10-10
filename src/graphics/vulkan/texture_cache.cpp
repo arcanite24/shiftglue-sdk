@@ -61,6 +61,19 @@ REXCVAR_DEFINE_BOOL(vulkan_force_bc_decode, false, "GPU/Vulkan",
                     "Decode BC (DXT, DXN) textures to uncompressed formats on the GPU as on a "
                     "device without them, to measure that path where BC is supported")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#ifdef __ANDROID__
+constexpr int32_t kTextureMemoryPreallocMBDefault = 256;
+#else
+constexpr int32_t kTextureMemoryPreallocMBDefault = 0;
+#endif
+REXCVAR_DEFINE_INT32(vulkan_texture_memory_prealloc_mb, kTextureMemoryPreallocMBDefault,
+                     "GPU/Vulkan",
+                     "Allocate this much texture memory at startup, in 64 MB blocks that later "
+                     "growth adds one at a time. On Android, VMA's growing blocks (64, 128, "
+                     "256 MB) each stalled the GPU thread 10 ms or more as the driver cleared "
+                     "them during gameplay; 0 leaves texture memory to VMA's default pools")
+    .range(0, 4096)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::vulkan {
 
@@ -520,9 +533,46 @@ VulkanTextureCache::~VulkanTextureCache() {
   // textures before destroying VMA.
   DestroyAllTextures(true);
 
+  if (texture_pool_ != VK_NULL_HANDLE) {
+    vmaDestroyPool(vma_allocator_, texture_pool_);
+    texture_pool_ = VK_NULL_HANDLE;
+  }
   if (vma_allocator_ != VK_NULL_HANDLE) {
     vmaDestroyAllocator(vma_allocator_);
   }
+}
+
+VkResult VulkanTextureCache::CreateTextureImage(const VkImageCreateInfo& image_create_info,
+                                                VkImage& image, VmaAllocation& allocation) {
+  VmaAllocationCreateInfo allocation_create_info = {};
+  allocation_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+  if (texture_pool_ != VK_NULL_HANDLE) {
+    // VMA does not check a pool's memory type against the image's, so images
+    // that cannot use it take the default pools below.
+    const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+    const VkDevice device = vulkan_device->device();
+    VkImage pool_image;
+    if (dfn.vkCreateImage(device, &image_create_info, nullptr, &pool_image) == VK_SUCCESS) {
+      VkMemoryRequirements memory_requirements;
+      dfn.vkGetImageMemoryRequirements(device, pool_image, &memory_requirements);
+      if (memory_requirements.memoryTypeBits & (uint32_t(1) << texture_pool_memory_type_)) {
+        VmaAllocationCreateInfo pool_allocation_create_info = {};
+        pool_allocation_create_info.pool = texture_pool_;
+        if (vmaAllocateMemoryForImage(vma_allocator_, pool_image, &pool_allocation_create_info,
+                                      &allocation, nullptr) == VK_SUCCESS) {
+          if (vmaBindImageMemory(vma_allocator_, allocation, pool_image) == VK_SUCCESS) {
+            image = pool_image;
+            return VK_SUCCESS;
+          }
+          vmaFreeMemory(vma_allocator_, allocation);
+        }
+      }
+      dfn.vkDestroyImage(device, pool_image, nullptr);
+    }
+  }
+  return vmaCreateImage(vma_allocator_, &image_create_info, &allocation_create_info, &image,
+                        &allocation, nullptr);
 }
 
 void VulkanTextureCache::BeginSubmission(uint64_t new_submission_index) {
@@ -1649,13 +1699,9 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
     image_format_list_create_info.pViewFormats = view_formats;
   }
 
-  VmaAllocationCreateInfo allocation_create_info = {};
-  allocation_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-
   VkImage image;
   VmaAllocation allocation;
-  if (vmaCreateImage(vma_allocator_, &image_create_info, &allocation_create_info, &image,
-                     &allocation, nullptr)) {
+  if (CreateTextureImage(image_create_info, image, allocation) != VK_SUCCESS) {
     return nullptr;
   }
 
@@ -2796,13 +2842,10 @@ VkImageView VulkanTextureCache::VulkanTexture::GetOrCreate3DAs2DImageView(bool i
     image_create_info.pQueueFamilyIndices = nullptr;
     image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    VmaAllocationCreateInfo allocation_create_info = {};
-    allocation_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-
     VkImage image_2d;
     VmaAllocation allocation_2d;
-    if (vmaCreateImage(vulkan_texture_cache.vma_allocator_, &image_create_info,
-                       &allocation_create_info, &image_2d, &allocation_2d, nullptr) != VK_SUCCESS) {
+    if (vulkan_texture_cache.CreateTextureImage(image_create_info, image_2d, allocation_2d) !=
+        VK_SUCCESS) {
       REXGPU_ERROR("VulkanTextureCache: Failed to create 3D-as-2D wrapper image");
       return VK_NULL_HANDLE;
     }
@@ -3140,6 +3183,37 @@ bool VulkanTextureCache::Initialize() {
   vma_allocator_ = ui::vulkan::CreateVmaAllocator(vulkan_device, true);
   if (vma_allocator_ == VK_NULL_HANDLE) {
     return false;
+  }
+  if (const int32_t prealloc_mb = REXCVAR_GET(vulkan_texture_memory_prealloc_mb)) {
+    constexpr VkDeviceSize kBlockSize = VkDeviceSize(64) << 20;
+    VkImageCreateInfo probe_create_info = {};
+    probe_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    probe_create_info.imageType = VK_IMAGE_TYPE_2D;
+    probe_create_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    probe_create_info.extent = {256, 256, 1};
+    probe_create_info.mipLevels = 1;
+    probe_create_info.arrayLayers = 1;
+    probe_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    probe_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    probe_create_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    probe_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VmaAllocationCreateInfo probe_allocation_info = {};
+    probe_allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    VmaPoolCreateInfo pool_create_info = {};
+    pool_create_info.blockSize = kBlockSize;
+    pool_create_info.minBlockCount =
+        size_t((VkDeviceSize(prealloc_mb) << 20) + kBlockSize - 1) / size_t(kBlockSize);
+    if (vmaFindMemoryTypeIndexForImageInfo(vma_allocator_, &probe_create_info,
+                                           &probe_allocation_info,
+                                           &pool_create_info.memoryTypeIndex) == VK_SUCCESS &&
+        vmaCreatePool(vma_allocator_, &pool_create_info, &texture_pool_) == VK_SUCCESS) {
+      texture_pool_memory_type_ = pool_create_info.memoryTypeIndex;
+      REXGPU_INFO("VulkanTextureCache: {} MB of texture memory allocated at startup (type {})",
+                  pool_create_info.minBlockCount * (kBlockSize >> 20),
+                  texture_pool_memory_type_);
+    } else {
+      REXGPU_WARN("VulkanTextureCache: could not allocate texture memory at startup");
+    }
   }
 
   if (IsDrawResolutionScaled() && !InitializeScaledResolveBuffer()) {

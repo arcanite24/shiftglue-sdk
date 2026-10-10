@@ -424,6 +424,14 @@ class VulkanTextureCache final : public TextureCache {
   // on Windows versions before 10, may have an allocation count limit as low as
   // 4096.
   VmaAllocator vma_allocator_ = VK_NULL_HANDLE;
+  // vulkan_texture_memory_prealloc_mb: device-local texture memory allocated at
+  // startup, used by textures whose memory types allow it.
+  VmaPool texture_pool_ = VK_NULL_HANDLE;
+  uint32_t texture_pool_memory_type_ = UINT32_MAX;
+
+  // Creates the image in texture_pool_ when it can, else in VMA's default pools.
+  VkResult CreateTextureImage(const VkImageCreateInfo& image_create_info, VkImage& image,
+                              VmaAllocation& allocation);
 
   static const HostFormatPair kBestHostFormats[64];
   static const HostFormatPair kHostFormatGBGRUnaligned;
