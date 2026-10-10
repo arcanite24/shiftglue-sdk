@@ -10,6 +10,12 @@
  */
 
 #include <rex/kernel/xam/apps/xmp_app.h>
+
+#include <algorithm>
+#include <atomic>
+#include <mutex>
+
+#include <rex/audio/host_music.h>
 #include <rex/logging.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
@@ -22,6 +28,10 @@ using namespace rex::system::xam;
 namespace apps {
 using namespace rex::system;
 
+namespace {
+XmpApp* g_xmp_app = nullptr;
+}  // namespace
+
 XmpApp::XmpApp(KernelState* kernel_state)
     : App(kernel_state, 0xFA),
       state_(State::kIdle),
@@ -33,7 +43,47 @@ XmpApp::XmpApp(KernelState* kernel_state)
       active_playlist_(nullptr),
       active_song_index_(0),
       next_playlist_handle_(1),
-      next_song_handle_(1) {}
+      next_song_handle_(1) {
+  // The host player may have started before the kernel made this app.
+  if (rex::audio::HostMusicHasTheMusic()) {
+    host_playback_ = true;
+    state_ = State::kPlaying;
+  }
+  g_xmp_app = this;
+}
+
+XmpApp::~XmpApp() {
+  if (g_xmp_app == this) g_xmp_app = nullptr;
+}
+
+XmpApp* XmpApp::Get() {
+  return g_xmp_app;
+}
+
+void XmpApp::SetHostPlayback(bool active) {
+  if (host_playback_.exchange(active) == active) return;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    playback_client_ = active ? PlaybackClient::kSystem : PlaybackClient::kTitle;
+    state_ = active ? State::kPlaying : State::kIdle;
+  }
+  REXKRNL_INFO("XMP: host music {}", active ? "took the music over" : "gave the music back");
+  // Data 1: the system's player has the music, as XMPSetPlaybackController
+  // sends for a system client. FH1 also polls XMPGetPlaybackController.
+  kernel_state_->BroadcastNotification(kMsgPlaybackControllerChanged, active ? 1 : 0);
+  OnStateChanged();
+}
+
+void XmpApp::TraceMessage(uint32_t message) {
+  // Its own lock: the global region is contended enough already (#416).
+  std::lock_guard lock(trace_mutex_);
+  if (std::find(traced_messages_.begin(), traced_messages_.end(), message) !=
+      traced_messages_.end()) {
+    return;
+  }
+  traced_messages_.push_back(message);
+  REXKRNL_INFO("XMP: first message {:08X}", message);
+}
 
 X_HRESULT XmpApp::XMPGetStatus(uint32_t state_ptr) {
   if (!XThread::GetCurrentThread()->main_thread()) {
@@ -206,6 +256,7 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                       uint32_t buffer_length) {
   // NOTE: buffer_length may be zero or valid.
   auto buffer = memory_->TranslateVirtual(buffer_ptr);
+  TraceMessage(message);
   switch (message) {
     case 0x00070002: {
       assert_true(!buffer_length || buffer_length == 12);
@@ -405,7 +456,10 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       assert_true(args->xmp_client == 0x00000002);
       REXKRNL_DEBUG("XMPGetPlaybackController({:08X}, {:08X}, {:08X})", uint32_t(args->xmp_client),
                     uint32_t(args->controller_ptr), uint32_t(args->locked_ptr));
-      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->controller_ptr), 0);
+      // 1: the system's player has the music, and the title keeps its own
+      // music silent (FH1 polls this every frame).
+      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->controller_ptr),
+                                       host_playback_.load(std::memory_order_relaxed) ? 1 : 0);
       memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->locked_ptr), 0);
 
       if (!XThread::GetCurrentThread()->main_thread()) {

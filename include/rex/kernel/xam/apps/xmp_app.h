@@ -10,7 +10,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -71,6 +73,14 @@ class XmpApp : public system::xam::App {
   };
 
   explicit XmpApp(system::KernelState* kernel_state);
+  ~XmpApp() override;
+
+  // The running title's XMP app, or null before the kernel registers it.
+  static XmpApp* Get();
+  // The host's own music player took the music over (or gave it back): the
+  // title sees the system player as the playback controller and playing,
+  // as when a 360 player starts a dashboard soundtrack, and mutes its own.
+  void SetHostPlayback(bool active);
 
   X_HRESULT XMPGetStatus(uint32_t status_ptr);
 
@@ -95,6 +105,10 @@ class XmpApp : public system::xam::App {
   static const uint32_t kMsgPlaybackControllerChanged = 0x0A000003;
 
   void OnStateChanged();
+  void TraceMessage(uint32_t message);
+  std::mutex trace_mutex_;
+  std::vector<uint32_t> traced_messages_;
+  std::atomic<bool> host_playback_{false};
 
   State state_;
   PlaybackClient playback_client_;

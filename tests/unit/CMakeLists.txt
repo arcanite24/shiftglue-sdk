@@ -2,6 +2,7 @@
 
 add_executable(unit_tests
     test_memory.cpp
+    audio/host_music_test.cpp
     audio/xma_packet_test.cpp
     memory/heap_allocation_test.cpp
     kernel/object_table_test.cpp
