@@ -35,6 +35,11 @@ REXCVAR_DEFINE_STRING(pad_chord_debug_overlay, "LS+RS", "Input",
                       "names as in pad_remap joined by '+'; empty turns the chord off. The "
                       "title does not see them while the chord is held")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(pad_chord_game_menu, "BACK+START", "Input",
+                      "Controller buttons held together that open the game's settings menu "
+                      "(bind_game_menu, F6), so a controller-only player (Steam Deck, handhelds) "
+                      "reaches it; names as in pad_remap joined by '+'; empty turns it off")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(pad_rumble_strength, 100, "Input",
                      "Controller rumble strength in percent of what the title asks for (0 turns "
                      "it off)")
@@ -244,6 +249,7 @@ struct PadChord {
   bool held[4] = {};
 };
 PadChord g_pad_chord_debug_overlay = {"bind_debug_overlay"};
+PadChord g_pad_chord_game_menu = {"bind_game_menu"};
 
 void ApplyPadChord(PadChord& chord, const std::string& text, uint32_t user_index,
                    X_INPUT_GAMEPAD& pad) {
@@ -291,6 +297,8 @@ X_RESULT InputSystem::GetMergedState(uint32_t user_index, bool host_pads_only,
     // layout so a remap can never lock the player out of the remap screen.
     if (!host_pads_only && !driver->is_keyboard_and_mouse()) {
       ApplyPadChord(g_pad_chord_debug_overlay, REXCVAR_GET(pad_chord_debug_overlay), user_index,
+                    state.gamepad);
+      ApplyPadChord(g_pad_chord_game_menu, REXCVAR_GET(pad_chord_game_menu), user_index,
                     state.gamepad);
       ApplyPadRemap(state.gamepad);
     }
