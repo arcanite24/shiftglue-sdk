@@ -51,7 +51,7 @@ bool Entry::is_read_only() const {
 }
 
 Entry* Entry::GetChild(const std::string_view name) {
-  auto global_lock = global_critical_region_.Acquire();
+  std::lock_guard<std::recursive_mutex> tree_lock(tree_mutex());
   // The size test is exact, not just a hint: the fold is ASCII-only, so any two
   // names it calls equal hold the same bytes per codepoint. It skips the UTF-8
   // decode for nearly every child, and a game directory can hold thousands.
@@ -79,7 +79,7 @@ Entry* Entry::ResolvePath(const std::string_view path) {
 
 Entry* Entry::IterateChildren(const rex::filesystem::WildcardEngine& engine,
                               size_t* current_index) {
-  auto global_lock = global_critical_region_.Acquire();
+  std::lock_guard<std::recursive_mutex> tree_lock(tree_mutex());
   while (*current_index < children_.size()) {
     auto& child = children_[*current_index];
     *current_index = *current_index + 1;
@@ -91,7 +91,7 @@ Entry* Entry::IterateChildren(const rex::filesystem::WildcardEngine& engine,
 }
 
 Entry* Entry::CreateEntry(const std::string_view name, uint32_t attributes) {
-  auto global_lock = global_critical_region_.Acquire();
+  std::lock_guard<std::recursive_mutex> tree_lock(tree_mutex());
   if (is_read_only()) {
     return nullptr;
   }
@@ -110,7 +110,7 @@ Entry* Entry::CreateEntry(const std::string_view name, uint32_t attributes) {
 }
 
 bool Entry::Delete(Entry* entry) {
-  auto global_lock = global_critical_region_.Acquire();
+  std::lock_guard<std::recursive_mutex> tree_lock(tree_mutex());
   if (is_read_only()) {
     return false;
   }

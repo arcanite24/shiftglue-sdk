@@ -45,7 +45,6 @@ class Device {
   virtual uint32_t bytes_per_sector() const = 0;
 
  protected:
-  rex::thread::global_critical_region global_critical_region_;
   std::string mount_path_;
 };
 

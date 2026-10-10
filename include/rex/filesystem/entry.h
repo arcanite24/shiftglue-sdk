@@ -33,6 +33,11 @@ namespace rex::filesystem {
 class Device;
 class File;
 
+// Guards the devices, symbolic links and entry trees. Lookups do host IO (stat,
+// directory scans), so this is not the global critical region: holding that
+// would stall every guest thread for the IO. Take no other lock inside it.
+std::recursive_mutex& tree_mutex();
+
 // Matches https://source.winehq.org/source/include/winternl.h#1591.
 enum class FileAction {
   kSuperseded = 0,
@@ -151,7 +156,6 @@ class Entry {
     return X_STATUS_NOT_SUPPORTED;
   }
 
-  rex::thread::global_critical_region global_critical_region_;
   Device* device_;
   Entry* parent_;
   std::string path_;

@@ -177,7 +177,7 @@ void StfsContainerDevice::CloseFiles() {
 }
 
 void StfsContainerDevice::Dump(string::StringBuffer* string_buffer) {
-  auto global_lock = global_critical_region_.Acquire();
+  std::lock_guard<std::recursive_mutex> tree_lock(tree_mutex());
   root_entry_->Dump(string_buffer, 0);
 }
 

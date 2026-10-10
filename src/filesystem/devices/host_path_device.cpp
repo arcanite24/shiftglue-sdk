@@ -52,7 +52,7 @@ bool HostPathDevice::Initialize() {
 }
 
 void HostPathDevice::Dump(string::StringBuffer* string_buffer) {
-  auto global_lock = global_critical_region_.Acquire();
+  std::lock_guard<std::recursive_mutex> tree_lock(tree_mutex());
   root_entry_->Dump(string_buffer, 0);
 }
 
@@ -114,7 +114,7 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
 }
 
 size_t HostPathDevice::MergeTree(const std::filesystem::path& other_root) {
-  auto global_lock = global_critical_region_.Acquire();
+  std::lock_guard<std::recursive_mutex> tree_lock(tree_mutex());
   if (!root_entry_) {
     return 0;
   }
