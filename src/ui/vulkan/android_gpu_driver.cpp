@@ -36,6 +36,16 @@ REXCVAR_DEFINE_STRING(android_gpu_driver_env, "", "UI/Vulkan",
                       "Environment for the custom driver, as NAME=value pairs separated by "
                       "semicolons (Mesa Turnip reads TU_DEBUG, for one: TU_DEBUG=sysmem)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// Turnip's ir3 hoists each shader's uniform work into a preamble that runs
+// before the draw's waves. FH1 draws are many and small (about 1,800 a
+// frame), and without preambles the Odin 2 Portal's frame-600 replay falls
+// from 13.89 to 13.65 ms, and the shadows drive has 8 % of frames over 17.5
+// ms instead of 12 %.
+REXCVAR_DEFINE_BOOL(android_gpu_driver_no_preamble, true, "UI/Vulkan",
+                    "Have a custom Mesa driver compile shaders without preambles "
+                    "(IR3_SHADER_DEBUG=nopreamble), unless android_gpu_driver_env or the "
+                    "environment sets IR3_SHADER_DEBUG")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(android_gpu_turbo, false, "UI/Vulkan",
                     "Run the Adreno GPU at its highest clocks while the game is shown (thermal "
                     "limits still apply); restored in the background and at exit")
@@ -144,6 +154,10 @@ void* OpenAndroidCustomVulkanDriver(const std::filesystem::path& drivers_root) {
     return nullptr;
   }
   // Settings the driver reads from the environment when it loads.
+  if (REXCVAR_GET(android_gpu_driver_no_preamble) && !getenv("IR3_SHADER_DEBUG")) {
+    setenv("IR3_SHADER_DEBUG", "nopreamble", 0);
+    REXLOG_INFO("Custom GPU driver {}: IR3_SHADER_DEBUG=nopreamble", name);
+  }
   std::stringstream pairs(REXCVAR_GET(android_gpu_driver_env));
   for (std::string pair; std::getline(pairs, pair, ';');) {
     const size_t equals = pair.find('=');
