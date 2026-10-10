@@ -137,6 +137,13 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
     return rex::string::utf8_starts_with_case(normalized_path, d->mount_path());
   });
   if (it == devices_.cend()) {
+    // A bare file name names no device: titles probe names their data lists
+    // but the disc never shipped (FH1's AMB_Festival.fsb), and fail the same
+    // way on the console. Only a missing named device is worth a warning.
+    if (path.find(':') == std::string_view::npos) {
+      REXFS_DEBUG("VFS: '{}' has no device prefix; not found", path);
+      return nullptr;
+    }
     REXFS_WARN("VFS: '{}' -> [no device]", path);
     // Supress logging the error for ShaderDumpxe:\CompareBackEnds as this is
     // not an actual problem nor something we care about.
