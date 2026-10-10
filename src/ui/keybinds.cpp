@@ -237,13 +237,47 @@ bool TriggerBind(std::string_view name) {
   return true;
 }
 
+// A bind lists alternatives separated by commas, each a key name with
+// optional modifiers before it ("F6,Cmd+Comma", "Ctrl+Cmd+F"). Ctrl, Alt and
+// Cmd (the Windows or Super key elsewhere) must be held exactly as listed, so
+// Cmd+Q does not also fire a plain Q bind; Shift is only checked when listed.
+bool BindMatches(std::string_view keys, const KeyEvent& e) {
+  while (!keys.empty()) {
+    const size_t comma = keys.find(',');
+    std::string_view token = keys.substr(0, comma);
+    keys = comma == std::string_view::npos ? std::string_view() : keys.substr(comma + 1);
+    bool shift = false, ctrl = false, alt = false, super = false, known = true;
+    for (size_t plus; (plus = token.find('+')) != std::string_view::npos && plus + 1 < token.size();
+         token.remove_prefix(plus + 1)) {
+      const std::string_view modifier = token.substr(0, plus);
+      if (modifier == "Shift") {
+        shift = true;
+      } else if (modifier == "Ctrl" || modifier == "Control") {
+        ctrl = true;
+      } else if (modifier == "Alt" || modifier == "Option") {
+        alt = true;
+      } else if (modifier == "Cmd" || modifier == "Super" || modifier == "Win") {
+        super = true;
+      } else {
+        known = false;
+      }
+    }
+    const VirtualKey vk = ParseVirtualKey(token);
+    if (known && vk != VirtualKey::kNone && e.virtual_key() == vk &&
+        (!shift || e.is_shift_pressed()) && ctrl == e.is_ctrl_pressed() &&
+        alt == e.is_alt_pressed() && super == e.is_super_pressed()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool ProcessKeyEvent(KeyEvent& e) {
   std::lock_guard lock(g_binds_mutex);
   for (auto& entry : g_binds) {
     if (!entry.callback)
       continue;
-    VirtualKey vk = ParseVirtualKey(entry.current_key);
-    if (vk != VirtualKey::kNone && e.virtual_key() == vk) {
+    if (BindMatches(entry.current_key, e)) {
       entry.callback();
       e.set_handled(true);
       return true;
