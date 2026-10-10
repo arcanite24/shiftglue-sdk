@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <mutex>
 
 namespace rex::thread {
@@ -65,6 +66,19 @@ class global_critical_region {
     }
   }
 
+  // Recompiled guest code: sections with interrupts disabled (mtmsrd r13 to
+  // enter, any other register to leave) hold the region, and mfmsr reads
+  // whether this thread is in one (0, or 0x8000 with interrupts enabled).
+  static void GuestEnter() {
+    LockCounted();
+    ++guest_depth_;
+  }
+  static void GuestLeave() {
+    --guest_depth_;
+    mutex().unlock();
+  }
+  static uint64_t GuestCheck() { return guest_depth_ ? 0 : 0x8000; }
+
   // Acquires a lock on the global critical section.
   // Use this when keeping an instance is not possible. Otherwise, prefer
   // to keep an instance of global_critical_region near the members requiring
@@ -91,6 +105,7 @@ class global_critical_region {
  private:
   // Counts the contention and the time blocked (kCriticalRegionBlockedNs).
   static void LockContended();
+  static inline thread_local int32_t guest_depth_ = 0;
 };
 
 }  // namespace rex::thread
