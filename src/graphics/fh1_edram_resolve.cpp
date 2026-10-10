@@ -128,6 +128,11 @@ bool Fh1PlanResolve(const RegisterFile& regs, const memory::Memory& memory,
         pack = 3;
         bpb_log2 = 3;
         break;
+      // Depth of field resolves its 16_16_16_16_FLOAT target into one (#425).
+      case xenos::TextureFormat::k_16_16_16_16:
+        pack = 5;
+        bpb_log2 = 3;
+        break;
       default:
         break;
     }

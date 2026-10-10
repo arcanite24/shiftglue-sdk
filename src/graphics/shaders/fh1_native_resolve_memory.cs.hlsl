@@ -29,7 +29,7 @@ FH1_PUSH_CONSTANTS cbuffer Fh1NativeResolveMemoryConstants FH1_CONSTANTS_REGISTE
                             // same place 30 (fh1_native_edram.hlsli)
   uint fh1_sample_select;   // sanitized xenos::CopySampleSelect
   // pack 0:2 (0: 8_8_8_8, 1: 2_10_10_10, 2: 32_FLOAT, 3: 16_16_16_16_FLOAT,
-  // 4: raw 32-bit word), endian 3:5, swap red/blue 6, float24 rounding 7,
+  // 4: raw 32-bit word, 5: 16_16_16_16 unorm), endian 3:5, swap red/blue 6, float24 rounding 7,
   // exp bias 8:15 (signed), bytes per texel log2 16:17, gamma targets hold
   // linear values 18, 16_16[_16_16] hosts keep the full range as snorm / 32 19,
   // resolution scale - 1 20:21 (the rectangle is then in host pixels and the
@@ -280,8 +280,15 @@ void main(uint3 thread : SV_DispatchThreadID) {
   } else if (pack == 2u) {
     StoreWord(address, host_pixel, EndianSwap32(asuint(color.r), endian));
   } else {
-    uint2 words = uint2(f32tof16(color.r) | (f32tof16(color.g) << 16u),
-                        f32tof16(color.b) | (f32tof16(color.a) << 16u));
+    uint2 words;
+    if (pack == 5u) {
+      // 16_16_16_16 textures are unsigned normalized, as D3DFMT_A16B16G16R16.
+      uint4 q = uint4(saturate(color) * 65535.0f + 0.5f);
+      words = uint2(q.x | (q.y << 16u), q.z | (q.w << 16u));
+    } else {
+      words = uint2(f32tof16(color.r) | (f32tof16(color.g) << 16u),
+                    f32tof16(color.b) | (f32tof16(color.a) << 16u));
+    }
     fh1_memory.Store2(address, uint2(EndianSwap32(words.x, endian), EndianSwap32(words.y, endian)));
   }
 }
