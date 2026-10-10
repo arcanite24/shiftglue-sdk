@@ -71,10 +71,14 @@ class global_critical_region {
   // whether this thread is in one (0, or 0x8000 with interrupts enabled).
   static void GuestEnter() {
     LockCounted();
-    ++guest_depth_;
+    if (guest_depth_++ == 0 && GuestHoldLogEnabled()) {
+      GuestHoldBegin();
+    }
   }
   static void GuestLeave() {
-    --guest_depth_;
+    if (--guest_depth_ == 0 && guest_hold_start_ns_) {
+      GuestHoldEnd();
+    }
     mutex().unlock();
   }
   static uint64_t GuestCheck() { return guest_depth_ ? 0 : 0x8000; }
@@ -106,6 +110,21 @@ class global_critical_region {
   // Counts the contention and the time blocked (kCriticalRegionBlockedNs).
   static void LockContended();
   static inline thread_local int32_t guest_depth_ = 0;
+
+  // critical_region_hold_log_ms: guest sections held at least that long are
+  // logged with the recompiled function that entered them.
+  static bool GuestHoldLogEnabled() {
+    if (guest_hold_log_ms_ < 0) {
+      GuestHoldLogInit();
+    }
+    return guest_hold_log_ms_ > 0;
+  }
+  static void GuestHoldLogInit();
+  static void GuestHoldBegin();
+  static void GuestHoldEnd();
+  static inline int32_t guest_hold_log_ms_ = -1;
+  static inline thread_local int64_t guest_hold_start_ns_ = 0;
+  static inline thread_local const void* guest_hold_site_ = nullptr;
 };
 
 }  // namespace rex::thread
