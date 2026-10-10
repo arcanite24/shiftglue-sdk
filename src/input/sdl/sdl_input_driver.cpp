@@ -16,6 +16,7 @@
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/input/flags.h>
 #include <rex/input/sdl/joystick_mapping.h>
 #include <rex/input/sdl/sdl_input_driver.h>
@@ -117,7 +118,7 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
       // The player's own mappings (the mapping assistant) replace the
       // database's for the same controller.
       const std::string user_mappings = REXCVAR_GET(hid_user_mappings_file);
-      if (!user_mappings.empty() && std::filesystem::exists(user_mappings)) {
+      if (!user_mappings.empty() && std::filesystem::exists(rex::to_path(user_mappings))) {
         const int loaded = SDL_AddGamepadMappingsFromFile(user_mappings.c_str());
         if (loaded < 0) {
           REXLOG_ERROR("SDL: error loading user mappings '{}': {}", user_mappings, SDL_GetError());

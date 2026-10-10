@@ -180,7 +180,7 @@ bool ReXApp::SetupEnvironment() {
                                         log_level_str, category_levels);
   if (log_file_cvar.empty()) {
     log_config.app_name = std::string(GetName());
-    log_config.log_dir = (exe_dir / "logs").string();
+    log_config.log_dir = rex::path_to_utf8(exe_dir / "logs");
   }
 
   rex::InitLogging(log_config);
@@ -192,21 +192,21 @@ bool ReXApp::SetupEnvironment() {
   OnPostInitLogging();
 
   if (std::filesystem::exists(config_path_))
-    REXLOG_DEBUG("Loaded config: {}", config_path_.filename().string());
+    REXLOG_DEBUG("Loaded config: {}", rex::path_to_utf8(config_path_.filename()));
 
   REXLOG_DEBUG("{} starting", GetName());
   if (!game_data_root_.empty()) {
-    REXLOG_DEBUG("  Game directory: {}", game_data_root_.string());
+    REXLOG_DEBUG("  Game directory: {}", rex::path_to_utf8(game_data_root_));
   }
   if (!user_data_root_.empty()) {
-    REXLOG_DEBUG("  User data:      {}", user_data_root_.string());
+    REXLOG_DEBUG("  User data:      {}", rex::path_to_utf8(user_data_root_));
   }
   if (!update_data_root_.empty()) {
-    REXLOG_DEBUG("  Update data:    {}", update_data_root_.string());
+    REXLOG_DEBUG("  Update data:    {}", rex::path_to_utf8(update_data_root_));
   }
-  REXLOG_DEBUG("  Cache root:     {}", cache_root_.string());
+  REXLOG_DEBUG("  Cache root:     {}", rex::path_to_utf8(cache_root_));
   if (!metadata_root_.empty()) {
-    REXLOG_DEBUG("  Metadata root:  {}", metadata_root_.string());
+    REXLOG_DEBUG("  Metadata root:  {}", rex::path_to_utf8(metadata_root_));
   }
 
   return true;
@@ -220,7 +220,8 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     return false;
   }
   if (!std::filesystem::is_directory(paths.game_data_root)) {
-    auto msg = fmt::format("--game_data_root does not exist: {}", paths.game_data_root.string());
+    auto msg =
+        fmt::format("--game_data_root does not exist: {}", rex::path_to_utf8(paths.game_data_root));
     REXLOG_ERROR("{}", msg);
     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
     return false;
@@ -288,7 +289,7 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     std::replace(host_tail.begin(), host_tail.end(), '\\', '/');
     auto xex_host = paths.game_data_root / host_tail;
     if (!std::filesystem::is_regular_file(xex_host)) {
-      auto msg = fmt::format("Entrypoint XEX not found: {}", xex_host.string());
+      auto msg = fmt::format("Entrypoint XEX not found: {}", rex::path_to_utf8(xex_host));
       REXLOG_ERROR("{}", msg);
       rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
       return false;

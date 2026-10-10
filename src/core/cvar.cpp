@@ -21,6 +21,7 @@
 #include <CLI/CLI.hpp>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/platform/env.h>
 
@@ -724,16 +725,26 @@ std::vector<std::string> Init(int argc, char** argv) {
 
 void LoadConfig(const std::filesystem::path& config_path) {
   if (!std::filesystem::exists(config_path)) {
-    REXLOG_DEBUG("Config file not found: {}", config_path.string());
+    REXLOG_DEBUG("Config file not found: {}", rex::path_to_utf8(config_path));
     return;
   }
 
+  // Read through the path: path::string() is in the ANSI code page on
+  // Windows, which toml++ would read as UTF-8 (or which throws for characters
+  // outside it), so a config under C:\Users\Júnior was silently skipped.
+  const std::string name = rex::path_to_utf8(config_path);
   try {
-    auto config = toml::parse_file(config_path.string());
+    std::ifstream file(config_path, std::ios::binary);
+    if (!file) {
+      REXLOG_ERROR("Failed to open config {}", name);
+      return;
+    }
+    const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    auto config = toml::parse(text, name);
     ApplyTomlTable(config, "");
-    REXLOG_DEBUG("Loaded config from {}", config_path.string());
+    REXLOG_DEBUG("Loaded config from {}", name);
   } catch (const toml::parse_error& err) {
-    REXLOG_ERROR("Failed to parse config {}: {}", config_path.string(), err.what());
+    REXLOG_ERROR("Failed to parse config {}: {}", name, err.what());
   }
 }
 
@@ -805,12 +816,12 @@ void SaveConfig(const std::filesystem::path& config_path) {
     {
       std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
       if (!file || !file.write(content.data(), std::streamsize(content.size())) || !file.flush()) {
-        REXLOG_ERROR("SaveConfig: failed to write {}", temporary.string());
+        REXLOG_ERROR("SaveConfig: failed to write {}", rex::path_to_utf8(temporary));
         return;
       }
     }
     std::filesystem::rename(temporary, config_path);
-    REXLOG_INFO("Saved config to {}", config_path.string());
+    REXLOG_INFO("Saved config to {}", rex::path_to_utf8(config_path));
   } catch (const std::exception& e) {
     REXLOG_ERROR("SaveConfig: {}", e.what());
   }

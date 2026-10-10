@@ -164,6 +164,14 @@ void SetAllLevels(spdlog::level::level_enum level);
 void RegisterLogLevelCallback();
 
 /**
+ * Create the rotating file sink the log file uses. It opens through
+ * std::filesystem::path, so non-ASCII paths work on Windows, and rotates to
+ * name.1.ext ... name.<max_files>.ext once the file passes max_size bytes.
+ */
+spdlog::sink_ptr CreateRotatingFileSink(const std::filesystem::path& path, size_t max_size,
+                                        size_t max_files);
+
+/**
  * Add a sink to all current and future loggers.
  *
  * @param sink  Shared pointer to the spdlog sink.

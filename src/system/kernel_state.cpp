@@ -784,7 +784,7 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
     const std::filesystem::path library_path = ModuleLibraryPath(recomp->shared_lib_name);
     if (!library_local.Load(library_path, rex::platform::SymbolResolution::kImmediate)) {
       REXSYS_ERROR("Failed to load shared library for module '{}': {}", recomp->pe_name,
-                   library_path.string());
+                   rex::path_to_utf8(library_path));
     } else {
       auto register_func = reinterpret_cast<runtime::FunctionDispatcher::RegisterFn>(
           library_local.GetRawSymbol("ReXModule_Register"));

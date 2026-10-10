@@ -1,3 +1,4 @@
+#include <rex/filesystem.h>
 #include <rex/graphics/fh1_frame_dump.h>
 
 #include <algorithm>
@@ -270,8 +271,8 @@ void Fh1FrameDump::End(uint32_t frontbuffer_address) {
   REXGPU_INFO(
       "FH1 frame dump: frame {} written to {} ({} packet dwords, {} blocks, {} MB, front buffer "
       "{:08X}+{})",
-      frame_, path_.string(), packets_.size(), block_count, block_bytes >> 20, front.address,
-      front.length);
+      frame_, rex::path_to_utf8(path_), packets_.size(), block_count, block_bytes >> 20,
+      front.address, front.length);
   packets_.clear();
   blocks_.clear();
 }

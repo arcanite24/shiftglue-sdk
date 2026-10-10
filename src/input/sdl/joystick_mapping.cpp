@@ -9,6 +9,7 @@
 #include <SDL3/SDL.h>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/input/flags.h>
 #include <rex/logging.h>
 
@@ -44,7 +45,7 @@ std::vector<std::string> ReadLines(const std::filesystem::path& path) {
 bool WriteLines(const std::filesystem::path& path, const std::vector<std::string>& lines) {
   std::error_code error;
   if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path(), error);
-  const std::filesystem::path temporary = path.string() + ".tmp";
+  const std::filesystem::path temporary = std::filesystem::path(path) += ".tmp";
   {
     std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
     for (const auto& line : lines) output << line << '\n';
@@ -78,7 +79,7 @@ std::vector<JoystickInfo> ListJoysticks() {
     }
     const std::string user_path = REXCVAR_GET(hid_user_mappings_file);
     if (!user_path.empty()) {
-      const auto lines = ReadLines(user_path);
+      const auto lines = ReadLines(rex::to_path(user_path));
       info.user_mapping = std::any_of(lines.begin(), lines.end(), [&](const std::string& line) {
         return SameGuid(line, info.guid);
       });
@@ -199,18 +200,19 @@ bool SaveMapping(std::string_view mapping) {
   const std::string path = REXCVAR_GET(hid_user_mappings_file);
   if (path.empty()) return true;
   const std::string_view guid = mapping.substr(0, mapping.find(','));
-  std::vector<std::string> lines = ReadLines(path);
+  // The cvar is UTF-8, as SDL reads it.
+  std::vector<std::string> lines = ReadLines(rex::to_path(path));
   std::erase_if(lines, [&](const std::string& line) { return SameGuid(line, guid); });
   lines.push_back(text);
-  return WriteLines(path, lines);
+  return WriteLines(rex::to_path(path), lines);
 }
 
 bool RemoveUserMapping(std::string_view guid) {
   const std::string path = REXCVAR_GET(hid_user_mappings_file);
   if (!path.empty()) {
-    std::vector<std::string> lines = ReadLines(path);
+    std::vector<std::string> lines = ReadLines(rex::to_path(path));
     std::erase_if(lines, [&](const std::string& line) { return SameGuid(line, guid); });
-    WriteLines(path, lines);
+    WriteLines(rex::to_path(path), lines);
   }
   // The database line for this platform (or for every platform).
   const std::string platform = std::string("platform:") + SDL_GetPlatform() + ",";

@@ -10,6 +10,7 @@ add_executable(unit_tests
     core/fiber_test.cpp
     core/filesystem_test.cpp
     core/hash_test.cpp
+    core/logging_file_sink_test.cpp
     core/stream_test.cpp
     core/chrono_test.cpp
     codegen/resume_entry_test.cpp

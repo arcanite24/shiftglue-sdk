@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include <rex/filesystem.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
@@ -69,10 +70,10 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     if (candidate.empty()) {
       continue;
     }
-    attempted_loader_paths.push_back(candidate.string());
+    attempted_loader_paths.push_back(rex::path_to_utf8(candidate));
     if (vulkan_instance->loader_.Load(candidate)) {
       loader_loaded = true;
-      REXLOG_INFO("Loaded Vulkan runtime from {}", candidate.string());
+      REXLOG_INFO("Loaded Vulkan runtime from {}", rex::path_to_utf8(candidate));
       break;
     }
   }

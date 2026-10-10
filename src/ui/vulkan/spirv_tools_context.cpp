@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <string>
 
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/platform/env.h>
 #include <rex/ui/vulkan/spirv_tools_context.h>
@@ -46,7 +47,7 @@ bool SpirvToolsContext::Initialize(unsigned int spirv_version) {
 
   if (!library_.Load(library_path)) {
     REXLOG_INFO("SPIRV-Tools: Failed to load {}; SPIR-V validation is disabled",
-                library_path.string());
+                rex::path_to_utf8(library_path));
     Shutdown();
     return false;
   }

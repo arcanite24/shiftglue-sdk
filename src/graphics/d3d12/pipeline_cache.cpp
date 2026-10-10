@@ -1141,7 +1141,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
         }
       }
       for (const std::filesystem::path& corpus_file : corpus_files) {
-        const std::string name = corpus_file.filename().string();
+        const std::string name = rex::path_to_utf8(corpus_file.filename());
         xenos::ShaderType stage;
         size_t digit_offset;
         if (name.size() == 78 && name.starts_with("pixel-i")) {
@@ -1345,7 +1345,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
                it(cache_root / "fh1-shader-misses", corpus_error),
            end;
            !corpus_error && it != end; it.increment(corpus_error)) {
-        const std::string name = it->path().filename().string();
+        const std::string name = rex::path_to_utf8(it->path().filename());
         uint64_t hash = 0, modification = 0;
         char stage_name[9] = {};
         if (!it->is_regular_file() ||

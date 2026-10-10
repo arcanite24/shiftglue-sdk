@@ -1937,7 +1937,7 @@ bool D3D12TextureCache::TryLoadTextureReplacement(Texture& texture) {
         std::error_code error;
         if (end > start && std::filesystem::is_directory(dir, error)) {
           for (const auto& entry : std::filesystem::directory_iterator(dir, error)) {
-            const auto stem = entry.path().stem().string();
+            const auto stem = rex::path_to_utf8(entry.path().stem());
             if (entry.path().extension() != ".dds" || stem.size() != 16) continue;
             unsigned long long hash = 0;
             if (std::sscanf(stem.c_str(), "%16llx", &hash) == 1) {
@@ -2011,7 +2011,7 @@ bool D3D12TextureCache::TryLoadTextureReplacement(Texture& texture) {
       auto read = ReadDds(file->second);
       if (!read) {
         REXGPU_WARN("Texture replacement {} is not a DDS of a supported format",
-                    file->second.string());
+                    rex::path_to_utf8(file->second));
         state.files.erase(file);
         state.loaded.erase(hash);
         use_guest_resource();

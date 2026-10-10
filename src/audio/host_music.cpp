@@ -5,6 +5,7 @@
  *              SDL output stream of their own.
  */
 
+#include <rex/filesystem.h>
 #include <rex/audio/host_music.h>
 
 #include <algorithm>
@@ -244,7 +245,7 @@ class Mp3Decoder final : public Decoder {
 };
 
 std::unique_ptr<Decoder> OpenDecoder(const std::filesystem::path& path) {
-  const std::string extension = Lower(path.extension().string());
+  const std::string extension = Lower(rex::path_to_utf8(path.extension()));
   auto data = ReadFile(path);
   if (extension == ".wav") {
     auto decoder = std::make_unique<WavDecoder>();
@@ -354,7 +355,7 @@ struct HostMusicPlayer::Impl {
         decoder = OpenDecoder(path);
         lock.lock();
         if (!decoder) {
-          REXAPU_WARN("Host music: cannot play {}", path.string());
+          REXAPU_WARN("Host music: cannot play {}", rex::path_to_utf8(path));
           // Nothing in the folder plays: stop instead of trying forever.
           if (++failures >= tracks.size()) {
             active = false;
@@ -365,7 +366,7 @@ struct HostMusicPlayer::Impl {
         failures = 0;
         const SDL_AudioSpec spec = {SDL_AUDIO_F32, 2, decoder->rate};
         SDL_SetAudioStreamFormat(stream, &spec, nullptr);
-        REXAPU_INFO("Host music: playing {}", path.filename().string());
+        REXAPU_INFO("Host music: playing {}", rex::path_to_utf8(path.filename()));
       }
       // Keep about a quarter second queued.
       const int queued = SDL_GetAudioStreamQueued(stream);
@@ -435,7 +436,7 @@ std::vector<std::filesystem::path> HostMusicPlayer::FindTracks(
            folder, std::filesystem::directory_options::skip_permission_denied, error);
        !error && it != std::filesystem::recursive_directory_iterator(); it.increment(error)) {
     if (!it->is_regular_file(error)) continue;
-    const std::string extension = Lower(it->path().extension().string());
+    const std::string extension = Lower(rex::path_to_utf8(it->path().extension()));
     if (extension == ".wav" || (mp3 && extension == ".mp3")) tracks.push_back(it->path());
   }
   std::sort(tracks.begin(), tracks.end());

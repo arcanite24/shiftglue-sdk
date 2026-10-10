@@ -941,7 +941,7 @@ void VulkanPipelineCache::LoadVkPipelineCache() {
   vk_pipeline_cache_saved_creations_ = 0;
   vk_pipeline_cache_saved_time_ms_ = rex::chrono::Clock::QueryHostUptimeMillis();
   REXGPU_INFO("Vulkan pipeline cache: {} bytes loaded from {}", data.size(),
-              vk_pipeline_cache_path_.string());
+              rex::path_to_utf8(vk_pipeline_cache_path_));
 }
 
 void VulkanPipelineCache::SaveVkPipelineCache() {

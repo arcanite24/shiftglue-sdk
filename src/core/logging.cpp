@@ -12,17 +12,21 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
 
-#include <spdlog/sinks/rotating_file_sink.h>
+#include <spdlog/sinks/base_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include <toml++/toml.hpp>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/platform/env.h>
@@ -69,6 +73,89 @@ spdlog::sink_ptr g_early_sink;
 std::vector<spdlog::sink_ptr> g_extra_sinks;
 bool g_early_initialized = false;
 bool g_initialized = false;
+
+// spdlog's file sinks take narrow names, which Windows opens in the ANSI code
+// page, so a log path with characters outside it (a profile like C:\Users\Júnior
+// or 日本語) went to the wrong place. This sink opens through
+// std::filesystem::path and rotates as spdlog's rotating sink does:
+// name.log, then name.1.log up to name.<max_files>.log.
+class PathRotatingFileSink final : public spdlog::sinks::base_sink<std::mutex> {
+ public:
+  PathRotatingFileSink(std::filesystem::path path, size_t max_size, size_t max_files)
+      : path_(std::move(path)), max_size_(max_size), max_files_(max_files) {
+    rex::filesystem::CreateParentFolder(path_);
+    Open("ab");
+  }
+  ~PathRotatingFileSink() override {
+    if (file_)
+      std::fclose(file_);
+  }
+
+ protected:
+  void sink_it_(const spdlog::details::log_msg& msg) override {
+    spdlog::memory_buf_t formatted;
+    formatter_->format(msg, formatted);
+    if (size_ > 0 && size_ + formatted.size() > max_size_)
+      Rotate();
+    if (!file_)
+      return;
+    std::fwrite(formatted.data(), 1, formatted.size(), file_);
+    size_ += formatted.size();
+  }
+  void flush_() override {
+    if (file_)
+      std::fflush(file_);
+  }
+
+ private:
+  std::filesystem::path Indexed(size_t index) const {
+    if (index == 0)
+      return path_;
+    std::filesystem::path name = path_.stem();
+    name += "." + std::to_string(index);
+    name += path_.extension();
+    return path_.parent_path() / name;
+  }
+  void Open(std::string_view mode) {
+    file_ = rex::filesystem::OpenFile(path_, mode);
+    size_ = 0;
+    if (file_ && rex::filesystem::Seek(file_, 0, SEEK_END)) {
+      const int64_t end = rex::filesystem::Tell(file_);
+      size_ = end > 0 ? static_cast<size_t>(end) : 0;
+    }
+  }
+  void Rotate() {
+    if (file_) {
+      std::fclose(file_);
+      file_ = nullptr;
+    }
+    std::error_code ec;
+    for (size_t i = max_files_; i > 0; --i) {
+      const auto from = Indexed(i - 1);
+      if (!std::filesystem::exists(from, ec))
+        continue;
+      std::filesystem::remove(Indexed(i), ec);
+      std::filesystem::rename(from, Indexed(i), ec);
+    }
+    Open("wb");
+  }
+
+  std::filesystem::path path_;
+  size_t max_size_;
+  size_t max_files_;
+  FILE* file_ = nullptr;
+  size_t size_ = 0;
+};
+
+// Log paths are UTF-8; a string that isn't (an older caller's ANSI path) is
+// taken as it is.
+std::filesystem::path LogPath(const std::string& path) {
+  try {
+    return rex::to_path(path);
+  } catch (const std::exception&) {
+    return std::filesystem::path(path);
+  }
+}
 std::mutex g_mutex;
 LogConfig g_config;
 
@@ -223,18 +310,18 @@ void InitLogging(const LogConfig& config) {
   }
 
   // File sink (rotating) with sequential naming fallback
-  std::string resolved_path;
+  std::filesystem::path resolved_path;
   if (config.log_file) {
-    resolved_path = config.log_file;
+    resolved_path = LogPath(config.log_file);
   } else if (!config.app_name.empty()) {
-    auto log_dir = config.log_dir.empty() ? std::filesystem::current_path() / "logs"
-                                          : std::filesystem::path(config.log_dir);
-    resolved_path = NextSequentialLogPath(log_dir, config.app_name).string();
+    auto log_dir =
+        config.log_dir.empty() ? std::filesystem::current_path() / "logs" : LogPath(config.log_dir);
+    resolved_path = NextSequentialLogPath(log_dir, config.app_name);
   }
   if (!resolved_path.empty()) {
-    auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+    auto sink = CreateRotatingFileSink(
         resolved_path, static_cast<size_t>(REXCVAR_GET(log_max_file_size_mb)) * 1024 * 1024,
-        static_cast<size_t>(REXCVAR_GET(log_max_files)), false);
+        static_cast<size_t>(REXCVAR_GET(log_max_files)));
     sink->set_level(spdlog::level::trace);
     sink->set_pattern(config.file_pattern);
     g_file_sink = sink;
@@ -420,6 +507,11 @@ void RegisterLogLevelCallback() {
   });
 }
 
+spdlog::sink_ptr CreateRotatingFileSink(const std::filesystem::path& path, size_t max_size,
+                                        size_t max_files) {
+  return std::make_shared<PathRotatingFileSink>(path, max_size, max_files);
+}
+
 void AddSink(spdlog::sink_ptr sink) {
   std::lock_guard lock(g_mutex);
   g_extra_sinks.push_back(sink);
@@ -550,7 +642,11 @@ std::map<std::string, std::string> ParseCategoryLevelsFromConfig(
     return result;
 
   try {
-    auto config = toml::parse_file(config_path.string());
+    std::ifstream file(config_path, std::ios::binary);
+    if (!file)
+      return result;
+    const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    auto config = toml::parse(text, rex::path_to_utf8(config_path));
     auto* log_table = config["log"].as_table();
     if (!log_table)
       return result;

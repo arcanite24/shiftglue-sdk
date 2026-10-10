@@ -350,7 +350,7 @@ void RegisterContentAchievements(KernelState* kernel_state,
                                   std::istreambuf_iterator<char>());
   const util::XdbfGameData db(data.data(), data.size());
   if (!db.is_valid()) {
-    REXSYS_WARN("Ignoring unreadable content spa.bin in {}", package_path.string());
+    REXSYS_WARN("Ignoring unreadable content spa.bin in {}", rex::path_to_utf8(package_path));
     return;
   }
   auto& manager = kernel_state->achievements();
@@ -376,7 +376,7 @@ void RegisterContentAchievements(KernelState* kernel_state,
   }
   if (added) {
     REXSYS_INFO("Registered {} achievement(s) from content {}", added,
-                package_path.filename().string());
+                rex::path_to_utf8(package_path.filename()));
   }
 }
 

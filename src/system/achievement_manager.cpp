@@ -9,6 +9,7 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <rex/filesystem.h>
 #include <rex/system/achievement_manager.h>
 
 #include <algorithm>
@@ -77,10 +78,11 @@ void AchievementManager::ReplaceAchievements(std::vector<AchievementInfo> achiev
 
 bool AchievementManager::LoadMetadataFile(const std::filesystem::path& path) {
   try {
-    auto table = toml::parse_file(path.string());
+    auto table = toml::parse_file(rex::path_to_utf8(path));
     const auto* entries = table["achievements"].as_array();
     if (!entries) {
-      REXSYS_WARN("Achievement metadata has no [[achievements]] entries: {}", path.string());
+      REXSYS_WARN("Achievement metadata has no [[achievements]] entries: {}",
+                  rex::path_to_utf8(path));
       return false;
     }
 
@@ -104,10 +106,10 @@ bool AchievementManager::LoadMetadataFile(const std::filesystem::path& path) {
         ++loaded;
       }
     }
-    REXSYS_DEBUG("Loaded achievements.toml: {} entries from {}", loaded, path.string());
+    REXSYS_DEBUG("Loaded achievements.toml: {} entries from {}", loaded, rex::path_to_utf8(path));
     return true;
   } catch (const toml::parse_error& error) {
-    REXSYS_WARN("Failed to parse {}: {}", path.string(), error.what());
+    REXSYS_WARN("Failed to parse {}: {}", rex::path_to_utf8(path), error.what());
     return false;
   }
 }
@@ -228,7 +230,7 @@ void AchievementManager::LoadUnlockState() {
 
   bool migrated = false;
   try {
-    auto table = toml::parse_file(save_path.string());
+    auto table = toml::parse_file(rex::path_to_utf8(save_path));
     std::lock_guard lock(mutex_);
     if (const auto* unlocked = table["unlocked"].as_table()) {
       for (const auto& [key, value] : *unlocked) {
@@ -253,15 +255,15 @@ void AchievementManager::LoadUnlockState() {
     }
     if (!unlocked_achievements_.empty()) {
       REXSYS_DEBUG("Loaded {} persisted unlocks from {}", unlocked_achievements_.size(),
-                   save_path.string());
+                   rex::path_to_utf8(save_path));
     }
   } catch (const std::exception& error) {
-    REXSYS_WARN("Failed to parse unlock save {}: {}", save_path.string(), error.what());
+    REXSYS_WARN("Failed to parse unlock save {}: {}", rex::path_to_utf8(save_path), error.what());
     return;
   }
 
   if (migrated) {
-    REXSYS_DEBUG("Migrating legacy achievement save format: {}", save_path.string());
+    REXSYS_DEBUG("Migrating legacy achievement save format: {}", rex::path_to_utf8(save_path));
     SaveUnlockState();
   }
 }
@@ -285,8 +287,8 @@ void AchievementManager::SaveUnlockState() const {
     std::filesystem::create_directories(save_path.parent_path(), ec);
   }
   if (ec) {
-    REXSYS_WARN("Achievement save: cannot create {}: {}", save_path.parent_path().string(),
-                ec.message());
+    REXSYS_WARN("Achievement save: cannot create {}: {}",
+                rex::path_to_utf8(save_path.parent_path()), ec.message());
     return;
   }
 
@@ -300,7 +302,7 @@ void AchievementManager::SaveUnlockState() const {
   {
     std::ofstream file(temporary_path, std::ios::binary);
     if (!file) {
-      REXSYS_WARN("Achievement save: cannot write {}", temporary_path.string());
+      REXSYS_WARN("Achievement save: cannot write {}", rex::path_to_utf8(temporary_path));
       return;
     }
     file << content;
