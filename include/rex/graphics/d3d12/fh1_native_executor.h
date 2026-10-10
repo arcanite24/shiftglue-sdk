@@ -217,6 +217,10 @@ class Fh1NativeExecutor {
     // the range being new (first resolved, or again after an idle time).
     uint64_t run_start_frame = 0;
     uint64_t new_since_frame = 0;
+    // Resolves this frame (count_frame) and in the frame before it.
+    uint64_t count_frame = UINT64_MAX;
+    uint32_t count = 0;
+    uint32_t previous_count = 0;
   };
   std::map<uint64_t, ResolveReadback> resolve_readbacks_;
   struct PendingReadback {

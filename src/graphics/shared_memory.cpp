@@ -340,6 +340,31 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   MakeRangeValid(start, length, true);
 }
 
+void SharedMemory::CopyReadbackToGuest(uint32_t start, const uint8_t* source, uint32_t length) {
+  if (length == 0 || start >= kBufferSize) {
+    return;
+  }
+  length = std::min(length, kBufferSize - start);
+  const uint32_t page_size = uint32_t(1) << page_size_log2_;
+  for (uint32_t offset = 0; offset < length;) {
+    const uint32_t address = start + offset;
+    const uint32_t chunk = std::min(length - offset, page_size - (address & (page_size - 1)));
+    const uint32_t page = address >> page_size_log2_;
+    bool valid;
+    {
+      auto global_lock = global_critical_region_.Acquire();
+      valid = (system_page_flags_valid_[page >> 6] >> (page & 63)) & 1;
+    }
+    // Not under the lock: the store may fault on the page's write watch.
+    if (valid) {
+      if (uint8_t* destination = memory().TranslatePhysical(address)) {
+        std::memcpy(destination, source + offset, chunk);
+      }
+    }
+    offset += chunk;
+  }
+}
+
 std::pair<uint32_t, uint32_t> SharedMemory::CountValidPages(uint32_t start, uint32_t length) {
   if (!length || start >= kBufferSize) return {0, 0};
   length = std::min(length, kBufferSize - start);

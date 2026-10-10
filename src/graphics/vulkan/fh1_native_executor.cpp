@@ -2637,11 +2637,20 @@ void Fh1NativeExecutor::DumpResolveOutput(uint32_t address, uint32_t length) {
 
 bool Fh1NativeExecutor::IsOneOffResolve(uint32_t address, uint32_t length) {
   // As the D3D12 executor: the first frames of each run of resolves to a new,
-  // large range are read back (car thumbnails the game saves).
+  // large range are read back (car thumbnails the game saves). So is a
+  // resolve to a range already resolved more times this frame than in the
+  // previous one: a capture drawn after the frame into one of its own
+  // targets, such as the photo mode picture the game encodes (#399).
   constexpr uint64_t kRunGapFrames = 4, kRunReadbackFrames = 2, kIdleFrames = 300,
                      kNewFrames = 120;
   constexpr uint32_t kMinLength = 256 * 1024;
   ResolveReadback& readback = resolve_readbacks_[(uint64_t(address) << 32) | length];
+  if (readback.count_frame != frame_) {
+    readback.previous_count = readback.count_frame + 1 == frame_ ? readback.count : 0;
+    readback.count = 0;
+    readback.count_frame = frame_;
+  }
+  ++readback.count;
   if (!readback.last_used_frame || frame_ > readback.last_used_frame + kRunGapFrames) {
     if (!readback.last_used_frame || frame_ > readback.last_used_frame + kIdleFrames) {
       readback.new_since_frame = frame_;
@@ -2649,8 +2658,10 @@ bool Fh1NativeExecutor::IsOneOffResolve(uint32_t address, uint32_t length) {
     readback.run_start_frame = frame_;
   }
   readback.last_used_frame = frame_;
-  return length >= kMinLength && frame_ < readback.run_start_frame + kRunReadbackFrames &&
-         frame_ < readback.new_since_frame + kNewFrames;
+  const bool extra = readback.previous_count && readback.count > readback.previous_count;
+  return length >= kMinLength &&
+         (extra || (frame_ < readback.run_start_frame + kRunReadbackFrames &&
+                    frame_ < readback.new_since_frame + kNewFrames));
 }
 
 void Fh1NativeExecutor::QueueResolveReadback(uint32_t address, uint32_t length) {
@@ -2705,9 +2716,8 @@ void Fh1NativeExecutor::FlushResolveReadbacks() {
   dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
   // In order: a later resolve over the same bytes wins, as on the GPU.
   for (PendingReadback& pending : pending_readbacks_) {
-    if (uint8_t* destination = memory_.TranslatePhysical(pending.address)) {
-      std::memcpy(destination, readback_mapped_ + pending.offset, pending.length);
-    }
+    config_.memory->CopyReadbackToGuest(pending.address, readback_mapped_ + pending.offset,
+                                        pending.length);
   }
   pending_readbacks_.clear();
   readback_used_ = 0;

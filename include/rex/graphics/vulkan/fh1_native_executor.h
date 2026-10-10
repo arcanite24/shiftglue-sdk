@@ -231,6 +231,10 @@ class Fh1NativeExecutor {
     uint64_t last_used_frame = 0;
     uint64_t run_start_frame = 0;
     uint64_t new_since_frame = 0;
+    // Resolves this frame (count_frame) and in the frame before it.
+    uint64_t count_frame = UINT64_MAX;
+    uint32_t count = 0;
+    uint32_t previous_count = 0;
   };
 
   SurfaceKey MakeColorKey(uint32_t base, uint32_t pitch_tiles, uint32_t msaa,

@@ -135,6 +135,13 @@ class SharedMemory {
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
 
+  // Writes bytes read back from a resolve to guest memory, except on pages the
+  // CPU has written since the resolve made them valid. A resolve's extent
+  // spans whole rows (and tiles) while the GPU writes only its rectangle, and
+  // a readback lands once the GPU is done, so a page the CPU wrote in between
+  // would get the GPU's older copy of it.
+  void CopyReadbackToGuest(uint32_t start, const uint8_t* source, uint32_t length);
+
   // Diagnostics: pages in the range currently valid, and valid because the GPU
   // wrote them.
   std::pair<uint32_t, uint32_t> CountValidPages(uint32_t start, uint32_t length);
