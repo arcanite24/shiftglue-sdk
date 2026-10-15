@@ -2386,9 +2386,14 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
 
 namespace {
 thread_local uint32_t access_fault_virtual_address = 0;
+thread_local std::pair<uint32_t, uint32_t> invalidation_exact_physical_range = {0, 0};
 }  // namespace
 
 uint32_t CurrentAccessFaultVirtualAddress() { return access_fault_virtual_address; }
+
+std::pair<uint32_t, uint32_t> CurrentInvalidationExactPhysicalRange() {
+  return invalidation_exact_physical_range;
+}
 
 bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                                     uint32_t virtual_address, uint32_t length, bool is_write,
@@ -2490,6 +2495,7 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
     }
   }
   if (any_invalidation_watched) {
+    invalidation_exact_physical_range = {GetPhysicalAddress(virtual_address), length};
     for (auto invalidation_callback : memory_->physical_memory_invalidation_callbacks_) {
       std::pair<uint32_t, uint32_t> callback_unwatch_range =
           invalidation_callback->first(invalidation_callback->second, physical_address_start,
@@ -2501,6 +2507,7 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
                                        std::max(callback_unwatch_range.second, uint32_t(1)) - 1));
       }
     }
+    invalidation_exact_physical_range = {0, 0};
   }
   if (any_invalidation_watched && !unwatch_exact_range) {
     // Always unwatch at least the requested pages.

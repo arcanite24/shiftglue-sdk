@@ -55,6 +55,7 @@
 
 #include "d3d_census_decoder.h"
 #include "d3d_draw_window.h"
+#include "d3d_list_compiler.h"
 
 REXCVAR_DEFINE_INT32(gpu_trace_bins_vblank, -1, "GPU",
                      "Diagnostics: log the bin masks, bin selects, screen extent writes, draws, "
@@ -185,10 +186,13 @@ struct WaitRegMemPolicy {
 // after a 200 us yield took 2.3-3.5 ms less decoder CPU a race frame than
 // the former 2 ms yield, with a p95 about 0.9 ms lower, on 16, 8 and 4
 // threads of a Ryzen 7 5800X. Above 60 the wake-up latency cost 3 % of the
-// frame rate at 120, so faster rates keep the 2 ms yield (NP-9.3).
+// frame rate at 120, so faster rates keep the 2 ms yield (NP-9.3). macOS
+// takes the Windows choice: its short sleeps overshoot under load, and on an
+// M4 Pro free-roam drive the 100 us sleeps gave 187 frames over 25 ms and a
+// p99 of 41.8 ms against 23 frames and 19.8 ms with the 2 ms yield.
 WaitRegMemPolicy CurrentWaitRegMemPolicy() {
   WaitRegMemPolicy policy{REXCVAR_GET(wait_reg_mem_yield_us), REXCVAR_GET(wait_reg_mem_sleep_us)};
-#if REX_PLATFORM_WIN32
+#if REX_PLATFORM_WIN32 || REX_PLATFORM_MAC
   if (policy.yield_us < 0 || policy.sleep_us < 0) {
     // The game rate's settings live in other modules: read them by name,
     // at most twice a second (the decoder thread is the only caller).
@@ -1302,7 +1306,7 @@ bool CommandProcessor::SetupContext() {
   return true;
 }
 
-void CommandProcessor::ShutdownContext() {}
+void CommandProcessor::ShutdownContext() { D3dShaderCacheReset(); }
 
 void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
   read_ptr_index_ = 0;
@@ -1889,6 +1893,13 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
     }
   }
 
+  // DL-2.1: nested buffers (display lists) from their compiled form. The
+  // mode is 0 whenever the census, the packet recorder or bin tracing is on.
+  if (d3d_list_mode_ && trace_ib_depth_ >= 2 && !d3d_draw_open_ && !probe_mode &&
+      !ib_stats_enabled && !template_stats && D3dListExecute(ptr, count)) {
+    return;
+  }
+
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
@@ -1900,6 +1911,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
       break;
     }
   } while (reader.read_count());
+  if (d3d_list_verify_depth_ == trace_ib_depth_) D3dListVerifyEnd();
 
   if (template_stats) {
     RecordCall([this]() { TemplateStatsIbEnd(); });
@@ -2251,6 +2263,8 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     ++trace_swaps_;
     d3d_census_decoder::Swap();
     if (d3d_draw_) D3dDrawSwap();
+    D3dListSwap();
+    D3dShaderCacheSwap();
   }
   const int32_t trace_bins_vblank = REXCVAR_GET(gpu_trace_bins_vblank);
   const bool trace_bins = trace_bins_vblank >= 0 && trace_swaps_ == uint32_t(trace_bins_vblank);
@@ -2269,6 +2283,10 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   }
   if (d3d_draw_open_ && D3dDrawType3(reader, packet, opcode, count)) {
     return true;
+  }
+  if (d3d_list_verify_depth_ == trace_ib_depth_ &&
+      (opcode == PM4_DRAW_INDX || opcode == PM4_DRAW_INDX_2)) {
+    D3dListVerifyDraw();
   }
   if ((packet & 1) && PredicatedOut(packet, opcode)) {
     reader->AdvanceRead(count * sizeof(uint32_t));
@@ -2496,7 +2514,12 @@ bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32
     const uint32_t magic = reader->ReadAndSwap<uint32_t>();
     const uint32_t id = reader->ReadAndSwap<uint32_t>();
     const uint32_t mode = reader->ReadAndSwap<uint32_t>();
-    if (magic == system::d3d_draw::kMarkerMagic) D3dDrawMarker(id, mode);
+    if (magic == system::d3d_draw::kMarkerMagic) {
+      D3dDrawMarker(id, mode);
+    } else if (magic == system::d3d_draw::kReplaceMagic) {
+      // DL-2.1: a replaced draw call (arena offset, (id << 2) | mode).
+      D3dSliceMarker(id, mode);
+    }
     return true;
   }
   // skip N 32-bit words to get to the next packet
@@ -3569,8 +3592,20 @@ void CommandProcessor::LoadGuestShader(xenos::ShaderType shader_type, uint32_t a
                                        uint32_t size_dwords) {
   const uint32_t* ucode = memory_->TranslatePhysical<uint32_t*>(addr);
   d3d_skipped_load_[shader_type == xenos::ShaderType::kPixel].valid = false;
+  if (d3d_list_verify_depth_ == trace_ib_depth_) {
+    D3dListVerifyLoad(uint32_t(shader_type), addr, size_dwords);
+  }
+  uint64_t cached_hash = 0;
+  if (d3d_shader_cache_mode_ &&
+      D3dShaderCacheLoad(shader_type, addr, size_dwords, ucode, cached_hash)) {
+    // The same microcode as when hashed; the shader is set.
+    decode_last_shader_load_[shader_type == xenos::ShaderType::kPixel].valid = false;
+    return;
+  }
   // Hashing the microcode is most of a shader load; the decoder has time.
-  const uint64_t ucode_hash = record_split_ ? HashShaderMicrocode(ucode, size_dwords) : 0;
+  // The shader cache may have hashed it already.
+  const uint64_t ucode_hash =
+      cached_hash ? cached_hash : (record_split_ ? HashShaderMicrocode(ucode, size_dwords) : 0);
   if (record_split_ && REXCVAR_GET(gpu_record_shader_load_entries)) {
     decode_shader_loads_.store(decode_shader_loads_.load(std::memory_order_relaxed) + 1,
                                std::memory_order_relaxed);
@@ -3652,6 +3687,9 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer* 
 void CommandProcessor::LoadInlineShader(xenos::ShaderType shader_type, uint32_t guest_address,
                                         const uint32_t* ucode_words, uint32_t size_dwords) {
   d3d_skipped_load_[shader_type == xenos::ShaderType::kPixel].valid = false;
+  if (d3d_list_verify_depth_ == trace_ib_depth_) {
+    D3dListVerifyLoad(uint32_t(shader_type), 0, size_dwords);
+  }
   if (!record_split_) {
     auto shader =
         LoadShader(shader_type, guest_address, const_cast<uint32_t*>(ucode_words), size_dwords);

@@ -851,6 +851,15 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   // The retirement or destruction of the swapchain here will also cause
   // awaiting completion of the usage of the swapchain and the surface on the
   // GPU.
+#if REX_PLATFORM_MAC
+  // On MoltenVK a swapchain created from the old one on the same CAMetalLayer
+  // presents, but the window shows one flat colour (black, or a colour from
+  // the frame) after every resize, menus included. A new VkSurface for the
+  // layer presents normally, so start from scratch on each reconnection.
+  if (paint_context_.vulkan_surface != VK_NULL_HANDLE) {
+    paint_context_.DestroySwapchainAndVulkanSurface();
+  }
+#endif
   if (paint_context_.vulkan_surface != VK_NULL_HANDLE) {
     VkSwapchainKHR old_swapchain = paint_context_.PrepareForSwapchainRetirement();
     bool surface_unusable;

@@ -29,6 +29,7 @@
 #include <rex/system/user_module.h>
 #include <rex/system/util/string_utils.h>
 #include <rex/system/xevent.h>
+#include <rex/system/xmemory.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 #include <rex/thread/atomic.h>
@@ -387,9 +388,9 @@ u32 RtlInitializeCriticalSectionAndSpinCount_entry(ppc_ptr_t<X_RTL_CRITICAL_SECT
 // The guest thread object of the caller. Guest code runs with r13 at its
 // thread's PCR, whose PRCB names the current thread; reading it there avoids
 // the host's dynamic TLS lookup (a resolver call from this library).
-uint32_t CriticalSectionThread(const PPCContext& ctx, const uint8_t* base) {
+uint32_t CriticalSectionThread(const PPCContext& ctx, uint8_t* base) {
   if (REXCVAR_GET(rtl_critical_section_pcr_thread)) {
-    const auto* pcr = reinterpret_cast<const X_KPCR*>(base + ctx.r13.u32);
+    const auto* pcr = rex::memory::GuestPtr<const X_KPCR*>(base, ctx.r13.u32);
     return pcr->prcb_data.current_thread;
   }
   PERF_counter_inc(kRtlCriticalSectionThreadLookups);
@@ -649,7 +650,10 @@ REX_EXPORT(__imp__RtlInitializeCriticalSectionAndSpinCount,
 extern "C" REX_FUNC(__imp__RtlEnterCriticalSection) {
   REX_TRACE_IMPORT_REACH(__imp__RtlEnterCriticalSection);
   using namespace rex::kernel::xboxkrnl;
-  RtlEnterCriticalSection(reinterpret_cast<X_RTL_CRITICAL_SECTION*>(base + ctx.r3.u32),
+  // GuestPtr adds the 0xE0000000 view's host offset (Apple silicon), as
+  // RtlLeaveCriticalSection's translated pointer does: critical sections in
+  // physical memory must be entered and left at the same host address.
+  RtlEnterCriticalSection(rex::memory::GuestPtr<X_RTL_CRITICAL_SECTION*>(base, ctx.r3.u32),
                           CriticalSectionThread(ctx, base));
 }
 static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__RtlEnterCriticalSection(
@@ -658,7 +662,8 @@ extern "C" REX_FUNC(__imp__RtlTryEnterCriticalSection) {
   REX_TRACE_IMPORT_REACH(__imp__RtlTryEnterCriticalSection);
   using namespace rex::kernel::xboxkrnl;
   ctx.r3.u64 = RtlTryEnterCriticalSection(
-      reinterpret_cast<X_RTL_CRITICAL_SECTION*>(base + ctx.r3.u32), CriticalSectionThread(ctx, base));
+      rex::memory::GuestPtr<X_RTL_CRITICAL_SECTION*>(base, ctx.r3.u32),
+      CriticalSectionThread(ctx, base));
 }
 static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__RtlTryEnterCriticalSection(
     "__imp__RtlTryEnterCriticalSection", &__imp__RtlTryEnterCriticalSection);

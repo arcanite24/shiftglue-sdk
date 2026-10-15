@@ -65,7 +65,8 @@ REXCVAR_DEFINE_INT32(vulkan_async_pipeline_wait_ms, REX_PLATFORM_ANDROID ? 0 : 2
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
 REXCVAR_DECLARE(int32_t, gpu_trace_bins_vblank);
-REXCVAR_DEFINE_BOOL(fh1_untile_predicated_tiling, REX_PLATFORM_ANDROID, "GPU",
+// On macOS an in-run A/B on an M4 Pro drive gives about 0.8 ms a frame.
+REXCVAR_DEFINE_BOOL(fh1_untile_predicated_tiling, REX_PLATFORM_ANDROID || REX_PLATFORM_MAC, "GPU",
                     "Render FH1's predicated tiling passes once: the first tile draws every "
                     "tile's objects over the whole surface height and the later tiles only "
                     "resolve their bands (Vulkan FH1 native executor; 3 ms a frame on the "
@@ -2669,6 +2670,7 @@ void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
   const auto destroy = [this]() {
     fh1_native_executor_.reset();
     texture_cache_.reset();
+    D3dShaderCacheReset();  // its shaders go with the pipeline cache
     pipeline_cache_.reset();
     render_target_cache_.reset();
   };

@@ -187,6 +187,11 @@ MacOSVulkanRuntimePaths DetectMacOSVulkanRuntimePaths() {
 }
 
 void ConfigureMacOSVulkanEnvironment(const MacOSVulkanRuntimePaths& paths) {
+  // Metal argument buffers make every descriptor set update an encode into a
+  // GPU buffer. FH1 rewrites sets for most draws, and without them an M4 Pro
+  // free-roam drive's median frame falls from 10.9 to 10.3 ms. A value the
+  // player sets is kept.
+  setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0", 0);
   if (!paths.sdk_root.empty()) {
     const char* vulkan_sdk = std::getenv("VULKAN_SDK");
     if (!vulkan_sdk || !vulkan_sdk[0]) {

@@ -53,8 +53,10 @@ REXCVAR_DEFINE_BOOL(spirv_ieee_vertex_math, REX_PLATFORM_ANDROID, "GPU",
 // 32), with only scattered pixels of foliage and shadow noise changing. That
 // was with plain IEEE products, whose 0 * Inf = NaN smeared the scene (#403);
 // with the NaN check the Thor's parked scene pass is 10.4 ms, as with the full
-// rule, against 10.0 ms with plain products.
-REXCVAR_DEFINE_BOOL(spirv_fast_pixel_math, REX_PLATFORM_ANDROID, "GPU",
+// rule, against 10.0 ms with plain products. On macOS: an M4 Pro free-roam
+// drive's median frame falls from 10.9 to 8.6 ms (two runs each), brightness
+// and the image unchanged against Windows.
+REXCVAR_DEFINE_BOOL(spirv_fast_pixel_math, REX_PLATFORM_ANDROID || REX_PLATFORM_MAC, "GPU",
                     "Vulkan: in pixel shaders, apply the Direct3D 9 multiply rule (0 * anything "
                     "= 0) only to products that come out NaN, and let the driver fuse "
                     "multiply-adds. Less pixel shader work at high scales; a NaN operand times "
@@ -62,8 +64,9 @@ REXCVAR_DEFINE_BOOL(spirv_fast_pixel_math, REX_PLATFORM_ANDROID, "GPU",
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 // On Android: the Odin 2 Portal's 1x drive frame falls about 3 ms (6 %) when
-// the texture sign switches fold away.
-REXCVAR_DEFINE_BOOL(spirv_specialize_texture_signs, REX_PLATFORM_ANDROID, "GPU",
+// the texture sign switches fold away. On macOS the M4 Pro drive's median
+// frame falls from 10.9 to 9.8 ms.
+REXCVAR_DEFINE_BOOL(spirv_specialize_texture_signs, REX_PLATFORM_ANDROID || REX_PLATFORM_MAC, "GPU",
                     "Vulkan: make each texture fetch's signedness (unsigned, signed, biased, "
                     "gamma) a specialization constant set from the bound textures when the "
                     "pipeline is created, so drivers fold the per-fetch switch away; pipelines "

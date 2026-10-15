@@ -24,7 +24,9 @@
 // description's words, at the place the guest's draw packet had in the
 // stream.
 
+#include <cstddef>
 #include <cstring>
+#include <type_traits>
 
 #include <fmt/format.h>
 #include <xxhash.h>
@@ -81,6 +83,29 @@ bool ForEachEntry(const d3d_draw::Description& description, Fn&& fn) {
 constexpr const char* kAbortName[] = {"nested buffer", "marker", "swap", "packet limit",
                                       "predicated draw"};
 
+// Fills the window's coverage from its description; false if the word
+// stream is malformed. (A generic lambda: the window type is private.)
+constexpr auto kCover = [](auto& w) {
+  w.has_shader[0] = w.has_shader[1] = false;
+  w.seen[0] = w.seen[1] = {};
+  w.packets = 0;
+  w.segments = 0;
+  w.uncovered = 0;
+  std::memset(w.covered, 0, sizeof(w.covered));
+  return ForEachEntry(w.description, [&w](const Entry& entry) {
+    if (entry.kind == d3d_draw::kEntryShader) {
+      if (entry.first < 2) w.has_shader[entry.first] = true;
+      return;
+    }
+    for (uint32_t i = 0; i < entry.count; ++i) {
+      const uint32_t index = entry.first + i;
+      if (index < std::decay_t<decltype(w)>::kCoveredRegisters) {
+        w.covered[index >> 6] |= uint64_t(1) << (index & 63);
+      }
+    }
+  });
+};
+
 }  // namespace
 
 void CommandProcessor::D3dDrawMarker(uint32_t id, uint32_t mode) {
@@ -98,25 +123,9 @@ void CommandProcessor::D3dDrawMarker(uint32_t id, uint32_t mode) {
     return;
   }
   w.mode = mode;
+  w.slice = false;
   w.depth = trace_ib_depth_;
-  w.packets = 0;
-  w.segments = 0;
-  w.has_shader[0] = w.has_shader[1] = false;
-  w.seen[0] = w.seen[1] = {};
-  std::memset(w.covered, 0, sizeof(w.covered));
-  const bool valid = ForEachEntry(w.description, [&w](const Entry& entry) {
-    if (entry.kind == d3d_draw::kEntryShader) {
-      if (entry.first < 2) w.has_shader[entry.first] = true;
-      return;
-    }
-    for (uint32_t i = 0; i < entry.count; ++i) {
-      const uint32_t index = entry.first + i;
-      if (index < D3dDrawWindow::kCoveredRegisters) {
-        w.covered[index >> 6] |= uint64_t(1) << (index & 63);
-      }
-    }
-  });
-  if (!valid) {
+  if (!kCover(w)) {
     ++w.stats.fetch_failed;
     return;
   }
@@ -131,10 +140,16 @@ bool CommandProcessor::D3dDrawType0(memory::RingBuffer* reader, uint32_t packet)
     D3dDrawAbort(D3dDrawWindow::kAbortLimit);
     return false;
   }
-  if (w.mode != d3d_draw::kModeDraw) return false;
   const uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
   const uint32_t first = packet & 0x7FFF;
   const bool one_register = (packet >> 15) & 1;
+  if (w.mode != d3d_draw::kModeDraw) {
+    if (w.slice && !w.CoveredRange(first, one_register ? 1 : count)) {
+      if (w.uncovered < std::size(w.uncovered_keys)) w.uncovered_keys[w.uncovered] = first;
+      ++w.uncovered;
+    }
+    return false;
+  }
   if (!w.CoveredRange(first, one_register ? 1 : count)) {
     ++w.stats.kept_packets;
     return false;
@@ -166,11 +181,20 @@ bool CommandProcessor::D3dDrawType3(memory::RingBuffer* reader, uint32_t packet,
     return false;
   }
   const bool draw_mode = w.mode == d3d_draw::kModeDraw;
+  // DL-2.1 verify: a packet of the call the replacement would not write.
+  auto uncovered = [&w, opcode]() {
+    if (!w.slice) return;
+    if (w.uncovered < std::size(w.uncovered_keys)) {
+      w.uncovered_keys[w.uncovered] = 0x10000 | opcode;
+    }
+    ++w.uncovered;
+  };
   switch (opcode) {
     case PM4_NOP:
       if (count == 3) {
         memory::RingBuffer peek = *reader;
-        if (peek.ReadAndSwap<uint32_t>() == d3d_draw::kMarkerMagic) {
+        const uint32_t magic = peek.ReadAndSwap<uint32_t>();
+        if (magic == d3d_draw::kMarkerMagic || magic == d3d_draw::kReplaceMagic) {
           D3dDrawAbort(D3dDrawWindow::kAbortMarker);
         }
       }
@@ -189,13 +213,13 @@ bool CommandProcessor::D3dDrawType3(memory::RingBuffer* reader, uint32_t packet,
         return false;
       }
       if (!draw_mode) {
-        D3dDrawVerify(*reader, opcode, count);
+        D3dDrawVerify(*reader, packet, opcode, count);
         d3d_draw_open_ = false;
         return false;
       }
       reader->AdvanceRead(count * sizeof(uint32_t));
-      D3dDrawApplyState();
-      D3dDrawIssue(packet);
+      D3dDrawApplyState(w.description);
+      D3dDrawIssue(w.description, packet);
       ++w.stats.drawn;
       d3d_draw_open_ = false;
       return true;
@@ -205,7 +229,10 @@ bool CommandProcessor::D3dDrawType3(memory::RingBuffer* reader, uint32_t packet,
       const uint32_t word0 = peek.ReadAndSwap<uint32_t>();
       const uint32_t word1 = peek.ReadAndSwap<uint32_t>();
       const uint32_t type = opcode == PM4_IM_LOAD ? (word0 & 3) : word0;
-      if (type > 1) return false;
+      if (type > 1) {
+        if (!draw_mode) uncovered();
+        return false;
+      }
       if (draw_mode) {
         if (!w.has_shader[type]) {
           ++w.stats.kept_packets;
@@ -232,7 +259,14 @@ bool CommandProcessor::D3dDrawType3(memory::RingBuffer* reader, uint32_t packet,
     case PM4_SET_CONSTANT2:
     case PM4_LOAD_ALU_CONSTANT:
     case PM4_SET_SHADER_CONSTANTS: {
-      if (!draw_mode) return false;
+      if (!draw_mode) {
+        uint32_t first = 0, registers = 0;
+        if (!ConstantPacketRange(*reader, opcode, count, &first, &registers) ||
+            !w.CoveredRange(first, registers)) {
+          uncovered();
+        }
+        return false;
+      }
       uint32_t first = 0, registers = 0;
       if (!ConstantPacketRange(*reader, opcode, count, &first, &registers) ||
           !w.CoveredRange(first, registers)) {
@@ -244,7 +278,11 @@ bool CommandProcessor::D3dDrawType3(memory::RingBuffer* reader, uint32_t packet,
       return true;
     }
     default:
-      if (draw_mode) ++w.stats.kept_packets;
+      if (draw_mode) {
+        ++w.stats.kept_packets;
+      } else {
+        uncovered();
+      }
       return false;
   }
 }
@@ -252,12 +290,11 @@ bool CommandProcessor::D3dDrawType3(memory::RingBuffer* reader, uint32_t packet,
 void CommandProcessor::D3dDrawAbort(uint32_t reason) {
   D3dDrawWindow& w = *d3d_draw_;
   ++w.stats.aborted[reason];
-  if (w.mode == d3d_draw::kModeDraw) D3dDrawApplyState();
+  if (w.mode == d3d_draw::kModeDraw) D3dDrawApplyState(w.description);
   d3d_draw_open_ = false;
 }
 
-void CommandProcessor::D3dDrawApplyState() {
-  const d3d_draw::Description& description = d3d_draw_->description;
+void CommandProcessor::D3dDrawApplyState(const d3d_draw::Description& description) {
   ForEachEntry(description, [this](const Entry& entry) {
     switch (entry.kind) {
       case d3d_draw::kEntryRegisters:
@@ -280,11 +317,23 @@ void CommandProcessor::D3dDrawApplyState() {
   });
 }
 
-void CommandProcessor::D3dDrawVerify(const memory::RingBuffer& reader, uint32_t opcode,
-                                     uint32_t count) {
+void CommandProcessor::D3dDrawVerify(const memory::RingBuffer& reader, uint32_t packet,
+                                     uint32_t opcode, uint32_t count) {
   D3dDrawWindow& w = *d3d_draw_;
   const d3d_draw::Description& description = w.description;
   ++w.stats.verified;
+  if (w.slice) {
+    ++w.stats.slice_verified;
+    if (w.uncovered && w.segments) {
+      ++w.stats.slice_carried_uncovered;
+    } else if (w.uncovered) {
+      ++w.stats.slice_uncovered_draws;
+      w.stats.slice_uncovered_packets += w.uncovered;
+      for (uint32_t i = 0; i < w.uncovered && i < std::size(w.uncovered_keys); ++i) {
+        ++w.uncovered_packets[w.uncovered_keys[i]];
+      }
+    }
+  }
   const RegisterFile& regs = decode_regs();
   uint32_t mismatches = 0;
   bool shader_mismatch = false;
@@ -341,10 +390,17 @@ void CommandProcessor::D3dDrawVerify(const memory::RingBuffer& reader, uint32_t 
     w.stats.register_mismatches += mismatches;
   }
   if (shader_mismatch) ++w.stats.shader_mismatch_draws;
-  bool draw_match = opcode == PM4_DRAW_INDX && count >= 4;
+  // DL-1.2 descriptions hold the indexed packet's four words; a replaced
+  // call's also its header (two words for the auto-index call).
+  const uint32_t draw_words = (description.flags & d3d_draw::kFlagAutoIndex) ? 2 : 4;
+  bool draw_match = opcode == PM4_DRAW_INDX && count >= draw_words;
+  if (w.slice && packet != description.packet) {
+    draw_match = false;
+    log_mismatch("draw header", 0, description.packet, packet);
+  }
   if (draw_match) {
     memory::RingBuffer peek = reader;
-    for (uint32_t i = 0; i < 4; ++i) {
+    for (uint32_t i = 0; i < draw_words; ++i) {
       const uint32_t word = peek.ReadAndSwap<uint32_t>();
       if (word != description.draw[i]) {
         draw_match = false;
@@ -355,30 +411,38 @@ void CommandProcessor::D3dDrawVerify(const memory::RingBuffer& reader, uint32_t 
   if (!draw_match) ++w.stats.draw_mismatch_draws;
 }
 
-void CommandProcessor::D3dDrawIssue(uint32_t packet) {
-  const d3d_draw::Description& description = d3d_draw_->description;
+void CommandProcessor::D3dDrawIssue(const d3d_draw::Description& description, uint32_t packet) {
   reg::VGT_DRAW_INITIATOR initiator;
   initiator.value = description.draw[1];
-  reg::VGT_DMA_SIZE dma_size;
-  dma_size.value = description.draw[3];
-  PacketWriteRegister(XE_GPU_REG_VGT_DRAW_INITIATOR, initiator.value);
-  PacketWriteRegister(XE_GPU_REG_VGT_DMA_BASE, description.draw[2]);
-  PacketWriteRegister(XE_GPU_REG_VGT_DMA_SIZE, dma_size.value);
-  const uint32_t index_size =
-      initiator.index_size == xenos::IndexFormat::kInt16 ? sizeof(uint16_t) : sizeof(uint32_t);
   DrawRecord record;
   record.packet = packet;
   record.initiator = initiator.value;
-  record.is_indexed = true;
   record.fused_registers = 0;
-  record.dma_base = description.draw[2];
-  record.dma_size = dma_size.value;
-  record.index_buffer_info.guest_base = description.draw[2] & ~(index_size - 1);
-  record.index_buffer_info.endianness = dma_size.swap_mode;
-  record.index_buffer_info.format = initiator.index_size;
-  record.index_buffer_info.length = dma_size.num_words * index_size;
-  record.index_buffer_info.count = initiator.num_indices;
   record.opcode_name = "D3D_DRAW";
+  PacketWriteRegister(XE_GPU_REG_VGT_DRAW_INITIATOR, initiator.value);
+  if (description.flags & d3d_draw::kFlagAutoIndex) {
+    // As PM4_DRAW_INDX with kAutoIndex: only the initiator is written.
+    record.is_indexed = false;
+    record.dma_base = 0;
+    record.dma_size = 0;
+    record.index_buffer_info.guest_base = 0;
+    record.index_buffer_info.length = 0;
+  } else {
+    reg::VGT_DMA_SIZE dma_size;
+    dma_size.value = description.draw[3];
+    PacketWriteRegister(XE_GPU_REG_VGT_DMA_BASE, description.draw[2]);
+    PacketWriteRegister(XE_GPU_REG_VGT_DMA_SIZE, dma_size.value);
+    const uint32_t index_size =
+        initiator.index_size == xenos::IndexFormat::kInt16 ? sizeof(uint16_t) : sizeof(uint32_t);
+    record.is_indexed = true;
+    record.dma_base = description.draw[2];
+    record.dma_size = dma_size.value;
+    record.index_buffer_info.guest_base = description.draw[2] & ~(index_size - 1);
+    record.index_buffer_info.endianness = dma_size.swap_mode;
+    record.index_buffer_info.format = initiator.index_size;
+    record.index_buffer_info.length = dma_size.num_words * index_size;
+    record.index_buffer_info.count = initiator.num_indices;
+  }
   D3dDrawCountDraw();
   if (!record_split_) {
     ExecuteDrawRecord(record);
@@ -392,6 +456,48 @@ void CommandProcessor::D3dDrawIssue(uint32_t packet) {
   if (++record_batch_draws_ >= 32) {
     PublishRecordBatch();
   }
+}
+
+void CommandProcessor::D3dSliceMarker(uint32_t offset, uint32_t id_mode) {
+  if (!d3d_draw_) d3d_draw_ = std::make_unique<D3dDrawWindow>();
+  D3dDrawWindow& w = *d3d_draw_;
+  if (d3d_draw_open_) D3dDrawAbort(D3dDrawWindow::kAbortMarker);
+  ++w.stats.slice_markers;
+  const uint32_t mode = id_mode & 3;
+  const d3d_draw::Description* description = d3d_draw::FetchArena(offset, id_mode >> 2);
+  if (!description) {
+    // Not expected: the game side publishes before it writes the marker,
+    // and a chunk is kept until the decoder has fetched descriptions two
+    // frames newer. In draw mode the call is then lost; counted.
+    ++w.stats.slice_lost;
+    return;
+  }
+  if (mode == d3d_draw::kSliceOn) {
+    // The replaced call: its state flush, then its predicated draw.
+    D3dDrawApplyState(*description);
+    if (PredicatedOut(description->packet, PM4_DRAW_INDX)) {
+      ++w.stats.slice_predicated_out;
+      return;
+    }
+    if (d3d_skipped_loads_pending_) FlushSkippedShaderLoads();
+    D3dDrawIssue(*description, description->packet);
+    ++w.stats.slice_drawn;
+    if (description->flags & d3d_draw::kFlagAutoIndex) ++w.stats.slice_auto_index;
+    return;
+  }
+  if (mode != d3d_draw::kSliceVerify) return;
+  std::memcpy(&w.description, description,
+              offsetof(d3d_draw::Description, words) +
+                  size_t(description->word_count) * sizeof(uint32_t));
+  w.mode = d3d_draw::kModeVerify;
+  w.slice = true;
+  w.depth = trace_ib_depth_;
+  if (!kCover(w)) {
+    ++w.stats.slice_lost;
+    return;
+  }
+  ++w.stats.slice_windows;
+  d3d_draw_open_ = true;
 }
 
 void CommandProcessor::D3dDrawSwap() {
@@ -412,6 +518,25 @@ void CommandProcessor::D3dDrawSwap() {
       aborted.empty() ? " none" : aborted, s.verified, s.verified_registers,
       s.register_mismatch_draws, s.register_mismatches, s.shader_mismatch_draws,
       s.draw_mismatch_draws, s.drawn, s.skipped_packets, s.kept_packets);
+  if (s.slice_markers) {
+    REXGPU_INFO(
+        "DL-2.1 slice ({} swaps): {} markers, {} lost, {} drawn ({} auto-index), {} predicated "
+        "out; verify: {} windows, {} calls verified, {} with undescribed packets ({} packets), "
+        "{} more carried across segments (kick packets)",
+        s.swaps, s.slice_markers, s.slice_lost, s.slice_drawn, s.slice_auto_index,
+        s.slice_predicated_out, s.slice_windows, s.slice_verified, s.slice_uncovered_draws,
+        s.slice_uncovered_packets, s.slice_carried_uncovered);
+  }
+  if (!w.uncovered_packets.empty()) {
+    std::string top;
+    uint32_t n = 0;
+    for (const auto& [key, packets] : w.uncovered_packets) {
+      if (n++ >= 32) break;
+      top += key >> 16 ? fmt::format(" op{:02X}x{}", key & 0xFF, packets)
+                       : fmt::format(" {:04X}x{}", key, packets);
+    }
+    REXGPU_INFO("DL-2.1 verify: undescribed packets:{}", top);
+  }
   if (!w.mismatch_registers.empty()) {
     std::string top;
     uint32_t n = 0;
@@ -423,6 +548,7 @@ void CommandProcessor::D3dDrawSwap() {
   }
   w.stats = {};
   w.mismatch_registers.clear();
+  w.uncovered_packets.clear();
 }
 
 }  // namespace rex::graphics

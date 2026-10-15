@@ -3579,13 +3579,25 @@ void Fh1NativeExecutor::GpuDrain() {
     const auto available = [&](uint32_t query) { return ticks[size_t(query) * 2 + 1] != 0; };
     const auto tick = [&](uint32_t query) { return ticks[size_t(query) * 2]; };
     bool frame_measured = false;
+    // MoltenVK samples timestamps at Metal encoder boundaries, and one after
+    // the frame's last encoder may never become available: end the frame at
+    // its latest available timestamp instead.
+    uint64_t frame_end_tick = 0;
+    for (uint32_t query = 1; query < slot.used; ++query) {
+      if (available(query)) frame_end_tick = std::max(frame_end_tick, tick(query));
+    }
     for (const auto& span : slot.spans) {
-      if (span[0] == uint32_t(kGpuFrame) && available(span[1]) && available(span[2])) {
+      if (span[0] == uint32_t(kGpuFrame) && available(span[1]) &&
+          (available(span[2]) || frame_end_tick > tick(span[1]))) {
         frame_measured = true;
       }
     }
     if ((result == VK_SUCCESS || result == VK_NOT_READY) && frame_measured) {
       for (const auto& [phase, begin, end] : slot.spans) {
+        if (phase == uint32_t(kGpuFrame) && available(begin) && !available(end)) {
+          if (frame_end_tick > tick(begin)) gpu_ticks_[phase] += frame_end_tick - tick(begin);
+          continue;
+        }
         if (!available(begin) || !available(end) || tick(end) <= tick(begin)) continue;
         if (phase < kGpuPhases) {
           gpu_ticks_[phase] += tick(end) - tick(begin);

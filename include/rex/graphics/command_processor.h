@@ -43,10 +43,15 @@ namespace rex::stream {
 class ByteStream;
 }  // namespace rex::stream
 
+namespace rex::system::d3d_draw {
+struct Description;
+}  // namespace rex::system::d3d_draw
+
 namespace rex::graphics {
 
 class GraphicsSystem;
 class Shader;
+struct D3dPageWatch;
 
 enum class ReadbackResolveMode {
   kDisabled,
@@ -518,6 +523,8 @@ class CommandProcessor {
   // gpu_trace_bins_vblank: the indirect buffer nesting depth.
   uint32_t trace_ib_depth_ = 0;
  protected:
+  // Forgets the shader cache's shaders (before the backend destroys them).
+  void D3dShaderCacheReset();
 
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;
@@ -643,12 +650,59 @@ class CommandProcessor {
                     uint32_t count);
   // Closes the window; in draw mode applies the skipped state first.
   void D3dDrawAbort(uint32_t reason);
-  void D3dDrawApplyState();
-  void D3dDrawVerify(const memory::RingBuffer& reader, uint32_t opcode, uint32_t count);
-  void D3dDrawIssue(uint32_t packet);
+  void D3dDrawApplyState(const system::d3d_draw::Description& description);
+  void D3dDrawVerify(const memory::RingBuffer& reader, uint32_t packet, uint32_t opcode,
+                     uint32_t count);
+  // Draws the description's draw packet (indexed, or auto-index with
+  // kFlagAutoIndex) as the packet `packet` would.
+  void D3dDrawIssue(const system::d3d_draw::Description& description, uint32_t packet);
   void D3dDrawSwap();
   // Counts a drawn description as a decoded draw (the scene measure).
   void D3dDrawCountDraw();
+  // DL-2.1 slice: a replacement marker (kReplaceMagic, arena offset,
+  // (id << 2) | mode). Draw mode applies the description and draws it; verify
+  // mode opens a DL-1.2 window over the call's packets that follow.
+  void D3dSliceMarker(uint32_t offset, uint32_t id_mode);
+  // DL-2.1 list compiler (d3d_list_compiler.cpp): nested buffers (display
+  // lists) run from a compiled form, checked against their packet headers
+  // and control words at each run; register values, draw words and inline
+  // microcode are read from the buffer as it is at the run, so fixups are
+  // bindings. Mode (gpu_d3d_list_compile, read at each swap): 0 off, 1
+  // verify (compiled and modelled, then decoded and compared), 2 on.
+  struct D3dListCompiler;
+  std::unique_ptr<D3dListCompiler> d3d_lists_;
+  uint32_t d3d_list_mode_ = 0;
+  // Attempt 2 parts, read at each swap with the mode: the page watch
+  // validates compiled lists (gpu_d3d_list_watch) and watched lists replay
+  // their register writes from a host plan (gpu_d3d_list_host_regs).
+  bool d3d_list_watch_ = false;
+  bool d3d_list_host_regs_ = false;
+  // Write watch on guest physical pages (d3d_shader_cache.cpp), shared by the
+  // list compiler and the shader cache; made by the first user.
+  std::unique_ptr<D3dPageWatch> d3d_page_watch_;
+  D3dPageWatch& D3dPageWatchGet();
+  // Shader-load cache (d3d_shader_cache.cpp): IM_LOADs reuse their hash and,
+  // decoding inline, their shader while their microcode is unwritten
+  // (gpu_d3d_shader_cache, read at each swap: 0 off, 1 verify, 2 on).
+  struct D3dShaderCache;
+  std::unique_ptr<D3dShaderCache> d3d_shader_cache_;
+  uint32_t d3d_shader_cache_mode_ = 0;
+  // An IM_LOAD through the shader cache: true if it set the active shader;
+  // otherwise `hash` is the microcode's hash when the cache knows it (0 not).
+  bool D3dShaderCacheLoad(xenos::ShaderType shader_type, uint32_t addr, uint32_t size_dwords,
+                          const uint32_t* ucode, uint64_t& hash);
+  void D3dShaderCacheSwap();
+  // Runs a nested buffer from its compiled form; false to decode it.
+  bool D3dListExecute(uint32_t ptr, uint32_t count);
+  // Verify: the buffer at this depth was modelled; it is decoded now and
+  // compared at its draws, shader loads and end (~0u: none).
+  uint32_t d3d_list_verify_depth_ = ~0u;
+  void D3dListVerifyDraw();
+  void D3dListVerifyLoad(uint32_t type, uint32_t address, uint32_t dwords);
+  void D3dListVerifyEnd();
+  void D3dListSwap();
+  // Runs packets of [base, base + count words) from word `offset` on.
+  void ExecutePacketsFrom(const uint32_t* base, uint32_t count, uint32_t offset);
   // PD-1.6: scratch registers whose writes do not write back (their
   // SCRATCH_UMSK bit is clear) are recorded once, with their latest value,
   // before anything that could observe them.

@@ -55,6 +55,9 @@ enum DescriptionFlags : uint32_t {
   kFlagDeclined = 1,
   // The description did not fit: the same.
   kFlagOverflow = 2,
+  // DL-2.1 replacement: the draw packet is an auto-index DRAW_INDX of two
+  // words (viz query, VGT_DRAW_INITIATOR) instead of an indexed one of four.
+  kFlagAutoIndex = 4,
 };
 
 constexpr uint32_t kMaxWords = 3072;
@@ -65,6 +68,11 @@ struct Description {
   // The draw packet the call writes: PM4_DRAW_INDX's viz query word,
   // VGT_DRAW_INITIATOR, VGT_DMA_BASE and VGT_DMA_SIZE.
   uint32_t draw[4] = {};
+  // DL-2.1 replacement: the draw packet's header (its predicate bit decides
+  // whether a tiling pass draws it).
+  uint32_t packet = 0;
+  // DL-2.1 arena: the guest frame that published it (set by PublishArena).
+  uint32_t frame = 0;
   uint32_t word_count = 0;
   uint32_t words[kMaxWords];
 };
@@ -78,5 +86,49 @@ bool Fetch(uint32_t id, Description* out);
 
 // A new id (never 0).
 uint32_t NextId();
+
+// --- DL-2.1, the first native slice (Pinyon Shift D3D_RENDERER_RESEARCH) ---
+//
+// Replaced draw calls: the title's indexed and auto-index draw calls are
+// replaced at their entry (the guest writes none of their packets). The
+// game side describes the call from the device state, clears the dirty
+// masks as the call would, and writes one marker, a type-3 NOP of three
+// words: kReplaceMagic, the description's arena offset, and (id << 2) |
+// mode. The decoder applies the description where the marker is and, in
+// mode kSliceOn, draws it; in kSliceVerify the call ran as usual after the
+// marker and the decoder compares.
+//
+// Descriptions live in an arena of chunks that are reused only once the
+// decoder has fetched a description two guest frames newer than the chunk's
+// last writer (a marker in the tiling stream is decoded once per tile, so a
+// description is read more than once, but never after the next frame's
+// markers). Publishing fails rather than overwriting; the caller then runs
+// the guest call as usual.
+
+// "D3DR", the first word of a replacement marker's payload.
+constexpr uint32_t kReplaceMagic = 0x44334452;
+
+enum SliceMode : uint32_t {
+  kSliceOff = 0,
+  // Calls run as usual after a marker; the decoder compares them with the
+  // description. Display lists are compiled and checked against the packets.
+  kSliceVerify = 1,
+  // Calls are replaced; display lists run from their compiled form.
+  kSliceOn = 2,
+};
+
+// The game's slice mode (pinyon_shift_d3d_slice), set once a frame.
+uint32_t GetSliceMode();
+void SetSliceMode(uint32_t mode);
+
+// Publishes a description into the arena; returns its offset + 1, or 0 if
+// the arena has no chunk the decoder is done with.
+uint32_t PublishArena(const Description& description);
+// The description at offset (offset + 1 as returned by PublishArena, minus
+// one) if it is still the one with this id, else nullptr. Only
+// word_count words of words[] are valid.
+const Description* FetchArena(uint32_t offset, uint32_t id);
+// The guest's frame boundary (once a frame, before its draws).
+void GuestFrame();
 
 }  // namespace rex::system::d3d_draw

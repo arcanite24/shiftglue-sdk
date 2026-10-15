@@ -397,6 +397,11 @@ class PhysicalHeap : public BaseHeap {
 // Within a physical memory access callback: the guest virtual address whose
 // access triggered it (the callback itself gets whole pages).
 uint32_t CurrentAccessFaultVirtualAddress();
+// Within a physical memory invalidation callback: the guest physical bytes the
+// write actually touched, as {start, length}. The callback's own range is
+// rounded out to host pages, which can be larger than guest pages (16 KB on
+// Apple silicon). {0, 0} outside a callback.
+std::pair<uint32_t, uint32_t> CurrentInvalidationExactPhysicalRange();
 
 class Memory {
  public:

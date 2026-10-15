@@ -13,14 +13,24 @@
 namespace rex::graphics {
 
 struct CommandProcessor::D3dDrawWindow {
-  // Registers a window can cover: everything below the loop constants' end.
-  static constexpr uint32_t kCoveredRegisters = 0x5000;
+  // Registers a window can cover: the register file (with the constant
+  // flush registers at 0x5000-0x5002), rounded up to 64.
+  static constexpr uint32_t kCoveredRegisters = 0x5040;
   // A window that has not reached its draw packet after this many packets
   // is abandoned.
   static constexpr uint32_t kMaxPackets = 4096;
 
   system::d3d_draw::Description description;
   uint32_t mode = 0;
+  // DL-2.1: a replacement marker's verify window. The call is replaced in
+  // draw mode, so every packet of the window that the description does not
+  // cover is counted as uncovered.
+  bool slice = false;
+  uint32_t uncovered = 0;
+  // The first undescribed packets' keys (as uncovered_packets), counted at
+  // the draw unless the window was carried across segments: a segment kick
+  // inside the call writes its own packets (the replaced call needs no kick).
+  uint32_t uncovered_keys[16] = {};
   uint32_t depth = 0;
   uint32_t packets = 0;
   uint32_t segments = 0;
@@ -73,8 +83,22 @@ struct CommandProcessor::D3dDrawWindow {
     uint64_t skipped_packets = 0;
     uint64_t kept_packets = 0;
     uint64_t swaps = 0;
+    // DL-2.1 slice.
+    uint64_t slice_markers = 0;
+    uint64_t slice_lost = 0;
+    uint64_t slice_drawn = 0;
+    uint64_t slice_predicated_out = 0;
+    uint64_t slice_windows = 0;
+    uint64_t slice_verified = 0;
+    uint64_t slice_uncovered_draws = 0;
+    uint64_t slice_uncovered_packets = 0;
+    uint64_t slice_auto_index = 0;
+    uint64_t slice_carried_uncovered = 0;
   } stats;
   std::map<uint32_t, uint64_t> mismatch_registers;
+  // DL-2.1 verify: undescribed packets by (type-0 first register) or
+  // (0x10000 | type-3 opcode).
+  std::map<uint32_t, uint64_t> uncovered_packets;
   uint32_t mismatch_logs = 0;
 };
 

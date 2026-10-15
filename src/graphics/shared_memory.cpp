@@ -31,8 +31,31 @@ namespace rex::graphics {
 // critical_region_census (NN-3.10): this file's global lock acquisitions.
 constexpr auto kSharedMemoryLockSource = rex::thread::LockSource::kSharedMemory;
 
+namespace {
+// Bits of 64-page block `block` that fall in pages [first, last].
+uint64_t PageBlockMask(uint32_t block, uint32_t first, uint32_t last) {
+  if (first > last || (last >> 6) < block || (first >> 6) > block) {
+    return 0;
+  }
+  uint64_t mask = UINT64_MAX;
+  if ((first >> 6) == block) {
+    mask &= ~((uint64_t(1) << (first & 63)) - 1);
+  }
+  if ((last >> 6) == block && (last & 63) != 63) {
+    mask &= (uint64_t(1) << ((last & 63) + 1)) - 1;
+  }
+  return mask;
+}
+}  // namespace
+
 SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
-  page_size_log2_ = rex::log2_ceil(uint32_t(rex::memory::page_size()));
+  // Guest pages, not host pages. With 16 KB host pages (Apple silicon) a
+  // 4 KB resolve shares its tracking page with unrelated CPU data, and a CPU
+  // write there invalidated the resolve, so draws read stale memory instead
+  // (auto exposure from an old luminance resolve: an overbright, flashing
+  // scene). Host protection still works on whole host pages; see
+  // MemoryInvalidationCallback for how the excess is handled.
+  page_size_log2_ = 12;
 }
 
 SharedMemory::~SharedMemory() {
@@ -743,6 +766,24 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
     }
   }
 
+  // The range is rounded out to host pages. When those are larger than the
+  // tracking pages, keep GPU-written pages the write didn't touch: they are
+  // not in sync with CPU memory, so reuploading them would lose the GPU data.
+  uint32_t keep_page_first = 1, keep_page_last = 0;
+  uint32_t exact_page_first = 1, exact_page_last = 0;
+  if (page_size_log2_ < rex::log2_ceil(uint32_t(rex::memory::page_size()))) {
+    auto exact = memory::CurrentInvalidationExactPhysicalRange();
+    if (exact.second && exact.first >= physical_address_start &&
+        exact.first - physical_address_start < length) {
+      keep_page_first = physical_address_start >> page_size_log2_;
+      keep_page_last = physical_address_last >> page_size_log2_;
+      exact_page_first = exact.first >> page_size_log2_;
+      exact_page_last =
+          std::min(exact.first + (exact.second - 1), physical_address_last) >> page_size_log2_;
+    }
+  }
+
+  bool any_kept = false;
   for (uint32_t i = block_first; i <= block_last; ++i) {
     uint64_t invalidate_bits = UINT64_MAX;
     if (i == block_first) {
@@ -751,11 +792,34 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
     if (i == block_last && (page_last & 63) != 63) {
       invalidate_bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
     }
+    if (keep_page_first <= keep_page_last) {
+      uint64_t keep_bits = system_page_flags_valid_and_gpu_written_[i] &
+                           PageBlockMask(i, keep_page_first, keep_page_last) &
+                           ~PageBlockMask(i, exact_page_first, exact_page_last);
+      invalidate_bits &= ~keep_bits;
+      any_kept |= keep_bits != 0;
+    }
     system_page_flags_valid_[i] &= ~invalidate_bits;
     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
   }
 
-  FireWatches(page_first, page_last, false);
+  if (!any_kept) {
+    FireWatches(page_first, page_last, false);
+  } else {
+    // Only the invalidated runs: a watch on a kept page would drop textures
+    // that still match it.
+    uint32_t run_first = page_first;
+    for (uint32_t page = page_first; page <= page_last + 1; ++page) {
+      bool kept = page <= page_last &&
+                  ((system_page_flags_valid_and_gpu_written_[page >> 6] >> (page & 63)) & 1);
+      if (page > page_last || kept) {
+        if (run_first < page) {
+          FireWatches(run_first, page - 1, false);
+        }
+        run_first = page + 1;
+      }
+    }
+  }
 
   return std::make_pair(page_first << page_size_log2_, (page_last - page_first + 1)
                                                            << page_size_log2_);
