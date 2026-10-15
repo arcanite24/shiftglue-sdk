@@ -187,6 +187,33 @@ TEST_CASE("Capabilities follow the controller in hand", "[input]") {
   REQUIRE(caps.sub_type == 2);
 }
 
+TEST_CASE("A physical controller answers capabilities before keyboard emulation", "[input]") {
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  // Keyboard emulation enumerates first and nothing has been used yet.
+  driver->Add(1, true);
+  driver->Add(2);
+  X_INPUT_CAPABILITIES caps = {};
+  REQUIRE(system->GetCapabilities(0, 0, &caps) == X_ERROR_SUCCESS);
+  CHECK(caps.sub_type == 2);
+
+  // A key pressed last still leaves the controller answering.
+  driver->SetButtons(1, X_INPUT_GAMEPAD_A);
+  X_INPUT_STATE state = {};
+  REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
+  REQUIRE(system->GetCapabilities(0, 0, &caps) == X_ERROR_SUCCESS);
+  CHECK(caps.sub_type == 2);
+}
+
+TEST_CASE("Keyboard emulation answers capabilities when it is alone", "[input]") {
+  FakeDriver* driver = nullptr;
+  auto system = SharedSystem(&driver);
+  driver->Add(1, true);
+  X_INPUT_CAPABILITIES caps = {};
+  REQUIRE(system->GetCapabilities(0, 0, &caps) == X_ERROR_SUCCESS);
+  CHECK(caps.sub_type == 1);
+}
+
 TEST_CASE("A keystroke from the second controller reaches the guest", "[input]") {
   FakeDriver* driver = nullptr;
   auto system = SharedSystem(&driver);
