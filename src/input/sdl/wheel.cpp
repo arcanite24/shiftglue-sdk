@@ -21,6 +21,10 @@ REXCVAR_DEFINE_INT32(hid_wheel_steering_linearity, 100, "Input",
                      "Racing wheel: steering curve exponent in percent; 100 is linear, higher is "
                      "less sensitive near centre")
     .range(50, 300);
+REXCVAR_DEFINE_INT32(hid_wheel_steering_centre, 15, "Input",
+                     "Racing wheel: tenths of a percent of the wheel's travel either side of "
+                     "centre that read as exactly centred")
+    .range(0, 50);
 REXCVAR_DEFINE_INT32(hid_wheel_pedal_deadzone, 0, "Input",
                      "Racing wheel: percent of each pedal's travel ignored at rest")
     .range(0, 50);
@@ -52,6 +56,7 @@ WheelShaping CurrentWheelShaping() {
   shaping.deadzone = std::clamp(REXCVAR_GET(hid_wheel_steering_deadzone), 0, 50);
   shaping.linearity = std::clamp(REXCVAR_GET(hid_wheel_steering_linearity), 50, 300);
   shaping.pedal_deadzone = std::clamp(REXCVAR_GET(hid_wheel_pedal_deadzone), 0, 50);
+  shaping.centre = std::clamp(REXCVAR_GET(hid_wheel_steering_centre), 0, 50);
   return shaping;
 }
 
@@ -59,6 +64,10 @@ int16_t ShapeWheelSteering(int16_t value, const WheelShaping& shaping) {
   if (value == 0) return 0;
   // -32768 and 32767 are both full lock.
   double travel = value < 0 ? -double(value) / 32768.0 : double(value) / 32767.0;
+  const double band = std::clamp(shaping.centre, 0, 50) / 1000.0;
+  if (travel <= band)
+    return 0;
+  travel = (travel - band) / (1.0 - band);
   travel = std::min(1.0, travel * 100.0 / std::clamp(shaping.saturation, 10, 100));
   if (shaping.linearity != 100) {
     travel = std::pow(travel, std::clamp(shaping.linearity, 50, 300) / 100.0);

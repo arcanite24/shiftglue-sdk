@@ -1139,6 +1139,11 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
                 (state.wheel_type || IsListedWheel(state.guid)))
                    ? 0x02
                    : 0x01;
+  // With the wheel subtype the title also checks the force feedback flag
+  // before it takes its wheel path (FB-2.1).
+  if (c.sub_type == 0x02) {
+    cap_flags |= X_INPUT_CAPS_FFB_SUPPORTED;
+  }
   c.flags = cap_flags;
   c.gamepad.buttons = 0xF3FF | (REXCVAR_GET(guide_button) ? X_INPUT_GAMEPAD_GUIDE : 0x0);
   c.gamepad.left_trigger = 0xFF;
@@ -1147,6 +1152,14 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
   c.gamepad.thumb_ly = static_cast<int16_t>(0xFFFFu);
   c.gamepad.thumb_rx = static_cast<int16_t>(0xFFFFu);
   c.gamepad.thumb_ry = static_cast<int16_t>(0xFFFFu);
+  if (c.sub_type == 0x02) {
+    // A wheel reporting 900 in its capabilities' left stick X is a
+    // 900-degree wheel to FH1, which then maps steering linearly with no
+    // reduction at speed. Its default wheel mapping keeps 35 % of the
+    // steering by 30 m/s and halves small inputs, made for wheels with a
+    // short rotation (sub_82D2FD30; the caps value is read in sub_82BFBA90).
+    c.gamepad.thumb_lx = 900;
+  }
   c.vibration.left_motor_speed = 0xFFFFu;
   c.vibration.right_motor_speed = 0xFFFFu;
 }

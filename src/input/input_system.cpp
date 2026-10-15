@@ -30,10 +30,10 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
     .allowed({"sdl", "xinput"});
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
-REXCVAR_DEFINE_BOOL(input_report_wheel_subtype, false, "Input",
-                    "Report a detected wheel to the title as XINPUT_DEVSUBTYPE_WHEEL instead of "
-                    "a gamepad, so the title can pick its wheel handling (untested in FH1: the "
-                    "title's wheel path is still being traced)");
+REXCVAR_DEFINE_BOOL(input_report_wheel_subtype, true, "Input",
+                    "Report a detected wheel to the title as a 900-degree XINPUT_DEVSUBTYPE_WHEEL "
+                    "with force feedback instead of a gamepad, so FH1 uses its wheel steering, "
+                    "wheel layouts, analog clutch and H-shifter gear request");
 REXCVAR_DEFINE_STRING(pad_chord_debug_overlay, "LS+RS", "Input",
                       "Controller buttons held together that toggle the debug overlay (F3), "
                       "names as in pad_remap joined by '+'; empty turns the chord off. The "

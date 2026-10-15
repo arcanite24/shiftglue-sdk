@@ -36,6 +36,23 @@ TEST_CASE("Steering deadzone skips the start of the output", "[input][wheel]") {
   CHECK(ShapeWheelSteering(32767, shaping) == 32767);
 }
 
+TEST_CASE("Steering centre band holds a wheel resting off zero", "[input][wheel]") {
+  WheelShaping shaping;
+  shaping.deadzone = 25;
+  shaping.centre = 15;  // 1.5% of the travel
+  // A T248 at rest reads about -440: centred, not a quarter of lock.
+  CHECK(ShapeWheelSteering(-440, shaping) == 0);
+  CHECK(ShapeWheelSteering(440, shaping) == 0);
+  // Past the band the deadzone jump applies, and full lock stays full.
+  CHECK(ShapeWheelSteering(1000, shaping) >= 8192);
+  CHECK(ShapeWheelSteering(-1000, shaping) <= -8192);
+  CHECK(ShapeWheelSteering(32767, shaping) == 32767);
+  CHECK(ShapeWheelSteering(-32768, shaping) == -32768);
+  // Without a deadzone the output starts from 0 at the band's edge.
+  shaping.deadzone = 0;
+  CHECK(ShapeWheelSteering(500, shaping) < 100);
+}
+
 TEST_CASE("Steering linearity bends the curve, not the ends", "[input][wheel]") {
   WheelShaping shaping;
   shaping.linearity = 200;

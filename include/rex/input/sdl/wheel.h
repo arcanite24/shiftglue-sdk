@@ -15,6 +15,7 @@ REXCVAR_DECLARE(int32_t, hid_wheel_steering_saturation);
 REXCVAR_DECLARE(int32_t, hid_wheel_steering_deadzone);
 REXCVAR_DECLARE(int32_t, hid_wheel_steering_linearity);
 REXCVAR_DECLARE(int32_t, hid_wheel_pedal_deadzone);
+REXCVAR_DECLARE(int32_t, hid_wheel_steering_centre);
 
 namespace rex::input::sdl {
 
@@ -30,6 +31,11 @@ struct WheelShaping {
   int linearity = 100;
   // Percent of each pedal's travel ignored at rest.
   int pedal_deadzone = 0;
+  // Tenths of a percent of the wheel's travel either side of centre read as
+  // exactly centred, before the rest of the shaping. A wheel rarely rests at
+  // exactly 0 (a T248 rests about 1.3% off), and the steering deadzone jumps
+  // any reading off 0 past the game's stick deadzone.
+  int centre = 0;
 };
 
 // The shaping the cvars hold now.
