@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <array>
@@ -236,6 +237,10 @@ void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
       }
       controllers_.clear();
     }
+    if (shifter_) {
+      SDL_CloseJoystick(shifter_);
+      shifter_ = nullptr;
+    }
     if (SDL_Gamepad_initialized_) {
       SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
       SDL_Gamepad_initialized_ = false;
@@ -364,6 +369,12 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     pad.thumb_lx = ShapeWheelSteering(static_cast<int16_t>(pad.thumb_lx), shaping);
     pad.left_trigger = ShapeWheelPedal(pad.left_trigger, shaping);
     pad.right_trigger = ShapeWheelPedal(pad.right_trigger, shaping);
+    // An H-pattern shifter's gear, where the title reads it for a wheel.
+    if (controller->caps.sub_type == 0x02) {
+      if (const auto gear = ReadShifterLocked()) {
+        pad.thumb_rx = *gear;
+      }
+    }
   }
   if (!is_active) {
     // Simulate an "untouched" controller. When we become active again the
@@ -982,6 +993,59 @@ bool WriteSlackTriggersDirect(const std::string& path, bool bluetooth) {
 }
 
 }  // namespace
+
+std::optional<int16_t> SDLInputDriver::ReadShifterLocked() {
+  const std::string wanted = REXCVAR_GET(hid_shifter_guid);
+  if (wanted.empty()) {
+    if (shifter_) {
+      SDL_CloseJoystick(shifter_);
+      shifter_ = nullptr;
+    }
+    return std::nullopt;
+  }
+  if (shifter_ && (wanted != shifter_guid_ || !SDL_JoystickConnected(shifter_))) {
+    SDL_CloseJoystick(shifter_);
+    shifter_ = nullptr;
+  }
+  const uint64_t now = SteadyNs();
+  if (!shifter_ && now - shifter_checked_ns_ >= 1'000'000'000ull) {
+    // Look for it at most once a second: it may be plugged in later.
+    shifter_checked_ns_ = now;
+    int count = 0;
+    SDL_JoystickID* ids = SDL_GetJoysticks(&count);
+    for (int i = 0; ids && i < count && !shifter_; ++i) {
+      char guid[33] = {};
+      SDL_GUIDToString(SDL_GetJoystickGUIDForID(ids[i]), guid, int(sizeof(guid)));
+      if (wanted == guid) {
+        shifter_ = SDL_OpenJoystick(ids[i]);
+        shifter_guid_ = wanted;
+        if (shifter_) {
+          REXLOG_INFO("Shifter: opened \"{}\" ({} buttons)", SDL_GetJoystickName(shifter_),
+                      SDL_GetNumJoystickButtons(shifter_));
+        }
+      }
+    }
+    SDL_free(ids);
+  }
+  if (!shifter_) {
+    return std::nullopt;
+  }
+  uint64_t down = 0;
+  for (int b = 0, n = std::min(SDL_GetNumJoystickButtons(shifter_), 64); b < n; ++b) {
+    if (SDL_GetJoystickButton(shifter_, b))
+      down |= uint64_t(1) << b;
+  }
+  const int16_t gear = ShifterGearValue(ParseShifterGears(REXCVAR_GET(hid_shifter_gears)), down);
+  if (gear != shifter_gear_) {
+    REXLOG_INFO("Shifter: gear {} (buttons 0x{:X})",
+                gear < 0    ? std::string("R")
+                : gear == 0 ? std::string("N")
+                            : std::to_string(gear),
+                down);
+    shifter_gear_ = gear;
+  }
+  return gear;
+}
 
 bool SDLInputDriver::ReleaseFeedbackLocked(ControllerState& controller, bool stop_rumble) {
   // A pad keeps its last rumble when the process dies without closing it.

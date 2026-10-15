@@ -125,6 +125,9 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   // Slack triggers and the player colour; `stop_rumble` also stops the
   // motors (the crash path, where SDL never closes the pad).
   bool ReleaseFeedbackLocked(ControllerState& controller, bool stop_rumble = false);
+  // The H-pattern shifter's gear value for a wheel's thumb_rx, or nullopt
+  // without a configured, connected shifter (hid_shifter_guid).
+  std::optional<int16_t> ReadShifterLocked();
   void ApplyPlayerLedHint();
 
   inline uint64_t AnalogToKeyfield(const X_INPUT_GAMEPAD& gamepad) const;
@@ -138,6 +141,10 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   rex::ui::Window* attached_window_ = nullptr;
   bool sdl_events_initialized_;
   bool SDL_Gamepad_initialized_;
+  SDL_Joystick* shifter_ = nullptr;
+  std::string shifter_guid_;
+  uint64_t shifter_checked_ns_ = 0;
+  int16_t shifter_gear_ = 0;
   std::atomic<int> sdl_events_unflushed_;
   std::atomic<bool> sdl_pumpevents_queued_;
   // steady_clock nanoseconds of the last queued pump (QueueControllerUpdate).
