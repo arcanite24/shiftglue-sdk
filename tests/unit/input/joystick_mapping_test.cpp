@@ -114,6 +114,70 @@ TEST_CASE("A built mapping applies and the gamepad view follows it", "[input][sd
   view.End();
 }
 
+// Some DirectInput wheels (a Thrustmaster T248 on Windows) report every axis
+// as 0 when opened and their real positions about half a second later, so
+// SDL's initial state for pedals resting at the top is 0.
+TEST_CASE("A pedal reporting its rest after capture begins is a trigger", "[input][sdl]") {
+  rex::input::sdl::VirtualJoystick wheel;
+  REQUIRE(wheel.Attach("Late Pedal Wheel", 4, 12, 1, true));
+  JoystickCapture capture;
+  REQUIRE(capture.Begin(wheel.id()));
+  CHECK_FALSE(capture.Poll());
+
+  // The pedal's real position arrives: resting at the top, not pressed.
+  wheel.SetAxis(1, 32767);
+  CHECK_FALSE(capture.Poll());
+  CHECK_FALSE(capture.Poll());
+  wheel.SetAxis(1, -32768);
+  CHECK(capture.Poll() == "a1~");
+  wheel.SetAxis(1, 32767);
+  CHECK_FALSE(capture.Poll());
+  capture.End();
+}
+
+TEST_CASE("A pedal SDL first saw at 0 rests where it reads", "[input][sdl]") {
+  rex::input::sdl::VirtualJoystick wheel;
+  REQUIRE(wheel.Attach("Stale Pedal Wheel", 4, 12, 1, true));
+  // Held open, as the input driver holds a mapped wheel. The wheel reports 0
+  // first, which SDL keeps as the pedal's initial state, then its real
+  // position.
+  JoystickCapture driver;
+  REQUIRE(driver.Begin(wheel.id()));
+  wheel.SetAxis(1, 0);
+  driver.Poll();
+  wheel.SetAxis(1, 32767);
+  driver.Poll();
+
+  JoystickCapture capture;
+  REQUIRE(capture.Begin(wheel.id()));
+  CHECK_FALSE(capture.Poll());
+  wheel.SetAxis(1, -32768);
+  CHECK(capture.Poll() == "a1~");
+  capture.End();
+  driver.End();
+}
+
+TEST_CASE("A wheel's steering counts from an eighth of its travel", "[input][sdl]") {
+  rex::input::sdl::VirtualJoystick wheel;
+  REQUIRE(wheel.Attach("Mapping Test Wheel", 4, 12, 1, true));
+  JoystickCapture capture;
+  REQUIRE(capture.Begin(wheel.id()));
+  CHECK_FALSE(capture.Poll());
+
+  wheel.SetAxis(0, -3000);
+  CHECK_FALSE(capture.Poll());
+  wheel.SetAxis(0, -6000);
+  CHECK(capture.Poll() == "-a0");
+  // Not back at rest until within a sixteenth of centre.
+  wheel.SetAxis(0, -3000);
+  CHECK_FALSE(capture.Poll());
+  wheel.SetAxis(0, 0);
+  CHECK_FALSE(capture.Poll());
+  wheel.SetAxis(0, 6000);
+  CHECK(capture.Poll() == "+a0");
+  capture.End();
+}
+
 TEST_CASE("A virtual wheel lists as a racing wheel", "[input][sdl]") {
   rex::input::sdl::VirtualJoystick wheel;
   REQUIRE(wheel.Attach("Mapping Test Wheel", 4, 12, 1, true));
