@@ -366,13 +366,15 @@ void InputSystem::UpdateFeedbackLocked(uint32_t user_index, const std::vector<De
   }
   bool any_triggers = false;
   bool any_lightbar = false;
+  bool any_wheel = false;
   for (DeviceId id : ids) {
     if (const DeviceInfo* info = DeviceInfoFor(id)) {
       any_triggers |= info->adaptive_triggers;
       any_lightbar |= info->lightbar;
+      any_wheel |= info->force_feedback;
     }
   }
-  if (!any_triggers && !any_lightbar) {
+  if (!any_triggers && !any_lightbar && !any_wheel) {
     return;
   }
 
@@ -441,11 +443,37 @@ void InputSystem::UpdateFeedbackLocked(uint32_t user_index, const std::vector<De
       break;
   }
 
+  wheel_ffb::Forces wheel_forces;
+  if (any_wheel) {
+    wheel_ffb::Inputs wheel_inputs;
+    // Driving while the player car reports and the game has the input. Not
+    // feedback_driving_: the host's narrow-view half of it follows one
+    // gameplay camera and went false for seconds at a time while driving.
+    wheel_inputs.driving = active && have_telemetry;
+    wheel_inputs.telemetry = inputs.telemetry;
+    wheel_inputs.motor_low = inputs.motor_low;
+    wheel_forces = wheel_ffb::Step(wheel_inputs, wheel_ffb::CurrentSettings());
+    if (REXCVAR_GET(hid_wheel_ffb_log) && now - last_wheel_log_ >= std::chrono::milliseconds(500)) {
+      last_wheel_log_ = now;
+      REXLOG_INFO(
+          "Wheel FFB: active {} gain {:.2f} constant {:+.2f} (torque {:+.2f}) damper {:.2f} "
+          "vibration {:.2f} | speed {:.1f} steer {} motor {} | driving {} telemetry {}",
+          wheel_forces.active, wheel_forces.gain, wheel_forces.constant,
+          have_telemetry && telemetry.has_steer_torque ? telemetry.steer_torque : 0.0f,
+          wheel_forces.damper, wheel_forces.vibration, have_telemetry ? telemetry.speed_mps : 0.0f,
+          int(int16_t(guest_state.gamepad.thumb_lx)), uint16_t(vibration.left_motor_speed),
+          wheel_inputs.driving, have_telemetry);
+    }
+  }
+
   for (DeviceId id : ids) {
     const DeviceInfo* info = DeviceInfoFor(id);
     InputDriver* driver = DriverForDevice(id);
     if (!info || !driver || info->synthetic) {
       continue;
+    }
+    if (info->force_feedback) {
+      driver->SetDeviceWheelForces(id, wheel_forces);
     }
     if (info->adaptive_triggers) {
       driver->SetDeviceTriggerEffects(id, physical);

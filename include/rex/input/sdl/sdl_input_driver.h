@@ -55,6 +55,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void OnWindowAvailable(rex::ui::Window* window) override;
   bool SetDeviceTriggerEffects(DeviceId id, const dualsense::TriggerEffects& effects) override;
   bool SetDeviceLightbar(DeviceId id, const dualsense::Rgb* colour) override;
+  bool SetDeviceWheelForces(DeviceId id, const wheel_ffb::Forces& forces) override;
   void ReleaseFeedback(bool crashing) override;
 
  private:
@@ -106,6 +107,26 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
     float tilt_rad = 0.0f;  // counter-clockwise roll seen from the player
     float tilt_centre_rad = 0.0f;
     uint64_t gyro_timestamp_ns = 0;
+    // Racing wheel force feedback (hid_wheel_ffb): a wheel SDL can drive
+    // through its haptic API, opened on first use and closed when turned off.
+    bool haptic_capable = false;
+    SDL_Haptic* haptic = nullptr;
+    int ffb_damper = -1;
+    int ffb_vibration = -1;
+    int ffb_constant = -1;
+    bool ffb_running = false;
+    bool ffb_constant_running = false;
+    float ffb_constant_sent = 0.0f;
+    uint64_t ffb_constant_ns = 0;
+    bool ffb_vibrating = false;
+    wheel_ffb::Forces ffb_sent;
+    uint64_t ffb_sent_ns = 0;
+    // Effect status checks (SDL_HAPTIC_STATUS): DirectInput stops every
+    // effect when SDL re-acquires the device after a lost acquisition.
+    bool ffb_status = false;
+    uint64_t ffb_checked_ns = 0;
+    uint64_t ffb_refreshed_ns = 0;
+    uint32_t ffb_restarts = 0;
   };
 
   // WindowListener
@@ -128,6 +149,9 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   // The H-pattern shifter's gear value for a wheel's thumb_rx, or nullopt
   // without a configured, connected shifter (hid_shifter_guid).
   std::optional<int16_t> ReadShifterLocked();
+  bool OpenWheelHapticLocked(ControllerState& controller);
+  void StopWheelForcesLocked(ControllerState& controller);
+  void CloseWheelHapticLocked(ControllerState& controller);
   void ApplyPlayerLedHint();
 
   inline uint64_t AnalogToKeyfield(const X_INPUT_GAMEPAD& gamepad) const;
@@ -141,6 +165,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   rex::ui::Window* attached_window_ = nullptr;
   bool sdl_events_initialized_;
   bool SDL_Gamepad_initialized_;
+  bool sdl_haptic_initialized_ = false;
   SDL_Joystick* shifter_ = nullptr;
   std::string shifter_guid_;
   uint64_t shifter_checked_ns_ = 0;

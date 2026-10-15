@@ -183,6 +183,13 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
         return;
       }
       SDL_Gamepad_initialized_ = true;
+      // Racing wheel force feedback. Without it wheels still drive.
+      if (SDL_InitSubSystem(SDL_INIT_HAPTIC)) {
+        sdl_haptic_initialized_ = true;
+      } else {
+        REXLOG_WARN("SDL: haptic subsystem unavailable, no wheel force feedback: {}",
+                    SDL_GetError());
+      }
       if (SteamInputHidesDualSense()) {
         REXLOG_INFO(
             "SDL pad: Steam Input hides a DualSense from the game (it is listed in "
@@ -233,6 +240,7 @@ void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
         // SDL's PS5 driver leaves the triggers as they are when it closes a
         // pad; it waits up to 30 ms for this report to go out.
         ReleaseFeedbackLocked(controller);
+        CloseWheelHapticLocked(controller);
         SDL_CloseGamepad(controller.sdl);
       }
       controllers_.clear();
@@ -240,6 +248,10 @@ void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
     if (shifter_) {
       SDL_CloseJoystick(shifter_);
       shifter_ = nullptr;
+    }
+    if (sdl_haptic_initialized_) {
+      SDL_QuitSubSystem(SDL_INIT_HAPTIC);
+      sdl_haptic_initialized_ = false;
     }
     if (SDL_Gamepad_initialized_) {
       SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
@@ -292,6 +304,7 @@ void SDLInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
     info.adaptive_triggers = controller.dualsense;
     info.lightbar = controller.lightbar;
     info.motion = controller.motion;
+    info.force_feedback = controller.haptic_capable;
     out.push_back(info);
   }
 }
@@ -394,6 +407,13 @@ X_RESULT SDLInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibr
   auto controller = FindController(id);
   if (!controller) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+
+  // A wheel under force feedback gets the motors as vibration through the
+  // force model; SDL's own rumble would fight the haptic effects for the
+  // device.
+  if (controller->haptic && REXCVAR_GET(hid_wheel_ffb)) {
+    return X_ERROR_SUCCESS;
   }
 
   // XInput vibration holds until the guest changes it, but SDL rumble expires,
@@ -638,6 +658,13 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
   state.guid = guid_text;
   if (state.wheel_type || IsListedWheel(state.guid)) {
     REXLOG_INFO("SDL OnControllerDeviceAdded: racing wheel, steering and pedals are shaped.");
+    int haptics = 0;
+    if (sdl_haptic_initialized_)
+      SDL_free(SDL_GetHaptics(&haptics));
+    state.haptic_capable =
+        sdl_haptic_initialized_ && (SDL_IsJoystickHaptic(joystick) || haptics > 0);
+    REXLOG_INFO("SDL OnControllerDeviceAdded: wheel force feedback {}.",
+                state.haptic_capable ? "available" : "not available");
   }
   // Identity (DS-0.1). Steam Input's virtual pad reports the real pad's type
   // on some platforms, so the Steam handle decides, not the type.
@@ -697,6 +724,7 @@ void SDLInputDriver::OnControllerDeviceRemovedLocked(const SDL_Event& event) {
     REXLOG_WARN("SDL OnControllerDeviceRemoved: Ignored. Unknown device.");
     return;
   }
+  CloseWheelHapticLocked(controllers_.at(*idx));
   SDL_CloseGamepad(controllers_.at(*idx).sdl);
   controllers_.erase(controllers_.begin() + static_cast<ptrdiff_t>(*idx));
 
@@ -994,6 +1022,126 @@ bool WriteSlackTriggersDirect(const std::string& path, bool bluetooth) {
 
 }  // namespace
 
+namespace {
+
+// The damper, vibration and gain change at most this often (25 a second),
+// and only by a felt step: a T248's driver stopped honouring a condition
+// effect retuned up to 100 times a second while still reporting it playing.
+constexpr uint64_t kWheelForceIntervalNs = 40'000'000;
+// How often a running wheel's effects are checked (or, without status
+// support, simply started again), and how often they are started again in
+// any case, since a driver can drop an effect and still report it playing.
+constexpr uint64_t kWheelEffectCheckNs = 250'000'000;
+constexpr uint64_t kWheelEffectRefreshNs = 2'000'000'000;
+// The constant force (the title's steering torque) changes faster: road
+// noise and the torque's fall past the tyres' peak are in it.
+constexpr uint64_t kWheelConstantIntervalNs = 10'000'000;
+constexpr float kWheelConstantStep = 0.004f;
+
+SDL_HapticEffect WheelCondition(uint16_t type, float coefficient) {
+  SDL_HapticEffect effect;
+  SDL_zero(effect);
+  effect.condition.type = type;
+  effect.condition.direction.type = SDL_HAPTIC_STEERING_AXIS;
+  effect.condition.length = SDL_HAPTIC_INFINITY;
+  const auto coeff =
+      static_cast<int16_t>(std::lround(std::clamp(coefficient, 0.0f, 1.0f) * 32767.0f));
+  effect.condition.right_coeff[0] = coeff;
+  effect.condition.left_coeff[0] = coeff;
+  effect.condition.right_sat[0] = 0xFFFF;
+  effect.condition.left_sat[0] = 0xFFFF;
+  return effect;
+}
+
+SDL_HapticEffect WheelVibration(float level, uint16_t period_ms) {
+  SDL_HapticEffect effect;
+  SDL_zero(effect);
+  effect.periodic.type = SDL_HAPTIC_SINE;
+  effect.periodic.direction.type = SDL_HAPTIC_STEERING_AXIS;
+  effect.periodic.length = SDL_HAPTIC_INFINITY;
+  effect.periodic.period = period_ms ? period_ms : 50;
+  effect.periodic.magnitude =
+      static_cast<int16_t>(std::lround(std::clamp(level, 0.0f, 1.0f) * 32767.0f));
+  return effect;
+}
+
+// Racing wheel makers by USB vendor, as their force feedback devices are
+// named.
+const char* WheelMaker(uint16_t vendor_id) {
+  switch (vendor_id) {
+    case 0x044F:
+      return "thrustmaster";
+    case 0x046D:
+      return "logitech";
+    case 0x0EB7:
+      return "fanatec";
+    case 0x346E:
+      return "moza";
+    case 0x16D0:
+      return "simucube";
+    case 0x11FF:
+      return "pxn";
+    default:
+      return nullptr;
+  }
+}
+
+std::string Lower(std::string text) {
+  for (char& c : text)
+    c = char(std::tolower(static_cast<unsigned char>(c)));
+  return text;
+}
+
+// SDL hides a joystick's haptic side once it has a gamepad mapping
+// (SDL_IsJoystickHaptic is false for gamepads), but its haptic device list
+// still has it. Pick the wheel's entry from that list: the name chosen in
+// hid_wheel_ffb_device, else the wheel maker's, else the only one.
+SDL_HapticID FindWheelHapticId(uint16_t vendor_id, const std::vector<SDL_HapticID>& in_use) {
+  int count = 0;
+  SDL_HapticID* ids = SDL_GetHaptics(&count);
+  if (!ids)
+    return 0;
+  std::vector<std::pair<SDL_HapticID, std::string>> free;
+  for (int i = 0; i < count; ++i) {
+    if (std::find(in_use.begin(), in_use.end(), ids[i]) != in_use.end())
+      continue;
+    const char* name = SDL_GetHapticNameForID(ids[i]);
+    free.emplace_back(ids[i], Lower(name ? name : ""));
+  }
+  SDL_free(ids);
+  const std::string wanted = Lower(REXCVAR_GET(hid_wheel_ffb_device));
+  const char* maker = WheelMaker(vendor_id);
+  for (const std::string& needle : {wanted, std::string(maker ? maker : "")}) {
+    if (needle.empty())
+      continue;
+    for (const auto& [id, name] : free) {
+      if (name.find(needle) != std::string::npos)
+        return id;
+    }
+  }
+  return free.size() == 1 && wanted.empty() ? free.front().first : 0;
+}
+
+SDL_HapticEffect WheelConstant(float level) {
+  SDL_HapticEffect effect;
+  SDL_zero(effect);
+  effect.constant.type = SDL_HAPTIC_CONSTANT;
+  effect.constant.direction.type = SDL_HAPTIC_STEERING_AXIS;
+  effect.constant.length = SDL_HAPTIC_INFINITY;
+  effect.constant.level =
+      static_cast<int16_t>(std::lround(std::clamp(level, -1.0f, 1.0f) * 32767.0f));
+  return effect;
+}
+
+bool ForcesClose(const wheel_ffb::Forces& a, const wheel_ffb::Forces& b) {
+  constexpr float kStep = 0.03f;
+  return a.active == b.active && std::fabs(a.gain - b.gain) < kStep &&
+         std::fabs(a.damper - b.damper) < kStep && std::fabs(a.vibration - b.vibration) < kStep &&
+         a.vibration_period_ms == b.vibration_period_ms;
+}
+
+}  // namespace
+
 std::optional<int16_t> SDLInputDriver::ReadShifterLocked() {
   const std::string wanted = REXCVAR_GET(hid_shifter_guid);
   if (wanted.empty()) {
@@ -1047,9 +1195,217 @@ std::optional<int16_t> SDLInputDriver::ReadShifterLocked() {
   return gear;
 }
 
+bool SDLInputDriver::OpenWheelHapticLocked(ControllerState& controller) {
+  if (controller.haptic)
+    return true;
+  SDL_Joystick* joystick = SDL_GetGamepadJoystick(controller.sdl);
+  SDL_Haptic* haptic = nullptr;
+  if (joystick && SDL_IsJoystickHaptic(joystick)) {
+    haptic = SDL_OpenHapticFromJoystick(joystick);
+  } else {
+    std::vector<SDL_HapticID> in_use;
+    for (const auto& other : controllers_) {
+      if (other.haptic)
+        in_use.push_back(SDL_GetHapticID(other.haptic));
+    }
+    const SDL_HapticID id = FindWheelHapticId(controller.vendor_id, in_use);
+    if (id) {
+      haptic = SDL_OpenHaptic(id);
+      if (haptic) {
+        REXLOG_INFO("Wheel FFB: using haptic device \"{}\" for device {}",
+                    SDL_GetHapticName(haptic) ? SDL_GetHapticName(haptic) : "",
+                    static_cast<uint64_t>(controller.id));
+      }
+    } else {
+      SDL_SetError("no force feedback device matches this wheel (set hid_wheel_ffb_device)");
+    }
+  }
+  if (!haptic) {
+    REXLOG_WARN("Wheel FFB: cannot open the haptic device: {}", SDL_GetError());
+    controller.haptic_capable = false;
+    return false;
+  }
+  const uint32_t features = SDL_GetHapticFeatures(haptic);
+  controller.haptic = haptic;
+  controller.ffb_damper = controller.ffb_vibration = controller.ffb_constant = -1;
+  if (features & SDL_HAPTIC_CONSTANT) {
+    SDL_HapticEffect effect = WheelConstant(0.0f);
+    controller.ffb_constant = SDL_CreateHapticEffect(haptic, &effect);
+  }
+  if (features & SDL_HAPTIC_DAMPER) {
+    SDL_HapticEffect effect = WheelCondition(SDL_HAPTIC_DAMPER, 0.0f);
+    controller.ffb_damper = SDL_CreateHapticEffect(haptic, &effect);
+  }
+  if (features & SDL_HAPTIC_SINE) {
+    SDL_HapticEffect effect = WheelVibration(0.0f, 50);
+    controller.ffb_vibration = SDL_CreateHapticEffect(haptic, &effect);
+  }
+  if (features & SDL_HAPTIC_AUTOCENTER) {
+    // The title's torque centres the wheel; the device's own centring would
+    // add to it.
+    SDL_SetHapticAutocenter(haptic, 0);
+  }
+  controller.ffb_running = false;
+  controller.ffb_vibrating = false;
+  controller.ffb_sent = {};
+  controller.ffb_status = (features & SDL_HAPTIC_STATUS) != 0;
+  controller.ffb_checked_ns = 0;
+  controller.ffb_restarts = 0;
+  controller.ffb_constant_running = false;
+  controller.ffb_constant_sent = 0.0f;
+  REXLOG_INFO("Wheel FFB: opened device {} (features 0x{:X}): constant {} damper {} vibration {}",
+              static_cast<uint64_t>(controller.id), features, controller.ffb_constant,
+              controller.ffb_damper, controller.ffb_vibration);
+  // The title's torque needs a constant force; without one the wheel stays free.
+  return controller.ffb_constant >= 0;
+}
+
+void SDLInputDriver::StopWheelForcesLocked(ControllerState& controller) {
+  if (!controller.haptic)
+    return;
+  SDL_StopHapticEffects(controller.haptic);
+  controller.ffb_running = false;
+  controller.ffb_vibrating = false;
+  controller.ffb_constant_running = false;
+  controller.ffb_sent = {};
+}
+
+void SDLInputDriver::CloseWheelHapticLocked(ControllerState& controller) {
+  if (!controller.haptic)
+    return;
+  StopWheelForcesLocked(controller);
+  for (int effect : {controller.ffb_damper, controller.ffb_vibration, controller.ffb_constant}) {
+    if (effect >= 0)
+      SDL_DestroyHapticEffect(controller.haptic, effect);
+  }
+  SDL_CloseHaptic(controller.haptic);
+  controller.haptic = nullptr;
+  controller.ffb_damper = controller.ffb_vibration = controller.ffb_constant = -1;
+  REXLOG_INFO("Wheel FFB: closed device {}", static_cast<uint64_t>(controller.id));
+}
+
+bool SDLInputDriver::SetDeviceWheelForces(DeviceId id, const wheel_ffb::Forces& forces) {
+  if (!SDL_Gamepad_initialized_ || !sdl_haptic_initialized_) {
+    return false;
+  }
+  auto guard = DrainAndLock();
+  auto controller = FindController(id);
+  if (!controller || !controller->haptic_capable) {
+    return false;
+  }
+  if (feedback_released_) {
+    return true;  // quitting or crashing: the wheel stays free
+  }
+  // Free while another window has focus (the release went out in
+  // OnLostFocus).
+  const wheel_ffb::Forces wanted = focused_ ? forces : wheel_ffb::Forces{};
+  if (!wanted.active) {
+    if (controller->haptic) {
+      if (controller->ffb_running)
+        StopWheelForcesLocked(*controller);
+      // Turned off: hand the device back, with its own centring.
+      if (!REXCVAR_GET(hid_wheel_ffb))
+        CloseWheelHapticLocked(*controller);
+    }
+    return true;
+  }
+  if (!controller->haptic && !OpenWheelHapticLocked(*controller)) {
+    return false;
+  }
+  const uint64_t now = SteadyNs();
+  SDL_Haptic* haptic = controller->haptic;
+  if (controller->ffb_running && now - controller->ffb_checked_ns >= kWheelEffectCheckNs) {
+    // When SDL re-acquires the device after DirectInput reported it lost
+    // (seen on a T248 on rough surfaces and in crashes), every effect is
+    // stopped while our updates keep succeeding, so the force went dead until
+    // a menu restarted it. Start the effects again when they stopped.
+    controller->ffb_checked_ns = now;
+    const bool playing =
+        controller->ffb_status && SDL_GetHapticEffectStatus(haptic, controller->ffb_constant);
+    const bool refresh = now - controller->ffb_refreshed_ns >= kWheelEffectRefreshNs;
+    if (refresh && REXCVAR_GET(hid_wheel_ffb_log)) {
+      REXLOG_INFO("Wheel FFB: device {} constant force reported {}",
+                  static_cast<uint64_t>(controller->id),
+                  !controller->ffb_status ? "unknown"
+                  : playing               ? "playing"
+                                          : "stopped");
+    }
+    if (!playing || refresh) {
+      controller->ffb_refreshed_ns = now;
+      if (controller->ffb_damper >= 0) {
+        SDL_RunHapticEffect(haptic, controller->ffb_damper, 1);
+      }
+      if (controller->ffb_vibrating && controller->ffb_vibration >= 0) {
+        SDL_RunHapticEffect(haptic, controller->ffb_vibration, 1);
+      }
+      if (controller->ffb_constant_running && controller->ffb_constant >= 0) {
+        SDL_RunHapticEffect(haptic, controller->ffb_constant, 1);
+      }
+      if (controller->ffb_status && !playing && controller->ffb_restarts++ < 20) {
+        REXLOG_INFO("Wheel FFB: effects had stopped on device {}; started them again",
+                    static_cast<uint64_t>(controller->id));
+      }
+    }
+  }
+  bool ok = true;
+  if (controller->ffb_constant >= 0 &&
+      (!controller->ffb_constant_running ||
+       (now - controller->ffb_constant_ns >= kWheelConstantIntervalNs &&
+        std::fabs(wanted.constant - controller->ffb_constant_sent) >= kWheelConstantStep))) {
+    SDL_HapticEffect effect = WheelConstant(wanted.constant);
+    ok &= SDL_UpdateHapticEffect(haptic, controller->ffb_constant, &effect);
+    if (!controller->ffb_constant_running) {
+      ok &= SDL_RunHapticEffect(haptic, controller->ffb_constant, 1);
+      controller->ffb_constant_running = true;
+    }
+    controller->ffb_constant_sent = wanted.constant;
+    controller->ffb_constant_ns = now;
+  }
+  if (controller->ffb_running && (now - controller->ffb_sent_ns < kWheelForceIntervalNs ||
+                                  ForcesClose(wanted, controller->ffb_sent))) {
+    if (!ok) {
+      REXLOG_WARN("Wheel FFB: constant force update failed: {}", SDL_GetError());
+    }
+    return ok;
+  }
+  if (!controller->ffb_running || std::fabs(wanted.gain - controller->ffb_sent.gain) >= 0.01f) {
+    ok &= SDL_SetHapticGain(haptic, static_cast<int>(std::lround(wanted.gain * 100.0f)));
+  }
+  if (controller->ffb_damper >= 0) {
+    SDL_HapticEffect effect = WheelCondition(SDL_HAPTIC_DAMPER, wanted.damper);
+    ok &= SDL_UpdateHapticEffect(haptic, controller->ffb_damper, &effect);
+  }
+  if (!controller->ffb_running) {
+    if (controller->ffb_damper >= 0) {
+      ok &= SDL_RunHapticEffect(haptic, controller->ffb_damper, 1);
+    }
+    controller->ffb_running = true;
+  }
+  if (controller->ffb_vibration >= 0) {
+    if (wanted.vibration > 0.0f) {
+      SDL_HapticEffect effect = WheelVibration(wanted.vibration, wanted.vibration_period_ms);
+      ok &= SDL_UpdateHapticEffect(haptic, controller->ffb_vibration, &effect);
+      if (!controller->ffb_vibrating) {
+        ok &= SDL_RunHapticEffect(haptic, controller->ffb_vibration, 1);
+        controller->ffb_vibrating = true;
+      }
+    } else if (controller->ffb_vibrating) {
+      ok &= SDL_StopHapticEffect(haptic, controller->ffb_vibration);
+      controller->ffb_vibrating = false;
+    }
+  }
+  if (!ok) {
+    REXLOG_WARN("Wheel FFB: effect update failed: {}", SDL_GetError());
+  }
+  controller->ffb_sent = wanted;
+  controller->ffb_sent_ns = now;
+  return ok;
+}
+
 bool SDLInputDriver::ReleaseFeedbackLocked(ControllerState& controller, bool stop_rumble) {
   // A pad keeps its last rumble when the process dies without closing it.
   bool sent = !stop_rumble || SDL_RumbleGamepad(controller.sdl, 0, 0, 0);
+  StopWheelForcesLocked(controller);
   if (controller.dualsense) {
     const dualsense::TriggerEffects slack;
     const auto payload = dualsense::BuildEffectPayload(slack);

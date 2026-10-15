@@ -17,6 +17,7 @@
 #include <rex/input/device.h>
 #include <rex/input/dualsense.h>
 #include <rex/input/input.h>
+#include <rex/input/wheel_ffb.h>
 #include <rex/kernel.h>
 #include <rex/ui/window.h>
 
@@ -55,6 +56,11 @@ class InputDriver {
   }
   /// Lightbar colour, or null for the driver's default (the player colour).
   virtual bool SetDeviceLightbar(DeviceId /*id*/, const dualsense::Rgb* /*colour*/) {
+    return false;
+  }
+  /// Wheel forces for a device with DeviceInfo::force_feedback. Drivers
+  /// send only changes, rate-limited; inactive forces stop every effect.
+  virtual bool SetDeviceWheelForces(DeviceId /*id*/, const wheel_ffb::Forces& /*forces*/) {
     return false;
   }
   /// Triggers slack and lightbars back to the player colour on every device
