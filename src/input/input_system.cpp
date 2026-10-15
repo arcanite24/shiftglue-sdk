@@ -236,10 +236,28 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
   }
 
   // Prefer the pad in hand, so button glyphs follow it rather than whichever
-  // device enumerated first.
+  // device enumerated first. But a physical controller answers before
+  // keyboard emulation: a title picks its control scheme from these caps,
+  // often only when a controller connects (FH1 decides there whether a wheel
+  // drives in its wheel mode), and the synthetic device answered whenever
+  // the wheel had not reported yet or a key was pressed last.
   DeviceId chosen = active_devices_.Active(user_index);
-  if (std::find(ids.begin(), ids.end(), chosen) == ids.end()) {
-    chosen = ids.front();
+  const bool assigned = std::find(ids.begin(), ids.end(), chosen) != ids.end();
+  const DeviceInfo* chosen_info = assigned ? DeviceInfoFor(chosen) : nullptr;
+  if (!chosen_info || chosen_info->synthetic) {
+    DeviceId physical = DeviceId::kInvalid;
+    for (DeviceId id : ids) {
+      const DeviceInfo* info = DeviceInfoFor(id);
+      if (info && !info->synthetic) {
+        physical = id;
+        break;
+      }
+    }
+    if (physical != DeviceId::kInvalid) {
+      chosen = physical;
+    } else if (!assigned) {
+      chosen = ids.front();
+    }
   }
 
   auto* driver = DriverForDevice(chosen);
