@@ -84,6 +84,11 @@ bool SaveMapping(std::string_view mapping);
 // line for it. Returns false when the file has none: SDL's built-in mapping,
 // if any, then applies after a restart.
 bool RemoveUserMapping(std::string_view guid);
+// Loads hid_user_mappings_file-style lines (comments and other platforms'
+// lines skipped). Unlike SDL_AddGamepadMappingsFromFile it also takes lines
+// without a platform field, as the assistant saved them before it added one.
+// Returns how many lines SDL took.
+int LoadUserMappings(std::string_view path);
 
 // A virtual controller SDL has no mapping for, for tests of the above: it
 // lives in the same SDL as the input driver.

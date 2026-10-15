@@ -245,6 +245,8 @@ std::string BuildMapping(const JoystickInfo& joystick,
   for (const auto& [output, input] : bindings) {
     mapping += output + ":" + input + ",";
   }
+  // SDL_AddGamepadMappingsFromFile skips lines without one.
+  mapping += std::string("platform:") + SDL_GetPlatform() + ",";
   return mapping;
 }
 
@@ -269,6 +271,25 @@ bool SaveMapping(std::string_view mapping) {
   std::erase_if(lines, [&](const std::string& line) { return SameGuid(line, guid); });
   lines.push_back(text);
   return WriteLines(rex::to_path(path), lines);
+}
+
+int LoadUserMappings(std::string_view path) {
+  if (path.empty()) return 0;
+  const std::string platform = std::string("platform:") + SDL_GetPlatform() + ",";
+  int loaded = 0;
+  for (const auto& line : ReadLines(rex::to_path(std::string(path)))) {
+    if (line.empty() || line.front() == '#') continue;
+    if (line.find("platform:") != std::string::npos &&
+        (line + ",").find(platform) == std::string::npos) {
+      continue;
+    }
+    if (SDL_AddGamepadMapping(line.c_str()) >= 0) {
+      ++loaded;
+    } else {
+      REXLOG_WARN("Controller mapping: SDL rejected saved '{}': {}", line, SDL_GetError());
+    }
+  }
+  return loaded;
 }
 
 bool RemoveUserMapping(std::string_view guid) {

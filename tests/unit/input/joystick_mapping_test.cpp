@@ -1,6 +1,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -96,6 +98,9 @@ TEST_CASE("A built mapping applies and the gamepad view follows it", "[input][sd
       info, {{"a", "b3"}, {"start", "b7"}, {"leftx", "a0"}, {"-lefty", "-a1"},
              {"righttrigger", "a3"}, {"dpup", "h0.1"}});
   CHECK(mapping.rfind(info.guid + ",Mapping Test Pad,a:b3,start:b7,leftx:a0,", 0) == 0);
+  // SDL_AddGamepadMappingsFromFile only takes lines with a platform field.
+  CHECK(mapping.find(",platform:") != std::string::npos);
+  CHECK(mapping.back() == ',');
   REQUIRE(rex::input::sdl::ApplyMapping(mapping));
   CHECK_FALSE(FindPad(pad.id()).mapping.empty());
 
@@ -176,6 +181,30 @@ TEST_CASE("A wheel's steering counts from an eighth of its travel", "[input][sdl
   wheel.SetAxis(0, 6000);
   CHECK(capture.Poll() == "+a0");
   capture.End();
+}
+
+TEST_CASE("Saved mappings load with or without a platform field", "[input][sdl]") {
+  // Its own name, so no other test has mapped its GUID in this SDL.
+  rex::input::sdl::VirtualJoystick pad;
+  REQUIRE(pad.Attach("Saved Mapping Pad", 4, 12, 1));
+  JoystickInfo info = FindPad(pad.id());
+  REQUIRE(info.mapping.empty());
+
+  const auto path = std::filesystem::temp_directory_path() / "rex_user_mappings_test.txt";
+  {
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    file << "# a comment\n";
+    // Another platform's line for the same pad: skipped.
+    file << info.guid << ",Elsewhere,a:b1,platform:NoSuchPlatform,\n";
+    // As the assistant saved it before it wrote a platform field.
+    file << info.guid << ",Saved Mapping Pad,a:b3,start:b7,\n";
+  }
+  CHECK(rex::input::sdl::LoadUserMappings(path.string()) == 1);
+  const std::string mapping = FindPad(pad.id()).mapping;
+  CHECK(mapping.find("a:b3") != std::string::npos);
+  CHECK(mapping.find("Elsewhere") == std::string::npos);
+  std::filesystem::remove(path);
+  CHECK(rex::input::sdl::LoadUserMappings("") == 0);
 }
 
 TEST_CASE("A virtual wheel lists as a racing wheel", "[input][sdl]") {
