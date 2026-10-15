@@ -81,6 +81,15 @@ REXCVAR_DEFINE_INT32(
     .range(-1, 32)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// MoltenVK hands every stored pipeline to the Metal compiler at start: on an
+// M4 Pro the 732 pipelines of a played save took 21.6 s on 9 threads, all of
+// it a black screen before the title's first frame.
+REXCVAR_DEFINE_BOOL(vulkan_pipeline_prewarm_background, REX_PLATFORM_MAC, "GPU/Vulkan",
+                    "Create the stored pipelines behind the running title instead of before "
+                    "it starts. A draw whose pipeline is not built yet builds it on the GPU "
+                    "commands thread, or waits for the thread building it")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(vulkan_async_pipeline_no_placeholder, REX_PLATFORM_ANDROID, "GPU/Vulkan",
                     "With async_shader_compilation, never build a pipeline on the GPU commands "
                     "thread nor wait for one: a draw whose pipeline is not ready is skipped (the "
@@ -773,6 +782,10 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     pipeline_creations.push_back(creation_arguments);
   }
 
+  if (!pipeline_creations.empty() && REXCVAR_GET(vulkan_pipeline_prewarm_background)) {
+    StartBackgroundPrewarm(std::move(pipeline_creations));
+    pipeline_creations.clear();
+  }
   if (!pipeline_creations.empty()) {
     {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
@@ -864,7 +877,95 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
   storage_write_thread_->set_name("Vulkan Storage writer");
 }
 
+void VulkanPipelineCache::StartBackgroundPrewarm(
+    std::vector<PipelineCreationArguments> creations) {
+  auto prewarm = std::make_unique<BackgroundPrewarm>();
+  prewarm->creations = std::move(creations);
+  const size_t count = prewarm->creations.size();
+  prewarm->states = std::make_unique<std::atomic<uint8_t>[]>(count);
+  prewarm->index.reserve(count);
+  for (size_t i = 0; i < count; ++i) {
+    prewarm->index.emplace(&prewarm->creations[i].pipeline->second, i);
+  }
+  prewarm->remaining.store(count, std::memory_order_release);
+  prewarm->start = std::chrono::steady_clock::now();
+  uint32_t logical_processor_count = rex::thread::logical_processor_count();
+  if (!logical_processor_count) {
+    logical_processor_count = 6;
+  }
+  size_t thread_count;
+  if (REXCVAR_GET(vulkan_pipeline_creation_threads) < 0) {
+    thread_count = std::max(logical_processor_count * 3 / 4, uint32_t(1));
+  } else {
+    thread_count = std::clamp(uint32_t(REXCVAR_GET(vulkan_pipeline_creation_threads)),
+                              uint32_t(1), logical_processor_count);
+  }
+  thread_count = std::min(thread_count, count);
+  background_prewarm_ = std::move(prewarm);
+  REXGPU_INFO("Creating {} stored graphics pipelines behind the title on {} threads", count,
+              thread_count);
+  for (size_t i = 0; i < thread_count; ++i) {
+    std::unique_ptr<rex::thread::Thread> thread = rex::thread::Thread::Create({}, [this]() {
+      BackgroundPrewarm& prewarm = *background_prewarm_;
+      while (!prewarm.stop.load(std::memory_order_acquire)) {
+        const size_t index = prewarm.next.fetch_add(1, std::memory_order_relaxed);
+        if (index >= prewarm.creations.size()) {
+          break;
+        }
+        RunBackgroundPrewarmEntry(index);
+      }
+    });
+    assert_not_null(thread);
+    thread->set_name("Vulkan Pipeline Prewarm");
+    background_prewarm_->threads.push_back(std::move(thread));
+  }
+}
+
+void VulkanPipelineCache::RunBackgroundPrewarmEntry(size_t index) {
+  BackgroundPrewarm& prewarm = *background_prewarm_;
+  uint8_t expected = 0;
+  if (prewarm.states[index].compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+    EnsurePipelineCreated(prewarm.creations[index]);
+    prewarm.states[index].store(2, std::memory_order_release);
+    if (prewarm.remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      REXGPU_INFO("Created {} stored graphics pipelines behind the title in {} ms",
+                  prewarm.creations.size(),
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - prewarm.start)
+                      .count());
+    }
+    return;
+  }
+  while (prewarm.states[index].load(std::memory_order_acquire) != 2) {
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+  }
+}
+
+void VulkanPipelineCache::AwaitBackgroundPrewarm(const Pipeline& pipeline) {
+  BackgroundPrewarm* prewarm = background_prewarm_.get();
+  if (!prewarm || !prewarm->remaining.load(std::memory_order_acquire)) {
+    return;
+  }
+  auto it = prewarm->index.find(&pipeline);
+  if (it != prewarm->index.end()) {
+    RunBackgroundPrewarmEntry(it->second);
+  }
+}
+
+void VulkanPipelineCache::StopBackgroundPrewarm() {
+  if (!background_prewarm_) {
+    return;
+  }
+  // Pipelines left unbuilt are built on demand, as without storage.
+  background_prewarm_->stop.store(true, std::memory_order_release);
+  for (const auto& thread : background_prewarm_->threads) {
+    rex::thread::Wait(thread.get(), false);
+  }
+  background_prewarm_.reset();
+}
+
 void VulkanPipelineCache::ShutdownShaderStorage() {
+  StopBackgroundPrewarm();
   if (storage_write_thread_) {
     {
       std::lock_guard<std::mutex> lock(storage_write_request_lock_);
@@ -1505,6 +1606,10 @@ bool VulkanPipelineCache::ConfigurePipeline(
                                        REXCVAR_GET(vulkan_async_pipeline_no_placeholder) &&
                                        pipeline_handle_out;
     auto [entry, inserted] = specialized_pipelines_.try_emplace(key);
+    if (!inserted && entry->second->second.pipeline.load(std::memory_order_acquire) ==
+                         VK_NULL_HANDLE) {
+      AwaitBackgroundPrewarm(entry->second->second);
+    }
     if (inserted) {
       entry->second = std::make_unique<std::pair<const PipelineDescription, Pipeline>>(
           description, Pipeline());
@@ -1600,6 +1705,10 @@ bool VulkanPipelineCache::ConfigurePipeline(
   auto it = pipelines_.find(description);
   if (it != pipelines_.end()) {
     VkPipeline found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
+    if (found_pipeline == VK_NULL_HANDLE) {
+      AwaitBackgroundPrewarm(it->second);
+      found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
+    }
     if (found_pipeline == VK_NULL_HANDLE && use_async &&
         REXCVAR_GET(vulkan_async_pipeline_no_placeholder) &&
         it->second.is_placeholder.load(std::memory_order_acquire)) {

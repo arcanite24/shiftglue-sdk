@@ -11,6 +11,7 @@
  */
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdio>
@@ -412,6 +413,13 @@ class VulkanPipelineCache {
   bool EnsurePipelineCreated(const PipelineCreationArguments& creation_arguments,
                              VkShaderModule fragment_shader_override = VK_NULL_HANDLE);
   void CreationThread(size_t thread_index);
+  void StartBackgroundPrewarm(std::vector<PipelineCreationArguments> creations);
+  // Creates the stored pipeline at the index, or waits for the thread that
+  // already is.
+  void RunBackgroundPrewarmEntry(size_t index);
+  // For a pipeline the background prewarm has not built yet.
+  void AwaitBackgroundPrewarm(const Pipeline& pipeline);
+  void StopBackgroundPrewarm();
   void CreateQueuedPipelinesOnProcessorThread();
   void ProcessDeferredPipelineDestructions(bool force_all);
 
@@ -575,6 +583,22 @@ class VulkanPipelineCache {
   bool creation_completion_set_event_ = false;
   size_t creation_threads_shutdown_from_ = SIZE_MAX;
   std::vector<std::unique_ptr<rex::thread::Thread>> creation_threads_;
+
+  // Stored pipelines created behind the running title
+  // (vulkan_pipeline_prewarm_background). Everything but the atomics is
+  // fixed once the threads start.
+  struct BackgroundPrewarm {
+    std::vector<PipelineCreationArguments> creations;
+    // 0 queued, 1 being created, 2 done.
+    std::unique_ptr<std::atomic<uint8_t>[]> states;
+    std::unordered_map<const Pipeline*, size_t> index;
+    std::atomic<size_t> next{0};
+    std::atomic<size_t> remaining{0};
+    std::atomic<bool> stop{false};
+    std::chrono::steady_clock::time_point start;
+    std::vector<std::unique_ptr<rex::thread::Thread>> threads;
+  };
+  std::unique_ptr<BackgroundPrewarm> background_prewarm_;
 };
 
 }  // namespace rex::graphics::vulkan
