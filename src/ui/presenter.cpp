@@ -95,6 +95,25 @@ REXCVAR_DEFINE_BOOL(present_dither, false, "UI/Presenter",
 REXCVAR_DEFINE_BOOL(present_allow_overscan_cutoff, false, "UI/Presenter",
                     "Allow overscan cutoff based on safe area settings");
 
+// Frame generation (opt-in, off by default): one generated frame presented
+// between each pair of the title's frames. metalfx: Apple MetalFX frame
+// interpolation (macOS 26, Apple silicon). fsr3: FidelityFX FSR 3.1 frame
+// generation (not wired yet; reports unavailable). repeat: development only,
+// re-presents the previous frame to measure the pacing and counters.
+REXCVAR_DEFINE_STRING(present_frame_generation, "off", "UI/Presenter",
+                      "Frame generation backend: off, metalfx, fsr3 (unavailable), repeat (debug)")
+    .allowed({"off", "metalfx", "fsr3", "repeat"});
+
+// The real frame is presented this fraction of the measured base interval
+// after it was produced, the generated frame right away: 0.5 spaces the
+// presents evenly, less trades evenness for latency.
+REXCVAR_DEFINE_DOUBLE(present_frame_generation_delay,
+                      rex::ui::Presenter::GuestOutputPaintConfig::kFrameGenerationDelayDefault,
+                      "UI/Presenter",
+                      "Real-frame delay with frame generation, as a fraction of the base interval")
+    .range(rex::ui::Presenter::GuestOutputPaintConfig::kFrameGenerationDelayMin,
+           rex::ui::Presenter::GuestOutputPaintConfig::kFrameGenerationDelayMax);
+
 namespace {
 using GuestOutputPaintConfig = rex::ui::Presenter::GuestOutputPaintConfig;
 
@@ -222,6 +241,9 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
   config.SetFsrQualityMode(ParsePresentFsrQualityMode(REXCVAR_GET(present_fsr_quality_mode)));
 #endif
   config.SetDither(REXCVAR_GET(present_dither));
+  config.SetFrameGeneration(
+      rex::ui::ParseFrameGenerationBackend(REXCVAR_GET(present_frame_generation)));
+  config.SetFrameGenerationDelay(float(REXCVAR_GET(present_frame_generation_delay)));
   return config;
 }
 
@@ -674,6 +696,11 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
     modified = true;
     request_repaint = true;
   }
+  if (guest_output_paint_config_.GetFrameGeneration() != new_config.GetFrameGeneration() ||
+      guest_output_paint_config_.GetFrameGenerationDelay() !=
+          new_config.GetFrameGenerationDelay()) {
+    modified = true;
+  }
 #if defined(REX_HAS_FIDELITYFX_SDK)
   if (guest_output_paint_config_.GetFsrQualityMode() != new_config.GetFsrQualityMode()) {
     modified = true;
@@ -687,6 +714,7 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
       std::unique_lock<std::mutex> config_lock(guest_output_paint_config_mutex_);
       guest_output_paint_config_ = new_config;
     }
+    PublishFrameGenerationStateFromUIThread(new_config.GetFrameGeneration());
     // Coarsely check the availability of painting and of the window (for
     // calling RequestPaint) via paint_mode_ because the actual painting
     // connection state may currently be owned not by the UI thread.
@@ -700,6 +728,35 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
       }
     }
   }
+}
+
+FrameGenerationAvailability Presenter::ProbeFrameGenerationBackend(
+    FrameGenerationBackend backend) {
+  return ProbeFrameGenerationBackendGeneric(backend);
+}
+
+bool Presenter::IsFrameGenerationOffered() const { return false; }
+
+void Presenter::PublishFrameGenerationStateFromUIThread(FrameGenerationBackend requested) {
+  FrameGenerationState state;
+  state.offered = IsFrameGenerationOffered();
+  state.requested = requested;
+  if (requested != FrameGenerationBackend::kOff) {
+    const FrameGenerationAvailability availability = ProbeFrameGenerationBackend(requested);
+    state.available = availability.available;
+    state.reason = availability.reason;
+    if (!availability.available &&
+        frame_generation_unavailable_logged_ != requested) {
+      frame_generation_unavailable_logged_ = requested;
+      REXLOG_WARN("Presenter: frame generation '{}' is unavailable: {}",
+                  FrameGenerationBackendName(requested), availability.reason);
+    }
+  }
+  // Generated frames are presented only once a generator runs (the Vulkan
+  // presenter sets `active` from its paint path); off or unavailable means
+  // every present is a real frame.
+  state.active = false;
+  PublishFrameGenerationState(state);
 }
 
 void Presenter::AddUIDrawerFromUIThread(UIDrawer* drawer, size_t z_order) {
@@ -779,6 +836,7 @@ bool Presenter::InitializeCommonSurfaceIndependent() {
     std::lock_guard<std::mutex> config_lock(guest_output_paint_config_mutex_);
     guest_output_paint_config_ = BuildGuestOutputPaintConfigFromCVar();
   }
+  PublishFrameGenerationStateFromUIThread(guest_output_paint_config_.GetFrameGeneration());
 
   // Initialize UI frame rate limiting.
 #if REX_PLATFORM_WIN32

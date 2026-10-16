@@ -102,6 +102,8 @@ constexpr const char* kPresenterPaintCvars[] = {
     "present_fsr_quality_mode",
     "present_dither",
     "present_allow_overscan_cutoff",
+    "present_frame_generation",
+    "present_frame_generation_delay",
 };
 }  // namespace
 

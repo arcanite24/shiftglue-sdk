@@ -32,6 +32,7 @@
 #include <rex/platform.h>
 #include <rex/types.h>
 #include <rex/ui/flags.h>
+#include <rex/ui/frame_generator.h>
 #include <rex/ui/presentation_pacer.h>
 #include <rex/ui/surface.h>
 #include <rex/ui/upscaler.h>
@@ -320,6 +321,25 @@ class Presenter {
     bool GetDither() const { return dither_; }
     void SetDither(bool new_dither) { dither_ = new_dither; }
 
+    // Frame generation (opt-in, off by default): one generated frame between
+    // each pair of the title's frames. The real frame is presented
+    // `GetFrameGenerationDelay()` of the measured base interval after it was
+    // produced (1/2 spaces the presents evenly; less trades evenness for
+    // latency).
+    static constexpr float kFrameGenerationDelayMin = 0.1f;
+    static constexpr float kFrameGenerationDelayMax = 0.5f;
+    static constexpr float kFrameGenerationDelayDefault = 0.5f;
+    FrameGenerationBackend GetFrameGeneration() const { return frame_generation_; }
+    void SetFrameGeneration(FrameGenerationBackend new_frame_generation) {
+      frame_generation_ = new_frame_generation;
+    }
+    float GetFrameGenerationDelay() const { return frame_generation_delay_; }
+    void SetFrameGenerationDelay(float new_frame_generation_delay) {
+      frame_generation_delay_ =
+          std::min(kFrameGenerationDelayMax,
+                   std::max(kFrameGenerationDelayMin, new_frame_generation_delay));
+    }
+
    private:
     // Tools, rather than the emulator itself, must not allow overscan cutoff
     // and must use the kBilinear effect as the image must be as close to the
@@ -333,6 +353,8 @@ class Presenter {
     FsrQualityMode fsr_quality_mode_ = FsrQualityMode::kAuto;
 #endif
     bool dither_ = false;
+    FrameGenerationBackend frame_generation_ = FrameGenerationBackend::kOff;
+    float frame_generation_delay_ = kFrameGenerationDelayDefault;
   };
 
   Presenter(const Presenter& presenter) = delete;
@@ -779,6 +801,16 @@ class Presenter {
   // Call via PaintAndPresent.
   virtual PaintResult PaintAndPresentImpl(bool execute_ui_drawers) = 0;
 
+  // Frame generation. The base presenter builds no generator: every backend
+  // is unavailable and the FRAME GENERATION row is not offered. A presenter
+  // with generators overrides both; it reads the requested backend from
+  // GetGuestOutputPaintConfig.
+  virtual FrameGenerationAvailability ProbeFrameGenerationBackend(FrameGenerationBackend backend);
+  virtual bool IsFrameGenerationOffered() const;
+  // Publishes GetFrameGenerationState for the menu and diagnostics after a
+  // config change; called on the UI thread.
+  void PublishFrameGenerationStateFromUIThread(FrameGenerationBackend requested);
+
   // For calling from the painting implementations if requested.
   void ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context);
 
@@ -999,6 +1031,9 @@ class Presenter {
   std::mutex guest_output_paint_config_mutex_;
   // UI thread: writable, guest output thread: read-only.
   GuestOutputPaintConfig guest_output_paint_config_;
+  // The backend whose unavailability was last logged, so the warning is
+  // written once per change rather than once per config refresh.
+  FrameGenerationBackend frame_generation_unavailable_logged_ = FrameGenerationBackend::kOff;
 
   // Single-producer-multiple-consumers (lock-free SPSC + consumer lock) mailbox
   // for presenting of the most up-to-date guest output image without long

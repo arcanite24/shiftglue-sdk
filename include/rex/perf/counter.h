@@ -262,6 +262,14 @@ enum class CounterId : uint16_t {
   kD3dProgramMarkDrops,
   kD3dProgramMarkReclaims,
 
+  // Frame generation (opt-in): generated frames presented between the
+  // title's frames (not source frames, never duplicates), the GPU time the
+  // backend reported for them, and the frames generation was skipped for (a
+  // history reset); append to preserve existing IDs.
+  kGeneratedPresentCount,
+  kFrameGenerationGpuTimeNs,
+  kFrameGenerationSkipped,
+
   kCount  // sentinel -- must be last
 };
 
@@ -439,6 +447,9 @@ class Profiler {
 #define PROFILE_PRESENT_DEADLINE_MISS(n) PERF_counter_add(kPresentDeadlineMisses, n)
 #define PROFILE_DUPLICATE_PRESENT() PERF_counter_inc(kDuplicatePresentCount)
 #define PROFILE_DROPPED_PRESENT() PERF_counter_inc(kDroppedPresentCount)
+#define PROFILE_GENERATED_PRESENT() PERF_counter_inc(kGeneratedPresentCount)
+#define PROFILE_FRAME_GENERATION_GPU_NS(value) PERF_counter_add(kFrameGenerationGpuTimeNs, value)
+#define PROFILE_FRAME_GENERATION_SKIPPED() PERF_counter_inc(kFrameGenerationSkipped)
 
 #else
 
@@ -497,5 +508,8 @@ class Profiler {
 #define PROFILE_PRESENT_DEADLINE_MISS(n)
 #define PROFILE_DUPLICATE_PRESENT()
 #define PROFILE_DROPPED_PRESENT()
+#define PROFILE_GENERATED_PRESENT()
+#define PROFILE_FRAME_GENERATION_GPU_NS(value)
+#define PROFILE_FRAME_GENERATION_SKIPPED()
 
 #endif
