@@ -17,6 +17,7 @@
 
 #include <fmt/format.h>
 
+#include <rex/input/ffb_trace.h>
 #include <rex/input/xinputd_ffb.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -85,6 +86,7 @@ u32 HidReadMouseChanges_entry(u32 unk1, u32 unk2) {
 namespace {
 
 namespace ffb = rex::input::xinputd_ffb;
+namespace ffb_trace = rex::input::ffb_trace;
 
 constexpr uint32_t kOverlappedSize = 28;
 
@@ -128,7 +130,7 @@ void CompleteOverlapped(uint32_t overlapped) {
   }
 }
 
-// The first few calls of each kind go to the runtime log.
+// The first few calls of each kind go to the runtime log as well as the trace.
 bool LogThis(std::atomic<uint32_t>& count, uint32_t limit = 12) {
   return count.fetch_add(1, std::memory_order_relaxed) < limit;
 }
@@ -195,6 +197,7 @@ uint32_t HandleEffectCall(EffectCall named, const char* export_name, uint32_t ha
       if (LogThis(g_log_unknown)) {
         REXKRNL_WARN("Wheel FFB: unrecognised call: {} (from {:08X})", detail, caller);
       }
+      ffb_trace::RecordWheelCall("ffb_unknown", caller, a, b, c, 0, detail);
       return X_STATUS_SUCCESS;
     }
     REXKRNL_INFO("Wheel FFB: {} called with the arguments of another effect call; handled as such",
@@ -209,6 +212,8 @@ uint32_t HandleEffectCall(EffectCall named, const char* export_name, uint32_t ha
         if (LogThis(g_log_set, 32)) {
           REXKRNL_INFO("Wheel FFB: set effect {}", ffb::DescribeEffect(effect));
         }
+        ffb_trace::RecordWheelCall("ffb_set_effect", caller, effect.id, effect.type, b, 0,
+                                   ffb::DescribeEffect(effect) + " | " + ffb::HexWords(effect));
         if (sink)
           sink->SetEffect(effect);
       }
@@ -220,6 +225,8 @@ uint32_t HandleEffectCall(EffectCall named, const char* export_name, uint32_t ha
       if (LogThis(g_log_update, 8)) {
         REXKRNL_INFO("Wheel FFB: update effect (flags {:#x}) {}", b, ffb::DescribeEffect(effect));
       }
+      ffb_trace::RecordWheelCall("ffb_update_effect", caller, effect.id, effect.type, b, 0,
+                                 ffb::DescribeEffect(effect) + " | " + ffb::HexWords(effect));
       if (sink)
         sink->UpdateEffect(effect, b);
       CompleteOverlapped(c);
@@ -232,6 +239,7 @@ uint32_t HandleEffectCall(EffectCall named, const char* export_name, uint32_t ha
         if (LogThis(g_log_op, 32)) {
           REXKRNL_INFO("Wheel FFB: effect #{} operation {} (flag {})", id, op, c);
         }
+        ffb_trace::RecordWheelCall("ffb_effect_op", caller, id, op, c, 0, "");
         if (sink)
           sink->EffectOperation(id, op);
       }
@@ -263,6 +271,7 @@ u32 XInputdFFGetDeviceInfo_entry(u32 handle, u32 info) {
         "feedback {}",
         (uint32_t)handle, kEffectSlots, sink && sink->HasForceFeedback() ? "yes" : "no");
   }
+  ffb_trace::RecordWheelCall("ffb_get_info", GuestCaller(), handle, info, kEffectSlots, 0, "");
   return X_STATUS_SUCCESS;
 }
 
@@ -283,6 +292,7 @@ u32 XInputdFFDeviceControl_entry(u32 handle, u32 command, u32 overlapped) {
   if (LogThis(g_log_control)) {
     REXKRNL_INFO("Wheel FFB: device control {}", (uint32_t)command);
   }
+  ffb_trace::RecordWheelCall("ffb_device_control", GuestCaller(), command, overlapped, 0, 0, "");
   if (ffb::Sink* sink = ffb::GetSink())
     sink->DeviceControl(command);
   CompleteOverlapped(overlapped);
@@ -293,6 +303,7 @@ u32 XInputdFFSetDeviceGain_entry(u32 handle, u32 gain, u32 overlapped) {
   if (LogThis(g_log_gain)) {
     REXKRNL_INFO("Wheel FFB: device gain {}", (uint32_t)gain);
   }
+  ffb_trace::RecordWheelCall("ffb_set_gain", GuestCaller(), gain, overlapped, 0, 0, "");
   if (ffb::Sink* sink = ffb::GetSink())
     sink->SetDeviceGain(gain);
   // Forza Horizon never calls this and its arguments are unconfirmed, so a
@@ -304,6 +315,7 @@ u32 XInputdFFCancelIo_entry(u32 handle, u32 a, u32 b) {
   if (LogThis(g_log_cancel, 4)) {
     REXKRNL_INFO("Wheel FFB: cancel I/O ({:08X} {:08X})", (uint32_t)a, (uint32_t)b);
   }
+  ffb_trace::RecordWheelCall("ffb_cancel_io", GuestCaller(), a, b, 0, 0, "");
   return X_STATUS_SUCCESS;
 }
 
@@ -319,6 +331,7 @@ u32 XInputdFFSetRumble_entry(u32 handle, u32 vibration, u32 overlapped) {
   if (LogThis(g_log_rumble, 4)) {
     REXKRNL_INFO("Wheel FFB: rumble {} {}", left, right);
   }
+  ffb_trace::RecordWheelCall("ffb_rumble", GuestCaller(), left, right, overlapped, 0, "");
   if (ffb::Sink* sink = ffb::GetSink())
     sink->SetRumble(left, right);
   CompleteOverlapped(overlapped);
