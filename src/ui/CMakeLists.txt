@@ -2,6 +2,7 @@
 
 # Core UI sources
 set(REXUI_CORE_SOURCES
+    frame_generation_pacer.cpp
     frame_generator.cpp
     graphics_upload_buffer_pool.cpp
     graphics_util.cpp
@@ -43,6 +44,7 @@ set(REXUI_VULKAN_SOURCES
     vulkan/vulkan_dlss_upscaler.cpp
     vulkan/vulkan_ffx_upscaler.cpp
     vulkan/vulkan_device.cpp
+    vulkan/vulkan_frame_generator.cpp
     vulkan/vulkan_immediate_drawer.cpp
     vulkan/vulkan_instance.cpp
     $<$<BOOL:${ANDROID}>:vulkan/android_gpu_driver.cpp>

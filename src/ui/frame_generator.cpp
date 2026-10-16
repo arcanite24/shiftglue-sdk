@@ -42,6 +42,10 @@ void PublishFrameGenerationState(const FrameGenerationState& state) {
   frame_generation_reason.store(state.reason ? state.reason : "", std::memory_order_relaxed);
 }
 
+void PublishFrameGenerationActive(bool active) {
+  frame_generation_active.store(active, std::memory_order_relaxed);
+}
+
 FrameGenerationBackend ParseFrameGenerationBackend(std::string_view name) {
   std::string lowered(name);
   for (char& c : lowered) {

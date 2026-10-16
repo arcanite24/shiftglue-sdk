@@ -54,6 +54,8 @@ struct FrameGenerationState {
 };
 FrameGenerationState GetFrameGenerationState();
 void PublishFrameGenerationState(const FrameGenerationState& state);
+// Only the `active` flag, from the paint thread.
+void PublishFrameGenerationActive(bool active);
 
 // The setting's value (case-insensitive) to a backend; unknown text is kOff.
 FrameGenerationBackend ParseFrameGenerationBackend(std::string_view name);

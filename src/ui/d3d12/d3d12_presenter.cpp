@@ -563,7 +563,8 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
   swap_chain_width = 0;
 }
 
-Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawers) {
+Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawers,
+                                                           PaintSource /*source*/) {
   // Begin the command list with the command allocator not currently potentially
   // used on the GPU.
   UINT64 current_paint_submission = paint_context_.paint_submission_tracker.GetCurrentSubmission();

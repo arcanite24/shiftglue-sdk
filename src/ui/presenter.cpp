@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 #include <utility>
 
@@ -24,6 +25,7 @@
 #include <rex/platform.h>
 #include <rex/system/gpu_plugin.h>
 #include <rex/thread.h>
+#include <rex/ui/frame_generation_pacer.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/upscaler.h>
 #include <rex/ui/window.h>
@@ -113,6 +115,7 @@ REXCVAR_DEFINE_DOUBLE(present_frame_generation_delay,
                       "Real-frame delay with frame generation, as a fraction of the base interval")
     .range(rex::ui::Presenter::GuestOutputPaintConfig::kFrameGenerationDelayMin,
            rex::ui::Presenter::GuestOutputPaintConfig::kFrameGenerationDelayMax);
+
 
 namespace {
 using GuestOutputPaintConfig = rex::ui::Presenter::GuestOutputPaintConfig;
@@ -261,6 +264,10 @@ Presenter::~Presenter() {
   // No intrusive lifetime management must be performed from UI drawers - defer
   // it if needed.
   assert_false(is_executing_ui_drawers_);
+
+  // The pacing thread calls into this presenter; it must stop before anything
+  // else is torn down (the implementation's destructor has already done so).
+  ShutdownFrameGenerationPacer();
 
 #if REX_PLATFORM_WIN32
   if (dxgi_ui_tick_thread_.joinable()) {
@@ -458,7 +465,54 @@ void Presenter::PaintFromUIThread(bool force_paint) {
       // doesn't limit the frame rate.
       WaitForUITickFromUIThread();
 
-      paint_result = PaintAndPresent(draw_ui);
+      // Frame generation: a generated frame when the publish asked for one
+      // and no UI is drawn over it (menus and overlays show real frames and
+      // start the history over); the real frame otherwise.
+      bool more_requests_pending = false;
+      const FrameGenerationUIPaintRequest generation_request =
+          TakeFrameGenerationUIRequest(more_requests_pending);
+      if (more_requests_pending) {
+        request_repaint_immediately = true;
+      }
+      const uint64_t newest_sequence =
+          guest_output_refresh_sequence_.load(std::memory_order_acquire);
+      bool painted_generated = false;
+      bool skip_paint = false;
+      if (generation_request.sequence != 0 && generation_request.sequence != newest_sequence) {
+        // The frame this request was for has been superseded: a real frame
+        // that never showed is dropped (it lives on inside the newer
+        // generated frame); a generated frame for an old pair is simply
+        // stale. Painting the newest frame in its place would show frames out
+        // of order, so this paint shows nothing.
+        if (generation_request.source == PaintSource::kGuestOutput) {
+          PROFILE_DROPPED_PRESENT();
+        }
+        skip_paint = !draw_ui;
+      } else if (generation_request.source == PaintSource::kGenerated) {
+        if (draw_ui) {
+          if (frame_generation_was_active_.exchange(false, std::memory_order_relaxed)) {
+            StopFrameGenerationFromAnyThread();
+            PublishFrameGenerationActive(false);
+          }
+        } else if (IsFrameGenerationReady()) {
+          {
+            // The real frame of this pair already showed (the pacer's request
+            // was served first): the generated one would step back in time.
+            std::lock_guard<std::mutex> pacing_lock(presentation_pacing_mutex_);
+            skip_paint = last_presented_refresh_sequence_ != UINT64_MAX &&
+                         generation_request.sequence <= last_presented_refresh_sequence_;
+          }
+          if (!skip_paint) {
+            painted_generated = PaintGeneratedFrameAndScheduleReal(generation_request);
+            if (painted_generated) {
+              paint_result = PaintResult::kPresented;
+            }
+          }
+        }
+      }
+      if (!painted_generated && !skip_paint) {
+        paint_result = PaintAndPresent(draw_ui);
+      }
       if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
         // Request another PaintFromUIThread which will try to recover from the
         // outdated connection in the next frame (not immediately, so the
@@ -622,14 +676,61 @@ void Presenter::PublishGuestOutput() {
       case PaintMode::kNone:
         // Neither painting nor window paint requesting is accessible.
         break;
-      case PaintMode::kUIThreadOnRequest:
-        // Only window paint requesting is accessible.
+      case PaintMode::kUIThreadOnRequest: {
+        // Only window paint requesting is accessible. With frame generation
+        // the UI thread paints the generated frame first (the request says
+        // so) and the pacing thread asks for the real one later.
+        const FrameGenerationUIPaintRequest request = PlanFrameGenerationForPublish();
+        {
+          std::lock_guard<std::mutex> request_lock(frame_generation_ui_request_mutex_);
+          // The previous publish's generated frame the UI thread has not
+          // painted yet gives way to this frame: a generated frame not shown,
+          // never a title frame. A pending real frame stays and goes first.
+          if (frame_generation_ui_generated_request_.sequence != 0) {
+            PROFILE_FRAME_GENERATION_SKIPPED();
+          }
+          if (request.source == PaintSource::kGenerated &&
+              request.overdue_real_sequence == UINT64_MAX) {
+            frame_generation_ui_generated_request_ = request;
+          } else {
+            frame_generation_ui_generated_request_ = FrameGenerationUIPaintRequest();
+            if (request.overdue_real_sequence != UINT64_MAX) {
+              // This frame came before the previous real frame's deadline:
+              // the UI thread paints this frame as the real one at once, and
+              // a stale real request for the previous frame is withdrawn.
+              frame_generation_ui_real_request_ = FrameGenerationUIPaintRequest();
+              PROFILE_FRAME_GENERATION_SKIPPED();
+            }
+          }
+        }
         RequestPaintOrConnectionRecoveryViaWindow(true);
-        break;
+      } break;
       case PaintMode::kGuestOutputThreadImmediately:
         // Both painting and window paint requesting are accessible.
         if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
-          paint_result = PaintAndPresent(false);
+          // Frame generation: present the frame made from the previous and
+          // this one now, and this one a fraction of the interval later from
+          // the pacing thread. The real frame is painted here when generation
+          // is off, not ready, or the frames are not a pair (a gap, a reset).
+          bool painted_generated = false;
+          const FrameGenerationUIPaintRequest request = PlanFrameGenerationForPublish();
+          if (request.source == PaintSource::kGenerated &&
+              request.overdue_real_sequence == UINT64_MAX) {
+            painted_generated = PaintGeneratedFrameAndScheduleReal(request);
+            if (painted_generated) {
+              paint_result = PaintResult::kPresented;
+            }
+          } else if (request.overdue_real_sequence != UINT64_MAX) {
+            // This frame came before the previous real frame's deadline: the
+            // mailbox now holds this frame, so the real paint below shows it
+            // at once and this publish generates nothing (the previous frame
+            // was seen through its generated one). Counted as a skip, not a
+            // drop: no title frame is lost from the sequence shown.
+            PROFILE_FRAME_GENERATION_SKIPPED();
+          }
+          if (!painted_generated) {
+            paint_result = PaintAndPresent(false);
+          }
           if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
             RequestPaintOrConnectionRecoveryViaWindow(true);
           }
@@ -715,6 +816,10 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
       guest_output_paint_config_ = new_config;
     }
     PublishFrameGenerationStateFromUIThread(new_config.GetFrameGeneration());
+    if (frame_generation_was_active_.exchange(false, std::memory_order_relaxed)) {
+      StopFrameGenerationFromAnyThread();
+      PublishFrameGenerationActive(false);
+    }
     // Coarsely check the availability of painting and of the window (for
     // calling RequestPaint) via paint_mode_ because the actual painting
     // connection state may currently be owned not by the UI thread.
@@ -1359,8 +1464,186 @@ void Presenter::SetPaintModeFromUIThread(PaintMode new_mode) {
   {
     std::lock_guard<std::mutex> lock(paint_mode_mutex_);
     paint_mode_ = new_mode;
+    // Without a paintable connection a real present the pacer still holds is
+    // dropped and the pair history starts over.
+    if (new_mode == PaintMode::kNone &&
+        frame_generation_was_active_.exchange(false, std::memory_order_relaxed)) {
+      StopFrameGenerationFromAnyThread();
+      PublishFrameGenerationActive(false);
+    }
   }
   UpdateUITicksNeededFromUIThread();
+}
+
+FrameGenerationPacer& Presenter::GetOrCreateFrameGenerationPacer() {
+  std::lock_guard<std::mutex> lock(frame_generation_pacer_mutex_);
+  if (!frame_generation_pacer_) {
+    frame_generation_pacer_ = std::make_unique<FrameGenerationPacer>(
+        [this](uint64_t sequence) { PresentScheduledRealFrame(sequence); });
+  }
+  return *frame_generation_pacer_;
+}
+
+void Presenter::ShutdownFrameGenerationPacer() {
+  std::unique_ptr<FrameGenerationPacer> pacer;
+  {
+    std::lock_guard<std::mutex> lock(frame_generation_pacer_mutex_);
+    pacer = std::move(frame_generation_pacer_);
+  }
+  // Joined outside the lock: the thread's last present may be running.
+  pacer.reset();
+}
+
+void Presenter::StopFrameGenerationFromAnyThread() {
+  std::lock_guard<std::mutex> lock(frame_generation_pacer_mutex_);
+  if (frame_generation_pacer_) {
+    if (frame_generation_pacer_->CancelPending() != UINT64_MAX) {
+      PROFILE_DROPPED_PRESENT();
+    }
+    frame_generation_pacer_->ResetIntervals();
+  }
+  ResetFrameGenerationHistory();
+}
+
+Presenter::FrameGenerationUIPaintRequest Presenter::TakeFrameGenerationUIRequest(
+    bool& more_pending_out) {
+  std::lock_guard<std::mutex> request_lock(frame_generation_ui_request_mutex_);
+  FrameGenerationUIPaintRequest request;
+  more_pending_out = false;
+  if (frame_generation_ui_real_request_.sequence != 0) {
+    request = frame_generation_ui_real_request_;
+    frame_generation_ui_real_request_ = FrameGenerationUIPaintRequest();
+    // The real frame was published before the generated request's frame, so
+    // the generated request still waiting is painted on the next request.
+    more_pending_out = frame_generation_ui_generated_request_.sequence != 0;
+    return request;
+  }
+  request = frame_generation_ui_generated_request_;
+  frame_generation_ui_generated_request_ = FrameGenerationUIPaintRequest();
+  return request;
+}
+
+Presenter::FrameGenerationUIPaintRequest Presenter::PlanFrameGenerationForPublish() {
+  FrameGenerationUIPaintRequest request;
+  request.sequence = guest_output_refresh_sequence_.load(std::memory_order_acquire);
+  if (!IsFrameGenerationReady()) {
+    if (frame_generation_was_active_.exchange(false, std::memory_order_relaxed)) {
+      StopFrameGenerationFromAnyThread();
+      PublishFrameGenerationActive(false);
+    }
+    return request;
+  }
+  FrameGenerationPacer& pacer = GetOrCreateFrameGenerationPacer();
+  request.publish_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+  const FrameGenerationPacer::Decision decision = pacer.OnPublish(request.publish_ns);
+  frame_generation_interval_ns_.store(decision.interval_ns, std::memory_order_relaxed);
+  // The previous frame's real present still pending (this frame came early,
+  // before the pacer's deadline): it is shown now, before anything of this
+  // frame, so a real frame is never lost to pacing.
+  request.overdue_real_sequence = pacer.CancelPending();
+  if (decision.reset_history) {
+    ResetFrameGenerationHistory();
+  }
+  if (!decision.generate) {
+    PROFILE_FRAME_GENERATION_SKIPPED();
+    return request;
+  }
+  // Twice the base rate has to fit under what the host shows: the frame rate
+  // limit, and the display's refresh when the swapchain waits for it (FIFO),
+  // or the second present only pushes the real frame out.
+  double present_cap_hz = 0.0;
+  if (const int32_t limit = REXCVAR_GET(host_present_fps_limit); limit > 0) {
+    present_cap_hz = double(limit);
+  }
+  if (surface_paint_connection_has_implicit_vsync_) {
+    const double refresh_hz =
+        std::atof(rex::cvar::GetFlagByName("video_mode_refresh_rate").c_str());
+    if (refresh_hz > 0.0 && (present_cap_hz <= 0.0 || refresh_hz < present_cap_hz)) {
+      present_cap_hz = refresh_hz;
+    }
+  }
+  if (present_cap_hz > 0.0 && decision.interval_ns > 0) {
+    const double base_hz = 1e9 / double(decision.interval_ns);
+    // An exact fit (30 fps on a 60 Hz panel) is the common case and works;
+    // only a base rate clearly above half the cap is refused.
+    if (2.0 * base_hz > present_cap_hz * 1.05) {
+      if (!frame_generation_headroom_logged_.exchange(true, std::memory_order_relaxed)) {
+        REXLOG_INFO(
+            "Presenter: frame generation is waiting: the base rate of {:.1f} fps doubled "
+            "does not fit under {:.0f} presents a second",
+            base_hz, present_cap_hz);
+      }
+      PROFILE_FRAME_GENERATION_SKIPPED();
+      return request;
+    }
+    frame_generation_headroom_logged_.store(false, std::memory_order_relaxed);
+  }
+  request.source = PaintSource::kGenerated;
+  request.interval_ns = decision.interval_ns;
+  request.shortest_interval_ns = decision.shortest_interval_ns;
+  {
+    std::lock_guard<std::mutex> config_lock(guest_output_paint_config_mutex_);
+    request.delay = guest_output_paint_config_.GetFrameGenerationDelay();
+  }
+  return request;
+}
+
+bool Presenter::PaintGeneratedFrameAndScheduleReal(const FrameGenerationUIPaintRequest& request) {
+  const PaintResult paint_result = PaintAndPresent(false, PaintSource::kGenerated);
+  const bool presented = paint_result == PaintResult::kPresented ||
+                         paint_result == PaintResult::kPresentedSuboptimal;
+  // The implementation shows the real frame when it has no generated one;
+  // that present is then the real frame's, and nothing is left to schedule.
+  const bool presented_generated = presented && last_paint_source_ == PaintSource::kGenerated;
+  if (presented_generated) {
+    GetOrCreateFrameGenerationPacer().ScheduleReal(
+        request.sequence,
+        request.publish_ns + int64_t(double(request.shortest_interval_ns) * request.delay));
+  }
+  frame_generation_was_active_.store(presented_generated, std::memory_order_relaxed);
+  PublishFrameGenerationActive(presented_generated);
+  return presented;
+}
+
+void Presenter::PresentScheduledRealFrame(uint64_t sequence) {
+  // The same lock order as PublishGuestOutput: the paint mode first, the
+  // mailbox consumer inside the paint.
+  std::lock_guard<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_);
+  if (guest_output_refresh_sequence_.load(std::memory_order_acquire) != sequence) {
+    // A newer frame was published between the pacer taking this present and
+    // here; that publish shows the newer frame as the real one at once, so
+    // this frame's own present is skipped, not lost from the sequence.
+    PROFILE_FRAME_GENERATION_SKIPPED();
+    return;
+  }
+  if (paint_mode_ == PaintMode::kUIThreadOnRequest) {
+    // The UI thread paints (an implicit-vsync swapchain, or a window that
+    // needs the UI thread): ask it for the real frame.
+    {
+      std::lock_guard<std::mutex> request_lock(frame_generation_ui_request_mutex_);
+      frame_generation_ui_real_request_ = FrameGenerationUIPaintRequest();
+      frame_generation_ui_real_request_.sequence = sequence;
+    }
+    RequestPaintOrConnectionRecoveryViaWindow(true);
+    return;
+  }
+  if (paint_mode_ != PaintMode::kGuestOutputThreadImmediately ||
+      surface_paint_connection_state_ != SurfacePaintConnectionState::kConnectedPaintable) {
+    return;
+  }
+  PaintResult paint_result = PaintAndPresent(false);
+  if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
+    RequestPaintOrConnectionRecoveryViaWindow(true);
+  }
+  if (host_gpu_loss_callback_) {
+    if (paint_result == PaintResult::kGpuLostResponsible) {
+      host_gpu_loss_callback_(true, false);
+    } else if (paint_result == PaintResult::kGpuLostExternally) {
+      host_gpu_loss_callback_(false, false);
+    }
+  }
 }
 
 Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintable) const {
@@ -1554,12 +1837,14 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
 #endif  // XE_PLATFORM
 }
 
-Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
+Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers, PaintSource source) {
   assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
   assert_true(surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable);
   std::lock_guard<std::mutex> pacing_lock(presentation_pacing_mutex_);
   const uint64_t refresh_sequence =
       guest_output_refresh_sequence_.load(std::memory_order_acquire);
+  // A generated frame is new even when the title's refresh sequence is unchanged.
+  const bool generated = source == PaintSource::kGenerated;
   using PresentationClock = std::chrono::steady_clock;
   auto now = PresentationClock::now();
   const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1576,7 +1861,7 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   // Presenting every UI tick while the title ran doubled the presents on
   // high-refresh displays and lagged the game with F3 open.
   constexpr int64_t kStalledTitleNs = 100'000'000;
-  if (REXCVAR_GET(pinyon_shift_fh1_source_presentation) &&
+  if (!generated && REXCVAR_GET(pinyon_shift_fh1_source_presentation) &&
       refresh_sequence == last_presented_refresh_sequence_) {
     const bool erase_overlay = !execute_ui_drawers && last_presented_ui_;
     const bool repaint_stalled =
@@ -1602,25 +1887,35 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
       std::this_thread::sleep_until(deadline);
     }
   }
-  PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
+  last_paint_source_ = PaintSource::kGuestOutput;
+  PaintResult result = PaintAndPresentImpl(execute_ui_drawers, source);
   if (result == PaintResult::kPresented || result == PaintResult::kPresentedSuboptimal) {
     const int64_t present_time_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             PresentationClock::now().time_since_epoch())
             .count();
     PROFILE_PRESENT();
-    perf::TraceCriticalPath(
-        "present", perf::GetTotalCounter(perf::CounterId::kSourceFrameCount),
-        int64_t(refresh_sequence));
     if (last_present_time_ns_) {
       PROFILE_PRESENT_DELTA_NS(present_time_ns - last_present_time_ns_);
     }
     last_present_time_ns_ = present_time_ns;
-    if (refresh_sequence == last_presented_refresh_sequence_) {
-      PROFILE_DUPLICATE_PRESENT();
+    if (generated && last_paint_source_ == PaintSource::kGenerated) {
+      // A generated frame shows no new title frame: it is neither a source
+      // frame nor a repeat of one, and leaves the real frame still to present.
+      PROFILE_GENERATED_PRESENT();
+      perf::TraceCriticalPath(
+          "present_generated", perf::GetTotalCounter(perf::CounterId::kSourceFrameCount),
+          int64_t(refresh_sequence));
+    } else {
+      perf::TraceCriticalPath(
+          "present", perf::GetTotalCounter(perf::CounterId::kSourceFrameCount),
+          int64_t(refresh_sequence));
+      if (refresh_sequence == last_presented_refresh_sequence_) {
+        PROFILE_DUPLICATE_PRESENT();
+      }
+      last_presented_refresh_sequence_ = refresh_sequence;
+      last_presented_ui_ = execute_ui_drawers;
     }
-    last_presented_refresh_sequence_ = refresh_sequence;
-    last_presented_ui_ = execute_ui_drawers;
   }
   switch (result) {
     case PaintResult::kPresented:
