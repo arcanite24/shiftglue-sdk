@@ -26,6 +26,7 @@ add_executable(unit_tests
     input/joystick_mapping_test.cpp
     input/wheel_test.cpp
     input/dualsense_test.cpp
+    input/xinputd_ffb_test.cpp
     codegen/codegen_writer_test.cpp
     codegen/output_partition_test.cpp
     codegen/output_stamp_test.cpp
