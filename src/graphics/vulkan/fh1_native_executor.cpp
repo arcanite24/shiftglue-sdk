@@ -93,6 +93,10 @@ REXCVAR_DEFINE_STRING(fh1_debug_skip_transfers, "", "GPU",
                       "<source>=<destination> descriptions (wrong image if they are needed)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DECLARE(bool, fh1_texture_reload_probe);
+REXCVAR_DEFINE_BOOL(fh1_readback_small_float_resolves, true, "GPU",
+                    "Read 32_FLOAT resolves of 4 KB or less back into guest memory, as the "
+                    "title's CPU reads the scene luminance for its auto exposure")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_resolve_two_textures, true, "GPU",
                     "Resolves write up to two textures over their destination directly (such as "
                     "a depth texture and an 8_8_8_8 one reading the same words), not one")
@@ -3102,6 +3106,8 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     constexpr uint32_t kUnscaledCopyMaxLength = 4096;
     const bool one_off =
         scale_ > 1 && written_address && IsOneOffResolve(extent_start, extent_length);
+    // Whether the guest-layout copy of a scaled resolve is in GPU memory.
+    bool unscaled_copy_complete = scale_ == 1 && complete;
     if (scale_ > 1 && written_address &&
         (one_off || extent_length <= kUnscaledCopyMaxLength)) {
       config_.memory->RequestRange(extent_start, extent_length);
@@ -3122,6 +3128,17 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
             range, true);
       }
       if (unscaled_complete && one_off) QueueResolveReadback(extent_start, extent_length);
+      unscaled_copy_complete = unscaled_complete;
+    }
+    // The title's CPU reads the scene luminance too (lr 830A4880 reads
+    // 1FCA6010) to set the auto exposure. Without a readback it reads stale
+    // guest memory: the exposure stays too high (washed-out daytime) and
+    // jumps for single frames (brightness flashes) as those bytes change.
+    if (written_address && unscaled_copy_complete &&
+        REXCVAR_GET(fh1_readback_small_float_resolves) &&
+        extent_length <= kUnscaledCopyMaxLength &&
+        resolve_info.copy_dest_info.copy_dest_format == xenos::ColorFormat::k_32_FLOAT) {
+      QueueResolveReadback(extent_start, extent_length);
     }
     // Invalidates textures over the range (and marks it scaled at scale).
     config_.textures->MarkRangeAsResolved(extent_start, extent_length);
