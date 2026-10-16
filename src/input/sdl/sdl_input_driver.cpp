@@ -210,12 +210,8 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
       // database's for the same controller.
       const std::string user_mappings = REXCVAR_GET(hid_user_mappings_file);
       if (!user_mappings.empty() && std::filesystem::exists(rex::to_path(user_mappings))) {
-        const int loaded = SDL_AddGamepadMappingsFromFile(user_mappings.c_str());
-        if (loaded < 0) {
-          REXLOG_ERROR("SDL: error loading user mappings '{}': {}", user_mappings, SDL_GetError());
-        } else {
-          REXLOG_INFO("SDL: loaded {} user mappings.", loaded);
-        }
+        const int loaded = LoadUserMappings(user_mappings);
+        REXLOG_INFO("SDL: loaded {} user mappings.", loaded);
       }
       REXLOG_INFO("SDL input driver initialized successfully");
     });
