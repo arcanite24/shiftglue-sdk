@@ -5290,17 +5290,20 @@ void VulkanCommandProcessor::SubmitBarriersAndBeginFh1Rendering(
   EndRenderPass();
   fh1_rendering_begin_position_ = deferred_command_buffer_.position();
   fh1_rendering_writes_shared_memory_ = false;
-  deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
-  PERF_counter_inc(kGpuRenderings);
   const char* const next_rendering_label = next_rendering_label_;
   next_rendering_label_ = nullptr;
   if (debug_labels_) {
+    // Before the begin: MoltenVK names the Metal render encoder after a label
+    // open when it begins, so GPU traces show the pass by name; a label opened
+    // inside the rendering is only a debug group within it.
     deferred_command_buffer_.CmdVkBeginDebugLabel(next_rendering_label ? next_rendering_label
                                                   : (id >> 62) == 3        ? "fh1 resolve fill"
                                                   : (id >> 63) != 0 ? "fh1 transfer or clear"
                                                                     : "fh1 draws");
     rendering_label_open_ = true;
   }
+  deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
+  PERF_counter_inc(kGpuRenderings);
   ++rendering_begin_count_;
   if (!was_rendering) {
     ++fh1_rendering_enders_[last_rendering_ender_];
