@@ -324,12 +324,39 @@ bool VulkanSharedMemory::UploadRanges(
   }
   // upload_page_ranges are sorted, use them to determine the range for the
   // ordering barrier.
+  // A draw's upload found while its rendering is open goes behind the
+  // rendering's begin instead of ending it (see BeginFh1HoistedUpload). The
+  // usage barriers are recorded with the copy: the rendering read the buffer
+  // before and reads it after, so the barrier state is the same on both sides.
+  // Only a draw's reads are reordered: a write usage before the upload keeps
+  // the guest order.
+  const bool hoisted = (last_usage_ == Usage::kRead || last_usage_ == Usage::kTransferDestination) &&
+                       command_processor_.BeginFh1HoistedUpload();
   Use(Usage::kTransferDestination,
       std::make_pair(upload_page_ranges.front().first << page_size_log2(),
                      (upload_page_ranges.back().first + upload_page_ranges.back().second -
                       upload_page_ranges.front().first)
                          << page_size_log2()));
+  if (hoisted) {
+    // The barrier into the transfer goes before the copies, the one back to
+    // the reading usage after them, then the whole upload moves ahead of the
+    // rendering's begin, so its draws see the data.
+    command_processor_.RecordFh1HoistedBarriers();
+    struct EndHoist {
+      VulkanSharedMemory& memory;
+      ~EndHoist() {
+        memory.Use(Usage::kRead);
+        memory.command_processor_.EndFh1HoistedUpload();
+      }
+    } end_hoist{*this};
+    return UploadRangesCopies(upload_page_ranges);
+  }
   command_processor_.SubmitBarriers(true);
+  return UploadRangesCopies(upload_page_ranges);
+}
+
+bool VulkanSharedMemory::UploadRangesCopies(
+    const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
   Fh1NativeExecutor* const gpu_profile_executor = command_processor_.GetFh1NativeExecutor();
   const uint64_t gpu_timing =
       gpu_profile_executor ? gpu_profile_executor->BeginLabelGpuTiming("upload") : UINT64_MAX;

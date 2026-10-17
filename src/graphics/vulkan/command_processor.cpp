@@ -89,6 +89,13 @@ REXCVAR_DEFINE_BOOL(present_upscaler_object_motion, true, "GPU",
 REXCVAR_DEFINE_INT32(present_upscaler_object_debug, 0, "GPU",
                      "UP-1.7 debug: 1 shows the object slots in the motion view (red: slot, green: its depth is the pixel's)");
 
+REXCVAR_DEFINE_BOOL(fh1_hoist_uploads, true, "GPU",
+                    "Record a CPU-to-GPU shared memory upload that a draw needs behind the "
+                    "begin of the open FH1 draw rendering instead of ending the rendering for "
+                    "it (Vulkan FH1 native executor). On a tiler every rendering restart "
+                    "stores and reloads the attachments; in FH1's free roam about 180 of "
+                    "the ~290 restarts a frame were vertex and index uploads")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_untile_predicated_tiling, REX_PLATFORM_ANDROID || REX_PLATFORM_MAC, "GPU",
                     "Render FH1's predicated tiling passes once: the first tile draws every "
                     "tile's objects over the whole surface height and the later tiles only "
@@ -5281,6 +5288,8 @@ void VulkanCommandProcessor::SubmitBarriersAndBeginFh1Rendering(
     return;
   }
   EndRenderPass();
+  fh1_rendering_begin_position_ = deferred_command_buffer_.position();
+  fh1_rendering_writes_shared_memory_ = false;
   deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
   PERF_counter_inc(kGpuRenderings);
   const char* const next_rendering_label = next_rendering_label_;
@@ -5449,6 +5458,9 @@ void VulkanCommandProcessor::FlushCpuVisibleResults() {
 void VulkanCommandProcessor::EndRenderPass(std::source_location caller) {
   assert_true(submission_open_);
   current_fh1_rendering_id_ = 0;
+  // Ending the rendering while an upload is being hoisted into it leaves the
+  // upload where it is, after the (now closed) rendering, in guest order.
+  fh1_hoisted_upload_open_ = false;
   if (!in_render_pass_) {
     return;
   }
@@ -7194,6 +7206,11 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
                         std::make_pair(0u, SharedMemory::kBufferSize));
   } else {
     shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+  }
+  if (memexport_writes_possible) {
+    // The draw's shared-memory writes must stay ahead of later uploads in
+    // the same rendering, so those end it as before.
+    NoteFh1RenderingWritesSharedMemory();
   }
 
   DrawCostMark(kCostMemexport);
@@ -9166,6 +9183,64 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
   transient_descriptor_allocator_uniform_buffer_dynamic_.Reset();
   constants_descriptor_sets_frame_.Clear();
   last_constants_descriptor_set_ = VK_NULL_HANDLE;
+}
+
+bool VulkanCommandProcessor::BeginFh1HoistedUpload() {
+  assert_true(submission_open_);
+  assert_false(fh1_hoisted_upload_open_);
+  if (!REXCVAR_GET(fh1_hoist_uploads) || !in_render_pass_ || !fh1_native_executor_) return false;
+  // Only the executor's draw renderings (bit 63 clear: not a transfer, clear
+  // or resolve fill, which read the shared memory themselves).
+  if (!current_fh1_rendering_id_ || (current_fh1_rendering_id_ >> 63)) return false;
+  if (fh1_rendering_writes_shared_memory_) return false;
+  // Barriers already pending belong before the rendering too, but they would
+  // end it; leave that case to the normal path.
+  SplitPendingBarrier();
+  if (!pending_barriers_.empty()) return false;
+  fh1_hoisted_upload_position_ = deferred_command_buffer_.position();
+  fh1_hoisted_upload_open_ = true;
+  return true;
+}
+
+void VulkanCommandProcessor::RecordFh1HoistedBarriers() {
+  assert_true(fh1_hoisted_upload_open_);
+  SplitPendingBarrier();
+  for (auto it = pending_barriers_.cbegin(); it != pending_barriers_.cend(); ++it) {
+    auto it_next = std::next(it);
+    const bool is_last = it_next == pending_barriers_.cend();
+    deferred_command_buffer_.CmdVkPipelineBarrier(
+        it->src_stage_mask ? it->src_stage_mask : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        it->dst_stage_mask ? it->dst_stage_mask : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
+        nullptr,
+        uint32_t((is_last ? pending_barriers_buffer_memory_barriers_.size()
+                          : it_next->buffer_memory_barriers_offset) -
+                 it->buffer_memory_barriers_offset),
+        pending_barriers_buffer_memory_barriers_.data() + it->buffer_memory_barriers_offset,
+        uint32_t((is_last ? pending_barriers_image_memory_barriers_.size()
+                          : it_next->image_memory_barriers_offset) -
+                 it->image_memory_barriers_offset),
+        pending_barriers_image_memory_barriers_.data() + it->image_memory_barriers_offset);
+  }
+  barrier_batch_count_ += pending_barriers_.size();
+  pending_barriers_.clear();
+  pending_barriers_buffer_memory_barriers_.clear();
+  pending_barriers_image_memory_barriers_.clear();
+  current_pending_barrier_.buffer_memory_barriers_offset = 0;
+  current_pending_barrier_.image_memory_barriers_offset = 0;
+}
+
+void VulkanCommandProcessor::EndFh1HoistedUpload() {
+  if (!fh1_hoisted_upload_open_) return;
+  // The barriers after the copies, then the whole upload ahead of the
+  // rendering's begin. The pass stays open: nothing here touched the
+  // attachments.
+  RecordFh1HoistedBarriers();
+  fh1_hoisted_upload_open_ = false;
+  deferred_command_buffer_.MoveTailBefore(fh1_rendering_begin_position_,
+                                          fh1_hoisted_upload_position_);
+  fh1_rendering_begin_position_ +=
+      deferred_command_buffer_.position() - fh1_hoisted_upload_position_;
+  ++fh1_hoisted_upload_count_;
 }
 
 void VulkanCommandProcessor::SplitPendingBarrier() {

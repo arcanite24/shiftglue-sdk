@@ -287,6 +287,20 @@ class VulkanCommandProcessor : public CommandProcessor {
     return in_render_pass_ && id && current_fh1_rendering_id_ == id;
   }
   bool in_render_pass() const { return in_render_pass_; }
+  // Shared-memory uploads found by a draw while its FH1 draw rendering is
+  // open are recorded behind the rendering's begin instead of ending it
+  // (fh1_hoist_uploads). Returns false when there is no open draw rendering
+  // to hoist into, or the rendering must not be reordered against (a draw in
+  // it may write the shared memory). Submission must be open.
+  bool BeginFh1HoistedUpload();
+  // Records the pending barriers at the current position without ending the
+  // rendering (only inside a hoisted upload, whose commands move out of it).
+  void RecordFh1HoistedBarriers();
+  void EndFh1HoistedUpload();
+  uint64_t TakeFh1HoistedUploadCount() { return std::exchange(fh1_hoisted_upload_count_, 0); }
+  // A draw in the open rendering may write the shared memory (memexport), so
+  // uploads must stay in guest order behind it.
+  void NoteFh1RenderingWritesSharedMemory() { fh1_rendering_writes_shared_memory_ = true; }
   system::GraphicsShaderTranslationObserver GetShaderTranslationObserver() const;
   // Submits the open submission, waits for every queue operation and reopens
   // the submission if one was open (FH1 resolve read-backs).
@@ -1089,6 +1103,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool ResetInspectionReplay();
   // Identifies the open dynamic rendering scope of the executor (0: none).
   uint64_t current_fh1_rendering_id_ = 0;
+  // Where the open FH1 draw rendering's begin was recorded in the deferred
+  // command buffer, and where a hoisted upload's commands start.
+  size_t fh1_rendering_begin_position_ = 0;
+  size_t fh1_hoisted_upload_position_ = 0;
+  bool fh1_rendering_writes_shared_memory_ = false;
+  bool fh1_hoisted_upload_open_ = false;
+  uint64_t fh1_hoisted_upload_count_ = 0;
   bool debug_labels_ = false;
   // An FH1 rendering opened a label its end closes.
   bool rendering_label_open_ = false;
