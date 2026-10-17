@@ -30,10 +30,10 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
     .allowed({"sdl", "xinput"});
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
-REXCVAR_DEFINE_BOOL(input_report_wheel_subtype, false, "Input",
-                    "Report a detected wheel to the title as XINPUT_DEVSUBTYPE_WHEEL instead of "
-                    "a gamepad, so the title can pick its wheel handling (untested in FH1: the "
-                    "title's wheel path is still being traced)");
+REXCVAR_DEFINE_BOOL(input_report_wheel_subtype, true, "Input",
+                    "Report a detected wheel to the title as a 900-degree XINPUT_DEVSUBTYPE_WHEEL "
+                    "with force feedback instead of a gamepad, so FH1 uses its wheel steering, "
+                    "wheel layouts, analog clutch and H-shifter gear request");
 REXCVAR_DEFINE_STRING(pad_chord_debug_overlay, "LS+RS", "Input",
                       "Controller buttons held together that toggle the debug overlay (F3), "
                       "names as in pad_remap joined by '+'; empty turns the chord off. The "
@@ -236,10 +236,28 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
   }
 
   // Prefer the pad in hand, so button glyphs follow it rather than whichever
-  // device enumerated first.
+  // device enumerated first. But a physical controller answers before
+  // keyboard emulation: a title picks its control scheme from these caps,
+  // often only when a controller connects (FH1 decides there whether a wheel
+  // drives in its wheel mode), and the synthetic device answered whenever
+  // the wheel had not reported yet or a key was pressed last.
   DeviceId chosen = active_devices_.Active(user_index);
-  if (std::find(ids.begin(), ids.end(), chosen) == ids.end()) {
-    chosen = ids.front();
+  const bool assigned = std::find(ids.begin(), ids.end(), chosen) != ids.end();
+  const DeviceInfo* chosen_info = assigned ? DeviceInfoFor(chosen) : nullptr;
+  if (!chosen_info || chosen_info->synthetic) {
+    DeviceId physical = DeviceId::kInvalid;
+    for (DeviceId id : ids) {
+      const DeviceInfo* info = DeviceInfoFor(id);
+      if (info && !info->synthetic) {
+        physical = id;
+        break;
+      }
+    }
+    if (physical != DeviceId::kInvalid) {
+      chosen = physical;
+    } else if (!assigned) {
+      chosen = ids.front();
+    }
   }
 
   auto* driver = DriverForDevice(chosen);
@@ -348,13 +366,15 @@ void InputSystem::UpdateFeedbackLocked(uint32_t user_index, const std::vector<De
   }
   bool any_triggers = false;
   bool any_lightbar = false;
+  bool any_wheel = false;
   for (DeviceId id : ids) {
     if (const DeviceInfo* info = DeviceInfoFor(id)) {
       any_triggers |= info->adaptive_triggers;
       any_lightbar |= info->lightbar;
+      any_wheel |= info->force_feedback;
     }
   }
-  if (!any_triggers && !any_lightbar) {
+  if (!any_triggers && !any_lightbar && !any_wheel) {
     return;
   }
 
@@ -423,11 +443,37 @@ void InputSystem::UpdateFeedbackLocked(uint32_t user_index, const std::vector<De
       break;
   }
 
+  wheel_ffb::Forces wheel_forces;
+  if (any_wheel) {
+    wheel_ffb::Inputs wheel_inputs;
+    // Driving while the player car reports and the game has the input. Not
+    // feedback_driving_: the host's narrow-view half of it follows one
+    // gameplay camera and went false for seconds at a time while driving.
+    wheel_inputs.driving = active && have_telemetry;
+    wheel_inputs.telemetry = inputs.telemetry;
+    wheel_inputs.motor_low = inputs.motor_low;
+    wheel_forces = wheel_ffb::Step(wheel_inputs, wheel_ffb::CurrentSettings());
+    if (REXCVAR_GET(hid_wheel_ffb_log) && now - last_wheel_log_ >= std::chrono::milliseconds(500)) {
+      last_wheel_log_ = now;
+      REXLOG_INFO(
+          "Wheel FFB: active {} gain {:.2f} constant {:+.2f} (torque {:+.2f}) damper {:.2f} "
+          "vibration {:.2f} | speed {:.1f} steer {} motor {} | driving {} telemetry {}",
+          wheel_forces.active, wheel_forces.gain, wheel_forces.constant,
+          have_telemetry && telemetry.has_steer_torque ? telemetry.steer_torque : 0.0f,
+          wheel_forces.damper, wheel_forces.vibration, have_telemetry ? telemetry.speed_mps : 0.0f,
+          int(int16_t(guest_state.gamepad.thumb_lx)), uint16_t(vibration.left_motor_speed),
+          wheel_inputs.driving, have_telemetry);
+    }
+  }
+
   for (DeviceId id : ids) {
     const DeviceInfo* info = DeviceInfoFor(id);
     InputDriver* driver = DriverForDevice(id);
     if (!info || !driver || info->synthetic) {
       continue;
+    }
+    if (info->force_feedback) {
+      driver->SetDeviceWheelForces(id, wheel_forces);
     }
     if (info->adaptive_triggers) {
       driver->SetDeviceTriggerEffects(id, physical);

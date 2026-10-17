@@ -26,6 +26,19 @@ namespace {
 // rest within a quarter.
 constexpr int kMoved = 16384;
 constexpr int kRested = 8192;
+// A wheel's steering: moved past an eighth (about 110 degrees each way on a
+// 900-degree wheel), back at rest within a sixteenth.
+constexpr int kWheelMoved = 4096;
+constexpr int kWheelRested = 2048;
+// How long after Begin an axis's first real report can still arrive (see
+// SampleRest).
+constexpr uint64_t kSettleNs = 1'000'000'000;
+
+// Exactly at an end of the axis range, where triggers and pedals rest; a
+// centred stick at rest never reads there.
+bool AtEnd(int value) {
+  return value >= 32767 || value <= -32767;
+}
 
 std::string GuidString(SDL_GUID guid) {
   char text[64] = {};
@@ -113,6 +126,8 @@ bool JoystickCapture::Begin(uint32_t instance_id) {
     REXLOG_WARN("Controller mapping: cannot open joystick {}: {}", instance_id, SDL_GetError());
     return false;
   }
+  wheel_ = SDL_GetJoystickType(joystick_) == SDL_JOYSTICK_TYPE_WHEEL;
+  begin_ns_ = SDL_GetTicksNS();
   SDL_UpdateJoysticks();
   SampleRest();
   waiting_for_rest_ = true;
@@ -127,15 +142,45 @@ void JoystickCapture::End() {
 }
 
 void JoystickCapture::SampleRest() {
-  // Where each axis rests: centred sticks near 0, triggers at an end.
+  // Where each axis rests: centred sticks near 0, triggers at an end. SDL's
+  // initial state is preferred, since a control may be held when capture
+  // begins. But SDL keeps the first value an axis reports as its initial
+  // state, and some DirectInput wheels (a Thrustmaster T248 on Windows)
+  // report every axis as 0 when opened and their real positions about half
+  // a second later, so pedals resting at the top keep an initial state of 0.
+  // An axis exactly at an end with an initial state of 0 is such a pedal.
   const int axes = SDL_GetNumJoystickAxes(joystick_);
   rest_axes_.assign(size_t(std::max(axes, 0)), 0);
   for (int i = 0; i < axes; ++i) {
     int16_t value = SDL_GetJoystickAxis(joystick_, i);
     int16_t start = 0;
-    if (SDL_GetJoystickAxisInitialState(joystick_, i, &start)) value = start;
+    if (SDL_GetJoystickAxisInitialState(joystick_, i, &start) && !(start == 0 && AtEnd(value))) {
+      value = start;
+    }
     rest_axes_[size_t(i)] = std::abs(value) > kMoved ? (value < 0 ? -32768 : 32767) : 0;
   }
+}
+
+void JoystickCapture::SettleRest() {
+  // The same wheels' real positions can arrive after Begin: an axis taken as
+  // centred that reaches an end within kSettleNs is a pedal reporting late,
+  // not a player who read the prompt and pushed a stick fully in that time.
+  if (SDL_GetTicksNS() - begin_ns_ > kSettleNs)
+    return;
+  for (size_t i = 0; i < rest_axes_.size(); ++i) {
+    const int value = SDL_GetJoystickAxis(joystick_, int(i));
+    if (rest_axes_[i] == 0 && AtEnd(value)) {
+      rest_axes_[i] = value < 0 ? -32768 : 32767;
+    }
+  }
+}
+
+int JoystickCapture::MovedThreshold(size_t axis) const {
+  return wheel_ && rest_axes_[axis] == 0 ? kWheelMoved : kMoved;
+}
+
+int JoystickCapture::RestedThreshold(size_t axis) const {
+  return wheel_ && rest_axes_[axis] == 0 ? kWheelRested : kRested;
 }
 
 bool JoystickCapture::AtRest() const {
@@ -146,7 +191,8 @@ bool JoystickCapture::AtRest() const {
     if (SDL_GetJoystickHat(joystick_, i) != SDL_HAT_CENTERED) return false;
   }
   for (size_t i = 0; i < rest_axes_.size(); ++i) {
-    if (std::abs(int(SDL_GetJoystickAxis(joystick_, int(i))) - rest_axes_[i]) > kRested) {
+    if (std::abs(int(SDL_GetJoystickAxis(joystick_, int(i))) - rest_axes_[i]) >
+        RestedThreshold(i)) {
       return false;
     }
   }
@@ -156,6 +202,7 @@ bool JoystickCapture::AtRest() const {
 std::optional<std::string> JoystickCapture::Poll() {
   if (!joystick_) return std::nullopt;
   SDL_UpdateJoysticks();
+  SettleRest();
   if (waiting_for_rest_) {
     if (!AtRest()) return std::nullopt;
     waiting_for_rest_ = false;
@@ -174,7 +221,8 @@ std::optional<std::string> JoystickCapture::Poll() {
   for (size_t i = 0; i < rest_axes_.size() && !input; ++i) {
     const int value = SDL_GetJoystickAxis(joystick_, int(i));
     const int rest = rest_axes_[i];
-    if (std::abs(value - rest) <= kMoved) continue;
+    if (std::abs(value - rest) <= MovedThreshold(i))
+      continue;
     const std::string axis = "a" + std::to_string(i);
     if (rest == 0) {
       input = (value < 0 ? "-" : "+") + axis;
@@ -197,6 +245,8 @@ std::string BuildMapping(const JoystickInfo& joystick,
   for (const auto& [output, input] : bindings) {
     mapping += output + ":" + input + ",";
   }
+  // SDL_AddGamepadMappingsFromFile skips lines without one.
+  mapping += std::string("platform:") + SDL_GetPlatform() + ",";
   return mapping;
 }
 
@@ -221,6 +271,25 @@ bool SaveMapping(std::string_view mapping) {
   std::erase_if(lines, [&](const std::string& line) { return SameGuid(line, guid); });
   lines.push_back(text);
   return WriteLines(rex::to_path(path), lines);
+}
+
+int LoadUserMappings(std::string_view path) {
+  if (path.empty()) return 0;
+  const std::string platform = std::string("platform:") + SDL_GetPlatform() + ",";
+  int loaded = 0;
+  for (const auto& line : ReadLines(rex::to_path(std::string(path)))) {
+    if (line.empty() || line.front() == '#') continue;
+    if (line.find("platform:") != std::string::npos &&
+        (line + ",").find(platform) == std::string::npos) {
+      continue;
+    }
+    if (SDL_AddGamepadMapping(line.c_str()) >= 0) {
+      ++loaded;
+    } else {
+      REXLOG_WARN("Controller mapping: SDL rejected saved '{}': {}", line, SDL_GetError());
+    }
+  }
+  return loaded;
 }
 
 bool RemoveUserMapping(std::string_view guid) {

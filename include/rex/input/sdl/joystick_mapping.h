@@ -45,7 +45,9 @@ std::vector<JoystickInfo> ListJoysticks();
 // next control moved from rest: "b3" (button), "h0.4" (hat direction), "+a2"
 // or "-a2" (half axis from a centred rest), "a5" or "a5~" (an axis resting at
 // one end, a trigger). After each capture every control has to return to rest
-// before the next one counts, so one press is never taken twice.
+// before the next one counts, so one press is never taken twice. On a racing
+// wheel a centred axis (the steering) counts as moved at an eighth of its
+// travel, not half, since half a 900-degree wheel is 450 degrees each way.
 class JoystickCapture {
  public:
   ~JoystickCapture() { End(); }
@@ -56,11 +58,16 @@ class JoystickCapture {
 
  private:
   void SampleRest();
+  void SettleRest();
   bool AtRest() const;
+  int MovedThreshold(size_t axis) const;
+  int RestedThreshold(size_t axis) const;
 
   ::SDL_Joystick* joystick_ = nullptr;
   std::vector<int16_t> rest_axes_;
   bool waiting_for_rest_ = false;
+  bool wheel_ = false;
+  uint64_t begin_ns_ = 0;
 };
 
 // "<guid>,<name>,<bindings>" from output names (a, b, leftx, -lefty,
@@ -77,6 +84,11 @@ bool SaveMapping(std::string_view mapping);
 // line for it. Returns false when the file has none: SDL's built-in mapping,
 // if any, then applies after a restart.
 bool RemoveUserMapping(std::string_view guid);
+// Loads hid_user_mappings_file-style lines (comments and other platforms'
+// lines skipped). Unlike SDL_AddGamepadMappingsFromFile it also takes lines
+// without a platform field, as the assistant saved them before it added one.
+// Returns how many lines SDL took.
+int LoadUserMappings(std::string_view path);
 
 // A virtual controller SDL has no mapping for, for tests of the above: it
 // lives in the same SDL as the input driver.

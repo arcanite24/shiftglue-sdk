@@ -41,6 +41,8 @@ struct DeviceInfo {
   bool adaptive_triggers = false;
   bool lightbar = false;
   bool motion = false;  // gyro and accelerometer
+  // A racing wheel with a force feedback motor the driver can drive.
+  bool force_feedback = false;
 };
 
 }  // namespace rex::input

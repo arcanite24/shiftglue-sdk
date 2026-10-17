@@ -142,6 +142,10 @@ struct CarTelemetry {
   bool abs_active = false;
   bool driven_front = false;
   bool driven_rear = true;
+  // The title's own steering-wheel torque, -1 to 1, with the sign of the
+  // steering input it opposes: what it sent to force feedback wheels.
+  bool has_steer_torque = false;
+  float steer_torque = 0.0f;
 };
 
 struct TriggerInputs {

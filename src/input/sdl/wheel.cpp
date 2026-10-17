@@ -21,6 +21,15 @@ REXCVAR_DEFINE_INT32(hid_wheel_steering_linearity, 100, "Input",
                      "Racing wheel: steering curve exponent in percent; 100 is linear, higher is "
                      "less sensitive near centre")
     .range(50, 300);
+REXCVAR_DEFINE_INT32(hid_wheel_steering_centre, 15, "Input",
+                     "Racing wheel: tenths of a percent of the wheel's travel either side of "
+                     "centre that read as exactly centred")
+    .range(0, 50);
+REXCVAR_DEFINE_STRING(hid_shifter_guid, "", "Input",
+                      "Joystick GUID of an H-pattern shifter whose gear goes to the racing wheel "
+                      "(with input_report_wheel_subtype); empty is none");
+REXCVAR_DEFINE_STRING(hid_shifter_gears, "1:b0,2:b1,3:b2,4:b3,5:b4,6:b5,R:b7", "Input",
+                      "H-pattern shifter buttons per gear, as gear:button pairs (R is reverse)");
 REXCVAR_DEFINE_INT32(hid_wheel_pedal_deadzone, 0, "Input",
                      "Racing wheel: percent of each pedal's travel ignored at rest")
     .range(0, 50);
@@ -52,6 +61,7 @@ WheelShaping CurrentWheelShaping() {
   shaping.deadzone = std::clamp(REXCVAR_GET(hid_wheel_steering_deadzone), 0, 50);
   shaping.linearity = std::clamp(REXCVAR_GET(hid_wheel_steering_linearity), 50, 300);
   shaping.pedal_deadzone = std::clamp(REXCVAR_GET(hid_wheel_pedal_deadzone), 0, 50);
+  shaping.centre = std::clamp(REXCVAR_GET(hid_wheel_steering_centre), 0, 50);
   return shaping;
 }
 
@@ -59,6 +69,10 @@ int16_t ShapeWheelSteering(int16_t value, const WheelShaping& shaping) {
   if (value == 0) return 0;
   // -32768 and 32767 are both full lock.
   double travel = value < 0 ? -double(value) / 32768.0 : double(value) / 32767.0;
+  const double band = std::clamp(shaping.centre, 0, 50) / 1000.0;
+  if (travel <= band)
+    return 0;
+  travel = (travel - band) / (1.0 - band);
   travel = std::min(1.0, travel * 100.0 / std::clamp(shaping.saturation, 10, 100));
   if (shaping.linearity != 100) {
     travel = std::pow(travel, std::clamp(shaping.linearity, 50, 300) / 100.0);
@@ -67,6 +81,69 @@ int16_t ShapeWheelSteering(int16_t value, const WheelShaping& shaping) {
   if (skip > 0.0 && travel > 0.0) travel = skip + (1.0 - skip) * travel;
   const double out = value < 0 ? -travel * 32768.0 : travel * 32767.0;
   return int16_t(std::clamp(std::lround(out), -32768L, 32767L));
+}
+
+bool ShifterLayout::empty() const {
+  for (int b : button) {
+    if (b >= 0)
+      return false;
+  }
+  return true;
+}
+
+ShifterLayout ParseShifterGears(std::string_view text) {
+  ShifterLayout layout;
+  size_t start = 0;
+  while (start < text.size()) {
+    size_t end = text.find(',', start);
+    if (end == std::string_view::npos)
+      end = text.size();
+    std::string_view item = text.substr(start, end - start);
+    start = end + 1;
+    while (!item.empty() && item.front() == ' ')
+      item.remove_prefix(1);
+    while (!item.empty() && item.back() == ' ')
+      item.remove_suffix(1);
+    const size_t colon = item.find(':');
+    if (colon == std::string_view::npos || colon == 0 || colon + 2 > item.size())
+      continue;
+    const std::string_view gear = item.substr(0, colon);
+    std::string_view input = item.substr(colon + 1);
+    if (input.front() != 'b')
+      continue;
+    input.remove_prefix(1);
+    int button = 0;
+    bool digits = !input.empty() && input.size() <= 2;
+    for (char ch : input) {
+      if (ch < '0' || ch > '9')
+        digits = false;
+      else
+        button = button * 10 + (ch - '0');
+    }
+    if (!digits || button > 63)
+      continue;
+    int index = -1;
+    if (gear == "R" || gear == "r") {
+      index = 0;
+    } else if (gear.size() == 1 && gear[0] >= '1' && gear[0] <= '8') {
+      index = gear[0] - '0';
+    }
+    if (index >= 0)
+      layout.button[size_t(index)] = button;
+  }
+  return layout;
+}
+
+int16_t ShifterGearValue(const ShifterLayout& layout, uint64_t buttons_down) {
+  for (int gear = 1; gear <= 8; ++gear) {
+    const int b = layout.button[size_t(gear)];
+    if (b >= 0 && (buttons_down >> b) & 1)
+      return int16_t(gear);
+  }
+  const int reverse = layout.button[0];
+  if (reverse >= 0 && (buttons_down >> reverse) & 1)
+    return -1;
+  return 0;
 }
 
 uint8_t ShapeWheelPedal(uint8_t value, const WheelShaping& shaping) {

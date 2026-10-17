@@ -114,6 +114,7 @@ class InputSystem : public system::IInputSystem {
   dualsense::CarTelemetry telemetry_;
   std::chrono::steady_clock::time_point telemetry_time_ = {};
   std::atomic<bool> feedback_driving_{true};
+  std::chrono::steady_clock::time_point last_wheel_log_ = {};
 };
 
 /// Create a default InputSystem with SDL + NOP drivers.
