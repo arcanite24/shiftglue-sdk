@@ -9,6 +9,10 @@
 #include <rex/ui/vulkan/device.h>
 #include <rex/ui/vulkan/util.h>
 
+#if defined(REX_HAS_METALFX) && REX_HAS_METALFX
+#include <rex/ui/vulkan/metalfx_frame_generator.h>
+#endif
+
 namespace rex {
 namespace ui {
 namespace vulkan {
@@ -97,6 +101,12 @@ FrameGenerationAvailability ProbeVulkanFrameGenerationBackend(FrameGenerationBac
   switch (backend) {
     case FrameGenerationBackend::kRepeatDebug:
       return {vulkan_device != nullptr, vulkan_device ? "" : "no Vulkan device"};
+    case FrameGenerationBackend::kMetalFx:
+#if defined(REX_HAS_METALFX) && REX_HAS_METALFX
+      return ProbeMetalFxFrameGenerator(vulkan_device);
+#else
+      return {false, "this build has no MetalFX backend"};
+#endif
     case FrameGenerationBackend::kFsr3:
       // The stub. The design: ffxCreateContextDescFrameGeneration and
       // ffxDispatchDescFrameGeneration writing into the presenter's output
@@ -119,6 +129,10 @@ std::unique_ptr<VulkanFrameGenerator> CreateVulkanFrameGenerator(FrameGeneration
   switch (backend) {
     case FrameGenerationBackend::kRepeatDebug:
       return std::make_unique<RepeatFrameGenerator>(vulkan_device);
+#if defined(REX_HAS_METALFX) && REX_HAS_METALFX
+    case FrameGenerationBackend::kMetalFx:
+      return CreateMetalFxFrameGenerator(vulkan_device);
+#endif
     default:
       return nullptr;
   }

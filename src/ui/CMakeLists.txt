@@ -197,6 +197,18 @@ elseif(UNIX AND NOT APPLE)
     )
 elseif(APPLE)
     target_link_libraries(rexui PRIVATE "-framework CoreFoundation")
+    if(REXGLUE_USE_VULKAN AND REXGLUE_ENABLE_METALFX)
+        # MetalFX frame interpolation (frame generation). MetalFX is linked
+        # weakly: the binary still launches on macOS 13-25, where the backend
+        # reports itself unavailable.
+        target_sources(rexui PRIVATE vulkan/vulkan_metalfx_frame_generator.mm)
+        set_source_files_properties(vulkan/vulkan_metalfx_frame_generator.mm PROPERTIES
+            COMPILE_OPTIONS "-fno-objc-arc"
+            SKIP_PRECOMPILE_HEADERS ON)
+        target_compile_definitions(rexui PRIVATE REX_HAS_METALFX=1)
+        target_link_libraries(rexui PRIVATE
+            "-framework Foundation" "-framework Metal" "-weak_framework MetalFX")
+    endif()
 endif()
 
 if(WIN32)

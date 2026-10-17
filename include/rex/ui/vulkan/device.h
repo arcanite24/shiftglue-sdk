@@ -256,6 +256,8 @@ class VulkanDevice {
     bool ext_KHR_fragment_shading_rate = false;  // #227
     // Only with vulkan_image_compression_report.
     bool ext_EXT_image_compression_control = false;  // #339
+    // macOS: exporting MoltenVK's Metal objects (frame generation).
+    bool ext_EXT_metal_objects = false;
   };
 
   const Extensions& extensions() const { return extensions_; }
@@ -287,6 +289,12 @@ class VulkanDevice {
 #include <rex/ui/vulkan/functions/device_ext_hdr_metadata.inc>
     // VK_KHR_fragment_shading_rate (#227)
 #include <rex/ui/vulkan/functions/device_khr_fragment_shading_rate.inc>
+    // Timeline semaphores (core in 1.2)
+#include <rex/ui/vulkan/functions/device_1_2_khr_timeline_semaphore.inc>
+#if REX_PLATFORM_MAC
+    // VK_EXT_metal_objects (#312)
+#include <rex/ui/vulkan/functions/device_ext_metal_objects.inc>
+#endif
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 #undef XE_UI_VULKAN_FUNCTION
   };

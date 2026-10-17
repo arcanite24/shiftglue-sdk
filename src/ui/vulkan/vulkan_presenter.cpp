@@ -347,6 +347,9 @@ VulkanPresenter::~VulkanPresenter() {
   for (auto& history : paint_context_.frame_generation.history) {
     history.reset();
   }
+  util::DestroyAndNullHandle(dfn.vkDestroyCommandPool, device,
+                             paint_context_.frame_generation.external_copy_pool);
+  paint_context_.frame_generation.external_copy_command_buffer = VK_NULL_HANDLE;
   util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
                              paint_context_.guest_output_descriptor_pool);
   for (PaintContext::GuestOutputPaintPipeline& guest_output_paint_pipeline :
@@ -1599,8 +1602,10 @@ bool VulkanPresenter::EnsureFrameGenerationResources(
     generation.history_sequences = {UINT64_MAX, UINT64_MAX};
     generation.reset_requested.store(true, std::memory_order_relaxed);
   }
+  const bool exportable = generation.generator_external_queue;
   if (!generation.generated) {
-    generation.generated = GuestOutputImage::Create(vulkan_device_, extent.width, extent.height);
+    generation.generated =
+        GuestOutputImage::Create(vulkan_device_, extent.width, extent.height, exportable);
     if (!generation.generated) {
       return false;
     }
@@ -1626,7 +1631,7 @@ bool VulkanPresenter::EnsureFrameGenerationResources(
   }
   for (auto& history : generation.history) {
     if (!history) {
-      history = GuestOutputImage::Create(vulkan_device_, extent.width, extent.height);
+      history = GuestOutputImage::Create(vulkan_device_, extent.width, extent.height, exportable);
       if (!history) {
         return false;
       }
@@ -1731,8 +1736,17 @@ bool VulkanPresenter::RecordFrameGeneration(
   if (!generation.generator) {
     return false;
   }
-  // This frame into the history first (a no-op when already there).
-  RecordFrameGenerationHistoryCopy(command_buffer, guest_output_image, submission_index);
+  // This frame into the history first (a no-op when already there). The
+  // external-queue backends need the copy on its own submission before their
+  // own-queue work; the in-command-buffer backends record it here.
+  if (generation.generator_external_queue) {
+    if (!SubmitFrameGenerationHistoryCopy(guest_output_image)) {
+      LogFrameGenerationSkip("the history copy submission failed");
+      return false;
+    }
+  } else {
+    RecordFrameGenerationHistoryCopy(command_buffer, guest_output_image, submission_index);
+  }
   if (generation.newest == SIZE_MAX) {
     LogFrameGenerationSkip("no frame in the history");
     return false;
@@ -1771,6 +1785,77 @@ bool VulkanPresenter::RecordFrameGeneration(
   return true;
 }
 
+bool VulkanPresenter::SubmitFrameGenerationHistoryCopy(
+    const std::shared_ptr<GuestOutputImage>& guest_output_image) {
+  // The external-queue backends (MetalFX) read the history on another API's
+  // queue, so the copy cannot sit in the paint command buffer that is only
+  // submitted afterwards; it is its own submission on the graphics/compute
+  // queue, which MoltenVK's synchronous submits keep before the Metal work.
+  PaintContext::FrameGeneration& generation = paint_context_.frame_generation;
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  if (generation.external_copy_pool == VK_NULL_HANDLE) {
+    VkCommandPoolCreateInfo pool_info;
+    pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    pool_info.pNext = nullptr;
+    pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    pool_info.queueFamilyIndex = vulkan_device_->queue_family_graphics_compute();
+    if (dfn.vkCreateCommandPool(device, &pool_info, nullptr, &generation.external_copy_pool) !=
+        VK_SUCCESS) {
+      return false;
+    }
+    VkCommandBufferAllocateInfo allocate_info;
+    allocate_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocate_info.pNext = nullptr;
+    allocate_info.commandPool = generation.external_copy_pool;
+    allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocate_info.commandBufferCount = 1;
+    if (dfn.vkAllocateCommandBuffers(device, &allocate_info,
+                                     &generation.external_copy_command_buffer) != VK_SUCCESS) {
+      dfn.vkDestroyCommandPool(device, generation.external_copy_pool, nullptr);
+      generation.external_copy_pool = VK_NULL_HANDLE;
+      return false;
+    }
+  }
+  if (dfn.vkResetCommandPool(device, generation.external_copy_pool, 0) != VK_SUCCESS) {
+    return false;
+  }
+  VkCommandBuffer command_buffer = generation.external_copy_command_buffer;
+  VkCommandBufferBeginInfo begin_info;
+  begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  begin_info.pNext = nullptr;
+  begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  begin_info.pInheritanceInfo = nullptr;
+  if (dfn.vkBeginCommandBuffer(command_buffer, &begin_info) != VK_SUCCESS) {
+    return false;
+  }
+  const uint64_t submission_index = paint_context_.submission_tracker.GetCurrentSubmission();
+  RecordFrameGenerationHistoryCopy(command_buffer, guest_output_image, submission_index);
+  if (dfn.vkEndCommandBuffer(command_buffer) != VK_SUCCESS) {
+    return false;
+  }
+  VkSubmitInfo submit_info;
+  submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  submit_info.pNext = nullptr;
+  submit_info.waitSemaphoreCount = 0;
+  submit_info.pWaitSemaphores = nullptr;
+  submit_info.pWaitDstStageMask = nullptr;
+  submit_info.commandBufferCount = 1;
+  submit_info.pCommandBuffers = &command_buffer;
+  submit_info.signalSemaphoreCount = 0;
+  submit_info.pSignalSemaphores = nullptr;
+  VulkanSubmissionTracker::FenceAcquisition fence_acquisition(
+      paint_context_.submission_tracker.AcquireFenceToAdvanceSubmission());
+  const VulkanDevice::Queue::Acquisition queue_acquisition =
+      vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
+  if (dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence_acquisition.fence()) !=
+      VK_SUCCESS) {
+    fence_acquisition.SubmissionFailedOrDropped();
+    return false;
+  }
+  return true;
+}
+
 void VulkanPresenter::RefreshFrameGenerator(const GuestOutputPaintConfig& config) {
   PaintContext::FrameGeneration& generation = paint_context_.frame_generation;
   const FrameGenerationBackend wanted = config.GetFrameGeneration();
@@ -1782,6 +1867,15 @@ void VulkanPresenter::RefreshFrameGenerator(const GuestOutputPaintConfig& config
   generation.generator.reset();
   generation.generator_backend = wanted;
   generation.reset_requested.store(true, std::memory_order_relaxed);
+  // A backend change invalidates the exportable-ness of the images; drop them
+  // so EnsureFrameGenerationResources recreates them for the new backend.
+  generation.generated.reset();
+  for (auto& history : generation.history) {
+    history.reset();
+  }
+  generation.generated_ever_written = false;
+  generation.newest = SIZE_MAX;
+  generation.history_sequences = {UINT64_MAX, UINT64_MAX};
   if (wanted != FrameGenerationBackend::kOff) {
     generation.generator = CreateVulkanFrameGenerator(wanted, vulkan_device_);
     if (generation.generator) {
@@ -1789,6 +1883,8 @@ void VulkanPresenter::RefreshFrameGenerator(const GuestOutputPaintConfig& config
                   FrameGenerationBackendName(wanted));
     }
   }
+  generation.generator_external_queue =
+      generation.generator && generation.generator->UsesExternalQueue();
   SetFrameGenerationReady(generation.generator != nullptr);
 }
 
@@ -2417,6 +2513,15 @@ bool VulkanPresenter::GuestOutputImage::CreateImage(VkImage& image, VkDeviceMemo
   VkImageCreateInfo image_create_info;
   image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
   image_create_info.pNext = nullptr;
+#if REX_PLATFORM_MAC
+  VkExportMetalObjectCreateInfoEXT export_metal_object;
+  if (exportable_) {
+    export_metal_object.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT;
+    export_metal_object.pNext = nullptr;
+    export_metal_object.exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT;
+    image_create_info.pNext = &export_metal_object;
+  }
+#endif
   image_create_info.flags = 0;
   image_create_info.imageType = VK_IMAGE_TYPE_2D;
   image_create_info.format = format;

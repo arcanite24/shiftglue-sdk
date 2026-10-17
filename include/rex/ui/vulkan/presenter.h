@@ -226,12 +226,16 @@ class VulkanPresenter final : public Presenter {
   // Usable for both the guest output image itself and for intermediate images.
   class GuestOutputImage {
    public:
+    // `exportable` chains VkExportMetalObjectCreateInfoEXT so MoltenVK can hand
+    // the image to Metal (frame generation's external-queue backends); it is
+    // ignored off macOS.
     static std::unique_ptr<GuestOutputImage> Create(const VulkanDevice* const vulkan_device,
-                                                    const uint32_t width, const uint32_t height) {
+                                                    const uint32_t width, const uint32_t height,
+                                                    bool exportable = false) {
       assert_not_zero(width);
       assert_not_zero(height);
-      auto image =
-          std::unique_ptr<GuestOutputImage>(new GuestOutputImage(vulkan_device, width, height));
+      auto image = std::unique_ptr<GuestOutputImage>(
+          new GuestOutputImage(vulkan_device, width, height, exportable));
       if (!image->Initialize()) {
         return nullptr;
       }
@@ -263,8 +267,8 @@ class VulkanPresenter final : public Presenter {
 
    private:
     GuestOutputImage(const VulkanDevice* const vulkan_device, const uint32_t width,
-                     const uint32_t height)
-        : vulkan_device_(vulkan_device) {
+                     const uint32_t height, bool exportable)
+        : vulkan_device_(vulkan_device), exportable_(exportable) {
       extent_.width = width;
       extent_.height = height;
     }
@@ -276,6 +280,8 @@ class VulkanPresenter final : public Presenter {
                                                VK_IMAGE_USAGE_SAMPLED_BIT |
                                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                                                VK_IMAGE_USAGE_STORAGE_BIT);
+
+    bool exportable_ = false;
 
     const VulkanDevice* vulkan_device_;
 
@@ -451,6 +457,13 @@ class VulkanPresenter final : public Presenter {
       uint64_t last_submission = 0;
       std::unique_ptr<VulkanFrameGenerator> generator;
       FrameGenerationBackend generator_backend = FrameGenerationBackend::kOff;
+      // Whether the generator runs on another API's queue (MetalFX): the
+      // history and output images are then exportable and the history copy is
+      // its own submission before Generate, not part of the paint buffer.
+      bool generator_external_queue = false;
+      // The external-queue history copy's one-off command pool and buffer.
+      VkCommandPool external_copy_pool = VK_NULL_HANDLE;
+      VkCommandBuffer external_copy_command_buffer = VK_NULL_HANDLE;
       // Set by ResetFrameGenerationHistory (any thread), consumed by the next
       // history copy, which then hands the backend its reset.
       std::atomic<bool> reset_requested{true};
@@ -667,6 +680,10 @@ class VulkanPresenter final : public Presenter {
   bool RecordFrameGeneration(VkCommandBuffer command_buffer,
                              const std::shared_ptr<GuestOutputImage>& guest_output_image,
                              const GuestOutputProperties& properties, uint64_t submission_index);
+  // External-queue backends only: submits the history copy as its own
+  // graphics-queue submission, before the backend's own-queue generation.
+  bool SubmitFrameGenerationHistoryCopy(
+      const std::shared_ptr<GuestOutputImage>& guest_output_image);
 
 
   const VulkanDevice* vulkan_device_;
