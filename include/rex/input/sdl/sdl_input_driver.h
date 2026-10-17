@@ -12,11 +12,16 @@
 #pragma once
 
 #include <atomic>
+#include <map>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include <rex/input/input_driver.h>
+#include <rex/input/sdl/wheel_mapping.h>
+#include <rex/input/xinputd_ffb.h>
 
 #include <string>
 
@@ -38,8 +43,19 @@ namespace rex::input::sdl {
 /// to skip the real pad, and the game sees Steam's virtual Xbox pad instead.
 bool SteamInputHidesDualSense();
 
-class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener {
+class SDLInputDriver final : public InputDriver,
+                             public rex::ui::WindowListener,
+                             public xinputd_ffb::Sink {
  public:
+  // xinputd_ffb::Sink: the title's XInputdFF* effects, played on the wheel.
+  bool HasForceFeedback() override;
+  void SetEffect(const xinputd_ffb::Effect& effect) override;
+  void UpdateEffect(const xinputd_ffb::Effect& effect, uint32_t flags) override;
+  void EffectOperation(uint32_t id, uint32_t op) override;
+  void DeviceControl(uint32_t command) override;
+  void SetDeviceGain(uint32_t gain) override;
+  void SetRumble(uint16_t left, uint16_t right) override;
+
   explicit SDLInputDriver(rex::ui::Window* window, size_t window_z_order);
   ~SDLInputDriver() override;
 
@@ -108,6 +124,52 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
     uint64_t gyro_timestamp_ns = 0;
   };
 
+  // A joystick opened raw for the wheel: the steering base or a device one of
+  // the pedal or button bindings names (a separate pedal set, a shifter).
+  struct WheelJoystick {
+    SDL_Joystick* sdl = nullptr;
+    SDL_JoystickID instance_id = 0;
+    std::string name;
+    std::string path;
+    uint16_t vendor = 0;
+    uint16_t product = 0;
+    // Last values logged by wheel_log_inputs.
+    std::vector<int16_t> logged_axes;
+    std::vector<bool> logged_buttons;
+  };
+
+  // The binding cvars, parsed again only when their text changes.
+  struct WheelBindings {
+    std::string throttle_text, brake_text, clutch_text, buttons_text;
+    std::optional<WheelAxisBinding> throttle, brake, clutch;
+    std::vector<WheelButtonBinding> buttons;
+  };
+
+  // The one guest wheel, built from the steering base plus whatever devices
+  // the bindings name. It exists while the steering base is connected.
+  struct WheelState {
+    DeviceId id = DeviceId::kInvalid;
+    SDL_JoystickID steering = 0;
+    SDL_Haptic* haptic = nullptr;
+    // The joystick the force feedback goes to: the steering base, or the
+    // device wheel_ffb_device names.
+    SDL_JoystickID haptic_source = 0;
+    int constant_effect = -1;
+    int rumble_effect = -1;  // the title's XInputdFF rumble, as a sine
+    int spring_effect = -1;
+    int16_t last_force = 0;
+    int last_spring = 0;
+    uint32_t haptic_features = 0;
+    // The guest's last motor values, for wheel_log_inputs.
+    uint16_t logged_left = 0;
+    uint16_t logged_right = 0;
+    X_INPUT_CAPABILITIES caps;
+    X_INPUT_STATE state;
+    bool state_changed = true;
+    bool is_active = false;
+    KeystrokeState keystroke;
+  };
+
   // WindowListener
   void OnClosing(rex::ui::UIEvent& e) override;
   void OnLostFocus(rex::ui::UISetupEvent& e) override;
@@ -127,6 +189,54 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   bool ReleaseFeedbackLocked(ControllerState& controller, bool stop_rumble = false);
   void ApplyPlayerLedHint();
 
+  // Wheel support (FB-2): raw SDL joysticks rather than gamepads, so axes keep
+  // their own ranges and force feedback can use the haptic subsystem.
+  bool IsSteeringCandidate(SDL_JoystickID instance_id);
+  bool IsWheelPart(SDL_JoystickID instance_id);
+  void OnJoystickAddedLocked(const SDL_Event& event);
+  void OnJoystickRemovedLocked(const SDL_Event& event);
+  WheelJoystick* FindWheelJoystick(std::string_view device_match, bool steering_default);
+  void OpenWheelHapticLocked(WheelState& wheel, const WheelJoystick& joystick);
+  void CloseWheelHapticLocked(WheelState& wheel);
+  bool IsFfbTarget(const WheelJoystick& joystick) const;
+  void CloseWheelLocked();
+  void RefreshWheelBindingsLocked();
+  void RefreshWheelStateLocked();
+  void LogWheelInputsLocked();
+  uint8_t ReadWheelPedalLocked(const std::optional<WheelAxisBinding>& binding);
+  // A pedal with its own dead zones; a negative bottom uses wheel_pedal_deadzone.
+  uint8_t ReadWheelPedalLocked(const std::optional<WheelAxisBinding>& binding, int bottom_percent,
+                               int top_percent);
+  X_RESULT SetWheelVibrationLocked(const X_INPUT_VIBRATION& vibration);
+  void UpdateWheelSpringLocked();
+
+  // The title's XInputdFF effects by id. They outlive the haptic device, so they
+  // are created again when it (re)opens.
+  struct GameEffect {
+    xinputd_ffb::Effect effect;
+    int sdl_id = -1;
+    bool running = false;      // the title started it
+    bool sdl_running = false;  // running on the host
+    bool unsupported = false;
+    bool dirty = false;       // an update waits for the rate limit
+    uint64_t applied_ms = 0;  // when it was last sent to the wheel
+  };
+  WheelEffectScale EffectScaleLocked() const;
+  bool GameEffectsEnabled() const;
+  void ApplyGameEffectLocked(GameEffect& game);
+  void StopGameEffectLocked(GameEffect& game);
+  void SyncGameEffectsLocked();
+  // Sends updates the rate limit held back and restarts effects the wheel stopped.
+  void FlushGameEffectsLocked();
+  uint64_t next_effect_check_ms_ = 0;
+  void ApplyRumbleLocked();
+  std::map<uint32_t, GameEffect> game_effects_;
+  uint16_t game_rumble_left_ = 0;
+  uint16_t game_rumble_right_ = 0;
+  int applied_effect_strength_ = -1;
+  bool applied_effect_invert_ = false;
+  int applied_condition_gains_ = -1;
+
   inline uint64_t AnalogToKeyfield(const X_INPUT_GAMEPAD& gamepad) const;
   std::optional<size_t> GetControllerIndexFromInstanceID(SDL_JoystickID instance_id);
   ControllerState* FindController(DeviceId id);
@@ -145,6 +255,10 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   // Appended in connection order, never re-sorted, and unbounded: the
   // assignment decides how many the guest sees.
   std::vector<ControllerState> controllers_;
+  std::vector<WheelJoystick> wheel_joysticks_;
+  std::optional<WheelState> wheel_;
+  WheelBindings wheel_bindings_;
+  bool sdl_haptic_initialized_ = false;
   std::mutex controllers_mutex_;
   std::mutex event_queue_mutex_;
   std::vector<SDL_Event> pending_events_;

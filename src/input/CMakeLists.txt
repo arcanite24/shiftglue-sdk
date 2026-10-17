@@ -3,10 +3,12 @@
 
 add_library(rexinput OBJECT
     input_system.cpp
+    ffb_trace.cpp
     pad_remap.cpp
     device_assignment.cpp
     state_merge.cpp
     dualsense.cpp
+    xinputd_ffb.cpp
     mnk/mnk_input_driver.cpp
     nop/nop_input_driver.cpp
 )
@@ -33,10 +35,10 @@ target_include_directories(rexinput PUBLIC
 )
 if(WIN32)
     target_sources(rexinput PRIVATE sdl/sdl_input_driver.cpp sdl/joystick_mapping.cpp
-        sdl/wheel.cpp sdl/hid_direct_win.cpp xinput/xinput_input_driver.cpp)
+        sdl/wheel.cpp sdl/wheel_mapping.cpp sdl/hid_direct_win.cpp xinput/xinput_input_driver.cpp)
 else()
     target_sources(rexinput PRIVATE sdl/sdl_input_driver.cpp sdl/joystick_mapping.cpp
-        sdl/wheel.cpp)
+        sdl/wheel.cpp sdl/wheel_mapping.cpp)
 endif()
 
 target_link_libraries(rexinput PUBLIC rexcore rexui SDL3::SDL3)

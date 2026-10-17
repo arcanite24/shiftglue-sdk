@@ -9,6 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstring>
+
+#include <rex/input/ffb_trace.h>
 #include <rex/input/input.h>
 #include <rex/input/input_system.h>
 #include <rex/kernel/xam/private.h>
@@ -17,6 +20,7 @@
 #include <rex/types.h>
 #include <rex/runtime.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/thread_state.h>
 #include <rex/system/xtypes.h>
 
 #pragma GCC diagnostic ignored "-Wunused-parameter"
@@ -36,6 +40,24 @@ constexpr uint32_t XINPUT_FLAG_ANY_USER = 1 << 30;
 
 rex::input::InputSystem* input_system() {
   return static_cast<rex::input::InputSystem*>(REX_KERNEL_STATE()->emulator()->input_system());
+}
+
+// The guest return address of the XAM call being served, for the FFB trace:
+// it tells which of the title's input paths (pad or wheel) made the call.
+uint32_t GuestCaller() {
+  auto* thread_state = rex::runtime::ThreadState::Get();
+  return thread_state ? static_cast<uint32_t>(thread_state->context()->lr) : 0;
+}
+
+void TraceCapabilities(uint32_t user_index, uint32_t flags, X_RESULT result,
+                       const X_INPUT_CAPABILITIES* caps) {
+  if (!rex::input::ffb_trace::Enabled()) {
+    return;
+  }
+  const bool ok = result == X_ERROR_SUCCESS && caps;
+  rex::input::ffb_trace::RecordCapabilities(user_index, flags, result, ok ? caps->type : 0,
+                                            ok ? caps->sub_type : 0, ok ? uint16_t(caps->flags) : 0,
+                                            GuestCaller());
 }
 
 void XamResetInactivity_entry() {
@@ -66,7 +88,9 @@ u32 XamInputGetCapabilities_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_C
   }
 
   auto* is = input_system();
-  return is->GetCapabilities(actual_user_index, flags, caps);
+  const X_RESULT result = is->GetCapabilities(actual_user_index, flags, caps);
+  TraceCapabilities(actual_user_index, flags, result, caps);
+  return result;
 }
 
 u32 XamInputGetCapabilitiesEx_entry(u32 unk, u32 user_index, u32 flags,
@@ -88,7 +112,9 @@ u32 XamInputGetCapabilitiesEx_entry(u32 unk, u32 user_index, u32 flags,
 
   (void)unk;  // Unused in this implementation
   auto* is = input_system();
-  return is->GetCapabilities(actual_user_index, flags, caps);
+  const X_RESULT result = is->GetCapabilities(actual_user_index, flags, caps);
+  TraceCapabilities(actual_user_index, flags, result, caps);
+  return result;
 }
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputgetstate(v=vs.85).aspx
@@ -127,9 +153,35 @@ u32 XamInputSetState_entry(u32 user_index, u32 unk, ppc_ptr_t<X_INPUT_VIBRATION>
     actual_user_index = 0;
   }
 
-  (void)unk;  // Unused in this implementation
+  // Read before SetState, which scales by pad_rumble_strength in a copy but
+  // the trace wants the title's own values.
+  const uint16_t left = vibration->left_motor_speed;
+  const uint16_t right = vibration->right_motor_speed;
   auto* is = input_system();
-  return is->SetState(actual_user_index, vibration);
+  const X_RESULT result = is->SetState(actual_user_index, vibration);
+  if (rex::input::ffb_trace::Enabled()) {
+    // The guest word after XINPUT_VIBRATION, in case a wheel call passes more.
+    rex::be<uint32_t> extra;
+    std::memcpy(&extra, reinterpret_cast<const uint8_t*>(vibration.host_address()) + 4,
+                sizeof(extra));
+    rex::input::ffb_trace::RecordSetState(actual_user_index, unk, left, right, uint32_t(extra),
+                                          GuestCaller(), result);
+  }
+  return result;
+}
+
+// XAM ordinal 442: DWORD XamInputGetUserVibrationLevel(DWORD user, DWORD* level).
+// The title's asynchronous XInputSetState (sub_8310CBC8) asks for the user's
+// profile vibration setting before sending motor values to a wheel; the stub
+// left the level unwritten, so the title read whatever was on its stack. 3 is
+// XPROFILE_OPTION_CONTROLLER_VIBRATION "on", the profile default.
+u32 XamInputGetUserVibrationLevel_entry(u32 user_index, mapped_u32 level) {
+  constexpr uint32_t kVibrationOn = 3;
+  if (level) {
+    *level = kVibrationOn;
+  }
+  rex::input::ffb_trace::RecordVibrationLevel(user_index, kVibrationOn, GuestCaller());
+  return X_ERROR_SUCCESS;
 }
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputgetkeystroke(v=vs.85).aspx
@@ -206,6 +258,8 @@ REX_EXPORT(__imp__XamInputGetCapabilities, rex::kernel::xam::XamInputGetCapabili
 REX_EXPORT(__imp__XamInputGetCapabilitiesEx, rex::kernel::xam::XamInputGetCapabilitiesEx_entry)
 REX_EXPORT(__imp__XamInputGetState, rex::kernel::xam::XamInputGetState_entry)
 REX_EXPORT(__imp__XamInputSetState, rex::kernel::xam::XamInputSetState_entry)
+REX_EXPORT(__imp__XamInputGetUserVibrationLevel,
+           rex::kernel::xam::XamInputGetUserVibrationLevel_entry)
 REX_EXPORT(__imp__XamInputGetKeystroke, rex::kernel::xam::XamInputGetKeystroke_entry)
 REX_EXPORT(__imp__XamInputGetKeystrokeEx, rex::kernel::xam::XamInputGetKeystrokeEx_entry)
 REX_EXPORT(__imp__XamUserGetDeviceContext, rex::kernel::xam::XamUserGetDeviceContext_entry)
@@ -217,7 +271,6 @@ REX_EXPORT_STUB(__imp__XamInputGetFailedConnectionOrBind);
 REX_EXPORT_STUB(__imp__XamInputGetKeyLocks);
 REX_EXPORT_STUB(__imp__XamInputGetKeystrokeHud);
 REX_EXPORT_STUB(__imp__XamInputGetKeystrokeHudEx);
-REX_EXPORT_STUB(__imp__XamInputGetUserVibrationLevel);
 REX_EXPORT_STUB(__imp__XamInputNonControllerGetRaw);
 REX_EXPORT_STUB(__imp__XamInputNonControllerGetRawEx);
 REX_EXPORT_STUB(__imp__XamInputNonControllerSetRaw);
