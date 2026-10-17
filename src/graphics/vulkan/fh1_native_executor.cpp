@@ -3842,14 +3842,15 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
       "FH1 native executor (Vulkan) per frame over {} frames: renderings {:.1f} barrier "
       "batches {:.1f}; renderings begun after barriers on the same surfaces {:.1f}, barriers "
       "and new surfaces {:.1f}, new surfaces {:.1f}, other work {:.1f}; uploads hoisted "
-      "behind the open rendering {:.1f}",
+      "behind the open rendering {:.1f} in {:.1f} barrier pairs",
       window_frames, double(command_processor_.TakeRenderingBeginCount()) * per_frame,
       double(command_processor_.TakeBarrierBatchCount()) * per_frame,
       double(causes[VulkanCommandProcessor::kFh1RenderingBarriersSameSurfaces]) * per_frame,
       double(causes[VulkanCommandProcessor::kFh1RenderingBarriersNewSurfaces]) * per_frame,
       double(causes[VulkanCommandProcessor::kFh1RenderingNewSurfaces]) * per_frame,
       double(causes[VulkanCommandProcessor::kFh1RenderingEndedElsewhere]) * per_frame,
-      double(command_processor_.TakeFh1HoistedUploadCount()) * per_frame);
+      double(command_processor_.TakeFh1HoistedUploadCount()) * per_frame,
+      double(command_processor_.TakeFh1HoistedBarrierPairCount()) * per_frame);
   std::vector<std::pair<uint64_t, std::string>> enders;
   for (auto& [name, count] : command_processor_.TakeFh1RenderingEnders()) {
     enders.emplace_back(count, name);

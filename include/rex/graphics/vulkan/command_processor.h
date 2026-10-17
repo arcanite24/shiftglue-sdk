@@ -290,15 +290,43 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool in_render_pass() const { return in_render_pass_; }
   // Shared-memory uploads found by a draw while its FH1 draw rendering is
   // open are recorded behind the rendering's begin instead of ending it
-  // (fh1_hoist_uploads). Returns false when there is no open draw rendering
-  // to hoist into, or the rendering must not be reordered against (a draw in
-  // it may write the shared memory). Submission must be open.
-  bool BeginFh1HoistedUpload();
+  // (fh1_hoist_uploads). The uploads hoisted ahead of one rendering form a
+  // group: one barrier into the transfer, every upload's copies, one barrier
+  // back to the read (fh1_hoist_uploads_merge; without it each upload is its
+  // own group). The caller records the barriers of a group's first upload
+  // around its copies; a merged upload records only its copies, which join
+  // the group ahead of its barrier back.
+  enum class Fh1HoistedUpload {
+    // Not hoisted: no open draw rendering to hoist into, or the rendering
+    // must not be reordered against (a draw in it may write the shared
+    // memory), or barriers are pending.
+    kNone,
+    // Starts a group (barriers around the copies).
+    kGroup,
+    // Joins the open group (copies only).
+    kMerged,
+  };
+  // `merge`: the caller allows joining the open group (its copies must not
+  // overlap the group's, and it must not need barriers of its own).
+  // Submission must be open.
+  Fh1HoistedUpload BeginFh1HoistedUpload(bool merge);
+  bool IsFh1HoistGroupOpen() const { return fh1_hoist_group_open_; }
   // Records the pending barriers at the current position without ending the
-  // rendering (only inside a hoisted upload, whose commands move out of it).
+  // rendering (inside a hoisted upload, whose commands move out of it, or
+  // after the rendering ended).
   void RecordFh1HoistedBarriers();
-  void EndFh1HoistedUpload();
+  // Returns false when the rendering ended during the upload, whose commands
+  // then stayed where they were recorded, after the rendering's end.
+  bool EndFh1HoistedUpload();
+  // After EndFh1HoistedUpload returned false for a merged upload: records
+  // the pending barriers (the upload's barrier into the transfer) between the
+  // rendering's end and the upload's commands, which the group's barriers no
+  // longer cover.
+  void RecordFh1CancelledHoistBarriers();
   uint64_t TakeFh1HoistedUploadCount() { return std::exchange(fh1_hoisted_upload_count_, 0); }
+  uint64_t TakeFh1HoistedBarrierPairCount() {
+    return std::exchange(fh1_hoisted_barrier_pair_count_, 0);
+  }
   // A draw in the open rendering may write the shared memory (memexport), so
   // uploads must stay in guest order behind it.
   void NoteFh1RenderingWritesSharedMemory() { fh1_rendering_writes_shared_memory_ = true; }
@@ -1108,9 +1136,18 @@ class VulkanCommandProcessor : public CommandProcessor {
   // command buffer, and where a hoisted upload's commands start.
   size_t fh1_rendering_begin_position_ = 0;
   size_t fh1_hoisted_upload_position_ = 0;
+  // Where the open hoist group's copies end (before its barrier back to the
+  // read): a merged upload's copies go there.
+  size_t fh1_hoist_group_copies_end_ = 0;
+  // Where the commands of a hoisted upload the rendering's end cancelled
+  // start, after that end.
+  size_t fh1_hoisted_upload_cancel_position_ = 0;
   bool fh1_rendering_writes_shared_memory_ = false;
   bool fh1_hoisted_upload_open_ = false;
+  bool fh1_hoisted_upload_merge_ = false;
+  bool fh1_hoist_group_open_ = false;
   uint64_t fh1_hoisted_upload_count_ = 0;
+  uint64_t fh1_hoisted_barrier_pair_count_ = 0;
   bool debug_labels_ = false;
   // An FH1 rendering opened a label its end closes.
   bool rendering_label_open_ = false;

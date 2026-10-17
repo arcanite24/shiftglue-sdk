@@ -330,17 +330,56 @@ bool VulkanSharedMemory::UploadRanges(
   // before and reads it after, so the barrier state is the same on both sides.
   // Only a draw's reads are reordered: a write usage before the upload keeps
   // the guest order.
-  const bool hoisted = (last_usage_ == Usage::kRead || last_usage_ == Usage::kTransferDestination) &&
-                       command_processor_.BeginFh1HoistedUpload();
-  Use(Usage::kTransferDestination,
-      std::make_pair(upload_page_ranges.front().first << page_size_log2(),
-                     (upload_page_ranges.back().first + upload_page_ranges.back().second -
-                      upload_page_ranges.front().first)
-                         << page_size_log2()));
-  if (hoisted) {
+  // The uploads hoisted ahead of one rendering share one barrier pair: the
+  // first records the barrier into the transfer (the whole buffer) before its
+  // copies and the one back to the read after them; a later one, with the
+  // buffer in the read state the group left, records only its copies, which
+  // go between the group's copies and its barrier back. Its pages must not
+  // repeat the group's: copies to the same range are unordered without a
+  // barrier between them.
+  const bool read_state = last_usage_ == Usage::kRead && !last_written_range_.second;
+  bool merge = read_state && command_processor_.IsFh1HoistGroupOpen();
+  if (merge) {
+    for (const auto& range : upload_page_ranges) {
+      for (const auto& group_range : hoist_group_page_ranges_) {
+        if (range.first < group_range.first + group_range.second &&
+            group_range.first < range.first + range.second) {
+          merge = false;
+          break;
+        }
+      }
+      if (!merge) break;
+    }
+  }
+  const VulkanCommandProcessor::Fh1HoistedUpload hoisted =
+      (last_usage_ == Usage::kRead || last_usage_ == Usage::kTransferDestination)
+          ? command_processor_.BeginFh1HoistedUpload(merge)
+          : VulkanCommandProcessor::Fh1HoistedUpload::kNone;
+  const std::pair<uint32_t, uint32_t> written_range(
+      upload_page_ranges.front().first << page_size_log2(),
+      (upload_page_ranges.back().first + upload_page_ranges.back().second -
+       upload_page_ranges.front().first)
+          << page_size_log2());
+  if (hoisted == VulkanCommandProcessor::Fh1HoistedUpload::kMerged) {
+    // Copies only, into the open group; the usage stays the read the group
+    // left. If the rendering ends meanwhile the copies stay after its end,
+    // outside the group, and get the barriers of their own they then need.
+    hoist_group_page_ranges_.insert(hoist_group_page_ranges_.end(), upload_page_ranges.begin(),
+                                    upload_page_ranges.end());
+    const bool successful = UploadRangesCopies(upload_page_ranges);
+    if (!command_processor_.EndFh1HoistedUpload()) {
+      Use(Usage::kTransferDestination, written_range);
+      command_processor_.RecordFh1CancelledHoistBarriers();
+      Use(Usage::kRead);
+    }
+    return successful;
+  }
+  Use(Usage::kTransferDestination, written_range);
+  if (hoisted == VulkanCommandProcessor::Fh1HoistedUpload::kGroup) {
     // The barrier into the transfer goes before the copies, the one back to
     // the reading usage after them, then the whole upload moves ahead of the
     // rendering's begin, so its draws see the data.
+    hoist_group_page_ranges_.assign(upload_page_ranges.begin(), upload_page_ranges.end());
     command_processor_.RecordFh1HoistedBarriers();
     struct EndHoist {
       VulkanSharedMemory& memory;

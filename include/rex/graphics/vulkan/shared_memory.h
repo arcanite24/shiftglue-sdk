@@ -74,6 +74,10 @@ class VulkanSharedMemory : public SharedMemory {
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
   std::vector<VkBufferCopy> upload_regions_;
+  // The page ranges the open hoist group copied (fh1_hoist_uploads_merge):
+  // a later upload of one of them must not join the group, whose copies are
+  // not ordered against each other.
+  std::vector<std::pair<uint32_t, uint32_t>> hoist_group_page_ranges_;
 };
 
 }  // namespace rex::graphics::vulkan
