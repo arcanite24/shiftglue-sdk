@@ -151,6 +151,12 @@ class VulkanDevice {
     bool shaderDenormFlushToZeroFloat32 = false;
     bool shaderRoundingModeRTEFloat32 = false;
 
+    // VK_KHR_shader_float16_int8 (#83, promoted to 1.2): 16-bit float
+    // arithmetic in shaders (fh1_shader_float16). Only the arithmetic; 16-bit
+    // storage, inputs and outputs are not enabled.
+
+    bool shaderFloat16 = false;
+
     // VK_EXT_fragment_shader_interlock (#252)
 
     bool fragmentShaderSampleInterlock = false;
