@@ -2650,13 +2650,20 @@ void Fh1NativeExecutor::BeginDrawRendering() {
   }
   if (clears) FoldPendingClears(bound, clear_width, clear_height, colors, &depth, true);
   rendering_id_ = id;
-  if (gpu_query_pool_ != VK_NULL_HANDLE) {
+  if (gpu_query_pool_ != VK_NULL_HANDLE || command_processor_.debug_labels()) {
+    // The rendering's name is its bound surfaces, for the GPU profile and for
+    // the debug label a GPU trace shows (vulkan_debug_labels). GpuLabel keeps
+    // the string, so the label pointer stays valid for the deferred commands.
     std::string label;
     for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
       if (bound_bits_ & (1u << i)) label += (label.empty() ? "" : "+") + pending_keys_[i].Describe();
     }
     if (label.empty()) label = "none";
-    GpuMarkRendering(GpuLabel(label));
+    const uint32_t label_id = GpuLabel(label);
+    if (gpu_query_pool_ != VK_NULL_HANDLE) GpuMarkRendering(label_id);
+    if (command_processor_.debug_labels()) {
+      command_processor_.SetNextRenderingLabel(gpu_labels_[label_id].c_str());
+    }
   }
   if (vis_frame_) VisMarkRendering();
   command_processor_.SubmitBarriersAndBeginFh1Rendering(info, id);

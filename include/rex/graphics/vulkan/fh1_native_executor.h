@@ -794,7 +794,9 @@ class Fh1NativeExecutor {
   std::array<uint64_t, kGpuPhases> gpu_ticks_{};
   // With the profile, the time from each draw rendering's start to the next
   // one's, by the rendering's surfaces (spans with phase kGpuPhases + label).
-  std::vector<std::string> gpu_labels_;
+  // A deque: the strings' addresses are handed to deferred debug labels and
+  // must survive later insertions.
+  std::deque<std::string> gpu_labels_;
   std::unordered_map<std::string, uint32_t> gpu_label_ids_;
   std::vector<uint64_t> gpu_label_ticks_;
   std::vector<uint64_t> gpu_label_counts_;

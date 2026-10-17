@@ -283,6 +283,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // The label of the next FH1 rendering begun (a string literal), instead of
   // the one its id implies.
   void SetNextRenderingLabel(const char* label) { next_rendering_label_ = label; }
+  bool debug_labels() const { return debug_labels_; }
   bool IsFh1RenderingOpen(uint64_t id) const {
     return in_render_pass_ && id && current_fh1_rendering_id_ == id;
   }
