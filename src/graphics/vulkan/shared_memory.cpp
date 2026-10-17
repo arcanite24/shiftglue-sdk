@@ -26,6 +26,17 @@
 #include <rex/perf/counter.h>
 #include <rex/ui/vulkan/util.h>
 
+// Apple M1 (MoltenVK, Metal argument buffers): every pipeline barrier outside
+// a render pass ends the Metal compute encoder, and the 21 ms free-roam drive
+// frame was 9 ms of 15-20 us gaps between ~390 encoders a frame, ~90 of them
+// single resolve dispatches split from their neighbours by this buffer's
+// write-after-write barrier.
+REXCVAR_DEFINE_BOOL(fh1_coalesce_resolve_writes, false, "GPU",
+                    "Vulkan: skip the shared-memory barrier between consecutive compute "
+                    "writes (resolves) to non-overlapping ranges; the next read's barrier "
+                    "commits them all. Fewer encoder splits on MoltenVK")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
                     "Use sparse shared memory on Vulkan")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -233,6 +244,24 @@ void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_
   written_range.first = std::min(written_range.first, kBufferSize);
   written_range.second = std::min(written_range.second, kBufferSize - written_range.first);
   assert_true(usage != Usage::kRead || !written_range.second);
+  // Consecutive compute writes (FH1's resolves, ~90 a drive frame in bursts)
+  // to ranges that do not overlap need no barrier between them: nothing reads
+  // the earlier write before the next read usage, whose barrier commits every
+  // write since the last one. On MoltenVK with Metal argument buffers each
+  // pipeline barrier outside a render pass ends the compute encoder, so the
+  // write-after-write barrier here cost a 15-20 us encoder gap per resolve;
+  // the pending range grows to cover all the uncommitted writes.
+  if (REXCVAR_GET(fh1_coalesce_resolve_writes) && usage == Usage::kComputeWrite &&
+      last_usage_ == usage && last_written_range_.second && written_range.second &&
+      (written_range.first >= last_written_range_.first + last_written_range_.second ||
+       written_range.first + written_range.second <= last_written_range_.first)) {
+    const uint32_t start = std::min(last_written_range_.first, written_range.first);
+    const uint32_t end =
+        std::max(last_written_range_.first + last_written_range_.second,
+                 written_range.first + written_range.second);
+    last_written_range_ = std::make_pair(start, end - start);
+    return;
+  }
   if (last_usage_ != usage || last_written_range_.second) {
     VkPipelineStageFlags src_stage_mask, dst_stage_mask;
     VkAccessFlags src_access_mask, dst_access_mask;
