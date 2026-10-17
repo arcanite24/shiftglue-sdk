@@ -116,6 +116,31 @@ void SpirvShaderTranslator::ProcessAluInstruction(const ParsedAluInstruction& in
                                               predicate_written_scalar);
   }
   if (scalar_result != spv::NoResult) {
+    if (float16_math_ && float16_clamp_sources_) {
+      // The scalar operations that stay 32-bit under fh1_shader_float16 are
+      // the only producers of values past the 16-bit range (exp2 of a large
+      // exponent, the reciprocal of a small number); clamping their results
+      // here keeps the lowered arithmetic they feed finite.
+      switch (instr.scalar_opcode) {
+        case ucode::AluScalarOpcode::kExp:
+        case ucode::AluScalarOpcode::kLog:
+        case ucode::AluScalarOpcode::kLogc:
+        case ucode::AluScalarOpcode::kRcp:
+        case ucode::AluScalarOpcode::kRcpc:
+        case ucode::AluScalarOpcode::kRcpf:
+        case ucode::AluScalarOpcode::kRsq:
+        case ucode::AluScalarOpcode::kRsqc:
+        case ucode::AluScalarOpcode::kRsqf: {
+          EnsureBuildPointAvailable();
+          SpirvBuilder::Float16ArithmeticScope exact_math(*builder_, false);
+          scalar_result = builder_->createTriBuiltinCall(
+              type_float_, ext_inst_glsl_std_450_, GLSLstd450NClamp, scalar_result,
+              builder_->makeFloatConstant(-65504.0f), builder_->makeFloatConstant(65504.0f));
+        } break;
+        default:
+          break;
+      }
+    }
     DecorateRelaxed(scalar_result);
     EnsureBuildPointAvailable();
     builder_->createStore(scalar_result, var_main_previous_scalar_);

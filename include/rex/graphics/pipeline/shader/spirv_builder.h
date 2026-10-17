@@ -53,6 +53,28 @@ class SpirvBuilder : public spv::Builder {
   // packing stay 32-bit.
   bool float16_arithmetic = false;
 
+  // Which operation classes float16_arithmetic applies to, for bisecting
+  // image differences (fh1_shader_float16_ops). All classes by default.
+  enum Float16OpClass : uint32_t {
+    kFloat16OpAdd = 1u << 0,       // FAdd, FSub
+    kFloat16OpMul = 1u << 1,       // FMul
+    kFloat16OpDiv = 1u << 2,       // FDiv
+    kFloat16OpRound = 1u << 3,     // Round, RoundEven, Trunc, Floor, Ceil, Fract
+    kFloat16OpTrig = 1u << 4,      // Sin, Cos
+    kFloat16OpSqrt = 1u << 5,      // Sqrt, InverseSqrt
+    kFloat16OpMinMax = 1u << 6,    // FMin, FMax, FClamp, NMin, NMax, NClamp
+    kFloat16OpAll = 0x7Fu,
+  };
+  uint32_t float16_op_classes = kFloat16OpAll;
+
+  // Clamp each non-constant operand to the finite 16-bit range (+-65504) with
+  // NClamp before the OpFConvert to 16 bits, so a 32-bit value past it
+  // saturates instead of becoming an infinity (fh1_shader_float16_clamp); the
+  // operations that stay 32-bit (exp2, log2, reciprocals) can produce such
+  // values. Needs the GLSL.std.450 import in float16_builtins.
+  bool float16_clamp_operands = false;
+  spv::Id float16_builtins = 0;
+
   // Sets float16_arithmetic for a scope and restores the previous value.
   class Float16ArithmeticScope {
    public:
@@ -178,10 +200,13 @@ class SpirvBuilder : public spv::Builder {
   // type under float16_arithmetic, or spv::NoType when the type is not one or
   // the mode is off.
   spv::Id GetFloat16ArithmeticType(spv::Id float32_type);
-  static bool IsFloat16BinOp(spv::Op op_code);
-  static bool IsFloat16BuiltinCall(int entry_point);
+  bool IsFloat16BinOp(spv::Op op_code) const;
+  bool IsFloat16BuiltinCall(int entry_point) const;
   spv::Id createFloat16BuiltinCall(spv::Id result_type, spv::Id float16_type, spv::Id builtins,
                                    int entry_point, const spv::Id* operands, int operand_count);
+  // The 32-bit operand converted to the 16-bit type, clamped first when
+  // float16_clamp_operands is set.
+  spv::Id ConvertToFloat16(spv::Id float16_type, spv::Id operand);
 };
 
 }  // namespace rex::graphics

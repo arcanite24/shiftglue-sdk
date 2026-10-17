@@ -839,6 +839,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // 16-bit floats (SpirvBuilder::float16_arithmetic), converted from and back
   // to the 32-bit registers around each operation.
   bool float16_math_ = false;
+  // fh1_shader_float16_clamp mode 1: the results of the scalar operations the
+  // lowering keeps in 32 bits (exp2, log2, reciprocals, inverse square roots)
+  // are clamped to the finite 16-bit range before they are stored.
+  bool float16_clamp_sources_ = false;
 
   std::unique_ptr<SpirvBuilder> builder_;
 

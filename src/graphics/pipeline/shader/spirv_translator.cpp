@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -25,6 +26,7 @@
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 
 #include <rex/cvar.h>
+#include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/platform.h>
 #include <rex/string/buffer.h>
@@ -81,6 +83,41 @@ REXCVAR_DEFINE_BOOL(fh1_shader_float16, false, "GPU",
                     "devices with shaderFloat16, converting from and back to the 32-bit "
                     "registers around each operation. Faster shading on GPUs with a higher "
                     "16-bit rate (Apple); banding and precision artifacts possible")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+// Bisecting aid for fh1_shader_float16: the M1's first image check showed sun
+// glints through foliage that fp32 does not draw, so the lowering can be
+// limited to some operation classes to find the one that overflows.
+REXCVAR_DEFINE_UINT32(fh1_shader_float16_ops, 0x7F, "GPU",
+                      "Vulkan: bit mask of the ALU operation classes fh1_shader_float16 "
+                      "performs in 16-bit floats: 1 add/subtract, 2 multiply, 4 divide, 8 "
+                      "rounding (round, trunc, floor, ceil, fract), 16 sin/cos, 32 sqrt and "
+                      "inverse sqrt, 64 min/max/clamp. 0x7F is all of them")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+// The M1's fh1-map image check: one sun-flare shader (ucode 90CAB86BE8159DA8)
+// raised exp2 results past the 16-bit range, and the lowered multiplies and
+// adds turned the infinities into NaNs that its final max wrote out as white
+// glints through the foliage. exp2, log2 and the reciprocal family stay
+// 32-bit by design, so their results are the values that can be out of range
+// when they enter the 16-bit arithmetic. Clamping every operand of every
+// lowered operation (mode 2) fixed the image but cost the whole 4 ms gain on
+// the M1's drive (52.9 against 52.4-53.8 ms); clamping the results of those
+// source operations once (mode 1) is the cheap form.
+REXCVAR_DEFINE_UINT32(fh1_shader_float16_clamp, 1, "GPU",
+                      "Vulkan: with fh1_shader_float16, keep 32-bit values finite in 16-bit "
+                      "arithmetic: 0 never, 1 clamp the results of exp2, log2 and the "
+                      "reciprocal and inverse-square-root operations to +-65504 (default), 2 "
+                      "clamp every operand before converting it (slow)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+// Second bisecting aid: by shader rather than by operation. Every pixel shader
+// the lowering applies to is logged with its ucode hash; listing hashes here
+// keeps those shaders in 32-bit floats.
+REXCVAR_DEFINE_STRING(fh1_shader_float16_skip, "", "GPU",
+                      "Vulkan: comma-separated ucode hashes (16 hex digits) of pixel shaders "
+                      "fh1_shader_float16 leaves in 32-bit floats; each shader the lowering "
+                      "applies to is logged with its hash")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 // On Android: the Odin 2 Portal's 1x drive frame falls about 3 ms (6 %) when
@@ -349,6 +386,37 @@ void SpirvShaderTranslator::StartTranslation() {
                        !current_shader().writes_depth();
   float16_math_ = REXCVAR_GET(fh1_shader_float16) && features_.float16_arithmetic &&
                   is_pixel_shader() && !current_shader().writes_depth();
+  if (float16_math_) {
+    const std::string hash = fmt::format("{:016X}", current_shader().ucode_data_hash());
+    const std::string& skip = REXCVAR_GET(fh1_shader_float16_skip);
+    bool skipped = false;
+    for (size_t pos = 0; pos < skip.size();) {
+      size_t end = skip.find(',', pos);
+      if (end == std::string::npos) {
+        end = skip.size();
+      }
+      size_t start = pos;
+      while (start < end && skip[start] == ' ') {
+        ++start;
+      }
+      size_t stop = end;
+      while (stop > start && skip[stop - 1] == ' ') {
+        --stop;
+      }
+      if (stop > start && std::equal(skip.begin() + start, skip.begin() + stop, hash.begin(),
+                                     hash.end(), [](char a, char b) {
+                                       return std::toupper(static_cast<unsigned char>(a)) ==
+                                              std::toupper(static_cast<unsigned char>(b));
+                                     })) {
+        skipped = true;
+        break;
+      }
+      pos = end + 1;
+    }
+    REXLOG_INFO("fh1_shader_float16: pixel shader {} {}", hash,
+                skipped ? "kept in 32-bit floats (fh1_shader_float16_skip)" : "in 16-bit floats");
+    float16_math_ = !skipped;
+  }
   std::fill(std::begin(spec_texture_signs_), std::end(spec_texture_signs_), spv::NoResult);
 
   builder_->addCapability(IsSpirvTessEvalShader() ? spv::CapabilityTessellation
@@ -357,6 +425,10 @@ void SpirvShaderTranslator::StartTranslation() {
     // 16-bit float arithmetic (the types are made on first use; the SPIR-V
     // 1.5 of Vulkan 1.2 has Float16 in core, no extension needed).
     builder_->addCapability(spv::CapabilityFloat16);
+    builder_->float16_op_classes =
+        REXCVAR_GET(fh1_shader_float16_ops) & SpirvBuilder::kFloat16OpAll;
+    float16_clamp_sources_ = REXCVAR_GET(fh1_shader_float16_clamp) == 1;
+    builder_->float16_clamp_operands = REXCVAR_GET(fh1_shader_float16_clamp) == 2;
   }
   if (features_.spirv_version < spv::Spv_1_4) {
     if (features_.signed_zero_inf_nan_preserve_float32 || features_.denorm_flush_to_zero_float32 ||
@@ -365,6 +437,7 @@ void SpirvShaderTranslator::StartTranslation() {
     }
   }
   ext_inst_glsl_std_450_ = builder_->import("GLSL.std.450");
+  builder_->float16_builtins = ext_inst_glsl_std_450_;
   builder_->setMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
   builder_->setSource(spv::SourceLanguageUnknown, 0);
 

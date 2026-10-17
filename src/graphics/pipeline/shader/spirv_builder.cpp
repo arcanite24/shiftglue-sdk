@@ -37,19 +37,21 @@ spv::Id SpirvBuilder::GetFloat16ArithmeticType(spv::Id float32_type) {
   return component_count > 1 ? makeVectorType(float16_type, component_count) : float16_type;
 }
 
-bool SpirvBuilder::IsFloat16BinOp(spv::Op op_code) {
+bool SpirvBuilder::IsFloat16BinOp(spv::Op op_code) const {
   switch (op_code) {
     case spv::OpFAdd:
     case spv::OpFSub:
+      return (float16_op_classes & kFloat16OpAdd) != 0;
     case spv::OpFMul:
+      return (float16_op_classes & kFloat16OpMul) != 0;
     case spv::OpFDiv:
-      return true;
+      return (float16_op_classes & kFloat16OpDiv) != 0;
     default:
       return false;
   }
 }
 
-bool SpirvBuilder::IsFloat16BuiltinCall(int entry_point) {
+bool SpirvBuilder::IsFloat16BuiltinCall(int entry_point) const {
   switch (entry_point) {
     case GLSLstd450Round:
     case GLSLstd450RoundEven:
@@ -57,20 +59,51 @@ bool SpirvBuilder::IsFloat16BuiltinCall(int entry_point) {
     case GLSLstd450Floor:
     case GLSLstd450Ceil:
     case GLSLstd450Fract:
+      return (float16_op_classes & kFloat16OpRound) != 0;
     case GLSLstd450Sin:
     case GLSLstd450Cos:
+      return (float16_op_classes & kFloat16OpTrig) != 0;
     case GLSLstd450Sqrt:
     case GLSLstd450InverseSqrt:
+      return (float16_op_classes & kFloat16OpSqrt) != 0;
     case GLSLstd450FMin:
     case GLSLstd450FMax:
     case GLSLstd450FClamp:
     case GLSLstd450NMin:
     case GLSLstd450NMax:
     case GLSLstd450NClamp:
-      return true;
+      return (float16_op_classes & kFloat16OpMinMax) != 0;
     default:
       return false;
   }
+}
+
+spv::Id SpirvBuilder::ConvertToFloat16(spv::Id float16_type, spv::Id operand) {
+  if (float16_clamp_operands && float16_builtins && !isConstant(operand)) {
+    spv::Id type = getTypeId(operand);
+    int component_count = isVectorType(type) ? getNumTypeComponents(type) : 1;
+    spv::Id min_scalar = makeFloatConstant(-65504.0f);
+    spv::Id max_scalar = makeFloatConstant(65504.0f);
+    spv::Id min_value = min_scalar, max_value = max_scalar;
+    if (component_count > 1) {
+      std::vector<spv::Id> min_components(component_count, min_scalar);
+      std::vector<spv::Id> max_components(component_count, max_scalar);
+      min_value = makeCompositeConstant(type, min_components);
+      max_value = makeCompositeConstant(type, max_components);
+    }
+    std::unique_ptr<spv::Instruction> clamp =
+        std::make_unique<spv::Instruction>(getUniqueId(), type, spv::OpExtInst);
+    clamp->addIdOperand(float16_builtins);
+    // NClamp: a NaN operand stays a NaN rather than becoming a bound, so the
+    // 32-bit NaN semantics the multiply rule relies on are unchanged.
+    clamp->addImmediateOperand(GLSLstd450NClamp);
+    clamp->addIdOperand(operand);
+    clamp->addIdOperand(min_value);
+    clamp->addIdOperand(max_value);
+    operand = clamp->getResultId();
+    getBuildPoint()->addInstruction(std::move(clamp));
+  }
+  return createUnaryOp(spv::OpFConvert, float16_type, operand);
 }
 
 spv::Id SpirvBuilder::createFloat16BuiltinCall(spv::Id result_type, spv::Id float16_type,
@@ -81,7 +114,7 @@ spv::Id SpirvBuilder::createFloat16BuiltinCall(spv::Id result_type, spv::Id floa
   instruction->addIdOperand(builtins);
   instruction->addImmediateOperand(entry_point);
   for (int i = 0; i < operand_count; ++i) {
-    instruction->addIdOperand(createUnaryOp(spv::OpFConvert, float16_type, operands[i]));
+    instruction->addIdOperand(ConvertToFloat16(float16_type, operands[i]));
   }
   spv::Id result = instruction->getResultId();
   getBuildPoint()->addInstruction(std::move(instruction));
@@ -123,9 +156,8 @@ spv::Id SpirvBuilder::createNoContractionBinOp(spv::Op op_code, spv::Id type_id,
   spv::Id float16_type = IsFloat16BinOp(op_code) ? GetFloat16ArithmeticType(type_id) : spv::NoType;
   spv::Id result;
   if (float16_type != spv::NoType) {
-    result = createBinOp(op_code, float16_type,
-                         createUnaryOp(spv::OpFConvert, float16_type, operand1),
-                         createUnaryOp(spv::OpFConvert, float16_type, operand2));
+    result = createBinOp(op_code, float16_type, ConvertToFloat16(float16_type, operand1),
+                         ConvertToFloat16(float16_type, operand2));
   } else {
     result = createBinOp(op_code, type_id, operand1, operand2);
   }
