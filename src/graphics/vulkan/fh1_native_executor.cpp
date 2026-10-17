@@ -2467,9 +2467,15 @@ bool Fh1NativeExecutor::BindTargets(VulkanRenderTargetCache::RenderPassKey& key_
 }
 
 void Fh1NativeExecutor::UpdateCoarseShading() {
-  const std::string spec = command_processor_.GetVulkanDevice()->properties().pipelineFragmentShadingRate
-                               ? REXCVAR_GET(fh1_coarse_shading)
-                               : std::string();
+  const bool supported =
+      command_processor_.GetVulkanDevice()->properties().pipelineFragmentShadingRate;
+  const std::string spec = supported ? REXCVAR_GET(fh1_coarse_shading) : std::string();
+  if (!supported && !REXCVAR_GET(fh1_coarse_shading).empty() && !coarse_shading_warned_) {
+    coarse_shading_warned_ = true;
+    REXGPU_WARN("FH1 native executor (Vulkan): fh1_coarse_shading set, but the device has no "
+                "VK_KHR_fragment_shading_rate (vulkan_fragment_shading_rate); nothing is "
+                "shaded coarsely");
+  }
   if (spec == coarse_shading_spec_) return;
   coarse_shading_spec_ = spec;
   coarse_shading_.clear();

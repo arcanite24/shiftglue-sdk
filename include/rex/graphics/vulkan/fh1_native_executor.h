@@ -766,6 +766,7 @@ class Fh1NativeExecutor {
   // frame, not every transfer, resolve, clear, upload and texture load (a
   // busy frame's labels would overflow a MoltenVK-sized pool).
   bool gpu_profile_renderings_only_ = false;
+  bool coarse_shading_warned_ = false;
   struct GpuProfileSlot {
     uint32_t used = 0;
     uint64_t submission = 0;
