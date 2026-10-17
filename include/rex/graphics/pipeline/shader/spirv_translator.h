@@ -425,6 +425,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
     bool signed_zero_inf_nan_preserve_float32;
     bool denorm_flush_to_zero_float32;
     bool rounding_mode_rte_float32;
+    // 16-bit float arithmetic (shaderFloat16, core in Vulkan 1.2), for
+    // fh1_shader_float16.
+    bool float16_arithmetic;
 
     bool fragment_shader_sample_interlock;
 
@@ -831,6 +834,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // registers, the interpolator inputs and the ALU results carry
   // RelaxedPrecision, so MoltenVK may run them as half.
   bool relaxed_precision_ = false;
+  // fh1_shader_float16 for the current (pixel) shader, on a device with
+  // shaderFloat16: the vector and scalar ALU arithmetic is performed in
+  // 16-bit floats (SpirvBuilder::float16_arithmetic), converted from and back
+  // to the 32-bit registers around each operation.
+  bool float16_math_ = false;
 
   std::unique_ptr<SpirvBuilder> builder_;
 

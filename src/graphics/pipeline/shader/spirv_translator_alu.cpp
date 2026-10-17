@@ -34,6 +34,9 @@ spv::Id SpirvShaderTranslator::ZeroIfAnyOperandIsZero(spv::Id value, spv::Id ope
   }
   assert_true(builder_->getNumComponents(operand_0_abs) == num_components);
   assert_true(builder_->getNumComponents(operand_1_abs) == num_components);
+  // The zero test stays exact under fh1_shader_float16: a 16-bit min would
+  // flush small operands to 0 and widen the multiply rule.
+  SpirvBuilder::Float16ArithmeticScope exact_math(*builder_, false);
   return builder_->createTriOp(
       spv::OpSelect, type_float_,
       builder_->createBinOp(spv::OpFOrdEqual, type_bool_vectors_[num_components - 1],
@@ -61,6 +64,8 @@ spv::Id SpirvShaderTranslator::ZeroIfNan(spv::Id value, int num_components,
 
 void SpirvShaderTranslator::KillPixel(spv::Id condition,
                                       uint8_t memexport_eM_potentially_written_before) {
+  // Memory export conversions stay exact under fh1_shader_float16.
+  SpirvBuilder::Float16ArithmeticScope exact_math(*builder_, false);
   SpirvBuilder::IfBuilder kill_if(condition, spv::SelectionControlMaskNone, *builder_);
   {
     // Perform outstanding memory exports before the invocation becomes inactive
@@ -98,13 +103,18 @@ void SpirvShaderTranslator::ProcessAluInstruction(const ParsedAluInstruction& in
   // Whether the instruction has changed the predicate, and it needs to be
   // checked again later.
   bool predicate_written_vector = false;
-  spv::Id vector_result = ProcessVectorAluOperation(instr, memexport_eM_potentially_written_before,
-                                                    predicate_written_vector);
-  DecorateRelaxed(vector_result);
-
   bool predicate_written_scalar = false;
-  spv::Id scalar_result = ProcessScalarAluOperation(instr, memexport_eM_potentially_written_before,
-                                                    predicate_written_scalar);
+  spv::Id vector_result, scalar_result;
+  {
+    // fh1_shader_float16: the ALU arithmetic itself in 16-bit floats; the
+    // operand loads and the result stores around it stay 32-bit.
+    SpirvBuilder::Float16ArithmeticScope float16_math(*builder_, float16_math_);
+    vector_result = ProcessVectorAluOperation(instr, memexport_eM_potentially_written_before,
+                                              predicate_written_vector);
+    DecorateRelaxed(vector_result);
+    scalar_result = ProcessScalarAluOperation(instr, memexport_eM_potentially_written_before,
+                                              predicate_written_scalar);
+  }
   if (scalar_result != spv::NoResult) {
     DecorateRelaxed(scalar_result);
     EnsureBuildPointAvailable();
@@ -321,6 +331,8 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
       spv::Id maxa_operand_0_w = spv::NoResult;
       if (is_maxa) {
         // a0 = (int)clamp(floor(src0.w + 0.5), -256.0, 255.0)
+        // Addressing stays exact under fh1_shader_float16.
+        SpirvBuilder::Float16ArithmeticScope exact_math(*builder_, false);
         int operand_0_num_components = builder_->getNumComponents(operand_0);
         if (operand_0_num_components > 1) {
           maxa_operand_0_w = builder_->createCompositeExtract(
@@ -516,6 +528,8 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
     }
 
     case ucode::AluVectorOpcode::kCube: {
+      // Cube map addressing stays exact under fh1_shader_float16.
+      SpirvBuilder::Float16ArithmeticScope exact_math(*builder_, false);
       // operands[0] is .z_xy.
       // Result is T coordinate, S coordinate, 2 * major axis, face ID.
       // Skipping the second component of the operand, so 120, not 230.
@@ -1002,6 +1016,8 @@ spv::Id SpirvShaderTranslator::ProcessScalarAluOperation(
           instr.scalar_opcode == ucode::AluScalarOpcode::kMaxAsf) {
         // maxas: a0 = (int)clamp(floor(src0.a + 0.5), -256.0, 255.0)
         // maxasf: a0 = (int)clamp(floor(src0.a), -256.0, 255.0)
+        // Addressing stays exact under fh1_shader_float16.
+        SpirvBuilder::Float16ArithmeticScope exact_math(*builder_, false);
         spv::Id maxa_address;
         if (instr.scalar_opcode == ucode::AluScalarOpcode::kMaxAs) {
           maxa_address = builder_->createNoContractionBinOp(spv::OpFAdd, type_float_, a,
@@ -1065,6 +1081,9 @@ spv::Id SpirvShaderTranslator::ProcessScalarAluOperation(
                                    builder_->makeFloatConstant(-FLT_MAX), result);
     }
     case ucode::AluScalarOpcode::kRcpc: {
+      // Clamped to the 32-bit limits (or a 32-bit -0.0 bit pattern): stays
+      // exact under fh1_shader_float16.
+      SpirvBuilder::Float16ArithmeticScope exact_math(*builder_, false);
       spv::Id result = builder_->createNoContractionBinOp(
           spv::OpFDiv, type_float_, const_float_1_,
           GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001));
@@ -1078,6 +1097,9 @@ spv::Id SpirvShaderTranslator::ProcessScalarAluOperation(
                                    builder_->makeFloatConstant(FLT_MAX), result);
     }
     case ucode::AluScalarOpcode::kRcpf: {
+      // Clamped to the 32-bit limits (or a 32-bit -0.0 bit pattern): stays
+      // exact under fh1_shader_float16.
+      SpirvBuilder::Float16ArithmeticScope exact_math(*builder_, false);
       spv::Id result = builder_->createNoContractionBinOp(
           spv::OpFDiv, type_float_, const_float_1_,
           GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001));
@@ -1100,6 +1122,9 @@ spv::Id SpirvShaderTranslator::ProcessScalarAluOperation(
           GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001));
     }
     case ucode::AluScalarOpcode::kRsqc: {
+      // Clamped to the 32-bit limits (or a 32-bit -0.0 bit pattern): stays
+      // exact under fh1_shader_float16.
+      SpirvBuilder::Float16ArithmeticScope exact_math(*builder_, false);
       spv::Id result = builder_->createUnaryBuiltinCall(
           type_float_, ext_inst_glsl_std_450_, GLSLstd450InverseSqrt,
           GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001));
@@ -1113,6 +1138,9 @@ spv::Id SpirvShaderTranslator::ProcessScalarAluOperation(
                                    builder_->makeFloatConstant(FLT_MAX), result);
     }
     case ucode::AluScalarOpcode::kRsqf: {
+      // Clamped to the 32-bit limits (or a 32-bit -0.0 bit pattern): stays
+      // exact under fh1_shader_float16.
+      SpirvBuilder::Float16ArithmeticScope exact_math(*builder_, false);
       spv::Id result = builder_->createUnaryBuiltinCall(
           type_float_, ext_inst_glsl_std_450_, GLSLstd450InverseSqrt,
           GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001));

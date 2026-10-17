@@ -73,6 +73,16 @@ REXCVAR_DEFINE_BOOL(fh1_shader_relaxed_precision, false, "GPU",
                     "precision artifacts possible")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// MoltenVK's SPIRV-Cross keeps RelaxedPrecision values as float, so the path
+// to Apple's 2x fp16 rate is true 16-bit float arithmetic. Only pixel shaders,
+// and not those writing depth, so depth matches between passes.
+REXCVAR_DEFINE_BOOL(fh1_shader_float16, false, "GPU",
+                    "Vulkan: perform the pixel shaders' ALU arithmetic in 16-bit floats on "
+                    "devices with shaderFloat16, converting from and back to the 32-bit "
+                    "registers around each operation. Faster shading on GPUs with a higher "
+                    "16-bit rate (Apple); banding and precision artifacts possible")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 // On Android: the Odin 2 Portal's 1x drive frame falls about 3 ms (6 %) when
 // the texture sign switches fold away. On macOS the M4 Pro drive's median
 // frame falls from 10.9 to 9.8 ms.
@@ -155,6 +165,7 @@ SpirvShaderTranslator::Features::Features(bool all)
       signed_zero_inf_nan_preserve_float32(all),
       denorm_flush_to_zero_float32(all),
       rounding_mode_rte_float32(all),
+      float16_arithmetic(all),
       fragment_shader_sample_interlock(all),
       demote_to_helper_invocation(all),
       sample_rate_shading(all),
@@ -177,6 +188,7 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
           vulkan_device->properties().shaderSignedZeroInfNanPreserveFloat32),
       denorm_flush_to_zero_float32(vulkan_device->properties().shaderDenormFlushToZeroFloat32),
       rounding_mode_rte_float32(vulkan_device->properties().shaderRoundingModeRTEFloat32),
+      float16_arithmetic(vulkan_device->properties().shaderFloat16),
       fragment_shader_sample_interlock(vulkan_device->properties().fragmentShaderSampleInterlock),
       demote_to_helper_invocation(vulkan_device->properties().shaderDemoteToHelperInvocation),
       sample_rate_shading(vulkan_device->properties().sampleRateShading),
@@ -335,10 +347,17 @@ void SpirvShaderTranslator::StartTranslation() {
   ieee_math_ = REXCVAR_GET(spirv_ieee_vertex_math) && is_vertex_shader();
   relaxed_precision_ = REXCVAR_GET(fh1_shader_relaxed_precision) && is_pixel_shader() &&
                        !current_shader().writes_depth();
+  float16_math_ = REXCVAR_GET(fh1_shader_float16) && features_.float16_arithmetic &&
+                  is_pixel_shader() && !current_shader().writes_depth();
   std::fill(std::begin(spec_texture_signs_), std::end(spec_texture_signs_), spv::NoResult);
 
   builder_->addCapability(IsSpirvTessEvalShader() ? spv::CapabilityTessellation
                                                   : spv::CapabilityShader);
+  if (float16_math_) {
+    // 16-bit float arithmetic (the types are made on first use; the SPIR-V
+    // 1.5 of Vulkan 1.2 has Float16 in core, no extension needed).
+    builder_->addCapability(spv::CapabilityFloat16);
+  }
   if (features_.spirv_version < spv::Spv_1_4) {
     if (features_.signed_zero_inf_nan_preserve_float32 || features_.denorm_flush_to_zero_float32 ||
         features_.rounding_mode_rte_float32) {
