@@ -63,6 +63,16 @@ REXCVAR_DEFINE_BOOL(spirv_fast_pixel_math, REX_PLATFORM_ANDROID || REX_PLATFORM_
                     "a nonzero one also gives 0")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// Experiment for Apple GPUs, which run fp16 arithmetic at twice the fp32 rate:
+// MoltenVK lowers RelaxedPrecision to MSL half. Only pixel shaders, and not
+// those writing depth, so depth matches between passes.
+REXCVAR_DEFINE_BOOL(fh1_shader_relaxed_precision, false, "GPU",
+                    "Vulkan: decorate the pixel shaders' registers, interpolators and ALU "
+                    "results RelaxedPrecision, so drivers that honor it (MoltenVK on Apple "
+                    "GPUs) run the arithmetic as 16-bit floats. Faster shading; banding and "
+                    "precision artifacts possible")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 // On Android: the Odin 2 Portal's 1x drive frame falls about 3 ms (6 %) when
 // the texture sign switches fold away. On macOS the M4 Pro drive's median
 // frame falls from 10.9 to 9.8 ms.
@@ -323,6 +333,8 @@ void SpirvShaderTranslator::StartTranslation() {
                      !current_shader().writes_depth();
   builder_->allow_contraction = fast_pixel_math_;
   ieee_math_ = REXCVAR_GET(spirv_ieee_vertex_math) && is_vertex_shader();
+  relaxed_precision_ = REXCVAR_GET(fh1_shader_relaxed_precision) && is_pixel_shader() &&
+                       !current_shader().writes_depth();
   std::fill(std::begin(spec_texture_signs_), std::end(spec_texture_signs_), spv::NoResult);
 
   builder_->addCapability(IsSpirvTessEvalShader() ? spv::CapabilityTessellation
@@ -687,6 +699,7 @@ void SpirvShaderTranslator::StartTranslation() {
     var_main_previous_scalar_ =
         builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float_,
                                  "xe_var_previous_scalar", const_float_0_);
+    DecorateRelaxed(var_main_previous_scalar_);
     var_main_vfetch_address_ =
         builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_int_,
                                  "xe_var_vfetch_address", const_int_0_);
@@ -704,6 +717,7 @@ void SpirvShaderTranslator::StartTranslation() {
           builder_->makeArrayType(type_float4_, builder_->makeUintConstant(register_count()), 1);
       var_main_registers_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction,
                                                      type_register_array, "xe_var_registers");
+      DecorateRelaxed(var_main_registers_);
     }
     if (IsSpirvRectangleListVertexLoopEnabled()) {
       Modification shader_modification = GetSpirvShaderModification();
@@ -3121,6 +3135,7 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
             spv::NoPrecision, spv::StorageClassInput, type_float4_,
             fmt::format("xe_in_interpolator_{}", interpolator_index).c_str());
         input_output_interpolators_[interpolator_index] = interpolator;
+        DecorateRelaxed(interpolator);
         builder_->addDecoration(interpolator, spv::DecorationLocation, int(input_location));
         if (shader_modification.pixel.interpolators_centroid &
             (UINT32_C(1) << interpolator_index)) {
@@ -3862,6 +3877,28 @@ spv::Id SpirvShaderTranslator::GetAbsoluteOperand(spv::Id operand_storage,
   EnsureBuildPointAvailable();
   return builder_->createUnaryBuiltinCall(builder_->getTypeId(operand_storage),
                                           ext_inst_glsl_std_450_, GLSLstd450FAbs, operand_storage);
+}
+
+void SpirvShaderTranslator::DecorateRelaxed(spv::Id id) {
+  if (!relaxed_precision_ || id == spv::NoResult || builder_->isConstant(id)) {
+    return;
+  }
+  spv::Op op = builder_->getOpCode(id);
+  // A bitcast carries a 32-bit bit pattern (-0.0f for rcpf and rsqf); it must
+  // not become a 16-bit reinterpretation.
+  if (op == spv::OpBitcast) {
+    return;
+  }
+  if (op != spv::OpVariable) {
+    spv::Id type = builder_->getTypeId(id);
+    if (builder_->isVectorType(type)) {
+      type = builder_->getContainedTypeId(type);
+    }
+    if (!builder_->isFloatType(type)) {
+      return;
+    }
+  }
+  builder_->addDecoration(id, spv::DecorationRelaxedPrecision);
 }
 
 void SpirvShaderTranslator::StoreResult(const InstructionResult& result, spv::Id value,

@@ -100,11 +100,13 @@ void SpirvShaderTranslator::ProcessAluInstruction(const ParsedAluInstruction& in
   bool predicate_written_vector = false;
   spv::Id vector_result = ProcessVectorAluOperation(instr, memexport_eM_potentially_written_before,
                                                     predicate_written_vector);
+  DecorateRelaxed(vector_result);
 
   bool predicate_written_scalar = false;
   spv::Id scalar_result = ProcessScalarAluOperation(instr, memexport_eM_potentially_written_before,
                                                     predicate_written_scalar);
   if (scalar_result != spv::NoResult) {
+    DecorateRelaxed(scalar_result);
     EnsureBuildPointAvailable();
     builder_->createStore(scalar_result, var_main_previous_scalar_);
   } else {

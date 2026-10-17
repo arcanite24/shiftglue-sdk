@@ -694,6 +694,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id ZeroIfNan(spv::Id value, int num_components, spv::Id replacement = spv::NoResult);
   // Conditionally discard the current fragment. Changes the build point.
   void KillPixel(spv::Id condition, uint8_t memexport_eM_potentially_written_before);
+
+  // Decorates a float variable or result with RelaxedPrecision when
+  // fh1_shader_relaxed_precision applies to the current shader; a no-op
+  // otherwise and for constants (which may be shared with exact code).
+  void DecorateRelaxed(spv::Id id);
   // Return type is a rex::bit_count(result.GetUsedResultComponents())-component
   // float vector or a single float, depending on whether it's a reduction
   // instruction (check getTypeId of the result), or returns spv::NoResult if
@@ -822,6 +827,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
   bool fast_pixel_math_ = false;
   // spirv_ieee_vertex_math for the current (vertex) shader: no multiply rule.
   bool ieee_math_ = false;
+  // fh1_shader_relaxed_precision for the current (pixel) shader: the r#
+  // registers, the interpolator inputs and the ALU results carry
+  // RelaxedPrecision, so MoltenVK may run them as half.
+  bool relaxed_precision_ = false;
 
   std::unique_ptr<SpirvBuilder> builder_;
 
