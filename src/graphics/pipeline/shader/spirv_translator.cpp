@@ -51,6 +51,22 @@ REXCVAR_DEFINE_BOOL(spirv_ieee_vertex_math, REX_PLATFORM_ANDROID, "GPU",
                     "vertex comes out NaN")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// On macOS the same NoContraction helper calls that cost the pixel stage half
+// its time remain in the vertex stage: 64 of the 66 free-roam vertex shaders
+// MoltenVK compiled carry them, 324 in the largest. This lifts the decoration
+// from vertex ALU results so Metal may fuse multiply-adds; positions then
+// depend on the compiler's fusing rather than matching bit for bit between
+// passes: the M1's fixed-clock image check matched the controls on all three
+// captures (no depth fighting, shadows intact) and the free-roam drive fell
+// from 28.5 to 21.1 ms GPU, so it is the macOS default. The multiply rule is
+// kept unless spirv_ieee_vertex_math drops it.
+REXCVAR_DEFINE_BOOL(spirv_fast_vertex_math, REX_PLATFORM_MAC, "GPU",
+                    "Vulkan: let the driver fuse multiply-adds in vertex shaders (no "
+                    "NoContraction on vertex ALU results). Faster vertex work on drivers that "
+                    "wrap NoContraction operations in function calls (MoltenVK); positions may "
+                    "differ in the last bit between passes")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 // On Android: the Odin 2 Portal's 1x drive GPU frame falls about 4 ms (36 to
 // 32), with only scattered pixels of foliage and shadow noise changing. That
 // was with plain IEEE products, whose 0 * Inf = NaN smeared the scene (#403);
@@ -380,8 +396,9 @@ void SpirvShaderTranslator::StartTranslation() {
   // Depth must match between passes, so shaders writing it stay exact.
   fast_pixel_math_ = REXCVAR_GET(spirv_fast_pixel_math) && is_pixel_shader() &&
                      !current_shader().writes_depth();
-  builder_->allow_contraction = fast_pixel_math_;
   ieee_math_ = REXCVAR_GET(spirv_ieee_vertex_math) && is_vertex_shader();
+  builder_->allow_contraction =
+      fast_pixel_math_ || (REXCVAR_GET(spirv_fast_vertex_math) && is_vertex_shader());
   relaxed_precision_ = REXCVAR_GET(fh1_shader_relaxed_precision) && is_pixel_shader() &&
                        !current_shader().writes_depth();
   float16_math_ = REXCVAR_GET(fh1_shader_float16) && features_.float16_arithmetic &&
