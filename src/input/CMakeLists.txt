@@ -7,6 +7,7 @@ add_library(rexinput OBJECT
     device_assignment.cpp
     state_merge.cpp
     dualsense.cpp
+    xinputd_ffb.cpp
     mnk/mnk_input_driver.cpp
     nop/nop_input_driver.cpp
 )

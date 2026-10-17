@@ -132,6 +132,19 @@ u32 XamInputSetState_entry(u32 user_index, u32 unk, ppc_ptr_t<X_INPUT_VIBRATION>
   return is->SetState(actual_user_index, vibration);
 }
 
+// XAM ordinal 442: DWORD XamInputGetUserVibrationLevel(DWORD user, DWORD* level).
+// Forza Horizon's asynchronous XInputSetState (sub_8310CBC8) asks for the
+// user's profile vibration setting before sending motor values to a wheel;
+// the stub left the level unwritten, so the title read whatever was on its
+// stack. 3 is XPROFILE_OPTION_CONTROLLER_VIBRATION "on", the profile default.
+u32 XamInputGetUserVibrationLevel_entry(u32 user_index, mapped_u32 level) {
+  constexpr uint32_t kVibrationOn = 3;
+  if (level) {
+    *level = kVibrationOn;
+  }
+  return X_ERROR_SUCCESS;
+}
+
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputgetkeystroke(v=vs.85).aspx
 u32 XamInputGetKeystroke_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_KEYSTROKE> keystroke) {
   // https://github.com/CodeAsm/ffplay360/blob/master/Common/AtgXime.cpp
@@ -206,6 +219,8 @@ REX_EXPORT(__imp__XamInputGetCapabilities, rex::kernel::xam::XamInputGetCapabili
 REX_EXPORT(__imp__XamInputGetCapabilitiesEx, rex::kernel::xam::XamInputGetCapabilitiesEx_entry)
 REX_EXPORT(__imp__XamInputGetState, rex::kernel::xam::XamInputGetState_entry)
 REX_EXPORT(__imp__XamInputSetState, rex::kernel::xam::XamInputSetState_entry)
+REX_EXPORT(__imp__XamInputGetUserVibrationLevel,
+           rex::kernel::xam::XamInputGetUserVibrationLevel_entry)
 REX_EXPORT(__imp__XamInputGetKeystroke, rex::kernel::xam::XamInputGetKeystroke_entry)
 REX_EXPORT(__imp__XamInputGetKeystrokeEx, rex::kernel::xam::XamInputGetKeystrokeEx_entry)
 REX_EXPORT(__imp__XamUserGetDeviceContext, rex::kernel::xam::XamUserGetDeviceContext_entry)
@@ -217,7 +232,6 @@ REX_EXPORT_STUB(__imp__XamInputGetFailedConnectionOrBind);
 REX_EXPORT_STUB(__imp__XamInputGetKeyLocks);
 REX_EXPORT_STUB(__imp__XamInputGetKeystrokeHud);
 REX_EXPORT_STUB(__imp__XamInputGetKeystrokeHudEx);
-REX_EXPORT_STUB(__imp__XamInputGetUserVibrationLevel);
 REX_EXPORT_STUB(__imp__XamInputNonControllerGetRaw);
 REX_EXPORT_STUB(__imp__XamInputNonControllerGetRawEx);
 REX_EXPORT_STUB(__imp__XamInputNonControllerSetRaw);
