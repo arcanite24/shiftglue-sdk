@@ -3373,6 +3373,19 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     }
     bool complete = true;
     for (const SourceRect& source : plan.sources) {
+      {
+        // Is the source one of the open rendering's attachments? If so the
+        // pass end is inherent: the resolve reads what the draws wrote.
+        bool bound = false;
+        for (uint32_t b = 0; b < 1 + xenos::kMaxColorRenderTargets; ++b) {
+          if ((bound_bits_ & (1u << b)) && pending_keys_[b].Pack() == source.surface->key.Pack()) {
+            bound = true;
+          }
+        }
+        Count(!command_processor_.IsFh1RenderingOpen(DrawRenderingId(bound_bits_))
+                  ? "resolve_no_rendering_open"
+                  : bound ? "resolve_source_bound" : "resolve_source_unbound");
+      }
       if (source.rect.left >= source.rect.right || source.rect.top >= source.rect.bottom) {
         continue;
       }
