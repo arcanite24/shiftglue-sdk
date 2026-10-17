@@ -46,6 +46,14 @@ bool SDLWindowedAppContext::Initialize() {
   if (requested_driver.empty()) {
     requested_driver = "cocoa";
   }
+  // Fullscreen in its own Space presents only black (the window's contents
+  // too) with MoltenVK on Apple silicon; a borderless window covering the
+  // display shows the image. Cocoa reads the hint when video initializes.
+  // Keep a user's own value.
+  const char* fullscreen_spaces = std::getenv("SDL_VIDEO_MAC_FULLSCREEN_SPACES");
+  if (!fullscreen_spaces || !fullscreen_spaces[0]) {
+    SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
+  }
 #endif
   if (!requested_driver.empty()) {
     SDL_SetHint(SDL_HINT_VIDEO_DRIVER, requested_driver.c_str());

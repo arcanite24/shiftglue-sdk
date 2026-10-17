@@ -42,7 +42,39 @@
 #include <rex/ui/surface_win.h>
 #endif
 #if REX_PLATFORM_MAC
+#include <CoreGraphics/CoreGraphics.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
 #include <rex/ui/surface_mac.h>
+
+namespace {
+// SDL's Metal view sets the layer's drawableSize from the view's bounds on
+// window events. Changing fullscreen while the host UI paints from the UI
+// thread left it at 1x1 after the swapchain had been created, so every frame
+// rendered into a 1x1 drawable stretched over the window (one color, black in
+// fullscreen) until the next resize. The swapchain extent is the size to keep.
+std::atomic<void*> mac_metal_layer{nullptr};
+
+void SyncMacMetalLayerDrawableSize(const VkExtent2D& extent) {
+  id layer = static_cast<id>(mac_metal_layer.load(std::memory_order_relaxed));
+  if (!layer || !extent.width || !extent.height) {
+    return;
+  }
+  const SEL get_size = sel_registerName("drawableSize");
+  const CGSize size = reinterpret_cast<CGSize (*)(id, SEL)>(objc_msgSend)(layer, get_size);
+  if (uint32_t(size.width) == extent.width && uint32_t(size.height) == extent.height) {
+    return;
+  }
+  static std::atomic<uint32_t> logged{0};
+  if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+    REXLOG_INFO("VulkanPresenter: CAMetalLayer drawable size {}x{} restored to the swapchain's {}x{}",
+                size.width, size.height, extent.width, extent.height);
+  }
+  reinterpret_cast<void (*)(id, SEL, CGSize)>(objc_msgSend)(
+      layer, sel_registerName("setDrawableSize:"),
+      CGSizeMake(CGFloat(extent.width), CGFloat(extent.height)));
+}
+}  // namespace
 #endif
 
 REXCVAR_DEFINE_BOOL(present_upscaler_profile, false, "UI/Presenter",
@@ -1064,6 +1096,14 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   const VkInstance instance = vulkan_instance->instance();
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
+
+#if REX_PLATFORM_MAC
+  mac_metal_layer.store(
+      new_surface.GetType() == Surface::kTypeIndex_CAMetalLayer
+          ? const_cast<void*>(static_cast<CAMetalLayerSurface&>(new_surface).layer())
+          : nullptr,
+      std::memory_order_relaxed);
+#endif
 
   VkFormat new_swapchain_format;
 
@@ -2199,6 +2239,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   // vkResetCommandPool resets from both initial and recording states, still
   // safe to return early from this function in case of an error.
 
+#if REX_PLATFORM_MAC
+  SyncMacMetalLayerDrawableSize(paint_context_.swapchain_extent);
+#endif
   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
   uint32_t swapchain_image_index;
   VkResult acquire_result =
