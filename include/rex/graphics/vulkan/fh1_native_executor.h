@@ -222,7 +222,7 @@ class Fh1NativeExecutor {
   void GpuRenderingEnded(const char* ender);
   // fh1_native_gpu_profile: other work's time by label (outside renderings).
   uint64_t BeginLabelGpuTiming(const char* label) {
-    if (gpu_query_pool_ == VK_NULL_HANDLE) return UINT64_MAX;
+    if (gpu_query_pool_ == VK_NULL_HANDLE || gpu_profile_renderings_only_) return UINT64_MAX;
     const uint32_t id = GpuLabel(label);
     return (uint64_t(id) << 32) | GpuBegin();
   }
@@ -762,6 +762,10 @@ class Fh1NativeExecutor {
   };
   static constexpr uint32_t kGpuProfileSlots = 16;
   static constexpr uint32_t kGpuProfileQueries = 32768;
+  // fh1_native_gpu_profile_renderings_only: time the draw renderings and the
+  // frame, not every transfer, resolve, clear, upload and texture load (a
+  // busy frame's labels would overflow a MoltenVK-sized pool).
+  bool gpu_profile_renderings_only_ = false;
   struct GpuProfileSlot {
     uint32_t used = 0;
     uint64_t submission = 0;
@@ -778,7 +782,9 @@ class Fh1NativeExecutor {
   class GpuTimer {
    public:
     GpuTimer(Fh1NativeExecutor& executor, GpuPhase phase)
-        : executor_(executor), phase_(phase), begin_(executor.GpuBegin()) {}
+        : executor_(executor),
+          phase_(phase),
+          begin_(executor.gpu_profile_renderings_only_ ? UINT32_MAX : executor.GpuBegin()) {}
     ~GpuTimer() { executor_.GpuEnd(phase_, begin_); }
 
    private:

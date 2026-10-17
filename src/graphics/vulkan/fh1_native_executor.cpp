@@ -76,6 +76,10 @@ REXCVAR_DEFINE_BOOL(fh1_trace_resolve_cpu_accesses, false, "GPU",
                     "reads and writes of it (thread and link register), to find the resolves "
                     "the CPU reads (FH1 native executor, Vulkan)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_native_gpu_profile_renderings_only, false, "GPU",
+                    "With fh1_native_gpu_profile, time only the draw renderings and the frame: "
+                    "about two timestamps a rendering, so a busy FH1 frame fits a MoltenVK pool")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(fh1_native_stats_frames, 600, "GPU",
                      "Frames between the FH1 native executor's periodic stats and GPU profile "
                      "logs (Vulkan); shorter windows separate heavy stretches of play")
@@ -494,6 +498,7 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   const VkDevice device = vulkan_device->device();
 
   if (REXCVAR_GET(fh1_native_gpu_profile)) {
+    gpu_profile_renderings_only_ = REXCVAR_GET(fh1_native_gpu_profile_renderings_only);
     VkQueryPoolCreateInfo query_pool_info = {};
     query_pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     query_pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -1650,7 +1655,7 @@ void Fh1NativeExecutor::FlushTransfers() {
     }
     if (Surface* dest = FindSurface(pending_transfers_[group].dest)) {
       uint64_t label_timing = UINT64_MAX;
-      if (gpu_query_pool_ != VK_NULL_HANDLE) {
+      if (gpu_query_pool_ != VK_NULL_HANDLE && !gpu_profile_renderings_only_) {
         const Surface* first_source = FindSurface(pending_transfers_[group].source);
         const std::string label = fmt::format("T {}={}",
             first_source ? first_source->key.Describe() : std::string("?"), dest->key.Describe());
@@ -2838,7 +2843,7 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
       if (begin != UINT32_MAX) executor.GpuEnd(GpuPhase(kGpuPhases + label), begin);
     }
   } label_timer{*this};
-  if (gpu_query_pool_ != VK_NULL_HANDLE) {
+  if (gpu_query_pool_ != VK_NULL_HANDLE && !gpu_profile_renderings_only_) {
     label_timer.label = GpuLabel(fmt::format("R {} {}x{}", surface.key.Describe(),
                                              source.rect.right - source.rect.left,
                                              source.rect.bottom - source.rect.top));
