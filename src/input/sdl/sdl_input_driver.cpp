@@ -1720,9 +1720,11 @@ void SDLInputDriver::UpdateWheelSpringLocked() {
   const int condition_gains = REXCVAR_GET(wheel_ffb_spring) * 1000003 +
                               REXCVAR_GET(wheel_ffb_damper) * 1009 +
                               REXCVAR_GET(wheel_ffb_friction) * 31 + REXCVAR_GET(wheel_ffb_inertia);
+  // A mode or strength change in F6 applies to running effects at once.
   if (!game_effects_.empty() &&
       (strength != applied_effect_strength_ || invert != applied_effect_invert_ ||
-       condition_gains != applied_condition_gains_)) {
+       condition_gains != applied_condition_gains_ ||
+       GameEffectsEnabled() != applied_effects_enabled_)) {
     applied_condition_gains_ = condition_gains;
     SyncGameEffectsLocked();
   }
@@ -1872,8 +1874,11 @@ void SDLInputDriver::ReleaseFeedback(bool crashing) {
 }
 
 bool SDLInputDriver::GameEffectsEnabled() const {
-  return REXCVAR_GET(wheel_ffb_effects) &&
-         ParseWheelFfbMode(REXCVAR_GET(wheel_ffb_mode)) != WheelFfbMode::kOff;
+  // "rumble" keeps only the title's vibration (XInputdFFSetRumble), so its
+  // steering forces and condition effects stay off there as in "off".
+  const WheelFfbMode mode = ParseWheelFfbMode(REXCVAR_GET(wheel_ffb_mode));
+  return REXCVAR_GET(wheel_ffb_effects) && mode != WheelFfbMode::kOff &&
+         mode != WheelFfbMode::kRumble;
 }
 
 WheelEffectScale SDLInputDriver::EffectScaleLocked() const {
@@ -2006,6 +2011,7 @@ void SDLInputDriver::FlushGameEffectsLocked() {
 void SDLInputDriver::SyncGameEffectsLocked() {
   applied_effect_strength_ = REXCVAR_GET(wheel_ffb_strength);
   applied_effect_invert_ = REXCVAR_GET(wheel_ffb_invert);
+  applied_effects_enabled_ = GameEffectsEnabled();
   for (auto& [id, game] : game_effects_) {
     ApplyGameEffectLocked(game);
   }
@@ -2021,7 +2027,9 @@ void SDLInputDriver::ApplyRumbleLocked() {
   int64_t magnitude = int64_t(strongest) * 32767 / 65535;
   magnitude = magnitude * std::clamp(REXCVAR_GET(wheel_ffb_rumble), 0, 100) / 100;
   magnitude = magnitude * std::clamp(REXCVAR_GET(wheel_ffb_strength), 0, 100) / 100;
-  if (!GameEffectsEnabled()) {
+  // The title's vibration plays in every mode but "off", "rumble" included.
+  if (!REXCVAR_GET(wheel_ffb_effects) ||
+      ParseWheelFfbMode(REXCVAR_GET(wheel_ffb_mode)) == WheelFfbMode::kOff) {
     magnitude = 0;
   }
   if (magnitude == 0) {

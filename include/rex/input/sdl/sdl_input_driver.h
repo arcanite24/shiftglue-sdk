@@ -235,6 +235,7 @@ class SDLInputDriver final : public InputDriver,
   uint16_t game_rumble_right_ = 0;
   int applied_effect_strength_ = -1;
   bool applied_effect_invert_ = false;
+  bool applied_effects_enabled_ = true;
   int applied_condition_gains_ = -1;
 
   inline uint64_t AnalogToKeyfield(const X_INPUT_GAMEPAD& gamepad) const;
