@@ -618,6 +618,12 @@ class Window {
   bool OnActualSizeUpdate(uint32_t new_physical_width, uint32_t new_physical_height,
                           WindowDestructionReceiver& destruction_receiver);
   void OnDesiredFullscreenUpdate(bool new_fullscreen) { fullscreen_ = new_fullscreen; }
+  // For calling when the platform has finished changing the window's state
+  // (such as a fullscreen transition) in a way that may have replaced what
+  // the surface is drawn to, even if the client area size is unchanged:
+  // rebuilds the presenter's connection to the surface and tells the resize
+  // listeners.
+  void OnSurfaceStateUpdate(WindowDestructionReceiver& destruction_receiver);
   void OnFocusUpdate(bool new_has_focus, WindowDestructionReceiver& destruction_receiver);
 
   // Pass true as force_paint in case the platform can't retain the image from
