@@ -49,6 +49,7 @@
 #include <rex/graphics/registers.h>
 #include <rex/graphics/vulkan/fh1_frame_dump.h>
 #include <rex/graphics/vulkan/command_processor.h>
+#include <rex/graphics/shader_compile_status.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/vulkan/shader.h>
@@ -3871,10 +3872,12 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
           "Skipping Vulkan frame presentation due to async placeholder draw "
           "usage in this frame");
     }
+    ShaderCompileStatus::Get().frames_held.fetch_add(1, std::memory_order_relaxed);
     swap_gpu_timing.End();
     EndSubmission(true);
     return;
   }
+  ShaderCompileStatus::Get().frames_presented.fetch_add(1, std::memory_order_relaxed);
 
   SwapPostEffect swap_post_effect = GetActualSwapPostEffect();
 

@@ -12,6 +12,7 @@
  */
 
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/shader_compile_status.h>
 
 #include <algorithm>
 #include <atomic>
@@ -536,6 +537,20 @@ std::shared_ptr<Fh1FrameInspector> GraphicsSystem::frame_inspector() const {
 
 bool GraphicsSystem::OpenInspectionDump(const std::filesystem::path& path, Fh1InspectionView view) {
   return command_processor_ && command_processor_->OpenInspectionDump(path, view);
+}
+
+system::GraphicsShaderCompileStatus GraphicsSystem::shader_compile_status() const {
+  // The live counters are a singleton inside this plugin; the host cannot
+  // see it across the library boundary, so it reads this snapshot instead.
+  const ShaderCompileStatus& live = ShaderCompileStatus::Get();
+  system::GraphicsShaderCompileStatus status;
+  status.startup_pipelines_total = live.startup_pipelines_total.load(std::memory_order_acquire);
+  status.startup_pipelines_done = live.startup_pipelines_done.load(std::memory_order_relaxed);
+  status.pending_pipelines = live.pending_pipelines.load(std::memory_order_relaxed);
+  status.pending_translations = live.pending_translations.load(std::memory_order_relaxed);
+  status.frames_held = live.frames_held.load(std::memory_order_relaxed);
+  status.frames_presented = live.frames_presented.load(std::memory_order_relaxed);
+  return status;
 }
 
 bool GraphicsSystem::fh1_shadow_mask(uint32_t* base, uint32_t* length,
