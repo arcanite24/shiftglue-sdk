@@ -100,6 +100,9 @@ struct Bookkeeping {
   double age_sum_ms = 0.0, age_max_ms = 0.0, interval_sum_ms = 0.0;
   uint64_t timed = 0, intervals = 0, last_eye_ns[2] = {}, last_tag = UINT64_MAX;
   std::atomic<float> presented_fov_y{0.0f};
+  // A decoded frame's age from its request to its copy, smoothed: NextEye
+  // predicts the head that far ahead.
+  std::atomic<float> recent_age_ms{0.0f};
   std::atomic<float> headset_fov_y{0.0f};
   std::atomic<float> headset_fov_x{0.0f};
 };
@@ -146,6 +149,9 @@ bool FindRequest(const Lens& lens, EyeRequest& out, uint64_t* requested_ns = nul
     const uint64_t now = SteadyNs();
     const double age = double(now - b.ring[tag].requested_ns) / 1e6;
     b.age_sum_ms += age;
+    const float recent = b.recent_age_ms.load(std::memory_order_relaxed);
+    b.recent_age_ms.store(recent > 0.0f ? recent + 0.05f * (float(age) - recent) : float(age),
+                          std::memory_order_relaxed);
     b.age_max_ms = std::max(b.age_max_ms, age);
     ++b.timed;
     uint64_t& last = b.last_eye_ns[out.eye & 1];
@@ -346,6 +352,12 @@ struct State {
   // The display time NextEye locates the eyes at: the latest frame's, one
   // period ahead (the game's frame shows about then).
   std::atomic<int64_t> next_display_time{0};
+  std::atomic<int64_t> display_period{0};
+  // NextEye: both eyes of a pair come from one xrLocateViews, at the time
+  // the pair is expected on the headset; the right eye's view waits here.
+  bool have_right_view = false;
+  float right_position[3] = {};
+  float right_orientation[4] = {};
 
   // The headset's frames: a thread of their own, at the headset's rate,
   // whatever the game's frame rate.
@@ -828,6 +840,7 @@ void FrameLoop() {
                                 ? headset_hz * (s.show_stereo ? 2u : 1u)
                                 : 0u);
     s.next_display_time = frame_state.predictedDisplayTime + frame_state.predictedDisplayPeriod;
+    s.display_period = frame_state.predictedDisplayPeriod;
 
     std::lock_guard<std::mutex> lock(s.mutex);
     if (s.session == XR_NULL_HANDLE) return;
@@ -1026,9 +1039,24 @@ bool NextEye(EyeRequest& out) {
   }
   State& s = S();
   if (!REXCVAR_GET(xr_stereo) || !s.running.load(std::memory_order_relaxed)) return false;
-  // xrLocateViews may run beside the headset thread's frame calls.
-  const int64_t time = s.next_display_time.load(std::memory_order_relaxed);
+  if (eye == 1 && s.have_right_view) {
+    // The pair's right eye, located with its left.
+    s.have_right_view = false;
+    out = Record(eye, s.right_position, s.right_orientation);
+    return true;
+  }
+  s.have_right_view = false;
+  // xrLocateViews may run beside the headset thread's frame calls. The pair
+  // reaches the headset about a frame's age after its request (rendering,
+  // the right eye, the copy): the head is predicted for then, so the
+  // headset's correction for the head's motion since stays small.
+  int64_t time = s.next_display_time.load(std::memory_order_relaxed);
   if (time == 0) return false;
+  const int64_t period = s.display_period.load(std::memory_order_relaxed);
+  const double age_ms = std::min(double(B().recent_age_ms.load(std::memory_order_relaxed)), 100.0);
+  if (period > 0 && age_ms > 0.0) {
+    time += int64_t(std::llround(age_ms * 1e6 / double(period))) * period;
+  }
   XrViewLocateInfo locate_info{XR_TYPE_VIEW_LOCATE_INFO};
   locate_info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
   locate_info.displayTime = time;
@@ -1052,6 +1080,17 @@ bool NextEye(EyeRequest& out) {
   const float position[3] = {pose.position.x, pose.position.y, pose.position.z};
   const float orientation[4] = {pose.orientation.x, pose.orientation.y, pose.orientation.z,
                                 pose.orientation.w};
+  if (eye == 0) {
+    const XrPosef& right = views[1].pose;
+    s.right_position[0] = right.position.x;
+    s.right_position[1] = right.position.y;
+    s.right_position[2] = right.position.z;
+    s.right_orientation[0] = right.orientation.x;
+    s.right_orientation[1] = right.orientation.y;
+    s.right_orientation[2] = right.orientation.z;
+    s.right_orientation[3] = right.orientation.w;
+    s.have_right_view = true;
+  }
   out = Record(eye, position, orientation);
   return true;
 }
