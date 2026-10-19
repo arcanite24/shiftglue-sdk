@@ -24,6 +24,7 @@
 #include <fmt/format.h>
 #include <xxhash.h>
 
+#include <rex/ui/xr.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
@@ -232,7 +233,9 @@ WaitRegMemPolicy CurrentWaitRegMemPolicy() {
     const auto now = std::chrono::steady_clock::now();
     if (now >= next_read) {
       next_read = now + std::chrono::milliseconds(500);
-      const int limit = std::atoi(rex::cvar::GetFlagByName("pinyon_shift_fh1_render_fps_limit").c_str());
+      const uint32_t headset_hz = rex::ui::xr::HeadsetRefreshHz();
+      const int limit = headset_hz ? int(headset_hz)
+                                   : std::atoi(rex::cvar::GetFlagByName("pinyon_shift_fh1_render_fps_limit").c_str());
       const double rate = limit > 0 ? double(limit)
                                     : std::atof(rex::cvar::GetFlagByName("video_mode_refresh_rate").c_str());
       fast = rate > 61.0;
