@@ -34,6 +34,13 @@ std::atomic<void (*)()> g_shutdown{nullptr};
 
 void SetShutdown(void (*shutdown)()) { g_shutdown.store(shutdown); }
 
+namespace {
+std::atomic<uint32_t> g_headset_frame_hz{0};
+}  // namespace
+
+uint32_t HeadsetFrameHz() { return g_headset_frame_hz.load(std::memory_order_relaxed); }
+void SetHeadsetFrameHz(uint32_t hz) { g_headset_frame_hz.store(hz, std::memory_order_relaxed); }
+
 void Shutdown() {
   if (auto shutdown = g_shutdown.exchange(nullptr)) shutdown();
 }

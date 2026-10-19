@@ -45,6 +45,11 @@ REXCVAR_DEFINE_INT32(xr_log_frames, 0, "Display",
                      "many frames from when it is set")
     .range(0, 1000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(xr_simulate_hz, 45, "Display",
+                     "Frames a second xr_simulate's headset asks for (rex/ui/xr.h "
+                     "HeadsetFrameHz), as Virtual Desktop's spacewarp at 90 Hz does")
+    .range(0, 240)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(xr_simulate_fov, 1.6, "Display",
                       "Vertical field of view in radians xr_simulate reports for its headset")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -313,6 +318,8 @@ struct Target {
   uint32_t width = 0, height = 0;
   std::vector<XrSwapchainImageVulkanKHR> images;
   bool acquired = false;
+  // The acquired image is ready to write (xrWaitSwapchainImage returned).
+  bool ready = false;
   uint32_t index = 0;
   // An image has been released since the swapchain was made: a layer may
   // only use a swapchain once it has one.
@@ -536,6 +543,7 @@ void DestroySession() {
   s.running = false;
   s.visible = false;
   xr::SetHeadsetRefreshHz(0);
+  xr::SetHeadsetFrameHz(0);
   s.next_display_time = 0;
   for (Target& target : s.targets) DestroyTarget(target);
   s.held_left_tag = UINT32_MAX;
@@ -566,6 +574,7 @@ void PollEvents() {
       } else if (changed.state == XR_SESSION_STATE_STOPPING && s.running) {
         s.running = false;
         xr::SetHeadsetRefreshHz(0);
+        xr::SetHeadsetFrameHz(0);
         xrEndSession(s.session);
       } else if (changed.state == XR_SESSION_STATE_EXITING ||
                  changed.state == XR_SESSION_STATE_LOSS_PENDING) {
@@ -662,8 +671,20 @@ bool EnsureTarget(Target& target, uint32_t width, uint32_t height, const char* n
   return true;
 }
 
+// Acquires and waits for an image without stalling the game: a runtime that
+// is not taking frames (Virtual Desktop losing the headset) held each game
+// frame for the full wait. On a timeout the image stays acquired and the
+// next frame waits for it again.
 bool Acquire(Target& target) {
   State& s = S();
+  if (target.acquired) {
+    if (target.ready) return true;
+    XrSwapchainImageWaitInfo image_wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    image_wait.timeout = 2'000'000;  // 2 ms
+    const XrResult result = xrWaitSwapchainImage(target.swapchain, &image_wait);
+    target.ready = result == XR_SUCCESS;
+    return target.ready;
+  }
   {
     // The runtime may use the game's queue here (XR_KHR_vulkan_enable).
     const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
@@ -675,14 +696,18 @@ bool Acquire(Target& target) {
   }
   target.acquired = true;
   XrSwapchainImageWaitInfo image_wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-  image_wait.timeout = 100'000'000;  // 100 ms
-  return Check(xrWaitSwapchainImage(target.swapchain, &image_wait), "xrWaitSwapchainImage");
+  image_wait.timeout = 2'000'000;  // 2 ms
+  const XrResult result = xrWaitSwapchainImage(target.swapchain, &image_wait);
+  target.ready = result == XR_SUCCESS;
+  if (XR_FAILED(result)) Check(result, "xrWaitSwapchainImage");
+  return target.ready;
 }
 
 // With the queue held.
 void Release(Target& target) {
-  if (!target.acquired) return;
+  if (!target.acquired || !target.ready) return;
   target.acquired = false;
+  target.ready = false;
   XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
   target.released |=
       Check(xrReleaseSwapchainImage(target.swapchain, &release_info), "xrReleaseSwapchainImage");
@@ -836,6 +861,7 @@ void FrameLoop() {
             ? uint32_t(std::lround(1e9 / double(frame_state.predictedDisplayPeriod)))
             : 0u;
     s.headset_hz = headset_hz;
+    xr::SetHeadsetFrameHz(headset_hz);
     xr::SetHeadsetRefreshHz(REXCVAR_GET(xr_match_refresh)
                                 ? headset_hz * (s.show_stereo ? 2u : 1u)
                                 : 0u);
@@ -1031,6 +1057,7 @@ bool NextEye(EyeRequest& out) {
   }();
   const int eye = int(sequence & 1);
   if (REXCVAR_GET(xr_simulate)) {
+    xr::SetHeadsetFrameHz(uint32_t(REXCVAR_GET(xr_simulate_hz)));
     const float half = float(REXCVAR_GET(xr_simulate_ipd)) * 0.5f;
     const float position[3] = {eye ? half : -half, 0.0f, 0.0f};
     const float orientation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -1130,10 +1157,7 @@ bool BeginGuestFrame(uint32_t width, uint32_t height, const Lens& lens, FrameCop
   }
   static const char* const kNames[] = {"left eye", "right eye", "screen"};
   Target& target = s.targets[index];
-  if (!EnsureTarget(target, width, height, kNames[index]) ||
-      (!target.acquired && !Acquire(target))) {
-    return false;
-  }
+  if (!EnsureTarget(target, width, height, kNames[index]) || !Acquire(target)) return false;
   if (stereo) {
     target.pose.position = {request.position[0], request.position[1], request.position[2]};
     target.pose.orientation = {request.orientation[0], request.orientation[1],
@@ -1225,6 +1249,7 @@ bool NextEye(EyeRequest& out) {
     return B().sequence;
   }();
   const int eye = int(sequence & 1);
+  xr::SetHeadsetFrameHz(uint32_t(REXCVAR_GET(xr_simulate_hz)));
   const float half = float(REXCVAR_GET(xr_simulate_ipd)) * 0.5f;
   const float position[3] = {eye ? half : -half, 0.0f, 0.0f};
   const float orientation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
