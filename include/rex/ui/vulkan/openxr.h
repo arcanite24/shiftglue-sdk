@@ -64,6 +64,14 @@ struct EyeRequest {
 // frame, from any thread; false (and nothing requested) while stereo is off.
 bool NextEye(EyeRequest& out);
 
+// The headset's vertical field of view (radians, the wider eye's), once
+// NextEye has located the eyes; 0 before that and without a headset.
+float HeadsetFovY();
+// The vertical field of view of the main view of the latest presented
+// tagged frame (radians), or 0: lets the host tell its main camera from
+// render-to-texture cameras.
+float PresentedFovY();
+
 // The tag in a vertical field of view (rex/ui/xr_tag.h).
 using xr::FovTag;
 using xr::kTagCount;

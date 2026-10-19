@@ -7,6 +7,7 @@
 
 #include <rex/ui/vulkan/openxr.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <mutex>
@@ -32,6 +33,9 @@ REXCVAR_DEFINE_BOOL(xr_simulate, false, "Display",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(xr_simulate_ipd, 0.064, "Display",
                       "Eye distance in metres for xr_simulate")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(xr_simulate_fov, 1.6, "Display",
+                      "Vertical field of view in radians xr_simulate reports for its headset")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex {
@@ -59,6 +63,8 @@ struct Bookkeeping {
   Lens previous_lens;
   EyeRequest previous_request;
   uint64_t eye_match = 0, eye_mismatch = 0, detailed = 0;
+  std::atomic<float> presented_fov_y{0.0f};
+  std::atomic<float> headset_fov_y{0.0f};
 };
 
 Bookkeeping& B() {
@@ -81,6 +87,7 @@ bool FindRequest(const Lens& lens, EyeRequest& out) {
   }
   out = b.ring[tag].request;
   ++b.decoded[out.eye & 1];
+  b.presented_fov_y = lens.fov_y;
   if (b.have_previous && lens.has_position && b.previous_lens.has_position) {
     double moved = 0.0;
     for (int i = 0; i < 3; ++i) {
@@ -131,6 +138,11 @@ EyeRequest Record(int eye, const float position[3], const float orientation[4]) 
 
 }  // namespace
 
+float HeadsetFovY() {
+  if (REXCVAR_GET(xr_simulate)) return float(REXCVAR_GET(xr_simulate_fov));
+  return B().headset_fov_y.load(std::memory_order_relaxed);
+}
+float PresentedFovY() { return B().presented_fov_y.load(std::memory_order_relaxed); }
 
 }  // namespace openxr
 }  // namespace vulkan
@@ -657,6 +669,9 @@ bool NextEye(EyeRequest& out) {
       !(view_state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
     return false;
   }
+  float fov_y = 0.0f;
+  for (const XrView& view : views) fov_y = std::max(fov_y, view.fov.angleUp - view.fov.angleDown);
+  B().headset_fov_y = fov_y;
   const XrPosef& pose = views[eye].pose;
   const float position[3] = {pose.position.x, pose.position.y, pose.position.z};
   const float orientation[4] = {pose.orientation.x, pose.orientation.y, pose.orientation.z,
