@@ -3762,6 +3762,88 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   RecreateSamplersIfMipLodBiasChanged();
 }
 
+void VulkanCommandProcessor::RecordXrFrameCopy(VkImage guest_output, uint32_t width,
+                                               uint32_t height,
+                                               const ui::vulkan::openxr::FrameCopy& copy) {
+  using Presenter = ui::vulkan::VulkanPresenter;
+  SubmitBarriers(true);
+  const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  auto barrier = [&](VkImage image, VkAccessFlags from_access, VkAccessFlags to_access,
+                     VkImageLayout from, VkImageLayout to) {
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask = from_access;
+    b.dstAccessMask = to_access;
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = range;
+    return b;
+  };
+  // The staging image was last read by the previous frame's copy, and the
+  // headset's image by the runtime.
+  const VkImageMemoryBarrier before[] = {
+      barrier(guest_output, Presenter::kGuestOutputInternalAccessMask,
+              VK_ACCESS_TRANSFER_READ_BIT, Presenter::kGuestOutputInternalLayout,
+              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+      barrier(copy.staging, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+              VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+      barrier(copy.target, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)};
+  deferred_command_buffer_.CmdVkPipelineBarrier(
+      Presenter::kGuestOutputInternalStageMask | VK_PIPELINE_STAGE_TRANSFER_BIT |
+          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, uint32_t(std::size(before)),
+      before);
+  VkImageBlit blit{};
+  blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  blit.srcOffsets[1] = {int32_t(width), int32_t(height), 1};
+  blit.dstSubresource = blit.srcSubresource;
+  blit.dstOffsets[1] = blit.srcOffsets[1];
+  deferred_command_buffer_.CmdVkBlitImage(guest_output, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                          copy.staging, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                          blit, VK_FILTER_NEAREST);
+  const VkImageMemoryBarrier middle[] = {
+      barrier(copy.staging, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+      barrier(guest_output, VK_ACCESS_TRANSFER_READ_BIT, Presenter::kGuestOutputInternalAccessMask,
+              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, Presenter::kGuestOutputInternalLayout)};
+  deferred_command_buffer_.CmdVkPipelineBarrier(
+      VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT | Presenter::kGuestOutputInternalStageMask, 0, 0, nullptr, 0,
+      nullptr, uint32_t(std::size(middle)), middle);
+  VkImageCopy image_copy{};
+  image_copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  image_copy.dstSubresource = image_copy.srcSubresource;
+  image_copy.extent = {width, height, 1};
+  deferred_command_buffer_.CmdVkCopyImage(copy.staging, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                          copy.target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                          image_copy);
+  if (copy.capture != VK_NULL_HANDLE) {
+    VkBufferImageCopy readback{};
+    readback.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    readback.imageExtent = {width, height, 1};
+    deferred_command_buffer_.CmdVkCopyImageToBuffer(
+        copy.staging, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, copy.capture, readback);
+    VkBufferMemoryBarrier to_host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    to_host.srcQueueFamilyIndex = to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_host.buffer = copy.capture;
+    to_host.size = VK_WHOLE_SIZE;
+    deferred_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                  VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
+                                                  &to_host, 0, nullptr);
+  }
+  // The runtime takes the image back as a color attachment.
+  const VkImageMemoryBarrier after =
+      barrier(copy.target, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
+              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+  deferred_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+                                                0, nullptr, 0, nullptr, 1, &after);
+}
+
 void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                            uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
@@ -4031,7 +4113,6 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
 
         auto& vulkan_context =
             static_cast<ui::vulkan::VulkanPresenter::VulkanGuestOutputRefreshContext&>(context);
-        vulkan_context.SetLens(xr_lens);
         uint64_t guest_output_image_version = vulkan_context.image_version();
 
         const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
@@ -4878,6 +4959,15 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                                  ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
         }
 
+        // The headset's copy of every frame (rex/ui/vulkan/openxr.h).
+        ui::vulkan::openxr::FrameCopy xr_copy;
+        const bool xr_frame = ui::vulkan::openxr::BeginGuestFrame(
+            guest_output_width, guest_output_height, xr_lens, xr_copy);
+        if (xr_frame) {
+          RecordXrFrameCopy(vulkan_context.image(), guest_output_width, guest_output_height,
+                            xr_copy);
+        }
+
         // Need to submit all the commands before giving the image back to the
         // presenter so it can submit its own commands for displaying it to the
         // queue, and also need to submit the release barrier.
@@ -4908,6 +4998,18 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             pending_present_notify_ = [renderer, native_context]() { renderer(native_context); };
           } else {
             renderer(native_context);
+          }
+        }
+        if (xr_frame) {
+          // The headset may show the frame once its copy is on the queue.
+          if (present_deferred_presenter_) {
+            pending_present_notify_ = [notify = std::move(pending_present_notify_)]() {
+              ui::vulkan::openxr::GuestFrameSubmitted();
+              if (notify) notify();
+            };
+          } else {
+            if (async_submission_) AwaitSubmissionWorker();
+            ui::vulkan::openxr::GuestFrameSubmitted();
           }
         }
         ++presented_output_frames_;

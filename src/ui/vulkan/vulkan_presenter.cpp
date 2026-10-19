@@ -26,7 +26,6 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/platform.h>
-#include <rex/ui/vulkan/openxr.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -1500,8 +1499,6 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
       is_8bpc_out_ref, image_instance.image->image(), image_instance.image->view(),
       image_instance.version, image_instance.ever_successfully_refreshed,
       image_instance.image.get(), &hudless_written, &camera, &camera_written);
-  openxr::Lens lens;
-  context.lens_out_ = &lens;
   bool refresher_succeeded = refresher(context);
   if (refresher_succeeded) {
     image_instance.ever_successfully_refreshed = true;
@@ -1509,7 +1506,6 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
   image_instance.hudless_valid = refresher_succeeded && hudless_written;
   image_instance.camera_valid = refresher_succeeded && camera_written;
   image_instance.camera = camera;
-  image_instance.lens = refresher_succeeded ? lens : openxr::Lens{};
   // Deferred: the refresher's work reaches the queue later, and the step
   // signals after it.
   if (!IsGuestOutputPublishDeferred()) {
@@ -2313,7 +2309,6 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   bool guest_output_hudless = false;
   bool guest_output_camera_valid = false;
   UpscalerCamera guest_output_camera;
-  openxr::Lens guest_output_lens;
   {
     uint32_t guest_output_mailbox_index;
     std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
@@ -2325,7 +2320,6 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       guest_output_hudless = guest_output_images_[guest_output_mailbox_index].hudless_valid;
       guest_output_camera_valid = guest_output_images_[guest_output_mailbox_index].camera_valid;
       guest_output_camera = guest_output_images_[guest_output_mailbox_index].camera;
-      guest_output_lens = guest_output_images_[guest_output_mailbox_index].lens;
     }
     // Incremented the reference count of the guest output image - safe to leave
     // the consumer critical section now as everything here either will be using
@@ -3196,20 +3190,6 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     dfn.vkCmdEndRenderPass(draw_command_buffer);
   }
 
-  // The headset's frame (xr_enabled): the guest output copied in, in this
-  // command buffer, after the painting that samples it.
-  if (guest_output_image) {
-    const VkExtent2D xr_extent = guest_output_image->extent();
-    if (openxr::BeginFrame(xr_extent.width, xr_extent.height)) {
-      openxr::RecordCopy(draw_command_buffer, guest_output_image->image(), xr_extent.width,
-                         xr_extent.height, kGuestOutputInternalLayout,
-                         kGuestOutputInternalAccessMask, kGuestOutputInternalStageMask,
-                         guest_output_lens);
-    } else if (openxr::StereoWanted()) {
-      openxr::NoteLens(guest_output_lens);
-    }
-  }
-
   dfn.vkEndCommandBuffer(draw_command_buffer);
 
   VkPipelineStageFlags acquire_semaphore_wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -3265,7 +3245,6 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         }
       }
     }
-    openxr::EndFrame();
     if (submit_result != VK_SUCCESS) {
       REXLOG_ERROR("VulkanPresenter: Failed to submit command buffers: {}", int32_t(submit_result));
       fence_acqusition.SubmissionFailedOrDropped();

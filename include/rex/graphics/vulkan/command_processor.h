@@ -50,6 +50,7 @@
 #include <rex/hash.h>
 #include <rex/system/kernel_state.h>
 #include <rex/ui/vulkan/linked_type_descriptor_set_allocator.h>
+#include <rex/ui/vulkan/openxr.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/provider.h>
 #include <rex/ui/vulkan/upload_buffer_pool.h>
@@ -416,6 +417,11 @@ class VulkanCommandProcessor : public CommandProcessor {
                  uint32_t frontbuffer_height) override;
   void IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                      uint32_t frontbuffer_height);
+  // The guest output's copy for the VR headset (openxr::BeginGuestFrame), in
+  // the swap's submission; the guest output is in the presenter's internal
+  // layout before and after.
+  void RecordXrFrameCopy(VkImage guest_output, uint32_t width, uint32_t height,
+                         const ui::vulkan::openxr::FrameCopy& copy);
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
