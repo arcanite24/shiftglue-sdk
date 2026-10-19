@@ -5,17 +5,21 @@
  *
  * With xr_enabled, the Vulkan instance and device are created with the
  * extensions the player's OpenXR runtime asks for (XR_KHR_vulkan_enable), a
- * session opens on that device, and presented frames go to the headset:
+ * session opens on that device, and the title's frames go to the headset:
  *
  * - On a screen: each frame is a quad in front of the player.
  * - In stereo (xr_stereo), for titles whose host moves their camera per
  *   frame: the host asks NextEye for each frame's eye and pose, renders it
  *   with that camera and tags the frame through its vertical field of view
  *   (TagFov). The frame's world-view-projection gives the field of view back
- *   (GuestOutputLens), FovTag recovers the request, and the frame goes to its
- *   eye of a projection layer; the other eye keeps its latest frame
- *   (alternate-eye rendering). Frames without a tag or a world (menus) show
- *   on the screen.
+ *   (the Lens), FovTag recovers the request, and the frame goes to its eye
+ *   of a projection layer (alternate-eye rendering). A left frame and the
+ *   right one requested after it are a pair, shown together; the host can
+ *   render a pair from one moment of its world. Frames without a tag or a
+ *   world (menus) show on the screen.
+ *
+ * The session's own thread submits the headset's frames at its refresh rate,
+ * each with the latest pair or screen frame.
  *
  * Builds without REX_HAS_OPENXR (cmake/rexglue_openxr.cmake) compile these to
  * no-ops; xr_simulate runs the stereo bookkeeping without a headset.
@@ -45,8 +49,10 @@ namespace openxr {
 std::vector<const char*> InstanceExtensions();
 std::vector<const char*> DeviceExtensions(VkInstance instance, VkPhysicalDevice physical_device);
 
-// Opens the session on the presenter's device, once.
+// Opens the session on the presenter's device, once, and starts its thread.
 void OnDeviceCreated(const VulkanInstance* instance, const VulkanDevice* device);
+// Ends the session and its thread before the device is destroyed.
+void OnDeviceDestroying();
 
 // Whether stereo frames are wanted: a running stereo session, or
 // xr_simulate. The GPU side then measures each frame's lens.
@@ -93,22 +99,29 @@ struct Lens {
   float right[3] = {};
 };
 
-// The presenter's per-frame hooks, all on its painting thread. BeginFrame
-// waits for the headset's next frame and returns true when the frame wants
-// an image; RecordCopy then copies the guest output (in the given layout,
-// which it restores) into the eye the lens tags, or the screen, in the
-// paint's command buffer. EndFrame goes after that command buffer is
-// submitted, whether or not BeginFrame returned true.
-bool BeginFrame(uint32_t width, uint32_t height);
-void RecordCopy(VkCommandBuffer command_buffer, VkImage source, uint32_t width, uint32_t height,
-                VkImageLayout source_layout, VkAccessFlags source_access,
-                VkPipelineStageFlags source_stage, const Lens& lens);
-void EndFrame();
-// Painting without a headset frame (xr_simulate, or no session): counts the
-// lens's tag for the log.
-void NoteLens(const Lens& lens);
+// Each title frame for the headset, from the GPU emulation's swap once the
+// guest output is final (every frame, so no eye of a pair is missed).
+// BeginGuestFrame decodes the lens's tag (and logs, also for xr_simulate) and
+// says where the frame goes. The caller then records in the frame's command
+// buffer:
+// - the guest output blitted, nearest, into `staging` (from an undefined
+//   layout to a transfer destination, then a transfer source; same size);
+// - `staging` copied into `target` (from an undefined layout to a transfer
+//   destination, then color attachment optimal);
+// - with `capture`, `staging` copied into that buffer for the host.
+// GuestFrameSubmitted goes after that command buffer has been submitted. A
+// left eye's frame stays unseen until the right one requested after it is
+// copied, and both reach the headset together. False when there is nothing
+// to copy: no session, or a right eye whose left frame was not copied.
+struct FrameCopy {
+  VkImage staging = VK_NULL_HANDLE;
+  VkImage target = VK_NULL_HANDLE;
+  VkBuffer capture = VK_NULL_HANDLE;
+};
+bool BeginGuestFrame(uint32_t width, uint32_t height, const Lens& lens, FrameCopy& out);
+void GuestFrameSubmitted();
 
-// Saves the next `frames` stereo frames as the headset gets them, into
+// Saves the next `frames` stereo frames as they are copied, into
 // `directory`: each eye's image (xr-capture-N-left.ppm, ...) and a line of
 // xr-capture.jsonl with what it was rendered with (tag, pose, field of view),
 // the head pose the headset predicted for its display, and its age. Each
