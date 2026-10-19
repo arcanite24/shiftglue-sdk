@@ -32,6 +32,13 @@ uint32_t FovTag(double fov_y);
 uint32_t HeadsetRefreshHz();
 void SetHeadsetRefreshHz(uint32_t hz);
 
+// The rate the headset asks the app for frames (its refresh, or half of it
+// with spacewarp) while a VR session runs, else 0. In stereo each of these
+// frames shows one pair of eyes, so a host that steps its world by whole
+// headset frames per pair moves it evenly on the headset.
+uint32_t HeadsetFrameHz();
+void SetHeadsetFrameHz(uint32_t hz);
+
 // Ends a running VR session before a hard exit (std::_Exit): its thread may
 // be inside the OpenXR runtime, which unloads with the process and faulted
 // under it. The VR output registers what Shutdown runs; once, any thread.
