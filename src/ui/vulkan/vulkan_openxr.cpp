@@ -348,6 +348,9 @@ void DestroyTarget(Target& target) {
 
 void DestroySession() {
   State& s = S();
+  // NextEye (the game thread) stops using the session first.
+  s.running = false;
+  s.next_display_time = 0;
   for (Target& target : s.targets) DestroyTarget(target);
   if (s.view != XR_NULL_HANDLE) xrDestroySpace(s.view);
   if (s.local != XR_NULL_HANDLE) xrDestroySpace(s.local);
