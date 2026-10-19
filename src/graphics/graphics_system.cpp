@@ -38,6 +38,7 @@
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/window.h>
+#include <rex/ui/xr.h>
 #include <rex/ui/windowed_app_context.h>
 
 REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
@@ -249,8 +250,10 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             rex::thread::Sleep(std::chrono::milliseconds(20));
             continue;
           }
+          // In VR the headset's refresh rate, when the output asks (rex/ui/xr.h).
+          const uint32_t headset_hz = ui::xr::HeadsetRefreshHz();
           const uint32_t current_render_fps_limit =
-              REXCVAR_GET(pinyon_shift_fh1_render_fps_limit);
+              headset_hz ? headset_hz : REXCVAR_GET(pinyon_shift_fh1_render_fps_limit);
           if (current_render_fps_limit != render_fps_limit) {
             render_fps_limit = current_render_fps_limit;
             const double refresh_rate_hz = Fh1GuestVblankHzForRenderLimit(

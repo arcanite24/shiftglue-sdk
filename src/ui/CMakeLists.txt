@@ -12,7 +12,7 @@ set(REXUI_CORE_SOURCES
     menu_item.cpp
     presenter.cpp
     upscaler.cpp
-    xr_tag.cpp
+    xr.cpp
     renderdoc_api.cpp
     sdl_virtual_key.cpp
     window.cpp

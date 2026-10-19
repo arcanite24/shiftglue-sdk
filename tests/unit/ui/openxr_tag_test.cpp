@@ -3,7 +3,7 @@
 #include <cmath>
 #include <cstdint>
 
-#include <rex/ui/xr_tag.h>
+#include <rex/ui/xr.h>
 
 using namespace rex::ui::xr;
 
