@@ -70,11 +70,16 @@ struct Bookkeeping {
   // Log: frames decoded per eye, untagged, lens missing.
   uint64_t decoded[2] = {}, untagged = 0, no_lens = 0, last_logged = 0;
   // Eye check: between consecutive decoded frames, does the camera move
-  // sideways the way their requests do?
+  // sideways the way their requests do? Frame to frame (the change of the
+  // move, so steady car motion cancels), and within a pair (a left frame and
+  // the right one requested after it): a host rendering a pair from one
+  // moment moves the camera by the eyes' offset alone there, while turning
+  // and sliding fool the frame to frame check.
   bool have_previous = false;
   Lens previous_lens;
   EyeRequest previous_request;
   uint64_t eye_match = 0, eye_mismatch = 0, detailed = 0, mismatches_logged = 0;
+  uint64_t pair_match = 0, pair_mismatch = 0, pair_mismatches_logged = 0;
   // Change of the sideways move between consecutive frames, measured and
   // expected: steady car motion cancels out of it, the eyes' swap does not.
   double previous_moved = 0.0, previous_expected = 0.0;
@@ -169,6 +174,13 @@ bool FindRequest(const Lens& lens, EyeRequest& out, uint64_t* requested_ns = nul
         residual += d * d;
       }
       residual = std::sqrt(residual);
+      const bool match = std::abs(moved - expected) < std::abs(moved + expected);
+      ++(match ? b.pair_match : b.pair_mismatch);
+      if (!match && b.pair_mismatches_logged < 20) {
+        ++b.pair_mismatches_logged;
+        REXLOG_INFO("OpenXR pair check: tags {}-{} moved {:+.4f}, expected {:+.4f}",
+                    b.previous_request.tag, out.tag, moved, expected);
+      }
       b.pair_motion_sum += residual;
       b.pair_motion_max = std::max(b.pair_motion_max, residual);
       ++b.pairs;
@@ -197,12 +209,13 @@ void LogDecoding(const char* where) {
   REXLOG_INFO(
       "OpenXR {}: {} requested, presented left {} right {}, untagged {}, no lens {}; "
       "eye check {} right, {} wrong; frame age {:.1f} ms (max {:.1f}), each eye every {:.1f} ms; "
-      "world motion between paired eyes {:.1f} mm (max {:.1f}) over {} pairs",
+      "world motion between paired eyes {:.1f} mm (max {:.1f}) over {} pairs; pair check {} "
+      "right, {} wrong",
       where, b.sequence, b.decoded[0], b.decoded[1], b.untagged, b.no_lens, b.eye_match,
       b.eye_mismatch, b.timed ? b.age_sum_ms / double(b.timed) : 0.0, b.age_max_ms,
       b.intervals ? b.interval_sum_ms / double(b.intervals) : 0.0,
       b.pairs ? 1000.0 * b.pair_motion_sum / double(b.pairs) : 0.0, 1000.0 * b.pair_motion_max,
-      b.pairs);
+      b.pairs, b.pair_match, b.pair_mismatch);
   b.age_sum_ms = b.age_max_ms = b.interval_sum_ms = 0.0;
   b.timed = b.intervals = 0;
   b.pair_motion_sum = b.pair_motion_max = 0.0;
@@ -307,6 +320,10 @@ struct State {
   XrSpace local = XR_NULL_HANDLE;
   XrSpace view = XR_NULL_HANDLE;
   std::atomic<bool> running{false};
+  // The headset shows the session (VISIBLE or FOCUSED). Otherwise (headset
+  // off or asleep) the runtime stops taking images, and acquiring one would
+  // wait out its timeout on every game frame.
+  std::atomic<bool> visible{false};
   // The display time NextEye locates the eyes at: the latest frame's, one
   // period ahead (the game's frame shows about then).
   std::atomic<int64_t> next_display_time{0};
@@ -485,6 +502,7 @@ void DestroySession() {
   State& s = S();
   // NextEye (the game thread) stops using the session first.
   s.running = false;
+  s.visible = false;
   xr::SetHeadsetRefreshHz(0);
   s.next_display_time = 0;
   for (Target& target : s.targets) DestroyTarget(target);
@@ -507,6 +525,8 @@ void PollEvents() {
     if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
       const auto& changed = reinterpret_cast<const XrEventDataSessionStateChanged&>(event);
       REXLOG_INFO("OpenXR: session state {}", int(changed.state));
+      s.visible = changed.state == XR_SESSION_STATE_VISIBLE ||
+                  changed.state == XR_SESSION_STATE_FOCUSED;
       if (changed.state == XR_SESSION_STATE_READY && !s.running) {
         XrSessionBeginInfo begin{XR_TYPE_SESSION_BEGIN_INFO};
         begin.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -837,6 +857,21 @@ void FrameLoop() {
   }
 }
 
+// xr::Shutdown, before a hard exit: the headset thread stops and the session
+// and instance end, without waiting on the GPU (stragglers may hold it).
+void ShutdownForExit() {
+  State& s = S();
+  s.stop = true;
+  if (s.thread.joinable()) s.thread.join();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (s.session != XR_NULL_HANDLE) DestroySession();
+  if (s.instance != XR_NULL_HANDLE) {
+    xrDestroyInstance(s.instance);
+    s.instance = XR_NULL_HANDLE;
+  }
+  REXLOG_INFO("OpenXR: session ended for exit");
+}
+
 }  // namespace
 
 std::vector<const char*> InstanceExtensions() {
@@ -908,6 +943,7 @@ void OnDeviceCreated(const VulkanInstance* instance, const VulkanDevice* device)
   s.device = device;
   s.stop = false;
   s.thread = std::thread(FrameLoop);
+  xr::SetShutdown(&ShutdownForExit);
   REXLOG_INFO("OpenXR: session created; put the headset on");
 }
 
@@ -1010,7 +1046,7 @@ bool BeginGuestFrame(uint32_t width, uint32_t height, const Lens& lens, FrameCop
                      .count());
     }
   } hold{std::chrono::steady_clock::now(), s.guest_hold};
-  if (!s.running || s.session == XR_NULL_HANDLE || !s.device || !ChooseFormat() ||
+  if (!s.running || !s.visible || s.session == XR_NULL_HANDLE || !s.device || !ChooseFormat() ||
       !EnsureStaging(width, height)) {
     return false;
   }
