@@ -189,6 +189,22 @@ class Fh1NativeExecutor {
   // readable from compute shaders) and camera, if the depth covers width x
   // height; null otherwise.
   VkImageView TakeCameraFrame(uint32_t width, uint32_t height, Camera& camera_out);
+  // After OnSwap, with camera tracking: the swapped frame's main view's full
+  // horizontal and vertical fields of view (radians), from its world's
+  // matrix, for the OpenXR output; false without a world.
+  bool TakeLens(float& fov_x, float& fov_y) const {
+    fov_x = lens_fov_x_;
+    fov_y = lens_fov_y_;
+    return lens_valid_;
+  }
+  // And where its camera was, with its right axis (world units).
+  bool TakeLensPosition(float (&position)[3], float (&right)[3]) const {
+    for (int i = 0; i < 3; ++i) {
+      position[i] = lens_position_[i];
+      right[i] = lens_right_[i];
+    }
+    return lens_valid_ && lens_has_position_;
+  }
   // UP-1.5: jitter the scene with a Halton(2, 3) sequence of this length
   // from the next frame (0: none).
   void SetJitterPhases(uint32_t phases) { jitter_phases_ = phases; }
@@ -580,6 +596,12 @@ class Fh1NativeExecutor {
   std::unordered_map<uint64_t, std::array<float, 16>> camera_previous_objects_;
   Camera camera_ready_ = {};
   bool camera_ready_valid_ = false;
+  bool lens_valid_ = false;
+  float lens_fov_x_ = 0.0f;
+  float lens_fov_y_ = 0.0f;
+  bool lens_has_position_ = false;
+  float lens_position_[3] = {};
+  float lens_right_[3] = {};
   // The previous frame's scene depth: the one most matrix draws tested,
   // and the color target those draws used most.
   uint32_t camera_scene_depth_ = 0;

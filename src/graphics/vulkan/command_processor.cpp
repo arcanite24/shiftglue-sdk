@@ -57,6 +57,7 @@
 #include <rex/types.h>
 #include <rex/memory/utils.h>
 #include <rex/ui/flags.h>
+#include <rex/ui/vulkan/openxr.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -4004,7 +4005,9 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                                                 hudless_wanted);
     hud_snapshot_view =
         fh1_native_executor_->TakeHudSnapshot(guest_output_width, guest_output_height);
-    fh1_native_executor_->SetCameraTrackingEnabled(camera_wanted);
+    // And the OpenXR output's stereo, which reads each frame's lens.
+    fh1_native_executor_->SetCameraTrackingEnabled(camera_wanted ||
+                                                   ui::vulkan::openxr::StereoWanted());
     // UP-1.7: once the object slot image is the guest output's size (made
     // between frames, IssueSwap) and initialised by a camera pass.
     const bool object_motion_wanted =
@@ -4023,9 +4026,15 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
     }
   }
 
+  ui::vulkan::openxr::Lens xr_lens;
+  if (fh1_native_executor_) {
+    xr_lens.valid = fh1_native_executor_->TakeLens(xr_lens.fov_x, xr_lens.fov_y);
+    xr_lens.has_position =
+        fh1_native_executor_->TakeLensPosition(xr_lens.position, xr_lens.right);
+  }
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
-      [this, guest_output_width, guest_output_height, display_width, display_height,
+      [this, xr_lens, guest_output_width, guest_output_height, display_width, display_height,
        frontbuffer_format, swap_texture_view, swap_post_effect, swap_source_needs_rb_swap,
        hud_snapshot_view, hdr_active, scene_fxaa, scene_lut, hudless_wanted, camera_depth_view,
        camera](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
@@ -4036,6 +4045,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
 
         auto& vulkan_context =
             static_cast<ui::vulkan::VulkanPresenter::VulkanGuestOutputRefreshContext&>(context);
+        vulkan_context.SetLens(xr_lens);
         uint64_t guest_output_image_version = vulkan_context.image_version();
 
         const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();

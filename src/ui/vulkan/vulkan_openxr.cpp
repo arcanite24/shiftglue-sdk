@@ -7,17 +7,155 @@
 
 #include <rex/ui/vulkan/openxr.h>
 
+#include <atomic>
+#include <cmath>
+#include <mutex>
+
 #include <rex/cvar.h>
+#include <rex/logging.h>
 
 REXCVAR_DEFINE_BOOL(xr_enabled, false, "Display",
                     "Show the game in a VR headset through the PC's OpenXR runtime (Virtual "
-                    "Desktop, SteamVR, Meta Link, ...), as a large screen in front of you. "
-                    "Read at start; Vulkan only");
+                    "Desktop, SteamVR, Meta Link, ...). Read at start; Vulkan only");
+REXCVAR_DEFINE_BOOL(xr_stereo, true, "Display",
+                    "In VR, render the cockpit in 3D, the eyes taking turns frame by frame, "
+                    "when the game supports it; otherwise, or off, a large screen")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(xr_screen_distance, 2.5, "Display",
                       "Distance in metres from the headset's start position to the VR screen")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(xr_screen_width, 3.2, "Display", "Width of the VR screen in metres")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(xr_simulate, false, "Display",
+                    "Testing without a headset: request alternating eyes at a fixed head pose "
+                    "and log how presented frames decode, without OpenXR")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(xr_simulate_ipd, 0.064, "Display",
+                      "Eye distance in metres for xr_simulate")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+namespace rex {
+namespace ui {
+namespace vulkan {
+namespace openxr {
+
+namespace {
+
+constexpr double kFovStep = 0.002;
+constexpr double kTagStep = kFovStep / 32.0;
+
+// What NextEye handed out, by tag, for presented frames to find again.
+struct Requested {
+  bool valid = false;
+  EyeRequest request;
+};
+
+struct Bookkeeping {
+  std::mutex mutex;
+  uint64_t sequence = 0;
+  Requested ring[kTagCount];
+  // Log: frames decoded per eye, untagged, lens missing.
+  uint64_t decoded[2] = {}, untagged = 0, no_lens = 0, last_logged = 0;
+  // Eye check: between consecutive decoded frames, does the camera move
+  // sideways the way their requests do?
+  bool have_previous = false;
+  Lens previous_lens;
+  EyeRequest previous_request;
+  uint64_t eye_match = 0, eye_mismatch = 0, detailed = 0;
+};
+
+Bookkeeping& B() {
+  static Bookkeeping bookkeeping;
+  return bookkeeping;
+}
+
+// The request a presented frame's lens tags, if any.
+bool FindRequest(const Lens& lens, EyeRequest& out) {
+  Bookkeeping& b = B();
+  std::lock_guard<std::mutex> lock(b.mutex);
+  if (!lens.valid) {
+    ++b.no_lens;
+    return false;
+  }
+  const uint32_t tag = FovTag(lens.fov_y);
+  if (tag >= kTagCount || !b.ring[tag].valid) {
+    ++b.untagged;
+    return false;
+  }
+  out = b.ring[tag].request;
+  ++b.decoded[out.eye & 1];
+  if (b.have_previous && lens.has_position && b.previous_lens.has_position) {
+    double moved = 0.0;
+    for (int i = 0; i < 3; ++i) {
+      moved += double(lens.position[i] - b.previous_lens.position[i]) * lens.right[i];
+    }
+    const double expected = double(out.position[0]) - b.previous_request.position[0];
+    if (std::abs(expected) > 0.01) {
+      ++((moved > 0.0) == (expected > 0.0) ? b.eye_match : b.eye_mismatch);
+    }
+    if (b.detailed < 12) {
+      ++b.detailed;
+      REXLOG_INFO("OpenXR frame: tag {} eye {} fov_y {:.6f}, moved {:+.4f} expected {:+.4f}",
+                  out.tag, out.eye, lens.fov_y, moved, expected);
+    }
+  }
+  b.have_previous = true;
+  b.previous_lens = lens;
+  b.previous_request = out;
+  return true;
+}
+
+void LogDecoding(const char* where) {
+  Bookkeeping& b = B();
+  std::lock_guard<std::mutex> lock(b.mutex);
+  const uint64_t total = b.decoded[0] + b.decoded[1] + b.untagged + b.no_lens;
+  if (total < b.last_logged + 300) return;
+  b.last_logged = total;
+  REXLOG_INFO(
+      "OpenXR {}: {} requested, presented left {} right {}, untagged {}, no lens {}; "
+      "eye check {} right, {} wrong",
+      where, b.sequence, b.decoded[0], b.decoded[1], b.untagged, b.no_lens, b.eye_match,
+      b.eye_mismatch);
+}
+
+// Stores and returns a new request for `eye` at this pose.
+EyeRequest Record(int eye, const float position[3], const float orientation[4]) {
+  Bookkeeping& b = B();
+  std::lock_guard<std::mutex> lock(b.mutex);
+  EyeRequest request;
+  request.eye = eye;
+  request.tag = uint32_t(b.sequence % kTagCount);
+  for (int i = 0; i < 3; ++i) request.position[i] = position[i];
+  for (int i = 0; i < 4; ++i) request.orientation[i] = orientation[i];
+  b.ring[request.tag] = {true, request};
+  ++b.sequence;
+  return request;
+}
+
+}  // namespace
+
+double TagFov(double fov_y, uint32_t tag) {
+  if (!(fov_y > 0.0)) return fov_y;
+  return std::floor(fov_y / kFovStep) * kFovStep + (double(tag % kTagCount) + 0.5) * kTagStep;
+}
+
+uint32_t FovTag(double fov_y) {
+  if (!(fov_y > 0.0)) return UINT32_MAX;
+  const double residual = fov_y - std::floor(fov_y / kFovStep) * kFovStep;
+  const double slot = residual / kTagStep - 0.5;
+  const double nearest = std::round(slot);
+  // An untagged field of view lands anywhere in the step; a tag lands within
+  // a tenth of a slot of its centre, in the lower half of the step.
+  if (nearest < 0.0 || nearest >= double(kTagCount) || std::abs(slot - nearest) > 0.1) {
+    return UINT32_MAX;
+  }
+  return uint32_t(nearest);
+}
+
+}  // namespace openxr
+}  // namespace vulkan
+}  // namespace ui
+}  // namespace rex
 
 #if REX_HAS_OPENXR
 
@@ -25,14 +163,12 @@ REXCVAR_DEFINE_DOUBLE(xr_screen_width, 3.2, "Display", "Width of the VR screen i
 #include <chrono>
 #include <cstring>
 #include <deque>
-#include <mutex>
 #include <string>
 
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
-#include <rex/logging.h>
 #include <rex/ui/vulkan/device.h>
 #include <rex/ui/vulkan/instance.h>
 #include <rex/ui/vulkan/util.h>
@@ -43,6 +179,21 @@ namespace vulkan {
 namespace openxr {
 
 namespace {
+
+// One swapchain the guest output is copied into: the screen, or an eye.
+struct Target {
+  XrSwapchain swapchain = XR_NULL_HANDLE;
+  uint32_t width = 0, height = 0;
+  std::vector<XrSwapchainImageVulkanKHR> images;
+  bool acquired = false;
+  uint32_t index = 0;
+  // An eye's last released frame: what it was rendered with.
+  bool has_frame = false;
+  XrPosef pose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+  XrFovf fov{};
+};
+
+enum TargetIndex { kLeft, kRight, kScreen, kTargetCount };
 
 struct State {
   std::mutex mutex;
@@ -60,25 +211,28 @@ struct State {
   XrSession session = XR_NULL_HANDLE;
   XrSpace local = XR_NULL_HANDLE;
   XrSpace view = XR_NULL_HANDLE;
-  bool running = false;
+  std::atomic<bool> running{false};
+  // The display time NextEye locates the eyes at: the latest frame's, one
+  // period ahead (the game's frame shows about then).
+  std::atomic<int64_t> next_display_time{0};
+  std::atomic<int64_t> display_period{0};
 
-  XrSwapchain swapchain = XR_NULL_HANDLE;
-  uint32_t swapchain_width = 0, swapchain_height = 0;
   VkFormat swapchain_format = VK_FORMAT_UNDEFINED;
   VkFormat staging_format = VK_FORMAT_UNDEFINED;  // the UNORM twin of swapchain_format
-  std::vector<XrSwapchainImageVulkanKHR> images;
-
+  Target targets[kTargetCount];
   // The guest output is 10:10:10:2 and gamma-encoded; the headset wants 8-bit
   // sRGB. A blit into an 8-bit UNORM image keeps the encoded values, and a
   // raw copy of those bits into the sRGB image then shows them as sRGB.
   VkImage staging = VK_NULL_HANDLE;
   VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+  uint32_t staging_width = 0, staging_height = 0;
   // Images replaced on a resize, freed at exit (the GPU may still read them).
   std::vector<std::pair<VkImage, VkDeviceMemory>> retired;
 
   bool frame_begun = false;
-  bool image_acquired = false;
-  uint32_t image_index = 0;
+  // What this frame shows: the screen, or the eyes.
+  bool frame_stereo = false;
+  bool frame_has_image = false;
   XrFrameState frame_state{XR_TYPE_FRAME_STATE};
   std::chrono::steady_clock::time_point last_pose_log{};
   uint64_t frames = 0;
@@ -187,18 +341,20 @@ std::string ExtensionList(Get get) {
   return list;
 }
 
+void DestroyTarget(Target& target) {
+  if (target.swapchain != XR_NULL_HANDLE) xrDestroySwapchain(target.swapchain);
+  target = {};
+}
+
 void DestroySession() {
   State& s = S();
-  if (s.swapchain != XR_NULL_HANDLE) xrDestroySwapchain(s.swapchain);
+  for (Target& target : s.targets) DestroyTarget(target);
   if (s.view != XR_NULL_HANDLE) xrDestroySpace(s.view);
   if (s.local != XR_NULL_HANDLE) xrDestroySpace(s.local);
   if (s.session != XR_NULL_HANDLE) xrDestroySession(s.session);
-  s.swapchain = XR_NULL_HANDLE;
   s.view = s.local = XR_NULL_HANDLE;
   s.session = XR_NULL_HANDLE;
   s.running = false;
-  s.images.clear();
-  s.swapchain_width = s.swapchain_height = 0;
 }
 
 void PollEvents() {
@@ -213,8 +369,8 @@ void PollEvents() {
         begin.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
         s.running = Check(xrBeginSession(s.session, &begin), "xrBeginSession");
       } else if (changed.state == XR_SESSION_STATE_STOPPING && s.running) {
-        xrEndSession(s.session);
         s.running = false;
+        xrEndSession(s.session);
       } else if (changed.state == XR_SESSION_STATE_EXITING ||
                  changed.state == XR_SESSION_STATE_LOSS_PENDING) {
         REXLOG_INFO("OpenXR: the runtime ended the session; VR is off until restart");
@@ -227,57 +383,36 @@ void PollEvents() {
   }
 }
 
-bool EnsureSwapchain(uint32_t width, uint32_t height) {
+bool ChooseFormat() {
   State& s = S();
-  if (s.swapchain != XR_NULL_HANDLE && s.swapchain_width == width &&
-      s.swapchain_height == height) {
-    return true;
-  }
-  if (s.swapchain != XR_NULL_HANDLE) {
-    xrDestroySwapchain(s.swapchain);
-    s.swapchain = XR_NULL_HANDLE;
-    s.images.clear();
-  }
-  if (s.swapchain_format == VK_FORMAT_UNDEFINED) {
-    uint32_t count = 0;
-    xrEnumerateSwapchainFormats(s.session, 0, &count, nullptr);
-    std::vector<int64_t> formats(count);
-    xrEnumerateSwapchainFormats(s.session, count, &count, formats.data());
-    for (const VkFormat wanted : {VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB}) {
-      for (const int64_t format : formats) {
-        if (format == wanted && s.swapchain_format == VK_FORMAT_UNDEFINED) {
-          s.swapchain_format = wanted;
-        }
+  if (s.swapchain_format != VK_FORMAT_UNDEFINED) return true;
+  uint32_t count = 0;
+  xrEnumerateSwapchainFormats(s.session, 0, &count, nullptr);
+  std::vector<int64_t> formats(count);
+  xrEnumerateSwapchainFormats(s.session, count, &count, formats.data());
+  for (const VkFormat wanted : {VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB}) {
+    for (const int64_t format : formats) {
+      if (format == wanted && s.swapchain_format == VK_FORMAT_UNDEFINED) {
+        s.swapchain_format = wanted;
       }
     }
-    if (s.swapchain_format == VK_FORMAT_UNDEFINED) {
-      REXLOG_WARN("OpenXR: the runtime offers no 8-bit sRGB swapchain format; VR is off");
-      DestroySession();
-      return false;
-    }
-    s.staging_format = s.swapchain_format == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM
-                                                                     : VK_FORMAT_B8G8R8A8_UNORM;
   }
-  XrSwapchainCreateInfo create_info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
-  create_info.usageFlags =
-      XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
-  create_info.format = s.swapchain_format;
-  create_info.sampleCount = 1;
-  create_info.width = width;
-  create_info.height = height;
-  create_info.faceCount = 1;
-  create_info.arraySize = 1;
-  create_info.mipCount = 1;
-  if (!Check(xrCreateSwapchain(s.session, &create_info, &s.swapchain), "xrCreateSwapchain")) {
+  if (s.swapchain_format == VK_FORMAT_UNDEFINED) {
+    REXLOG_WARN("OpenXR: the runtime offers no 8-bit sRGB swapchain format; VR is off");
     return false;
   }
-  uint32_t count = 0;
-  xrEnumerateSwapchainImages(s.swapchain, 0, &count, nullptr);
-  s.images.assign(count, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
-  xrEnumerateSwapchainImages(s.swapchain, count, &count,
-                             reinterpret_cast<XrSwapchainImageBaseHeader*>(s.images.data()));
+  s.staging_format = s.swapchain_format == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM
+                                                                   : VK_FORMAT_B8G8R8A8_UNORM;
+  return true;
+}
 
+bool EnsureStaging(uint32_t width, uint32_t height) {
+  State& s = S();
+  if (s.staging != VK_NULL_HANDLE && s.staging_width == width && s.staging_height == height) {
+    return true;
+  }
   if (s.staging != VK_NULL_HANDLE) s.retired.emplace_back(s.staging, s.staging_memory);
+  s.staging = VK_NULL_HANDLE;
   VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   image_info.imageType = VK_IMAGE_TYPE_2D;
   image_info.format = s.staging_format;
@@ -295,10 +430,124 @@ bool EnsureSwapchain(uint32_t width, uint32_t height) {
     s.staging = VK_NULL_HANDLE;
     return false;
   }
-  s.swapchain_width = width;
-  s.swapchain_height = height;
-  REXLOG_INFO("OpenXR: screen {}x{}, {} swapchain images", width, height, count);
+  s.staging_width = width;
+  s.staging_height = height;
   return true;
+}
+
+bool EnsureTarget(Target& target, uint32_t width, uint32_t height, const char* name) {
+  State& s = S();
+  if (target.swapchain != XR_NULL_HANDLE && target.width == width && target.height == height) {
+    return true;
+  }
+  DestroyTarget(target);
+  XrSwapchainCreateInfo create_info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+  create_info.usageFlags =
+      XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+  create_info.format = s.swapchain_format;
+  create_info.sampleCount = 1;
+  create_info.width = width;
+  create_info.height = height;
+  create_info.faceCount = 1;
+  create_info.arraySize = 1;
+  create_info.mipCount = 1;
+  if (!Check(xrCreateSwapchain(s.session, &create_info, &target.swapchain), "xrCreateSwapchain")) {
+    target.swapchain = XR_NULL_HANDLE;
+    return false;
+  }
+  uint32_t count = 0;
+  xrEnumerateSwapchainImages(target.swapchain, 0, &count, nullptr);
+  target.images.assign(count, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+  xrEnumerateSwapchainImages(target.swapchain, count, &count,
+                             reinterpret_cast<XrSwapchainImageBaseHeader*>(target.images.data()));
+  target.width = width;
+  target.height = height;
+  REXLOG_INFO("OpenXR: {} {}x{}, {} swapchain images", name, width, height, count);
+  return true;
+}
+
+bool Acquire(Target& target) {
+  State& s = S();
+  {
+    // The runtime may use the game's queue here (XR_KHR_vulkan_enable).
+    const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
+    XrSwapchainImageAcquireInfo acquire_info{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    if (!Check(xrAcquireSwapchainImage(target.swapchain, &acquire_info, &target.index),
+               "xrAcquireSwapchainImage")) {
+      return false;
+    }
+  }
+  target.acquired = true;
+  XrSwapchainImageWaitInfo image_wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+  image_wait.timeout = 100'000'000;  // 100 ms
+  return Check(xrWaitSwapchainImage(target.swapchain, &image_wait), "xrWaitSwapchainImage");
+}
+
+void RecordBlitAndCopy(VkCommandBuffer command_buffer, VkImage source, VkImage target,
+                       uint32_t width, uint32_t height, VkImageLayout source_layout,
+                       VkAccessFlags source_access, VkPipelineStageFlags source_stage) {
+  State& s = S();
+  const VulkanDevice::Functions& dfn = s.device->functions();
+  const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  auto barrier = [&](VkImage image, VkAccessFlags from_access, VkAccessFlags to_access,
+                     VkImageLayout from, VkImageLayout to) {
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask = from_access;
+    b.dstAccessMask = to_access;
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = range;
+    return b;
+  };
+
+  // The guest output to a transfer source; the staging image (last read by
+  // the previous frame's copy) and the headset's image to transfer targets.
+  std::array<VkImageMemoryBarrier, 3> before = {
+      barrier(source, source_access, VK_ACCESS_TRANSFER_READ_BIT, source_layout,
+              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+      barrier(s.staging, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+              VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+      barrier(target, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)};
+  dfn.vkCmdPipelineBarrier(command_buffer,
+                           source_stage | VK_PIPELINE_STAGE_TRANSFER_BIT |
+                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                           uint32_t(before.size()), before.data());
+
+  VkImageBlit blit{};
+  blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  blit.srcOffsets[1] = {int32_t(width), int32_t(height), 1};
+  blit.dstSubresource = blit.srcSubresource;
+  blit.dstOffsets[1] = blit.srcOffsets[1];
+  dfn.vkCmdBlitImage(command_buffer, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.staging,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+
+  std::array<VkImageMemoryBarrier, 2> middle = {
+      barrier(s.staging, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+      barrier(source, VK_ACCESS_TRANSFER_READ_BIT, source_access,
+              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, source_layout)};
+  dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT | source_stage, 0, 0, nullptr, 0,
+                           nullptr, uint32_t(middle.size()), middle.data());
+
+  VkImageCopy copy{};
+  copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  copy.dstSubresource = copy.srcSubresource;
+  copy.extent = {width, height, 1};
+  dfn.vkCmdCopyImage(command_buffer, s.staging, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+  // The runtime takes the image back as a color attachment.
+  VkImageMemoryBarrier after =
+      barrier(target, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
+              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+  dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0,
+                           nullptr, 1, &after);
 }
 
 void LogPose() {
@@ -390,11 +639,54 @@ void OnDeviceCreated(const VulkanInstance* instance, const VulkanDevice* device)
   REXLOG_INFO("OpenXR: session created; put the headset on");
 }
 
+bool StereoWanted() {
+  if (REXCVAR_GET(xr_simulate)) return true;
+  return REXCVAR_GET(xr_stereo) && S().running.load(std::memory_order_relaxed);
+}
+
+bool NextEye(EyeRequest& out) {
+  const uint64_t sequence = [] {
+    std::lock_guard<std::mutex> lock(B().mutex);
+    return B().sequence;
+  }();
+  const int eye = int(sequence & 1);
+  if (REXCVAR_GET(xr_simulate)) {
+    const float half = float(REXCVAR_GET(xr_simulate_ipd)) * 0.5f;
+    const float position[3] = {eye ? half : -half, 0.0f, 0.0f};
+    const float orientation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    out = Record(eye, position, orientation);
+    return true;
+  }
+  State& s = S();
+  if (!REXCVAR_GET(xr_stereo) || !s.running.load(std::memory_order_relaxed)) return false;
+  // xrLocateViews may run beside the painting thread's frame calls.
+  const int64_t time = s.next_display_time.load(std::memory_order_relaxed);
+  if (time == 0) return false;
+  XrViewLocateInfo locate_info{XR_TYPE_VIEW_LOCATE_INFO};
+  locate_info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+  locate_info.displayTime = time;
+  locate_info.space = s.local;
+  XrViewState view_state{XR_TYPE_VIEW_STATE};
+  XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+  uint32_t count = 0;
+  if (XR_FAILED(xrLocateViews(s.session, &locate_info, &view_state, 2, &count, views)) ||
+      count != 2 || !(view_state.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) ||
+      !(view_state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
+    return false;
+  }
+  const XrPosef& pose = views[eye].pose;
+  const float position[3] = {pose.position.x, pose.position.y, pose.position.z};
+  const float orientation[4] = {pose.orientation.x, pose.orientation.y, pose.orientation.z,
+                                pose.orientation.w};
+  out = Record(eye, position, orientation);
+  return true;
+}
+
 bool BeginFrame(uint32_t width, uint32_t height) {
   std::lock_guard<std::mutex> lock(S().mutex);
   State& s = S();
   s.frame_begun = false;
-  s.image_acquired = false;
+  s.frame_has_image = false;
   if (s.session == XR_NULL_HANDLE) return false;
   PollEvents();
   if (!s.running || width == 0 || height == 0) return false;
@@ -402,96 +694,54 @@ bool BeginFrame(uint32_t width, uint32_t height) {
   s.frame_state = {XR_TYPE_FRAME_STATE};
   XrFrameWaitInfo wait_info{XR_TYPE_FRAME_WAIT_INFO};
   if (!Check(xrWaitFrame(s.session, &wait_info, &s.frame_state), "xrWaitFrame")) return false;
+  s.display_period = s.frame_state.predictedDisplayPeriod;
+  s.next_display_time =
+      s.frame_state.predictedDisplayTime + s.frame_state.predictedDisplayPeriod;
   {
-    // The runtime may use the game's queue in these calls (XR_KHR_vulkan_enable).
     const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
     XrFrameBeginInfo begin_info{XR_TYPE_FRAME_BEGIN_INFO};
     if (!Check(xrBeginFrame(s.session, &begin_info), "xrBeginFrame")) return false;
   }
   s.frame_begun = true;
-  if (!s.frame_state.shouldRender || !EnsureSwapchain(width, height)) return false;
-  {
-    const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
-    XrSwapchainImageAcquireInfo acquire_info{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    if (!Check(xrAcquireSwapchainImage(s.swapchain, &acquire_info, &s.image_index),
-               "xrAcquireSwapchainImage")) {
-      return false;
-    }
+  if (!s.frame_state.shouldRender || !ChooseFormat() || !EnsureStaging(width, height)) {
+    return false;
   }
-  s.image_acquired = true;
-  XrSwapchainImageWaitInfo image_wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-  image_wait.timeout = 100'000'000;  // 100 ms
-  return Check(xrWaitSwapchainImage(s.swapchain, &image_wait), "xrWaitSwapchainImage");
+  return true;
 }
 
 void RecordCopy(VkCommandBuffer command_buffer, VkImage source, uint32_t width, uint32_t height,
                 VkImageLayout source_layout, VkAccessFlags source_access,
-                VkPipelineStageFlags source_stage) {
+                VkPipelineStageFlags source_stage, const Lens& lens) {
   std::lock_guard<std::mutex> lock(S().mutex);
   State& s = S();
-  if (!s.image_acquired || width != s.swapchain_width || height != s.swapchain_height) return;
-  const VulkanDevice::Functions& dfn = s.device->functions();
-  const VkImage target = s.images[s.image_index].image;
-  const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  auto barrier = [&](VkImage image, VkAccessFlags from_access, VkAccessFlags to_access,
-                     VkImageLayout from, VkImageLayout to) {
-    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    b.srcAccessMask = from_access;
-    b.dstAccessMask = to_access;
-    b.oldLayout = from;
-    b.newLayout = to;
-    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = image;
-    b.subresourceRange = range;
-    return b;
-  };
+  if (!s.frame_begun || width != s.staging_width || height != s.staging_height) return;
+  EyeRequest request;
+  const bool stereo = REXCVAR_GET(xr_stereo) && FindRequest(lens, request);
+  Target& target = s.targets[stereo ? (request.eye ? kRight : kLeft) : kScreen];
+  static const char* const kNames[] = {"left eye", "right eye", "screen"};
+  if (!EnsureTarget(target, width, height, kNames[stereo ? request.eye : kScreen]) ||
+      !Acquire(target)) {
+    return;
+  }
+  RecordBlitAndCopy(command_buffer, source, target.images[target.index].image, width, height,
+                    source_layout, source_access, source_stage);
+  s.frame_has_image = true;
+  s.frame_stereo = stereo;
+  if (stereo) {
+    target.has_frame = true;
+    target.pose.position = {request.position[0], request.position[1], request.position[2]};
+    target.pose.orientation = {request.orientation[0], request.orientation[1],
+                               request.orientation[2], request.orientation[3]};
+    const float half_x = lens.fov_x * 0.5f, half_y = lens.fov_y * 0.5f;
+    target.fov = {-half_x, half_x, half_y, -half_y};
+  }
+  LogDecoding("stereo");
+}
 
-  // The guest output to a transfer source; the staging image (last read by
-  // the previous frame's copy) and the headset's image to transfer targets.
-  std::array<VkImageMemoryBarrier, 3> before = {
-      barrier(source, source_access, VK_ACCESS_TRANSFER_READ_BIT, source_layout,
-              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
-      barrier(s.staging, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-              VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
-      barrier(target, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
-              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)};
-  dfn.vkCmdPipelineBarrier(command_buffer,
-                           source_stage | VK_PIPELINE_STAGE_TRANSFER_BIT |
-                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
-                           uint32_t(before.size()), before.data());
-
-  VkImageBlit blit{};
-  blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  blit.srcOffsets[1] = {int32_t(width), int32_t(height), 1};
-  blit.dstSubresource = blit.srcSubresource;
-  blit.dstOffsets[1] = blit.srcOffsets[1];
-  dfn.vkCmdBlitImage(command_buffer, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.staging,
-                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
-
-  std::array<VkImageMemoryBarrier, 2> middle = {
-      barrier(s.staging, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
-      barrier(source, VK_ACCESS_TRANSFER_READ_BIT, source_access,
-              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, source_layout)};
-  dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                           VK_PIPELINE_STAGE_TRANSFER_BIT | source_stage, 0, 0, nullptr, 0,
-                           nullptr, uint32_t(middle.size()), middle.data());
-
-  VkImageCopy copy{};
-  copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  copy.dstSubresource = copy.srcSubresource;
-  copy.extent = {width, height, 1};
-  dfn.vkCmdCopyImage(command_buffer, s.staging, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
-                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-
-  // The runtime takes the image back as a color attachment.
-  VkImageMemoryBarrier after =
-      barrier(target, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
-              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-  dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0,
-                           nullptr, 1, &after);
+void NoteLens(const Lens& lens) {
+  EyeRequest request;
+  FindRequest(lens, request);
+  LogDecoding("simulated");
 }
 
 void EndFrame() {
@@ -500,21 +750,43 @@ void EndFrame() {
   if (!s.frame_begun) return;
   s.frame_begun = false;
   const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
+  for (Target& target : s.targets) {
+    if (!target.acquired) continue;
+    target.acquired = false;
+    XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    Check(xrReleaseSwapchainImage(target.swapchain, &release_info), "xrReleaseSwapchainImage");
+  }
   XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+  XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+  XrCompositionLayerProjectionView views[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
+                                               {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
   const XrCompositionLayerBaseHeader* layers[1];
   uint32_t layer_count = 0;
-  if (s.image_acquired) {
-    s.image_acquired = false;
-    XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    Check(xrReleaseSwapchainImage(s.swapchain, &release_info), "xrReleaseSwapchainImage");
+  const Target& left = s.targets[kLeft];
+  const Target& right = s.targets[kRight];
+  if (s.frame_has_image && s.frame_stereo && left.has_frame && right.has_frame) {
+    for (int eye = 0; eye < 2; ++eye) {
+      const Target& t = s.targets[eye];
+      views[eye].pose = t.pose;
+      views[eye].fov = t.fov;
+      views[eye].subImage.swapchain = t.swapchain;
+      views[eye].subImage.imageRect = {{0, 0}, {int32_t(t.width), int32_t(t.height)}};
+    }
+    projection.space = s.local;
+    projection.viewCount = 2;
+    projection.views = views;
+    layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection);
+    ++s.frames;
+  } else if (s.frame_has_image && !s.frame_stereo && s.targets[kScreen].swapchain) {
+    const Target& screen = s.targets[kScreen];
     const float width_m = float(REXCVAR_GET(xr_screen_width));
     quad.space = s.local;
     quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-    quad.subImage.swapchain = s.swapchain;
-    quad.subImage.imageRect = {{0, 0}, {int32_t(s.swapchain_width), int32_t(s.swapchain_height)}};
+    quad.subImage.swapchain = screen.swapchain;
+    quad.subImage.imageRect = {{0, 0}, {int32_t(screen.width), int32_t(screen.height)}};
     quad.pose.orientation.w = 1.0f;
     quad.pose.position.z = -float(REXCVAR_GET(xr_screen_distance));
-    quad.size = {width_m, width_m * float(s.swapchain_height) / float(s.swapchain_width)};
+    quad.size = {width_m, width_m * float(screen.height) / float(screen.width)};
     layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
     ++s.frames;
   }
@@ -542,10 +814,29 @@ namespace openxr {
 std::vector<const char*> InstanceExtensions() { return {}; }
 std::vector<const char*> DeviceExtensions(VkInstance, VkPhysicalDevice) { return {}; }
 void OnDeviceCreated(const VulkanInstance*, const VulkanDevice*) {}
+bool StereoWanted() { return REXCVAR_GET(xr_simulate); }
+bool NextEye(EyeRequest& out) {
+  if (!REXCVAR_GET(xr_simulate)) return false;
+  const uint64_t sequence = [] {
+    std::lock_guard<std::mutex> lock(B().mutex);
+    return B().sequence;
+  }();
+  const int eye = int(sequence & 1);
+  const float half = float(REXCVAR_GET(xr_simulate_ipd)) * 0.5f;
+  const float position[3] = {eye ? half : -half, 0.0f, 0.0f};
+  const float orientation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+  out = Record(eye, position, orientation);
+  return true;
+}
 bool BeginFrame(uint32_t, uint32_t) { return false; }
 void RecordCopy(VkCommandBuffer, VkImage, uint32_t, uint32_t, VkImageLayout, VkAccessFlags,
-                VkPipelineStageFlags) {}
+                VkPipelineStageFlags, const Lens&) {}
 void EndFrame() {}
+void NoteLens(const Lens& lens) {
+  EyeRequest request;
+  FindRequest(lens, request);
+  LogDecoding("simulated");
+}
 
 }  // namespace openxr
 }  // namespace vulkan
