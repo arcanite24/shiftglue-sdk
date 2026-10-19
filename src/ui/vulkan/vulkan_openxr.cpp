@@ -351,6 +351,15 @@ struct State {
   XrSession session = XR_NULL_HANDLE;
   XrSpace local = XR_NULL_HANDLE;
   XrSpace view = XR_NULL_HANDLE;
+  // The seat: LOCAL moved to where the head was, facing level, at the start
+  // and at each Recenter. Runtimes put LOCAL's origin in different places
+  // (Virtual Desktop at the head at start, Meta's runtime where it was last
+  // recentred, 2.2 m away in a test), and the eye poses go to the title's
+  // camera as offsets from it. Spaces replaced while NextEye may use them
+  // stay until the session ends.
+  std::atomic<XrSpace> seat{XR_NULL_HANDLE};
+  std::vector<XrSpace> old_seats;
+  std::atomic<bool> recenter{true};
   std::atomic<bool> running{false};
   // The headset shows the session (VISIBLE or FOCUSED). Otherwise (headset
   // off or asleep) the runtime stops taking images, and acquiring one would
@@ -433,6 +442,45 @@ State& S() {
   return *state;
 }
 
+// The space eye poses, layers and logs use: the seat once set, else LOCAL.
+XrSpace Seat() {
+  const XrSpace seat = S().seat.load(std::memory_order_acquire);
+  return seat != XR_NULL_HANDLE ? seat : S().local;
+}
+
+bool Check(XrResult result, const char* what);
+
+// Under the state mutex: the seat where the head is at `time`, facing its
+// direction about the vertical. False until the head is tracked.
+bool PlaceSeat(XrTime time) {
+  State& s = S();
+  XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};
+  if (XR_FAILED(xrLocateSpace(s.view, s.local, time, &head)) ||
+      !(head.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) ||
+      !(head.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+    return false;
+  }
+  const XrQuaternionf& q = head.pose.orientation;
+  // The head's forward (-z) direction, and the yaw that turns -z onto it.
+  const double fx = -2.0 * (q.x * q.z + q.w * q.y);
+  const double fz = -(1.0 - 2.0 * (q.x * q.x + q.y * q.y));
+  const double yaw = std::atan2(-fx, -fz);
+  XrReferenceSpaceCreateInfo info{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+  info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+  info.poseInReferenceSpace.orientation = {0.0f, float(std::sin(yaw * 0.5)), 0.0f,
+                                           float(std::cos(yaw * 0.5))};
+  info.poseInReferenceSpace.position = head.pose.position;
+  XrSpace seat = XR_NULL_HANDLE;
+  if (!Check(xrCreateReferenceSpace(s.session, &info, &seat), "creating the seat space")) {
+    return false;
+  }
+  if (XrSpace old = s.seat.exchange(seat); old != XR_NULL_HANDLE) s.old_seats.push_back(old);
+  REXLOG_INFO("OpenXR: seat set at ({:.3f}, {:.3f}, {:.3f}) m, facing {:.1f} degrees",
+              head.pose.position.x, head.pose.position.y, head.pose.position.z,
+              yaw * 57.29577951308232);
+  return true;
+}
+
 bool Check(XrResult result, const char* what) {
   if (XR_SUCCEEDED(result)) return true;
   char text[XR_MAX_RESULT_STRING_SIZE] = {};
@@ -474,6 +522,14 @@ bool EnsureInstance() {
   std::vector<XrExtensionProperties> extensions(count, {XR_TYPE_EXTENSION_PROPERTIES});
   xrEnumerateInstanceExtensionProperties(nullptr, count, &count, extensions.data());
   bool has_vulkan = false;
+  {
+    std::string names;
+    for (const auto& extension : extensions) {
+      names += names.empty() ? "" : " ";
+      names += extension.extensionName;
+    }
+    REXLOG_INFO("OpenXR: runtime extensions: {}", names);
+  }
   for (const auto& extension : extensions) {
     has_vulkan |= std::strcmp(extension.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0;
   }
@@ -550,6 +606,10 @@ void DestroySession() {
   s.pending = Pending::kNone;
   s.show_stereo = s.show_screen = false;
   if (s.view != XR_NULL_HANDLE) xrDestroySpace(s.view);
+  if (XrSpace seat = s.seat.exchange(XR_NULL_HANDLE); seat != XR_NULL_HANDLE) xrDestroySpace(seat);
+  for (XrSpace seat : s.old_seats) xrDestroySpace(seat);
+  s.old_seats.clear();
+  s.recenter = true;
   if (s.local != XR_NULL_HANDLE) xrDestroySpace(s.local);
   if (s.session != XR_NULL_HANDLE) xrDestroySession(s.session);
   s.view = s.local = XR_NULL_HANDLE;
@@ -773,7 +833,7 @@ void SaveCapture() {
   }
   dfn.vkUnmapMemory(s.device->device(), s.capture_memory);
   XrSpaceLocation shown{XR_TYPE_SPACE_LOCATION};
-  xrLocateSpace(s.view, s.local, s.frame_state.predictedDisplayTime, &shown);
+  xrLocateSpace(s.view, Seat(), s.frame_state.predictedDisplayTime, &shown);
   const XrPosef& h = shown.pose;
   std::ofstream log(s.capture_directory + "/xr-capture.jsonl", std::ios::app);
   log << fmt::format(
@@ -802,7 +862,7 @@ void LogPose() {
   if (now - s.last_pose_log < std::chrono::seconds(5)) return;
   s.last_pose_log = now;
   XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
-  if (XR_FAILED(xrLocateSpace(s.view, s.local, s.frame_state.predictedDisplayTime, &location))) {
+  if (XR_FAILED(xrLocateSpace(s.view, Seat(), s.frame_state.predictedDisplayTime, &location))) {
     return;
   }
   const XrPosef& p = location.pose;
@@ -874,6 +934,9 @@ void FrameLoop() {
     s.wait_frame.Add(std::chrono::duration<double, std::milli>(wait_end - wait_start).count());
     s.wait_lock.Add(std::chrono::duration<double, std::milli>(locked - wait_end).count());
     s.frame_state = frame_state;
+    if (s.recenter.load(std::memory_order_acquire) && PlaceSeat(frame_state.predictedDisplayTime)) {
+      s.recenter = false;
+    }
     const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
     XrFrameBeginInfo begin_info{XR_TYPE_FRAME_BEGIN_INFO};
     if (failed(xrBeginFrame(s.session, &begin_info), "xrBeginFrame")) continue;
@@ -892,14 +955,14 @@ void FrameLoop() {
         views[eye].subImage.swapchain = t.swapchain;
         views[eye].subImage.imageRect = {{0, 0}, {int32_t(t.width), int32_t(t.height)}};
       }
-      projection.space = s.local;
+      projection.space = Seat();
       projection.viewCount = 2;
       projection.views = views;
       layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection);
     } else if (frame_state.shouldRender && s.show_screen && s.targets[kScreen].released) {
       const Target& screen = s.targets[kScreen];
       const float width_m = float(REXCVAR_GET(xr_screen_width));
-      quad.space = s.local;
+      quad.space = Seat();
       quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
       quad.subImage.swapchain = screen.swapchain;
       quad.subImage.imageRect = {{0, 0}, {int32_t(screen.width), int32_t(screen.height)}};
@@ -1087,7 +1150,7 @@ bool NextEye(EyeRequest& out) {
   XrViewLocateInfo locate_info{XR_TYPE_VIEW_LOCATE_INFO};
   locate_info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
   locate_info.displayTime = time;
-  locate_info.space = s.local;
+  locate_info.space = Seat();
   XrViewState view_state{XR_TYPE_VIEW_STATE};
   XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
   uint32_t count = 0;
@@ -1217,6 +1280,8 @@ void GuestFrameSubmitted() {
   }
 }
 
+void Recenter() { S().recenter = true; }
+
 void RequestCapture(const std::string& directory, int frames) {
   std::lock_guard<std::mutex> lock(S().mutex);
   State& s = S();
@@ -1265,6 +1330,7 @@ bool BeginGuestFrame(uint32_t, uint32_t, const Lens& lens, FrameCopy& out) {
   return false;
 }
 void GuestFrameSubmitted() {}
+void Recenter() {}
 void RequestCapture(const std::string&, int) {}
 
 }  // namespace openxr
