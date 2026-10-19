@@ -121,6 +121,10 @@ struct FrameCopy {
 bool BeginGuestFrame(uint32_t width, uint32_t height, const Lens& lens, FrameCopy& out);
 void GuestFrameSubmitted();
 
+// Makes where the head is now, facing level, the seat: the origin of the eye
+// poses and of the screen. Done at the start of each session too.
+void Recenter();
+
 // Saves the next `frames` stereo frames as they are copied, into
 // `directory`: each eye's image (xr-capture-N-left.ppm, ...) and a line of
 // xr-capture.jsonl with what it was rendered with (tag, pose, field of view),
