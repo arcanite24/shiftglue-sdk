@@ -27,6 +27,7 @@
 #include <vector>
 
 #include <rex/ui/vulkan/api.h>
+#include <rex/ui/xr_tag.h>
 
 namespace rex {
 namespace ui {
@@ -63,13 +64,10 @@ struct EyeRequest {
 // frame, from any thread; false (and nothing requested) while stereo is off.
 bool NextEye(EyeRequest& out);
 
-// The tag in a vertical field of view, in radians: the field of view is
-// rounded down to a 0.002 rad step (0.11 degrees) and the tag sits in the
-// fraction, at most 0.001 rad, which nobody sees. FovTag gives it back, or
-// UINT32_MAX for an untagged field of view.
-constexpr uint32_t kTagCount = 16;
-double TagFov(double fov_y, uint32_t tag);
-uint32_t FovTag(double fov_y);
+// The tag in a vertical field of view (rex/ui/xr_tag.h).
+using xr::FovTag;
+using xr::kTagCount;
+using xr::TagFov;
 
 // A presented frame's lens, from its world-view-projection: full horizontal
 // and vertical fields of view in radians.
