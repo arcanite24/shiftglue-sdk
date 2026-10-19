@@ -360,6 +360,10 @@ struct State {
   std::atomic<XrSpace> seat{XR_NULL_HANDLE};
   std::vector<XrSpace> old_seats;
   std::atomic<bool> recenter{true};
+  // Headset frames the session has been visible for: the seat waits for
+  // 30, since Virtual Desktop reports a placeholder head pose, (0, -0.963,
+  // 0) m facing ahead, when the session starts.
+  uint32_t visible_frames = 0;
   std::atomic<bool> running{false};
   // The headset shows the session (VISIBLE or FOCUSED). Otherwise (headset
   // off or asleep) the runtime stops taking images, and acquiring one would
@@ -627,6 +631,7 @@ void PollEvents() {
       REXLOG_INFO("OpenXR: session state {}", int(changed.state));
       s.visible = changed.state == XR_SESSION_STATE_VISIBLE ||
                   changed.state == XR_SESSION_STATE_FOCUSED;
+      if (!s.visible) s.visible_frames = 0;
       if (changed.state == XR_SESSION_STATE_READY && !s.running) {
         XrSessionBeginInfo begin{XR_TYPE_SESSION_BEGIN_INFO};
         begin.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -641,6 +646,12 @@ void PollEvents() {
         REXLOG_INFO("OpenXR: the runtime ended the session; VR is off until restart");
         DestroySession();
       }
+    } else if (event.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
+      // The headset's own recentre moved LOCAL: seat the player again once
+      // it has (the seat is placed a few frames later).
+      REXLOG_INFO("OpenXR: the headset recentred; placing the seat again");
+      s.recenter = true;
+      s.visible_frames = 0;
     } else if (event.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
       DestroySession();
     }
@@ -934,7 +945,9 @@ void FrameLoop() {
     s.wait_frame.Add(std::chrono::duration<double, std::milli>(wait_end - wait_start).count());
     s.wait_lock.Add(std::chrono::duration<double, std::milli>(locked - wait_end).count());
     s.frame_state = frame_state;
-    if (s.recenter.load(std::memory_order_acquire) && PlaceSeat(frame_state.predictedDisplayTime)) {
+    if (s.visible) ++s.visible_frames;
+    if (s.recenter.load(std::memory_order_acquire) && s.visible_frames >= 30 &&
+        PlaceSeat(frame_state.predictedDisplayTime)) {
       s.recenter = false;
     }
     const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
