@@ -1103,6 +1103,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   // The FH1 native renderer (NP-12.4); guest draws, copies and clears go
   // through it instead of the render target cache when it initialized.
   std::unique_ptr<Fh1NativeExecutor> fh1_native_executor_;
+  // The lens of the frame drawn before the latest swap: the next swap shows
+  // that frame (IssueSwapImpl).
+  ui::vulkan::openxr::Lens xr_lens_drawn_;
   // fh1_frame_dump_frame: records one frame for offline replay (at 1x).
   std::unique_ptr<Fh1FrameDump> frame_dump_;
   std::shared_ptr<Fh1FrameInspector> inspector_ = std::make_shared<Fh1FrameInspector>();

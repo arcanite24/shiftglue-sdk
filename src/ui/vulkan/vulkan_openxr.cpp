@@ -39,6 +39,11 @@ REXCVAR_DEFINE_BOOL(xr_simulate, false, "Display",
 REXCVAR_DEFINE_DOUBLE(xr_simulate_ipd, 0.064, "Display",
                       "Eye distance in metres for xr_simulate")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(xr_log_frames, 0, "Display",
+                     "Testing: log each stereo frame's decoded eye, tag and camera for this "
+                     "many frames from when it is set")
+    .range(0, 1000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(xr_simulate_fov, 1.6, "Display",
                       "Vertical field of view in radians xr_simulate reports for its headset")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -118,6 +123,19 @@ bool FindRequest(const Lens& lens, EyeRequest& out, uint64_t* requested_ns = nul
   }
   out = b.ring[tag].request;
   if (requested_ns) *requested_ns = b.ring[tag].requested_ns;
+  {
+    static int32_t last_setting = 0, remaining = 0;
+    const int32_t setting = REXCVAR_GET(xr_log_frames);
+    if (setting != last_setting) remaining = setting;
+    last_setting = setting;
+    if (remaining > 0) {
+      --remaining;
+      REXLOG_INFO("OpenXR frame log: tag {} eye {} camera ({:.4f}, {:.4f}, {:.4f}) right ({:.3f}, "
+                  "{:.3f}, {:.3f})",
+                  tag, out.eye, lens.position[0], lens.position[1], lens.position[2],
+                  lens.right[0], lens.right[1], lens.right[2]);
+    }
+  }
   ++b.decoded[out.eye & 1];
   b.presented_fov_y = lens.fov_y;
   // A frame painted again (no new one yet) is not counted twice.
