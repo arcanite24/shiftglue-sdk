@@ -171,6 +171,12 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                 rex::align(sizeof(ArgsVkCopyBufferToImage), alignof(VkBufferImageCopy))));
       } break;
 
+      case Command::kVkBlitImage: {
+        auto& args = *reinterpret_cast<const ArgsVkBlitImage*>(stream);
+        dfn.vkCmdBlitImage(command_buffer, args.src_image, args.src_image_layout, args.dst_image,
+                           args.dst_image_layout, 1, &args.region, args.filter);
+      } break;
+
       case Command::kVkCopyImage: {
         auto& args = *reinterpret_cast<const ArgsVkCopyImage*>(stream);
         dfn.vkCmdCopyImage(command_buffer, args.src_image, args.src_image_layout, args.dst_image,

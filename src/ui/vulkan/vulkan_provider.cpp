@@ -161,6 +161,11 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
   return provider;
 }
 
+VulkanProvider::~VulkanProvider() {
+  // The VR session runs on the device.
+  if (ui_samplers_) openxr::OnDeviceDestroying();
+}
+
 std::unique_ptr<Presenter> VulkanProvider::CreatePresenter(
     Presenter::HostGpuLossCallback host_gpu_loss_callback) {
   return VulkanPresenter::Create(host_gpu_loss_callback, vulkan_device(), ui_samplers());
