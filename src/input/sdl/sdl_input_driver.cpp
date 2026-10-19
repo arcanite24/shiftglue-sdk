@@ -1790,6 +1790,32 @@ uint16_t SdlEffectType(uint32_t type) {
   }
 }
 
+// Whether a condition differs from what the wheel has by less than a felt
+// step: 3 % of the gain and of the effect's own scale (bytes, as FH1 sends,
+// or DirectInput's 10000).
+bool ConditionClose(const xinputd_ffb::Effect& a, const xinputd_ffb::Effect& b) {
+  const int32_t fields[][2] = {{a.magnitude, b.magnitude},
+                               {a.positive_coefficient, b.positive_coefficient},
+                               {a.negative_coefficient, b.negative_coefficient},
+                               {a.positive_saturation, b.positive_saturation},
+                               {a.negative_saturation, b.negative_saturation},
+                               {a.dead_band, b.dead_band}};
+  int32_t largest = 0;
+  for (const auto& f : fields) {
+    largest = std::max({largest, std::abs(f[0]), std::abs(f[1])});
+  }
+  const int32_t step = largest <= 255 ? 4 : 300;
+  if (a.type != b.type || std::abs(int32_t(a.gain) - int32_t(b.gain)) >= 8) {
+    return false;
+  }
+  for (const auto& f : fields) {
+    if (std::abs(f[0] - f[1]) >= step) {
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 bool SDLInputDriver::ReleaseFeedbackLocked(ControllerState& controller, bool stop_rumble) {
@@ -1977,6 +2003,7 @@ void SDLInputDriver::ApplyGameEffectLocked(GameEffect& game) {
   }
   game.dirty = false;
   game.applied_ms = SDL_GetTicks();
+  game.sent = e;
   if (game.running && !game.sdl_running) {
     game.sdl_running = SDL_RunHapticEffect(haptic, game.sdl_id, 1);
   } else if (!game.running && game.sdl_running) {
@@ -1993,6 +2020,17 @@ void SDLInputDriver::FlushGameEffectsLocked() {
     const uint64_t interval = game.effect.type == xinputd_ffb::kConstant ? 10 : 40;
     if (game.dirty && now - game.applied_ms >= interval) {
       ApplyGameEffectLocked(game);
+    }
+  }
+  // A T248's driver can drop an effect and still report it playing, so the
+  // status check below misses it: start every running effect again every two
+  // seconds regardless (pinyon-shift PR #605 does the same for its forces).
+  if (now >= next_effect_refresh_ms_ && GameEffectsEnabled()) {
+    next_effect_refresh_ms_ = now + 2000;
+    for (auto& [id, game] : game_effects_) {
+      if (game.running && game.sdl_running && game.sdl_id >= 0) {
+        SDL_RunHapticEffect(wheel_->haptic, game.sdl_id, 1);
+      }
     }
   }
   // Some bases drop a running effect (a Thrustmaster T248 stopped them on
@@ -2088,6 +2126,14 @@ void SDLInputDriver::UpdateEffect(const xinputd_ffb::Effect& effect, uint32_t) {
   }
   GameEffect& game = it->second;
   game.effect = effect;
+  // A T248's driver stops honouring a condition effect retuned many times a
+  // second while still reporting it playing; FH1 retunes its spring's gain
+  // with speed, up to 30 times a second. Conditions change only by a felt step.
+  if (effect.type != xinputd_ffb::kConstant && game.sdl_id >= 0 &&
+      ConditionClose(effect, game.sent)) {
+    game.dirty = false;
+    return;
+  }
   // The title updates its constant force every frame (60-120 times a second).
   // Some bases drop effects retuned that often (pinyon-shift PR #605: a T248 at
   // 100 Hz), so the constant force goes at most every 10 ms and the others every

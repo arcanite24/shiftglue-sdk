@@ -220,6 +220,7 @@ class SDLInputDriver final : public InputDriver,
     bool unsupported = false;
     bool dirty = false;       // an update waits for the rate limit
     uint64_t applied_ms = 0;  // when it was last sent to the wheel
+    xinputd_ffb::Effect sent;  // what was last sent, for the felt-step check
   };
   WheelEffectScale EffectScaleLocked() const;
   bool GameEffectsEnabled() const;
@@ -229,6 +230,7 @@ class SDLInputDriver final : public InputDriver,
   // Sends updates the rate limit held back and restarts effects the wheel stopped.
   void FlushGameEffectsLocked();
   uint64_t next_effect_check_ms_ = 0;
+  uint64_t next_effect_refresh_ms_ = 0;
   void ApplyRumbleLocked();
   std::map<uint32_t, GameEffect> game_effects_;
   uint16_t game_rumble_left_ = 0;
