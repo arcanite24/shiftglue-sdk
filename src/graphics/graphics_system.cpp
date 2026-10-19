@@ -262,6 +262,12 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
                 std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
           }
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+          // In VR stereo the headset's frame loop keeps these vblanks in
+          // phase with its frames (rex/ui/xr.h).
+          if (const int64_t nudge_ns = ui::xr::TakeVblankPhaseNudge(); nudge_ns != 0) {
+            last_frame_time = uint64_t(int64_t(last_frame_time) +
+                                       int64_t(double(nudge_ns) * double(guest_tick_frequency) / 1e9));
+          }
           while (current_time - last_frame_time >= interval_ticks) {
             if (perf::CriticalPathTraceEnabled()) {
               const uint64_t late_ticks = current_time - last_frame_time - interval_ticks;
