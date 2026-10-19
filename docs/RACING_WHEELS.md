@@ -44,6 +44,10 @@ RB, LT, RT, LS, RS, BACK, START, UP, DOWN, LEFT, RIGHT). A NAME may appear more
 than once, or list several inputs (`A=0,1`); any of them presses it, e.g.
 `B=Handbrake|+axis0,B=9` for a handbrake lever and a rim button.
 
+An H-pattern shifter's gates bind the same way, to the names `GEAR1` to `GEAR7` and
+`REVERSE`: `GEAR1=0079:0006|0,GEAR2=0079:0006|1,...,REVERSE=0079:0006|7`. With no
+gate held the wheel is in neutral.
+
 ## What the title sees
 
 - Steering on the left stick's X axis, throttle on the right trigger, brake on the
@@ -54,7 +58,10 @@ than once, or list several inputs (`A=0,1`); any of them presses it, e.g.
   `wheel_900_degree`, the 900-degree flag (left stick X of 900), so Forza Horizon
   uses its linear 900-degree steering instead of the pad's reduction at speed. The
   wheel base should be set to 900 degrees.
-- No H-shifter (right stick X of 0 in the capabilities), so the paddles shift.
+- With gears bound in `wheel_buttons`, an H-shifter: the capabilities give the right
+  stick X a range, and Forza Horizon then reads the held gear from it (-1 reverse,
+  0 neutral, 1 and up the gear). Without them, right stick X is 0 in the
+  capabilities. The paddles shift either way.
 
 ## Settings
 

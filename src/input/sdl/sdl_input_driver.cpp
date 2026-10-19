@@ -108,7 +108,8 @@ REX_WHEEL_PEDAL_DEADZONES(clutch, "Clutch")
 REXCVAR_DEFINE_STRING(wheel_buttons, "UP=h0.up,DOWN=h0.down,LEFT=h0.left,RIGHT=h0.right", "Input",
                       "Wheel buttons as pad controls: \"NAME=[device|]N\" pairs separated by "
                       "commas, N a button number or hN.up/down/left/right for a hat; names as "
-                      "in pad_remap (A, B, X, Y, LB, RB, LT, RT, LS, RS, BACK, START, UP, ...)")
+                      "in pad_remap (A, B, X, Y, LB, RB, LT, RT, LS, RS, BACK, START, UP, ...), "
+                      "or GEAR1 to GEAR7 and REVERSE for an H-shifter's gates")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_STRING(wheel_ffb_mode, "difference", "Input",
                       "Force feedback: difference (the title's two motor values as a signed "
@@ -1350,8 +1351,12 @@ void SDLInputDriver::OnJoystickAddedLocked(const SDL_Event& event) {
   c.gamepad.thumb_ly = static_cast<int16_t>(0xFFFFu);
   // A wheel whose capabilities give thumb_rx other than 0 or 1 has an
   // H-shifter: FH1 then reads the gear from the raw thumb_rx (0 neutral).
-  // No shifter is reported, so paddles and buttons shift.
-  c.gamepad.thumb_rx = 0;
+  // Reported only when gears are bound; paddles and buttons still shift.
+  RefreshWheelBindingsLocked();
+  const bool shifter =
+      std::any_of(wheel_bindings_.buttons.begin(), wheel_bindings_.buttons.end(),
+                  [](const WheelButtonBinding& binding) { return binding.gear != 0; });
+  c.gamepad.thumb_rx = shifter ? static_cast<int16_t>(0xFFFFu) : 0;
   c.gamepad.thumb_ry = static_cast<int16_t>(0xFFFFu);
   c.vibration.left_motor_speed = 0xFFFFu;
   c.vibration.right_motor_speed = 0xFFFFu;
@@ -1559,6 +1564,7 @@ void SDLInputDriver::RefreshWheelStateLocked() {
   uint8_t left_trigger = ReadWheelPedalLocked(b.brake, REXCVAR_GET(wheel_brake_deadzone_bottom),
                                               REXCVAR_GET(wheel_brake_deadzone_top));
   uint16_t buttons = 0;
+  int16_t gear = 0;  // neutral unless a shifter gate is held
   // FH1's wheel layouts read the clutch from |thumb_ry| (a split deadzone
   // applied radially with thumb_rx), and layout 1 shifts on LB/RB, so the
   // clutch pedal is an axis, not a button (found by Ty Crowther,
@@ -1590,6 +1596,9 @@ void SDLInputDriver::RefreshWheelStateLocked() {
     if (!pressed) {
       continue;
     }
+    if (binding.gear != 0) {
+      gear = binding.gear;
+    }
     buttons |= binding.xbuttons;
     if (binding.left_trigger)
       left_trigger = 0xFF;
@@ -1602,6 +1611,9 @@ void SDLInputDriver::RefreshWheelStateLocked() {
   pad.buttons = buttons;
   pad.left_trigger = left_trigger;
   pad.right_trigger = right_trigger;
+  // With a shifter reported (below), FH1 reads the gear from the raw thumb_rx:
+  // -1 reverse, 0 neutral, 1 and up the gear (pinyon-shift PR #605).
+  pad.thumb_rx = gear;
   ffb_trace::NoteWheelInput(pad.thumb_lx, right_trigger, left_trigger, buttons);
 
   if (std::memcmp(&pad, &wheel_->state.gamepad, sizeof(pad)) != 0) {

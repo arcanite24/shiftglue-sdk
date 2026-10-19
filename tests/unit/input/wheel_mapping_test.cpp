@@ -49,6 +49,21 @@ TEST_CASE("Wheel button bindings map buttons and hats to pad controls", "[input]
   CHECK(ParseWheelButtonBindings("").empty());
 }
 
+TEST_CASE("Wheel button bindings name H-shifter gears", "[input][wheel]") {
+  auto bindings = ParseWheelButtonBindings(
+      "gear1=0079:0006|0,GEAR6=0079:0006|5,REVERSE=0079:0006|7,GEAR8=1,GEAR0=2,RB=1");
+  REQUIRE(bindings.size() == 4);
+  CHECK(bindings[0].gear == 1);
+  CHECK(bindings[0].device == "0079:0006");
+  CHECK(bindings[0].button == 0);
+  CHECK(bindings[0].xbuttons == 0);
+  CHECK(bindings[1].gear == 6);
+  CHECK(bindings[2].gear == -1);
+  CHECK(bindings[2].button == 7);
+  CHECK(bindings[3].gear == 0);
+  CHECK(bindings[3].xbuttons == X_INPUT_GAMEPAD_RIGHT_SHOULDER);
+}
+
 TEST_CASE("Wheel devices match by USB IDs or name", "[input][wheel]") {
   CHECK(WheelDeviceMatches("", "Anything", 1, 2));
   CHECK(WheelDeviceMatches("0EB7:0020", "FANATEC CSL DD", 0x0EB7, 0x0020));

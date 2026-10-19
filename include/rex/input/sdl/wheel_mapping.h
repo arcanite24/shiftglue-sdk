@@ -44,7 +44,8 @@ struct WheelAxisBinding {
 // "hN.left", "hN.right" for a hat direction, or "[+|-]axisN" for an axis
 // past half travel, such as a handbrake lever) presses the pad control NAME
 // (names as in pad_remap: A, B, X, Y, LB, RB, LT, RT, LS, RS, BACK, START,
-// UP, DOWN, LEFT, RIGHT).
+// UP, DOWN, LEFT, RIGHT), or selects an H-shifter gear (GEAR1 to GEAR7,
+// REVERSE).
 struct WheelButtonBinding {
   std::string device;
   int button = -1;  // >= 0 for a button
@@ -55,6 +56,9 @@ struct WheelButtonBinding {
   uint16_t xbuttons = 0;  // pad button bits pressed
   bool left_trigger = false;
   bool right_trigger = false;
+  // An H-shifter gate (NAME GEAR1 to GEAR7, or REVERSE as -1): the gear the
+  // title reads while it is held. 0 for a pad control.
+  int8_t gear = 0;
 };
 
 std::optional<WheelAxisBinding> ParseWheelAxisBinding(std::string_view text);

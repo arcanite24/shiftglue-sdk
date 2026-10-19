@@ -75,9 +75,18 @@ struct ControlTarget {
   uint16_t xbuttons = 0;
   bool left_trigger = false;
   bool right_trigger = false;
+  int8_t gear = 0;
 };
 
 std::optional<ControlTarget> TargetForName(std::string_view name) {
+  // An H-pattern shifter's gates: GEAR1 to GEAR7 and REVERSE.
+  const std::string lower = Lower(Trim(name));
+  if (lower == "reverse") {
+    return ControlTarget{.gear = -1};
+  }
+  if (lower.size() == 5 && lower.starts_with("gear") && lower[4] >= '1' && lower[4] <= '7') {
+    return ControlTarget{.gear = int8_t(lower[4] - '0')};
+  }
   auto control = PadControlFromName(Trim(name));
   if (!control) {
     return std::nullopt;
@@ -198,6 +207,7 @@ std::vector<WheelButtonBinding> ParseWheelButtonBindings(std::string_view text) 
     binding.xbuttons = target->xbuttons;
     binding.left_trigger = target->left_trigger;
     binding.right_trigger = target->right_trigger;
+    binding.gear = target->gear;
     std::string_view axis_text = rest;
     AxisDirection axis_direction = AxisDirection::kAuto;
     if (!axis_text.empty() && (axis_text.front() == '+' || axis_text.front() == '-')) {
