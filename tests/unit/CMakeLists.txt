@@ -58,7 +58,7 @@ target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/graphics/flags.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/shared_memory.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/texture/cache.cpp
-    ${PROJECT_SOURCE_DIR}/src/ui/xr_tag.cpp
+    ${PROJECT_SOURCE_DIR}/src/ui/xr.cpp
 )
 
 target_include_directories(unit_tests PRIVATE

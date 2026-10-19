@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <mutex>
 
@@ -21,6 +22,10 @@ REXCVAR_DEFINE_BOOL(xr_enabled, false, "Display",
 REXCVAR_DEFINE_BOOL(xr_stereo, true, "Display",
                     "In VR, render the cockpit in 3D, the eyes taking turns frame by frame, "
                     "when the game supports it; otherwise, or off, a large screen")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(xr_match_refresh, true, "Display",
+                    "In VR, render the game at the headset's refresh rate instead of the game "
+                    "frame rate limit (each eye gets half of it in stereo)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(xr_screen_distance, 2.5, "Display",
                       "Distance in metres from the headset's start position to the VR screen")
@@ -49,7 +54,14 @@ namespace {
 struct Requested {
   bool valid = false;
   EyeRequest request;
+  uint64_t requested_ns = 0;
 };
+
+uint64_t SteadyNs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
 
 struct Bookkeeping {
   std::mutex mutex;
@@ -63,8 +75,17 @@ struct Bookkeeping {
   Lens previous_lens;
   EyeRequest previous_request;
   uint64_t eye_match = 0, eye_mismatch = 0, detailed = 0;
+  // Change of the sideways move between consecutive frames, measured and
+  // expected: steady car motion cancels out of it, the eyes' swap does not.
+  double previous_moved = 0.0, previous_expected = 0.0;
+  bool have_previous_move = false;
+  // Timing: how old a frame is when it is copied for the headset, and how
+  // often each eye gets a new one.
+  double age_sum_ms = 0.0, age_max_ms = 0.0, interval_sum_ms = 0.0;
+  uint64_t timed = 0, intervals = 0, last_eye_ns[2] = {}, last_tag = UINT64_MAX;
   std::atomic<float> presented_fov_y{0.0f};
   std::atomic<float> headset_fov_y{0.0f};
+  std::atomic<float> headset_fov_x{0.0f};
 };
 
 Bookkeeping& B() {
@@ -73,7 +94,7 @@ Bookkeeping& B() {
 }
 
 // The request a presented frame's lens tags, if any.
-bool FindRequest(const Lens& lens, EyeRequest& out) {
+bool FindRequest(const Lens& lens, EyeRequest& out, uint64_t* requested_ns = nullptr) {
   Bookkeeping& b = B();
   std::lock_guard<std::mutex> lock(b.mutex);
   if (!lens.valid) {
@@ -86,17 +107,49 @@ bool FindRequest(const Lens& lens, EyeRequest& out) {
     return false;
   }
   out = b.ring[tag].request;
+  if (requested_ns) *requested_ns = b.ring[tag].requested_ns;
   ++b.decoded[out.eye & 1];
   b.presented_fov_y = lens.fov_y;
-  if (b.have_previous && lens.has_position && b.previous_lens.has_position) {
+  // A frame painted again (no new one yet) is not counted twice.
+  const bool repeat = b.last_tag == tag;
+  b.last_tag = tag;
+  if (!repeat) {
+    const uint64_t now = SteadyNs();
+    const double age = double(now - b.ring[tag].requested_ns) / 1e6;
+    b.age_sum_ms += age;
+    b.age_max_ms = std::max(b.age_max_ms, age);
+    ++b.timed;
+    uint64_t& last = b.last_eye_ns[out.eye & 1];
+    if (last) {
+      b.interval_sum_ms += double(now - last) / 1e6;
+      ++b.intervals;
+    }
+    last = now;
+  }
+  if (!repeat && b.have_previous && lens.has_position && b.previous_lens.has_position) {
     double moved = 0.0;
     for (int i = 0; i < 3; ++i) {
       moved += double(lens.position[i] - b.previous_lens.position[i]) * lens.right[i];
     }
-    const double expected = double(out.position[0]) - b.previous_request.position[0];
-    if (std::abs(expected) > 0.01) {
-      ++((moved > 0.0) == (expected > 0.0) ? b.eye_match : b.eye_mismatch);
+    // The eyes' offset along the head's right axis.
+    const double x = out.orientation[0], y = out.orientation[1], z = out.orientation[2],
+                 w = out.orientation[3];
+    const double right[3] = {1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + w * z),
+                             2.0 * (x * z - w * y)};
+    double expected = 0.0;
+    for (int i = 0; i < 3; ++i) {
+      expected += (double(out.position[i]) - b.previous_request.position[i]) * right[i];
     }
+    if (b.have_previous_move) {
+      const double change = moved - b.previous_moved;
+      const double expected_change = expected - b.previous_expected;
+      if (std::abs(expected_change) > 0.02) {
+        ++((change > 0.0) == (expected_change > 0.0) ? b.eye_match : b.eye_mismatch);
+      }
+    }
+    b.previous_moved = moved;
+    b.previous_expected = expected;
+    b.have_previous_move = true;
     if (b.detailed < 12) {
       ++b.detailed;
       REXLOG_INFO("OpenXR frame: tag {} eye {} fov_y {:.6f}, moved {:+.4f} expected {:+.4f}",
@@ -117,9 +170,12 @@ void LogDecoding(const char* where) {
   b.last_logged = total;
   REXLOG_INFO(
       "OpenXR {}: {} requested, presented left {} right {}, untagged {}, no lens {}; "
-      "eye check {} right, {} wrong",
+      "eye check {} right, {} wrong; frame age {:.1f} ms (max {:.1f}), each eye every {:.1f} ms",
       where, b.sequence, b.decoded[0], b.decoded[1], b.untagged, b.no_lens, b.eye_match,
-      b.eye_mismatch);
+      b.eye_mismatch, b.timed ? b.age_sum_ms / double(b.timed) : 0.0, b.age_max_ms,
+      b.intervals ? b.interval_sum_ms / double(b.intervals) : 0.0);
+  b.age_sum_ms = b.age_max_ms = b.interval_sum_ms = 0.0;
+  b.timed = b.intervals = 0;
 }
 
 // Stores and returns a new request for `eye` at this pose.
@@ -131,7 +187,7 @@ EyeRequest Record(int eye, const float position[3], const float orientation[4]) 
   request.tag = uint32_t(b.sequence % kTagCount);
   for (int i = 0; i < 3; ++i) request.position[i] = position[i];
   for (int i = 0; i < 4; ++i) request.orientation[i] = orientation[i];
-  b.ring[request.tag] = {true, request};
+  b.ring[request.tag] = {true, request, SteadyNs()};
   ++b.sequence;
   return request;
 }
@@ -141,6 +197,13 @@ EyeRequest Record(int eye, const float position[3], const float orientation[4]) 
 float HeadsetFovY() {
   if (REXCVAR_GET(xr_simulate)) return float(REXCVAR_GET(xr_simulate_fov));
   return B().headset_fov_y.load(std::memory_order_relaxed);
+}
+float HeadsetFovX() {
+  if (REXCVAR_GET(xr_simulate)) {
+    // A Quest 3 eye is about 1.2 times as wide as tall.
+    return float(2.0 * std::atan(std::tan(REXCVAR_GET(xr_simulate_fov) * 0.5) * 1.2));
+  }
+  return B().headset_fov_x.load(std::memory_order_relaxed);
 }
 float PresentedFovY() { return B().presented_fov_y.load(std::memory_order_relaxed); }
 
@@ -155,12 +218,14 @@ float PresentedFovY() { return B().presented_fov_y.load(std::memory_order_relaxe
 #include <chrono>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <string>
 
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
+#include <fmt/format.h>
 #include <rex/ui/vulkan/device.h>
 #include <rex/ui/vulkan/instance.h>
 #include <rex/ui/vulkan/util.h>
@@ -225,6 +290,19 @@ struct State {
   // What this frame shows: the screen, or the eyes.
   bool frame_stereo = false;
   bool frame_has_image = false;
+
+  // RequestCapture: frames left to save, and the readback of this frame's.
+  std::string capture_directory;
+  int capture_left = 0;
+  uint32_t capture_index = 0;
+  VkBuffer capture_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory capture_memory = VK_NULL_HANDLE;
+  VkDeviceSize capture_size = 0;
+  bool capture_recorded = false;
+  EyeRequest capture_request;
+  Lens capture_lens;
+  uint64_t capture_requested_ns = 0, capture_recorded_ns = 0;
+  uint32_t capture_width = 0, capture_height = 0;
   XrFrameState frame_state{XR_TYPE_FRAME_STATE};
   std::chrono::steady_clock::time_point last_pose_log{};
   uint64_t frames = 0;
@@ -342,6 +420,7 @@ void DestroySession() {
   State& s = S();
   // NextEye (the game thread) stops using the session first.
   s.running = false;
+  xr::SetHeadsetRefreshHz(0);
   s.next_display_time = 0;
   for (Target& target : s.targets) DestroyTarget(target);
   if (s.view != XR_NULL_HANDLE) xrDestroySpace(s.view);
@@ -365,6 +444,7 @@ void PollEvents() {
         s.running = Check(xrBeginSession(s.session, &begin), "xrBeginSession");
       } else if (changed.state == XR_SESSION_STATE_STOPPING && s.running) {
         s.running = false;
+        xr::SetHeadsetRefreshHz(0);
         xrEndSession(s.session);
       } else if (changed.state == XR_SESSION_STATE_EXITING ||
                  changed.state == XR_SESSION_STATE_LOSS_PENDING) {
@@ -545,6 +625,102 @@ void RecordBlitAndCopy(VkCommandBuffer command_buffer, VkImage source, VkImage t
                            nullptr, 1, &after);
 }
 
+// RequestCapture: copies the staging image (this frame's eye, 8-bit, still a
+// transfer source after RecordBlitAndCopy) into a host-visible buffer.
+void RecordCapture(VkCommandBuffer command_buffer, uint32_t width, uint32_t height) {
+  State& s = S();
+  const VulkanDevice::Functions& dfn = s.device->functions();
+  const VkDeviceSize size = VkDeviceSize(width) * height * 4;
+  if (s.capture_buffer == VK_NULL_HANDLE || s.capture_size != size) {
+    if (s.capture_buffer != VK_NULL_HANDLE) {
+      dfn.vkDestroyBuffer(s.device->device(), s.capture_buffer, nullptr);
+      dfn.vkFreeMemory(s.device->device(), s.capture_memory, nullptr);
+      s.capture_buffer = VK_NULL_HANDLE;
+    }
+    if (!util::CreateDedicatedAllocationBuffer(s.device, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                               util::MemoryPurpose::kReadback, s.capture_buffer,
+                                               s.capture_memory)) {
+      REXLOG_WARN("OpenXR: could not create the capture buffer");
+      s.capture_buffer = VK_NULL_HANDLE;
+      s.capture_left = 0;
+      return;
+    }
+    s.capture_size = size;
+  }
+  VkBufferImageCopy copy{};
+  copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  copy.imageExtent = {width, height, 1};
+  dfn.vkCmdCopyImageToBuffer(command_buffer, s.staging, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             s.capture_buffer, 1, &copy);
+  VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+  barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+  barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.buffer = s.capture_buffer;
+  barrier.size = VK_WHOLE_SIZE;
+  dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &barrier, 0, nullptr);
+  s.capture_width = width;
+  s.capture_height = height;
+  s.capture_recorded = true;
+}
+
+// After the GPU finished the captured frame: its image and what it was
+// rendered with, beside the head pose the headset predicted for its display.
+void SaveCapture() {
+  State& s = S();
+  const VulkanDevice::Functions& dfn = s.device->functions();
+  void* mapped = nullptr;
+  if (dfn.vkMapMemory(s.device->device(), s.capture_memory, 0, VK_WHOLE_SIZE, 0, &mapped) !=
+      VK_SUCCESS) {
+    s.capture_left = 0;
+    return;
+  }
+  VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+  range.memory = s.capture_memory;
+  range.size = VK_WHOLE_SIZE;
+  dfn.vkInvalidateMappedMemoryRanges(s.device->device(), 1, &range);
+  const EyeRequest& r = s.capture_request;
+  const uint32_t index = s.capture_index++;
+  const std::string name = std::string("xr-capture-") + std::to_string(index) +
+                           (r.eye ? "-right.ppm" : "-left.ppm");
+  {
+    std::ofstream image(s.capture_directory + "/" + name, std::ios::binary);
+    image << "P6\n" << s.capture_width << ' ' << s.capture_height << "\n255\n";
+    const auto* pixels = static_cast<const uint8_t*>(mapped);
+    const bool bgra = s.staging_format == VK_FORMAT_B8G8R8A8_UNORM;
+    std::vector<uint8_t> row(size_t(s.capture_width) * 3);
+    for (uint32_t y = 0; y < s.capture_height; ++y) {
+      const uint8_t* in = pixels + size_t(y) * s.capture_width * 4;
+      for (uint32_t x = 0; x < s.capture_width; ++x) {
+        row[x * 3 + 0] = in[x * 4 + (bgra ? 2 : 0)];
+        row[x * 3 + 1] = in[x * 4 + 1];
+        row[x * 3 + 2] = in[x * 4 + (bgra ? 0 : 2)];
+      }
+      image.write(reinterpret_cast<const char*>(row.data()), std::streamsize(row.size()));
+    }
+  }
+  dfn.vkUnmapMemory(s.device->device(), s.capture_memory);
+  XrSpaceLocation shown{XR_TYPE_SPACE_LOCATION};
+  xrLocateSpace(s.view, s.local, s.frame_state.predictedDisplayTime, &shown);
+  const XrPosef& h = shown.pose;
+  std::ofstream log(s.capture_directory + "/xr-capture.jsonl", std::ios::app);
+  log << fmt::format(
+      "{{\"index\":{},\"image\":\"{}\",\"eye\":{},\"tag\":{},"
+      "\"rendered_position\":[{:.4f},{:.4f},{:.4f}],\"rendered_orientation\":[{:.4f},{:.4f},{:.4f},{:.4f}],"
+      "\"fov_x\":{:.5f},\"fov_y\":{:.5f},\"age_ms\":{:.2f},"
+      "\"shown_head_position\":[{:.4f},{:.4f},{:.4f}],\"shown_head_orientation\":[{:.4f},{:.4f},{:.4f},{:.4f}],"
+      "\"display_period_ms\":{:.2f}}}\n",
+      index, name, r.eye, r.tag, r.position[0], r.position[1], r.position[2], r.orientation[0],
+      r.orientation[1], r.orientation[2], r.orientation[3], s.capture_lens.fov_x,
+      s.capture_lens.fov_y, double(s.capture_recorded_ns - s.capture_requested_ns) / 1e6,
+      h.position.x, h.position.y, h.position.z, h.orientation.x, h.orientation.y,
+      h.orientation.z, h.orientation.w, double(s.frame_state.predictedDisplayPeriod) / 1e6);
+  if (--s.capture_left == 0) {
+    REXLOG_INFO("OpenXR: capture saved ({} frames) in {}", s.capture_index, s.capture_directory);
+  }
+}
+
 void LogPose() {
   State& s = S();
   const auto now = std::chrono::steady_clock::now();
@@ -669,9 +845,13 @@ bool NextEye(EyeRequest& out) {
       !(view_state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
     return false;
   }
-  float fov_y = 0.0f;
-  for (const XrView& view : views) fov_y = std::max(fov_y, view.fov.angleUp - view.fov.angleDown);
+  float fov_y = 0.0f, fov_x = 0.0f;
+  for (const XrView& view : views) {
+    fov_y = std::max(fov_y, view.fov.angleUp - view.fov.angleDown);
+    fov_x = std::max(fov_x, view.fov.angleRight - view.fov.angleLeft);
+  }
   B().headset_fov_y = fov_y;
+  B().headset_fov_x = fov_x;
   const XrPosef& pose = views[eye].pose;
   const float position[3] = {pose.position.x, pose.position.y, pose.position.z};
   const float orientation[4] = {pose.orientation.x, pose.orientation.y, pose.orientation.z,
@@ -693,6 +873,10 @@ bool BeginFrame(uint32_t width, uint32_t height) {
   XrFrameWaitInfo wait_info{XR_TYPE_FRAME_WAIT_INFO};
   if (!Check(xrWaitFrame(s.session, &wait_info, &s.frame_state), "xrWaitFrame")) return false;
   s.display_period = s.frame_state.predictedDisplayPeriod;
+  // The guest's frame pacing follows the headset (rex/ui/xr.h).
+  xr::SetHeadsetRefreshHz(REXCVAR_GET(xr_match_refresh) && s.frame_state.predictedDisplayPeriod > 0
+                              ? uint32_t(std::lround(1e9 / double(s.frame_state.predictedDisplayPeriod)))
+                              : 0u);
   s.next_display_time =
       s.frame_state.predictedDisplayTime + s.frame_state.predictedDisplayPeriod;
   {
@@ -714,7 +898,8 @@ void RecordCopy(VkCommandBuffer command_buffer, VkImage source, uint32_t width, 
   State& s = S();
   if (!s.frame_begun || width != s.staging_width || height != s.staging_height) return;
   EyeRequest request;
-  const bool stereo = REXCVAR_GET(xr_stereo) && FindRequest(lens, request);
+  uint64_t requested_ns = 0;
+  const bool stereo = REXCVAR_GET(xr_stereo) && FindRequest(lens, request, &requested_ns);
   Target& target = s.targets[stereo ? (request.eye ? kRight : kLeft) : kScreen];
   static const char* const kNames[] = {"left eye", "right eye", "screen"};
   if (!EnsureTarget(target, width, height, kNames[stereo ? request.eye : kScreen]) ||
@@ -732,8 +917,23 @@ void RecordCopy(VkCommandBuffer command_buffer, VkImage source, uint32_t width, 
                                request.orientation[2], request.orientation[3]};
     const float half_x = lens.fov_x * 0.5f, half_y = lens.fov_y * 0.5f;
     target.fov = {-half_x, half_x, half_y, -half_y};
+    if (s.capture_left > 0) {
+      RecordCapture(command_buffer, width, height);
+      s.capture_request = request;
+      s.capture_lens = lens;
+      s.capture_requested_ns = requested_ns;
+      s.capture_recorded_ns = SteadyNs();
+    }
   }
   LogDecoding("stereo");
+}
+
+void RequestCapture(const std::string& directory, int frames) {
+  std::lock_guard<std::mutex> lock(S().mutex);
+  State& s = S();
+  s.capture_directory = directory;
+  s.capture_left = frames;
+  REXLOG_INFO("OpenXR: capturing the next {} stereo frames into {}", frames, directory);
 }
 
 void NoteLens(const Lens& lens) {
@@ -794,6 +994,12 @@ void EndFrame() {
   end_info.layerCount = layer_count;
   end_info.layers = layers;
   Check(xrEndFrame(s.session, &end_info), "xrEndFrame");
+  if (s.capture_recorded) {
+    s.capture_recorded = false;
+    // Still holding the queue: wait for this frame's copy, then save it.
+    s.device->functions().vkQueueWaitIdle(queue.queue());
+    SaveCapture();
+  }
   LogPose();
 }
 
@@ -835,6 +1041,7 @@ void NoteLens(const Lens& lens) {
   FindRequest(lens, request);
   LogDecoding("simulated");
 }
+void RequestCapture(const std::string&, int) {}
 
 }  // namespace openxr
 }  // namespace vulkan

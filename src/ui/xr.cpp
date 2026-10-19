@@ -1,12 +1,13 @@
 /**
- * @file        ui/xr_tag.cpp
- * @brief       A frame's VR stereo tag in its vertical field of view.
+ * @file        ui/xr.cpp
+ * @brief       What the VR output shares with the rest of the runtime.
  *
  * @license     BSD 3-Clause License
  */
 
-#include <rex/ui/xr_tag.h>
+#include <rex/ui/xr.h>
 
+#include <atomic>
 #include <cmath>
 
 namespace rex {
@@ -16,7 +17,11 @@ namespace xr {
 namespace {
 constexpr double kFovStep = 0.002;
 constexpr double kTagStep = kFovStep / 32.0;
+std::atomic<uint32_t> g_refresh_hz{0};
 }  // namespace
+
+uint32_t HeadsetRefreshHz() { return g_refresh_hz.load(std::memory_order_relaxed); }
+void SetHeadsetRefreshHz(uint32_t hz) { g_refresh_hz.store(hz, std::memory_order_relaxed); }
 
 double TagFov(double fov_y, uint32_t tag) {
   if (!(fov_y > 0.0)) return fov_y;

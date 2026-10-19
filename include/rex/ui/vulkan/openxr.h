@@ -24,10 +24,11 @@
  */
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include <rex/ui/vulkan/api.h>
-#include <rex/ui/xr_tag.h>
+#include <rex/ui/xr.h>
 
 namespace rex {
 namespace ui {
@@ -67,12 +68,14 @@ bool NextEye(EyeRequest& out);
 // The headset's vertical field of view (radians, the wider eye's), once
 // NextEye has located the eyes; 0 before that and without a headset.
 float HeadsetFovY();
+// And horizontal (the wider eye's), for the host's render aspect.
+float HeadsetFovX();
 // The vertical field of view of the main view of the latest presented
 // tagged frame (radians), or 0: lets the host tell its main camera from
 // render-to-texture cameras.
 float PresentedFovY();
 
-// The tag in a vertical field of view (rex/ui/xr_tag.h).
+// The tag in a vertical field of view (rex/ui/xr.h).
 using xr::FovTag;
 using xr::kTagCount;
 using xr::TagFov;
@@ -104,6 +107,13 @@ void EndFrame();
 // Painting without a headset frame (xr_simulate, or no session): counts the
 // lens's tag for the log.
 void NoteLens(const Lens& lens);
+
+// Saves the next `frames` stereo frames as the headset gets them, into
+// `directory`: each eye's image (xr-capture-N-left.ppm, ...) and a line of
+// xr-capture.jsonl with what it was rendered with (tag, pose, field of view),
+// the head pose the headset predicted for its display, and its age. Each
+// saved frame waits for the GPU, so the game hitches while it runs.
+void RequestCapture(const std::string& directory, int frames);
 
 }  // namespace openxr
 }  // namespace vulkan

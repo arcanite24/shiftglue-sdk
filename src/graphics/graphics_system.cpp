@@ -38,6 +38,7 @@
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/window.h>
+#include <rex/ui/xr.h>
 #include <rex/ui/windowed_app_context.h>
 
 REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
@@ -280,26 +281,33 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             continue;
           }
           uint32_t current_render_fps_limit = REXCVAR_GET(pinyon_shift_fh1_render_fps_limit);
-          // Issue #1094: the display's rate, or a little under it for low
-          // latency (frames at exactly the refresh fill the swapchain queue).
-          double display_rate = REXCVAR_GET(video_mode_refresh_rate);
-          if (REXCVAR_GET(low_latency_frame_cap) && display_rate > 1.0) {
-            display_rate -= display_rate * display_rate / 3600.0;
-            const uint32_t cap = uint32_t(display_rate);
-            if (cap && (!current_render_fps_limit || current_render_fps_limit > cap)) {
-              current_render_fps_limit = cap;
+          // In VR the headset's refresh rate, when the output asks (rex/ui/xr.h);
+          // the display's caps below are for the window.
+          const uint32_t headset_hz = ui::xr::HeadsetRefreshHz();
+          if (headset_hz) {
+            current_render_fps_limit = headset_hz;
+          } else {
+            // Issue #1094: the display's rate, or a little under it for low
+            // latency (frames at exactly the refresh fill the swapchain queue).
+            double display_rate = REXCVAR_GET(video_mode_refresh_rate);
+            if (REXCVAR_GET(low_latency_frame_cap) && display_rate > 1.0) {
+              display_rate -= display_rate * display_rate / 3600.0;
+              const uint32_t cap = uint32_t(display_rate);
+              if (cap && (!current_render_fps_limit || current_render_fps_limit > cap)) {
+                current_render_fps_limit = cap;
+              }
             }
-          }
-          // UP-4.2: with generated frames after each real one, the game
-          // renders at no more than the refresh divided by the frames shown
-          // per real one (half at 2x), so all are shown.
-          if (presenter_ && presenter_->IsFrameGenerating()) {
-            const uint32_t half_refresh = uint32_t(
-                display_rate / double(std::max(presenter_->FrameGenerationMultiplier(), 2u)) +
-                0.5);
-            if (half_refresh &&
-                (!current_render_fps_limit || current_render_fps_limit > half_refresh)) {
-              current_render_fps_limit = half_refresh;
+            // UP-4.2: with generated frames after each real one, the game
+            // renders at no more than the refresh divided by the frames shown
+            // per real one (half at 2x), so all are shown.
+            if (presenter_ && presenter_->IsFrameGenerating()) {
+              const uint32_t half_refresh = uint32_t(
+                  display_rate / double(std::max(presenter_->FrameGenerationMultiplier(), 2u)) +
+                  0.5);
+              if (half_refresh &&
+                  (!current_render_fps_limit || current_render_fps_limit > half_refresh)) {
+                current_render_fps_limit = half_refresh;
+              }
             }
           }
           if (current_render_fps_limit != render_fps_limit) {
