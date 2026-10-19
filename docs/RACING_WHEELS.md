@@ -88,6 +88,7 @@ gate held the wheel is in neutral.
 | `wheel_ffb_min_force` | `0` | Lift any non-zero force to at least this percent, for geared or belted wheels. |
 | `wheel_ffb_spring`, `_damper`, `_friction`, `_inertia` | `100` | Strength of each of the title's condition effects, in percent. |
 | `wheel_ffb_rumble` | `50` | Strength of the title's rumble, played as a vibration. |
+| `wheel_ffb_rumble_engine`, `wheel_ffb_rumble_road` | `100` | Share of that rumble for each motor, in percent. In Forza Horizon the right motor carries the engine (it climbs with RPM through each gear) and the left bumps, kerbs and impacts. |
 | `wheel_ffb_centering` | `0` | Extra host centring spring, in percent. |
 | `wheel_ffb_magnitude_max` | `10000` | Full-scale value of the title's effect magnitudes (Forza Horizon uses byte values: 127). |
 | `wheel_ffb_saturation_max` | `0` | Full-scale value of saturations and dead bands; 0 decides per effect. |

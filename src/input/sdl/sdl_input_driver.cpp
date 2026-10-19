@@ -170,6 +170,18 @@ REXCVAR_DEFINE_INT32(
     "vibration on top of the effects")
     .range(0, 100)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// FH1's motor census (pinyon-shift DS-2) and a T248 trace: the right motor carries the engine,
+// rising with RPM through each gear, and the left the bumps, kerbs and impacts.
+REXCVAR_DEFINE_INT32(wheel_ffb_rumble_engine, 100, "Input",
+                     "Share in percent of wheel_ffb_rumble for the title's right motor, which "
+                     "in Forza Horizon carries the engine and rises towards the limiter")
+    .range(0, 100)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(wheel_ffb_rumble_road, 100, "Input",
+                     "Share in percent of wheel_ffb_rumble for the title's left motor, which "
+                     "in Forza Horizon carries bumps, kerbs and impacts")
+    .range(0, 100)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(wheel_ffb_magnitude_max, 10000, "Input",
                      "Full-scale value of the title's effect magnitudes and coefficients "
                      "(DirectInput's 10000); the FFB trace shows the values it sends")
@@ -2073,8 +2085,12 @@ void SDLInputDriver::ApplyRumbleLocked() {
     return;
   }
   WheelState& wheel = *wheel_;
-  const uint16_t strongest = std::max(game_rumble_left_, game_rumble_right_);
-  int64_t magnitude = int64_t(strongest) * 32767 / 65535;
+  const int64_t left =
+      int64_t(game_rumble_left_) * std::clamp(REXCVAR_GET(wheel_ffb_rumble_road), 0, 100) / 100;
+  const int64_t right =
+      int64_t(game_rumble_right_) * std::clamp(REXCVAR_GET(wheel_ffb_rumble_engine), 0, 100) / 100;
+  const int64_t strongest = std::max(left, right);
+  int64_t magnitude = strongest * 32767 / 65535;
   magnitude = magnitude * std::clamp(REXCVAR_GET(wheel_ffb_rumble), 0, 100) / 100;
   magnitude = magnitude * std::clamp(REXCVAR_GET(wheel_ffb_strength), 0, 100) / 100;
   // The title's vibration plays in every mode but "off", "rumble" included.
@@ -2094,7 +2110,7 @@ void SDLInputDriver::ApplyRumbleLocked() {
   effect.periodic.direction.type = SDL_HAPTIC_STEERING_AXIS;
   effect.periodic.length = SDL_HAPTIC_INFINITY;
   // The right (small) motor buzzes, the left (large) one rumbles.
-  effect.periodic.period = game_rumble_right_ > game_rumble_left_ ? 25 : 60;
+  effect.periodic.period = right > left ? 25 : 60;
   effect.periodic.magnitude = static_cast<int16_t>(magnitude);
   if (wheel.rumble_effect < 0) {
     wheel.rumble_effect = SDL_CreateHapticEffect(wheel.haptic, &effect);
