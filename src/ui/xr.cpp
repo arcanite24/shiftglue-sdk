@@ -28,6 +28,16 @@ double TagFov(double fov_y, uint32_t tag) {
   return std::floor(fov_y / kFovStep) * kFovStep + (double(tag % kTagCount) + 0.5) * kTagStep;
 }
 
+namespace {
+std::atomic<void (*)()> g_shutdown{nullptr};
+}  // namespace
+
+void SetShutdown(void (*shutdown)()) { g_shutdown.store(shutdown); }
+
+void Shutdown() {
+  if (auto shutdown = g_shutdown.exchange(nullptr)) shutdown();
+}
+
 uint32_t FovTag(double fov_y) {
   if (!(fov_y > 0.0)) return UINT32_MAX;
   const double residual = fov_y - std::floor(fov_y / kFovStep) * kFovStep;
