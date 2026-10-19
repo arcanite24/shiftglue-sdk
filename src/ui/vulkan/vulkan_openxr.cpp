@@ -79,6 +79,11 @@ struct Bookkeeping {
   // expected: steady car motion cancels out of it, the eyes' swap does not.
   double previous_moved = 0.0, previous_expected = 0.0;
   bool have_previous_move = false;
+  // Pair check: from a left frame to the right frame requested after it,
+  // how far the camera moved beyond the eyes' own offset (the world's
+  // motion between the eyes, which shows as false depth).
+  double pair_motion_sum = 0.0, pair_motion_max = 0.0;
+  uint64_t pairs = 0;
   // Timing: how old a frame is when it is copied for the headset, and how
   // often each eye gets a new one.
   double age_sum_ms = 0.0, age_max_ms = 0.0, interval_sum_ms = 0.0;
@@ -155,6 +160,19 @@ bool FindRequest(const Lens& lens, EyeRequest& out, uint64_t* requested_ns = nul
         }
       }
     }
+    if (out.eye == 1 && b.previous_request.eye == 0 &&
+        out.tag == (b.previous_request.tag + 1) % kTagCount) {
+      double residual = 0.0;
+      for (int i = 0; i < 3; ++i) {
+        const double d =
+            double(lens.position[i] - b.previous_lens.position[i]) - expected * lens.right[i];
+        residual += d * d;
+      }
+      residual = std::sqrt(residual);
+      b.pair_motion_sum += residual;
+      b.pair_motion_max = std::max(b.pair_motion_max, residual);
+      ++b.pairs;
+    }
     b.previous_moved = moved;
     b.previous_expected = expected;
     b.have_previous_move = true;
@@ -178,12 +196,17 @@ void LogDecoding(const char* where) {
   b.last_logged = total;
   REXLOG_INFO(
       "OpenXR {}: {} requested, presented left {} right {}, untagged {}, no lens {}; "
-      "eye check {} right, {} wrong; frame age {:.1f} ms (max {:.1f}), each eye every {:.1f} ms",
+      "eye check {} right, {} wrong; frame age {:.1f} ms (max {:.1f}), each eye every {:.1f} ms; "
+      "world motion between paired eyes {:.1f} mm (max {:.1f}) over {} pairs",
       where, b.sequence, b.decoded[0], b.decoded[1], b.untagged, b.no_lens, b.eye_match,
       b.eye_mismatch, b.timed ? b.age_sum_ms / double(b.timed) : 0.0, b.age_max_ms,
-      b.intervals ? b.interval_sum_ms / double(b.intervals) : 0.0);
+      b.intervals ? b.interval_sum_ms / double(b.intervals) : 0.0,
+      b.pairs ? 1000.0 * b.pair_motion_sum / double(b.pairs) : 0.0, 1000.0 * b.pair_motion_max,
+      b.pairs);
   b.age_sum_ms = b.age_max_ms = b.interval_sum_ms = 0.0;
   b.timed = b.intervals = 0;
+  b.pair_motion_sum = b.pair_motion_max = 0.0;
+  b.pairs = 0;
 }
 
 // Stores and returns a new request for `eye` at this pose.
