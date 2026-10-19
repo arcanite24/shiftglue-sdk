@@ -74,7 +74,7 @@ struct Bookkeeping {
   bool have_previous = false;
   Lens previous_lens;
   EyeRequest previous_request;
-  uint64_t eye_match = 0, eye_mismatch = 0, detailed = 0;
+  uint64_t eye_match = 0, eye_mismatch = 0, detailed = 0, mismatches_logged = 0;
   // Change of the sideways move between consecutive frames, measured and
   // expected: steady car motion cancels out of it, the eyes' swap does not.
   double previous_moved = 0.0, previous_expected = 0.0;
@@ -144,7 +144,15 @@ bool FindRequest(const Lens& lens, EyeRequest& out, uint64_t* requested_ns = nul
       const double change = moved - b.previous_moved;
       const double expected_change = expected - b.previous_expected;
       if (std::abs(expected_change) > 0.02) {
-        ++((change > 0.0) == (expected_change > 0.0) ? b.eye_match : b.eye_mismatch);
+        const bool match = (change > 0.0) == (expected_change > 0.0);
+        ++(match ? b.eye_match : b.eye_mismatch);
+        if (!match && b.mismatches_logged < 20) {
+          ++b.mismatches_logged;
+          REXLOG_INFO(
+              "OpenXR eye check: tag {} eye {} moved {:+.4f} (before {:+.4f}), expected {:+.4f} "
+              "(before {:+.4f})",
+              out.tag, out.eye, moved, b.previous_moved, expected, b.previous_expected);
+        }
       }
     }
     b.previous_moved = moved;
@@ -710,12 +718,15 @@ void SaveCapture() {
       "\"rendered_position\":[{:.4f},{:.4f},{:.4f}],\"rendered_orientation\":[{:.4f},{:.4f},{:.4f},{:.4f}],"
       "\"fov_x\":{:.5f},\"fov_y\":{:.5f},\"age_ms\":{:.2f},"
       "\"shown_head_position\":[{:.4f},{:.4f},{:.4f}],\"shown_head_orientation\":[{:.4f},{:.4f},{:.4f},{:.4f}],"
-      "\"display_period_ms\":{:.2f}}}\n",
+      "\"display_period_ms\":{:.2f},"
+      "\"camera_position\":[{:.4f},{:.4f},{:.4f}],\"camera_right\":[{:.4f},{:.4f},{:.4f}]}}\n",
       index, name, r.eye, r.tag, r.position[0], r.position[1], r.position[2], r.orientation[0],
       r.orientation[1], r.orientation[2], r.orientation[3], s.capture_lens.fov_x,
       s.capture_lens.fov_y, double(s.capture_recorded_ns - s.capture_requested_ns) / 1e6,
       h.position.x, h.position.y, h.position.z, h.orientation.x, h.orientation.y,
-      h.orientation.z, h.orientation.w, double(s.frame_state.predictedDisplayPeriod) / 1e6);
+      h.orientation.z, h.orientation.w, double(s.frame_state.predictedDisplayPeriod) / 1e6,
+      s.capture_lens.position[0], s.capture_lens.position[1], s.capture_lens.position[2],
+      s.capture_lens.right[0], s.capture_lens.right[1], s.capture_lens.right[2]);
   if (--s.capture_left == 0) {
     REXLOG_INFO("OpenXR: capture saved ({} frames) in {}", s.capture_index, s.capture_directory);
   }
