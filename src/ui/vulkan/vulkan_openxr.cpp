@@ -355,6 +355,20 @@ struct State {
   // their left, since the last line.
   std::chrono::steady_clock::time_point last_pose_log{};
   uint64_t frames = 0, pairs = 0, unpaired = 0;
+  // Where the headset thread's time goes, and how long the game's copy
+  // holds the state lock (acquiring a swapchain image waits in it).
+  struct Timing {
+    double sum_ms = 0.0, max_ms = 0.0;
+    uint64_t count = 0;
+    void Add(double ms) {
+      sum_ms += ms;
+      max_ms = std::max(max_ms, ms);
+      ++count;
+    }
+    std::string Text() const {
+      return fmt::format("{:.2f} ms (max {:.1f})", count ? sum_ms / double(count) : 0.0, max_ms);
+    }
+  } wait_frame, wait_lock, begin_end, guest_hold, release_hold;
 };
 
 // Never destroyed: the headset's thread may still run at exit.
@@ -717,10 +731,14 @@ void LogPose() {
   const XrPosef& p = location.pose;
   REXLOG_INFO(
       "OpenXR: head at ({:.3f}, {:.3f}, {:.3f}) m, orientation ({:.3f}, {:.3f}, {:.3f}, {:.3f}); "
-      "{} headset frames, {} eye pairs shown, {} right eyes without their left",
+      "{} headset frames, {} eye pairs shown, {} right eyes without their left; headset thread "
+      "waits {} for the headset, {} for the lock, {} in begin and end; the game's copy holds "
+      "the lock {}, its release {}",
       p.position.x, p.position.y, p.position.z, p.orientation.x, p.orientation.y,
-      p.orientation.z, p.orientation.w, s.frames, s.pairs, s.unpaired);
+      p.orientation.z, p.orientation.w, s.frames, s.pairs, s.unpaired, s.wait_frame.Text(),
+      s.wait_lock.Text(), s.begin_end.Text(), s.guest_hold.Text(), s.release_hold.Text());
   s.frames = s.pairs = s.unpaired = 0;
+  s.wait_frame = s.wait_lock = s.begin_end = s.guest_hold = s.release_hold = {};
 }
 
 // The headset's frame loop: waits for each of its frames and submits what it
@@ -752,7 +770,9 @@ void FrameLoop() {
     }
     XrFrameState frame_state{XR_TYPE_FRAME_STATE};
     XrFrameWaitInfo wait_info{XR_TYPE_FRAME_WAIT_INFO};
+    const auto wait_start = std::chrono::steady_clock::now();
     if (failed(xrWaitFrame(s.session, &wait_info, &frame_state), "xrWaitFrame")) continue;
+    const auto wait_end = std::chrono::steady_clock::now();
     // The guest's frame pacing follows the headset (rex/ui/xr.h).
     xr::SetHeadsetRefreshHz(REXCVAR_GET(xr_match_refresh) && frame_state.predictedDisplayPeriod > 0
                                 ? uint32_t(std::lround(1e9 / double(frame_state.predictedDisplayPeriod)))
@@ -761,6 +781,9 @@ void FrameLoop() {
 
     std::lock_guard<std::mutex> lock(s.mutex);
     if (s.session == XR_NULL_HANDLE) return;
+    const auto locked = std::chrono::steady_clock::now();
+    s.wait_frame.Add(std::chrono::duration<double, std::milli>(wait_end - wait_start).count());
+    s.wait_lock.Add(std::chrono::duration<double, std::milli>(locked - wait_end).count());
     s.frame_state = frame_state;
     const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
     XrFrameBeginInfo begin_info{XR_TYPE_FRAME_BEGIN_INFO};
@@ -808,6 +831,8 @@ void FrameLoop() {
       xrEndFrame(s.session, &end_info);
     }
     if (!failed(ended, "xrEndFrame") && layer_count) ++s.frames;
+    s.begin_end.Add(
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - locked).count());
     LogPose();
   }
 }
@@ -977,6 +1002,14 @@ bool BeginGuestFrame(uint32_t width, uint32_t height, const Lens& lens, FrameCop
   }
   if (width == 0 || height == 0) return false;
   std::lock_guard<std::mutex> lock(s.mutex);
+  struct Hold {
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    State::Timing& timing;
+    ~Hold() {
+      timing.Add(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                     .count());
+    }
+  } hold{std::chrono::steady_clock::now(), s.guest_hold};
   if (!s.running || s.session == XR_NULL_HANDLE || !s.device || !ChooseFormat() ||
       !EnsureStaging(width, height)) {
     return false;
@@ -1027,6 +1060,7 @@ void GuestFrameSubmitted() {
   State& s = S();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (s.session == XR_NULL_HANDLE) return;
+  const auto start = std::chrono::steady_clock::now();
   const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
   if (s.pending == Pending::kPair) {
     Release(s.targets[kLeft]);
@@ -1044,6 +1078,8 @@ void GuestFrameSubmitted() {
     s.show_screen = true;
   }
   s.pending = Pending::kNone;
+  s.release_hold.Add(
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
   if (s.capture_recorded) {
     s.capture_recorded = false;
     // Still holding the queue: wait for this frame's copy, then save it.
