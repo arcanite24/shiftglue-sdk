@@ -32,6 +32,12 @@ uint32_t FovTag(double fov_y);
 uint32_t HeadsetRefreshHz();
 void SetHeadsetRefreshHz(uint32_t hz);
 
+// Ends a running VR session before a hard exit (std::_Exit): its thread may
+// be inside the OpenXR runtime, which unloads with the process and faulted
+// under it. The VR output registers what Shutdown runs; once, any thread.
+void SetShutdown(void (*shutdown)());
+void Shutdown();
+
 }  // namespace xr
 }  // namespace ui
 }  // namespace rex
