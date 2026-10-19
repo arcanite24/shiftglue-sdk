@@ -22,6 +22,7 @@
 #include <rex/assert.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/surface.h>
+#include <rex/ui/vulkan/openxr.h>
 #include <rex/ui/vulkan/device.h>
 #include <rex/ui/vulkan/instance.h>
 #include <rex/ui/vulkan/submission_tracker.h>
@@ -148,6 +149,12 @@ class VulkanPresenter final : public Presenter {
     VkImageView motion_image_view() const;
     bool camera_ever_written_previously() const;
     void SetCameraWritten(const UpscalerCamera& camera);
+
+    // The frame's lens for the OpenXR output (openxr.h), when known.
+    void SetLens(const openxr::Lens& lens) {
+      if (lens_out_) *lens_out_ = lens;
+    }
+    openxr::Lens* lens_out_ = nullptr;
 
    private:
     VkImage image_;
@@ -298,6 +305,8 @@ class VulkanPresenter final : public Presenter {
     bool hudless_valid = false;
     bool camera_valid = false;
     UpscalerCamera camera;
+    // The frame's lens, for the OpenXR output.
+    openxr::Lens lens;
     uint64_t last_refresher_submission = 0;
     // For choosing the barrier stage and access mask and layout depending on
     // whether the image has previously been written. If an image is active

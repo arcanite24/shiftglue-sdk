@@ -330,6 +330,7 @@ bool Fh1NativeExecutor::GetSceneJitter(float& x, float& y) const {
 
 void Fh1NativeExecutor::FinishCameraFrame() {
   camera_ready_valid_ = false;
+  lens_valid_ = false;
   camera_depth_dirty_ = false;
   std::vector<std::array<float, 16>> object_reprojections = std::move(object_reprojections_);
   object_reprojections_.clear();
@@ -395,6 +396,33 @@ void Fh1NativeExecutor::FinishCameraFrame() {
     return;
   }
   camera.fov_y = float(2.0 * std::atan(1.0 / y_scale));
+  // The OpenXR output reads the tag its host put in the field of view.
+  const double x_scale = RowLength(current, 0);
+  if (x_scale > 0.0) {
+    lens_fov_x_ = float(2.0 * std::atan(1.0 / x_scale));
+    lens_fov_y_ = camera.fov_y;
+    lens_valid_ = true;
+    // The camera: the point the x, y and w rows send to 0.
+    const double a[3][3] = {{current[0], current[1], current[2]},
+                            {current[4], current[5], current[6]},
+                            {current[12], current[13], current[14]}};
+    const double b[3] = {-current[3], -current[7], -current[15]};
+    auto det3 = [](const double m[3][3]) {
+      return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+             m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+             m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    };
+    const double d = det3(a);
+    lens_has_position_ = std::abs(d) > 1e-12;
+    for (int c = 0; c < 3 && lens_has_position_; ++c) {
+      double m[3][3];
+      for (int r = 0; r < 3; ++r) {
+        for (int k = 0; k < 3; ++k) m[r][k] = k == c ? b[r] : a[r][k];
+      }
+      lens_position_[c] = float(det3(m) / d);
+      lens_right_[c] = float(current[c] / x_scale);
+    }
+  }
   const double k = z_length / w_length;
   const double near_plane = (k * current[15] / w_length - current[11] / w_length) / k;
   camera.near_plane = float(near_plane);
