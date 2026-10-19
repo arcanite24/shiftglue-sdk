@@ -24,8 +24,9 @@ REXCVAR_DEFINE_BOOL(xr_stereo, true, "Display",
                     "when the game supports it; otherwise, or off, a large screen")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(xr_match_refresh, true, "Display",
-                    "In VR, render the game at the headset's refresh rate instead of the game "
-                    "frame rate limit (in stereo, each pair of eyes takes two frames)")
+                    "In VR, pace the game to the frames the headset asks for (its refresh, "
+                    "or half of it with spacewarp) instead of the frame rate limit: one frame "
+                    "per headset frame on the screen, two (a pair of eyes) in stereo")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(xr_screen_distance, 2.5, "Display",
                       "Distance in metres from the headset's start position to the VR screen")
@@ -390,6 +391,7 @@ struct State {
   // their left, since the last line.
   std::chrono::steady_clock::time_point last_pose_log{};
   uint64_t frames = 0, pairs = 0, unpaired = 0;
+  std::atomic<uint32_t> headset_hz{0};
   // Where the headset thread's time goes, and how long the game's copy
   // holds the state lock (acquiring a swapchain image waits in it).
   struct Timing {
@@ -769,11 +771,13 @@ void LogPose() {
   const XrPosef& p = location.pose;
   REXLOG_INFO(
       "OpenXR: head at ({:.3f}, {:.3f}, {:.3f}) m, orientation ({:.3f}, {:.3f}, {:.3f}, {:.3f}); "
+      "headset asks for {} Hz, game paced at {} Hz; "
       "{} headset frames, {} eye pairs shown, {} right eyes without their left; headset thread "
       "waits {} for the headset, {} for the lock, {} in begin and end; the game's copy holds "
       "the lock {}, its release {}",
       p.position.x, p.position.y, p.position.z, p.orientation.x, p.orientation.y,
-      p.orientation.z, p.orientation.w, s.frames, s.pairs, s.unpaired, s.wait_frame.Text(),
+      p.orientation.z, p.orientation.w, s.headset_hz.load(), xr::HeadsetRefreshHz(), s.frames,
+      s.pairs, s.unpaired, s.wait_frame.Text(),
       s.wait_lock.Text(), s.begin_end.Text(), s.guest_hold.Text(), s.release_hold.Text());
   s.frames = s.pairs = s.unpaired = 0;
   s.wait_frame = s.wait_lock = s.begin_end = s.guest_hold = s.release_hold = {};
@@ -811,9 +815,17 @@ void FrameLoop() {
     const auto wait_start = std::chrono::steady_clock::now();
     if (failed(xrWaitFrame(s.session, &wait_info, &frame_state), "xrWaitFrame")) continue;
     const auto wait_end = std::chrono::steady_clock::now();
-    // The guest's frame pacing follows the headset (rex/ui/xr.h).
-    xr::SetHeadsetRefreshHz(REXCVAR_GET(xr_match_refresh) && frame_state.predictedDisplayPeriod > 0
-                                ? uint32_t(std::lround(1e9 / double(frame_state.predictedDisplayPeriod)))
+    // The guest's frame pacing follows the headset (rex/ui/xr.h): in stereo
+    // two frames, a pair, per headset frame. The headset's frame is the one
+    // it asks the app for: with spacewarp (Virtual Desktop's SSW) half its
+    // refresh, the runtime making the frames between.
+    const uint32_t headset_hz =
+        frame_state.predictedDisplayPeriod > 0
+            ? uint32_t(std::lround(1e9 / double(frame_state.predictedDisplayPeriod)))
+            : 0u;
+    s.headset_hz = headset_hz;
+    xr::SetHeadsetRefreshHz(REXCVAR_GET(xr_match_refresh)
+                                ? headset_hz * (s.show_stereo ? 2u : 1u)
                                 : 0u);
     s.next_display_time = frame_state.predictedDisplayTime + frame_state.predictedDisplayPeriod;
 
