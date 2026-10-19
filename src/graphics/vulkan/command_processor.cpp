@@ -4108,11 +4108,18 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
     }
   }
 
-  ui::vulkan::openxr::Lens xr_lens;
+  // The lens of the frame this swap shows. The executor's lens is of the
+  // frame whose draws just ended, but the title presents the frame before
+  // it: with eyes a metre apart (xr_simulate), each image showed the other
+  // eye than this frame's lens tags, and with the previous lens the one it
+  // tags.
+  ui::vulkan::openxr::Lens xr_lens = xr_lens_drawn_;
+  xr_lens_drawn_ = {};
   if (fh1_native_executor_) {
-    xr_lens.valid = fh1_native_executor_->TakeLens(xr_lens.fov_x, xr_lens.fov_y);
-    xr_lens.has_position =
-        fh1_native_executor_->TakeLensPosition(xr_lens.position, xr_lens.right);
+    xr_lens_drawn_.valid =
+        fh1_native_executor_->TakeLens(xr_lens_drawn_.fov_x, xr_lens_drawn_.fov_y);
+    xr_lens_drawn_.has_position =
+        fh1_native_executor_->TakeLensPosition(xr_lens_drawn_.position, xr_lens_drawn_.right);
   }
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
