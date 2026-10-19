@@ -39,6 +39,12 @@ void SetHeadsetRefreshHz(uint32_t hz);
 uint32_t HeadsetFrameHz();
 void SetHeadsetFrameHz(uint32_t hz);
 
+// The guest's vblank runs on its own clock; in stereo the headset's frame
+// loop keeps it in phase with the headset's frames by nudging it, in
+// nanoseconds (negative: vblanks come sooner). The vblank loop takes the sum.
+void NudgeVblankPhase(int64_t ns);
+int64_t TakeVblankPhaseNudge();
+
 // Ends a running VR session before a hard exit (std::_Exit): its thread may
 // be inside the OpenXR runtime, which unloads with the process and faulted
 // under it. The VR output registers what Shutdown runs; once, any thread.

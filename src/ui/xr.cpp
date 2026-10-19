@@ -38,6 +38,13 @@ namespace {
 std::atomic<uint32_t> g_headset_frame_hz{0};
 }  // namespace
 
+namespace {
+std::atomic<int64_t> g_vblank_nudge_ns{0};
+}  // namespace
+
+void NudgeVblankPhase(int64_t ns) { g_vblank_nudge_ns.fetch_add(ns, std::memory_order_relaxed); }
+int64_t TakeVblankPhaseNudge() { return g_vblank_nudge_ns.exchange(0, std::memory_order_relaxed); }
+
 uint32_t HeadsetFrameHz() { return g_headset_frame_hz.load(std::memory_order_relaxed); }
 void SetHeadsetFrameHz(uint32_t hz) { g_headset_frame_hz.store(hz, std::memory_order_relaxed); }
 

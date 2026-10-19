@@ -294,6 +294,7 @@ float PresentedFovY() { return B().presented_fov_y.load(std::memory_order_relaxe
 #include <deque>
 #include <fstream>
 #include <string>
+#include <condition_variable>
 #include <thread>
 
 #define XR_USE_GRAPHICS_API_VULKAN
@@ -403,6 +404,13 @@ struct State {
   Pending pending = Pending::kNone;
   // What the headset shows: the eyes' latest released pair, or the screen.
   bool show_stereo = false, show_screen = false;
+  // Pairs released (GuestFrameSubmitted) and the latest shown, and when the
+  // latest was released: the headset's frame takes the next pair, waiting
+  // for it a little, and the guest's vblank is nudged so pairs arrive a
+  // third of a frame after the headset's frame starts.
+  std::condition_variable pair_released;
+  uint64_t released_pairs = 0, shown_pairs = 0;
+  uint64_t last_release_ns = 0;
   XrPosef shown_pose[2] = {};
   XrFovf shown_fov[2] = {};
 
@@ -438,6 +446,10 @@ struct State {
       return fmt::format("{:.2f} ms (max {:.1f})", count ? sum_ms / double(count) : 0.0, max_ms);
     }
   } wait_frame, wait_lock, begin_end, guest_hold, release_hold;
+  // When each shown pair arrived after its headset frame started (negative:
+  // before), and the frames that showed the previous pair again.
+  Timing pair_phase;
+  uint64_t repeats = 0;
 };
 
 // Never destroyed: the headset's thread may still run at exit.
@@ -881,12 +893,16 @@ void LogPose() {
       "OpenXR: head at ({:.3f}, {:.3f}, {:.3f}) m, orientation ({:.3f}, {:.3f}, {:.3f}, {:.3f}); "
       "headset asks for {} Hz, game paced at {} Hz; "
       "{} headset frames, {} eye pairs shown, {} right eyes without their left; headset thread "
-      "waits {} for the headset, {} for the lock, {} in begin and end; the game's copy holds "
-      "the lock {}, its release {}",
+      "waits {} for the headset, {} for the lock and the next pair, {} in begin and end; the game's copy holds "
+      "the lock {}, its release {}; pairs arrive {} into the headset's frame, {} frames "
+      "repeated a pair",
       p.position.x, p.position.y, p.position.z, p.orientation.x, p.orientation.y,
       p.orientation.z, p.orientation.w, s.headset_hz.load(), xr::HeadsetRefreshHz(), s.frames,
       s.pairs, s.unpaired, s.wait_frame.Text(),
-      s.wait_lock.Text(), s.begin_end.Text(), s.guest_hold.Text(), s.release_hold.Text());
+      s.wait_lock.Text(), s.begin_end.Text(), s.guest_hold.Text(), s.release_hold.Text(),
+      s.pair_phase.Text(), s.repeats);
+  s.pair_phase = {};
+  s.repeats = 0;
   s.frames = s.pairs = s.unpaired = 0;
   s.wait_frame = s.wait_lock = s.begin_end = s.guest_hold = s.release_hold = {};
 }
@@ -939,8 +955,27 @@ void FrameLoop() {
     s.next_display_time = frame_state.predictedDisplayTime + frame_state.predictedDisplayPeriod;
     s.display_period = frame_state.predictedDisplayPeriod;
 
-    std::lock_guard<std::mutex> lock(s.mutex);
+    std::unique_lock<std::mutex> lock(s.mutex);
     if (s.session == XR_NULL_HANDLE) return;
+    // The next pair, in order: a pair that lands on the headset's frame
+    // boundary otherwise shows twice and its successor not at all, which
+    // read as constant judder at full frame rate.
+    const int64_t period = frame_state.predictedDisplayPeriod;
+    if (s.show_stereo && period > 0) {
+      const uint64_t wait_ns = SteadyNs();
+      s.pair_released.wait_for(lock, std::chrono::nanoseconds(period * 6 / 10),
+                               [&] { return s.released_pairs != s.shown_pairs || s.stop; });
+      if (s.released_pairs == s.shown_pairs) ++s.repeats;
+      if (s.released_pairs != s.shown_pairs) {
+        // Keep pairs arriving a third of a frame in (a small step at a time).
+        const int64_t phase = int64_t(s.last_release_ns) - int64_t(wait_ns);
+        s.pair_phase.Add(double(phase) / 1e6);
+        int64_t error = phase - period / 3;
+        error = std::clamp<int64_t>(error, -period / 2, period / 2);
+        xr::NudgeVblankPhase(-error / 8);
+      }
+    }
+    s.shown_pairs = s.released_pairs;
     const auto locked = std::chrono::steady_clock::now();
     s.wait_frame.Add(std::chrono::duration<double, std::milli>(wait_end - wait_start).count());
     s.wait_lock.Add(std::chrono::duration<double, std::milli>(locked - wait_end).count());
@@ -1277,6 +1312,9 @@ void GuestFrameSubmitted() {
     s.show_stereo = true;
     s.held_left_tag = UINT32_MAX;
     ++s.pairs;
+    ++s.released_pairs;
+    s.last_release_ns = SteadyNs();
+    s.pair_released.notify_all();
   } else if (s.pending == Pending::kScreen) {
     Release(s.targets[kScreen]);
     s.show_stereo = false;
