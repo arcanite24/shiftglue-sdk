@@ -26,6 +26,7 @@
 #include <rex/platform.h>
 #include <rex/string.h>
 #include <rex/ui/vulkan/device.h>
+#include <rex/ui/vulkan/openxr.h>
 #include <rex/ui/vulkan/upscaler.h>
 
 REXCVAR_DEFINE_BOOL(vulkan_diagnostic_checkpoints, false, "UI/Vulkan",
@@ -520,6 +521,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   for (const char* name : GetVulkanUpscalerDeviceExtensions(vulkan_instance->instance(),
                                                             physical_device,
                                                             properties.vendorID)) {
+    upscaler_extensions_enabled.push_back(false);
+    requested_extensions.emplace(name, &upscaler_extensions_enabled.back());
+  }
+  // The OpenXR runtime's, on the GPU the headset is on (xr_enabled).
+  for (const char* name : openxr::DeviceExtensions(vulkan_instance->instance(), physical_device)) {
     upscaler_extensions_enabled.push_back(false);
     requested_extensions.emplace(name, &upscaler_extensions_enabled.back());
   }
