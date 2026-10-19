@@ -276,6 +276,9 @@ struct Target {
   std::vector<XrSwapchainImageVulkanKHR> images;
   bool acquired = false;
   uint32_t index = 0;
+  // An image has been released since the swapchain was made: a layer may
+  // only use a swapchain once it has one.
+  bool released = false;
   // What the frame in the acquired image was rendered with (eyes).
   XrPosef pose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
   XrFovf fov{};
@@ -615,7 +618,8 @@ void Release(Target& target) {
   if (!target.acquired) return;
   target.acquired = false;
   XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-  Check(xrReleaseSwapchainImage(target.swapchain, &release_info), "xrReleaseSwapchainImage");
+  target.released |=
+      Check(xrReleaseSwapchainImage(target.swapchain, &release_info), "xrReleaseSwapchainImage");
 }
 
 bool EnsureCaptureBuffer(uint32_t width, uint32_t height) {
@@ -724,6 +728,18 @@ void LogPose() {
 // every refresh even when the game runs slower.
 void FrameLoop() {
   State& s = S();
+  // A failing runtime is logged at first and then once a second, and the
+  // loop backs off, so it cannot flood the log.
+  uint64_t failures = 0;
+  auto failed = [&](XrResult result, const char* what) {
+    if (XR_SUCCEEDED(result)) {
+      failures = 0;
+      return false;
+    }
+    if (failures++ % 100 < 3) Check(result, what);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    return true;
+  };
   while (!s.stop.load(std::memory_order_acquire)) {
     {
       std::lock_guard<std::mutex> lock(s.mutex);
@@ -736,10 +752,7 @@ void FrameLoop() {
     }
     XrFrameState frame_state{XR_TYPE_FRAME_STATE};
     XrFrameWaitInfo wait_info{XR_TYPE_FRAME_WAIT_INFO};
-    if (!Check(xrWaitFrame(s.session, &wait_info, &frame_state), "xrWaitFrame")) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      continue;
-    }
+    if (failed(xrWaitFrame(s.session, &wait_info, &frame_state), "xrWaitFrame")) continue;
     // The guest's frame pacing follows the headset (rex/ui/xr.h).
     xr::SetHeadsetRefreshHz(REXCVAR_GET(xr_match_refresh) && frame_state.predictedDisplayPeriod > 0
                                 ? uint32_t(std::lround(1e9 / double(frame_state.predictedDisplayPeriod)))
@@ -751,15 +764,15 @@ void FrameLoop() {
     s.frame_state = frame_state;
     const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
     XrFrameBeginInfo begin_info{XR_TYPE_FRAME_BEGIN_INFO};
-    if (!Check(xrBeginFrame(s.session, &begin_info), "xrBeginFrame")) continue;
+    if (failed(xrBeginFrame(s.session, &begin_info), "xrBeginFrame")) continue;
     XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
     XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     XrCompositionLayerProjectionView views[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
                                                  {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
     const XrCompositionLayerBaseHeader* layers[1];
     uint32_t layer_count = 0;
-    if (frame_state.shouldRender && s.show_stereo && s.targets[kLeft].swapchain &&
-        s.targets[kRight].swapchain) {
+    if (frame_state.shouldRender && s.show_stereo && s.targets[kLeft].released &&
+        s.targets[kRight].released) {
       for (int eye = 0; eye < 2; ++eye) {
         const Target& t = s.targets[eye];
         views[eye].pose = s.shown_pose[eye];
@@ -771,7 +784,7 @@ void FrameLoop() {
       projection.viewCount = 2;
       projection.views = views;
       layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection);
-    } else if (frame_state.shouldRender && s.show_screen && s.targets[kScreen].swapchain) {
+    } else if (frame_state.shouldRender && s.show_screen && s.targets[kScreen].released) {
       const Target& screen = s.targets[kScreen];
       const float width_m = float(REXCVAR_GET(xr_screen_width));
       quad.space = s.local;
@@ -788,7 +801,13 @@ void FrameLoop() {
     end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     end_info.layerCount = layer_count;
     end_info.layers = layers;
-    if (Check(xrEndFrame(s.session, &end_info), "xrEndFrame") && layer_count) ++s.frames;
+    XrResult ended = xrEndFrame(s.session, &end_info);
+    if (XR_FAILED(ended) && layer_count) {
+      // The frame is still open: end it without layers.
+      end_info.layerCount = 0;
+      xrEndFrame(s.session, &end_info);
+    }
+    if (!failed(ended, "xrEndFrame") && layer_count) ++s.frames;
     LogPose();
   }
 }
