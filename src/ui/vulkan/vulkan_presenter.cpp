@@ -26,6 +26,7 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/platform.h>
+#include <rex/ui/vulkan/openxr.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -3190,6 +3191,17 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     dfn.vkCmdEndRenderPass(draw_command_buffer);
   }
 
+  // The headset's frame (xr_enabled): the guest output copied in, in this
+  // command buffer, after the painting that samples it.
+  if (guest_output_image) {
+    const VkExtent2D xr_extent = guest_output_image->extent();
+    if (openxr::BeginFrame(xr_extent.width, xr_extent.height)) {
+      openxr::RecordCopy(draw_command_buffer, guest_output_image->image(), xr_extent.width,
+                         xr_extent.height, kGuestOutputInternalLayout,
+                         kGuestOutputInternalAccessMask, kGuestOutputInternalStageMask);
+    }
+  }
+
   dfn.vkEndCommandBuffer(draw_command_buffer);
 
   VkPipelineStageFlags acquire_semaphore_wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -3245,6 +3257,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         }
       }
     }
+    openxr::EndFrame();
     if (submit_result != VK_SUCCESS) {
       REXLOG_ERROR("VulkanPresenter: Failed to submit command buffers: {}", int32_t(submit_result));
       fence_acqusition.SubmissionFailedOrDropped();
