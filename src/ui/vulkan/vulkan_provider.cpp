@@ -15,6 +15,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ui/vulkan/immediate_drawer.h>
+#include <rex/ui/vulkan/openxr.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/provider.h>
 
@@ -154,6 +155,7 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
     if (!provider->ui_samplers_) {
       return nullptr;
     }
+    openxr::OnDeviceCreated(provider->vulkan_instance_.get(), provider->vulkan_device_.get());
   }
 
   return provider;

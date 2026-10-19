@@ -21,6 +21,7 @@
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/ui/vulkan/instance.h>
+#include <rex/ui/vulkan/openxr.h>
 #include <rex/ui/vulkan/upscaler.h>
 #include <rex/ui/vulkan/presenter.h>
 
@@ -195,6 +196,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   // Upscaler providers' extensions (DLSS's NGX), enabled when supported.
   std::deque<bool> upscaler_extensions_enabled;
   for (const char* name : GetVulkanUpscalerInstanceExtensions()) {
+    upscaler_extensions_enabled.push_back(false);
+    requested_extensions.emplace(name, &upscaler_extensions_enabled.back());
+  }
+  // The OpenXR runtime's (xr_enabled).
+  for (const char* name : openxr::InstanceExtensions()) {
     upscaler_extensions_enabled.push_back(false);
     requested_extensions.emplace(name, &upscaler_extensions_enabled.back());
   }
