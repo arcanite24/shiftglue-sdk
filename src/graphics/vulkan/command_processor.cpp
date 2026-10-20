@@ -145,8 +145,9 @@ REXCVAR_DEFINE_STRING(fh1_debug_draw_state_path, "", "GPU",
                       "count) to this file, for finding which draws use which coverage technique")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(fh1_debug_skip_coverage, "", "GPU",
-                      "Diagnostics: skip the draws that use alpha to coverage (a2c), the alpha "
-                      "test (alphatest) or a pixel kill (kill), to see what they draw")
+                      "Diagnostics: skip the draws that use alpha to coverage (a2c; a2cdither: "
+                      "only those with per-pixel dither offsets), the alpha test (alphatest) or "
+                      "a pixel kill (kill), to see what they draw")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_native_gpu_profile_draws, false, "GPU",
                     "Diagnostics: with fh1_native_gpu_profile, also time every draw by its "
@@ -6657,7 +6658,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       static FILE* state_file = [] {
         FILE* file = std::fopen(state_path.c_str(), "w");
         if (file) {
-          std::fputs("draw,vs,ps,alpha_test,alpha_func,alpha_to_coverage,kills,msaa,prim,indices\n",
+          std::fputs("draw,vs,ps,alpha_test,alpha_func,alpha_to_coverage,a2c_offsets,kills,msaa,prim,indices\n",
                      file);
         }
         return file;
@@ -6665,11 +6666,11 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       static uint32_t state_draw = 0;
       if (state_file) {
         const auto colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
-        std::fprintf(state_file, "%u,%016llX,%016llX,%u,%u,%u,%u,%u,%u,%u\n", state_draw++,
+        std::fprintf(state_file, "%u,%016llX,%016llX,%u,%u,%u,%02X,%u,%u,%u,%u\n", state_draw++,
                      (unsigned long long)vertex_shader->ucode_data_hash(),
                      (unsigned long long)(pixel_shader ? pixel_shader->ucode_data_hash() : 0),
                      uint32_t(colorcontrol.alpha_test_enable), uint32_t(colorcontrol.alpha_func),
-                     uint32_t(colorcontrol.alpha_to_mask_enable),
+                     uint32_t(colorcontrol.alpha_to_mask_enable), colorcontrol.value >> 24,
                      uint32_t(pixel_shader && pixel_shader->kills_pixels()),
                      uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples),
                      uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type), index_count);
@@ -6680,6 +6681,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     if (!skip_coverage.empty()) {
       const auto colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
       if ((skip_coverage == "a2c" && colorcontrol.alpha_to_mask_enable) ||
+          (skip_coverage == "a2cdither" && colorcontrol.alpha_to_mask_enable &&
+           (colorcontrol.value >> 24) != 0xAA) ||
           (skip_coverage == "alphatest" && colorcontrol.alpha_test_enable) ||
           (skip_coverage == "kill" && pixel_shader && pixel_shader->kills_pixels())) {
         return true;
