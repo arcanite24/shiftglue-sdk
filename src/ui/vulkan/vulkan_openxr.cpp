@@ -50,6 +50,11 @@ REXCVAR_DEFINE_INT32(xr_simulate_hz, 45, "Display",
                      "HeadsetFrameHz), as Virtual Desktop's spacewarp at 90 Hz does")
     .range(0, 240)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(xr_test_eye_spread, 1.0, "Display",
+                      "Testing: spread the headset's eyes this many times wider about the head's "
+                      "centre, so captures show which eye each image was rendered for")
+    .range(1.0, 20.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(xr_right_eye_first, false, "Display",
                     "Testing: render each stereo pair's right eye first and its left second")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -1505,6 +1510,16 @@ bool NextEye(EyeRequest& out) {
   }
   B().headset_fov_y = fov_y;
   B().headset_fov_x = fov_x;
+  if (const double spread = REXCVAR_GET(xr_test_eye_spread); spread != 1.0) {
+    XrVector3f& a = views[0].pose.position;
+    XrVector3f& b = views[1].pose.position;
+    const XrVector3f centre{(a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f, (a.z + b.z) * 0.5f};
+    for (XrVector3f* p : {&a, &b}) {
+      p->x = float(centre.x + (p->x - centre.x) * spread);
+      p->y = float(centre.y + (p->y - centre.y) * spread);
+      p->z = float(centre.z + (p->z - centre.z) * spread);
+    }
+  }
   const XrPosef& pose = views[eye].pose;
   const float position[3] = {pose.position.x, pose.position.y, pose.position.z};
   const float orientation[4] = {pose.orientation.x, pose.orientation.y, pose.orientation.z,
