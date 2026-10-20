@@ -425,6 +425,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   // decode time; with the recorder their draws intermittently sampled other
   // textures (frame-to-frame noise on FH1's foliage, flags and signs).
   bool SupportsRecordThread() const override { return push_pixel_texture_descriptors_; }
+  // A frame dump starts recording packets at the swap before its frame.
+  bool RecordSyncAfterSwap(uint64_t frame) const override {
+    return frame + 1 == Fh1FrameDump::RequestedFrame();
+  }
 
  private:
   struct CommandBuffer {

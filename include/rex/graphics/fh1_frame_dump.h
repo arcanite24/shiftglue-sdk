@@ -39,6 +39,10 @@ class Fh1FrameDumpMirror {
 // loads from guest memory as the CPU holds them, vertex, index and texture
 // ranges as the GPU mirror holds them when the draw reads them. The front
 // buffer as the mirror holds it after the swap is the expected output.
+// Swaps and draws reach the recorder on the thread that records host work,
+// packets on the decoding one; with the decoder/recorder split
+// (gpu_record_thread), the decoder waits for the recorder at both swaps and
+// before every packet in between, so one thread at a time touches the dump.
 //
 // Replay (fh1_frame_replay, RunFh1FrameReplay): with no title running, the
 // ranges are written to guest memory, the registers and shaders restored and
