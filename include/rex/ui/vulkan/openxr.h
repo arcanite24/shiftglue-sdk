@@ -70,6 +70,8 @@ struct EyeRequest {
 // The next frame's eye and pose; the eyes alternate. Call once per title
 // frame, from any thread; false (and nothing requested) while stereo is off.
 bool NextEye(EyeRequest& out);
+// The eye each pair starts with: 0 (left), or 1 with xr_right_eye_first.
+int FirstEye();
 
 // The headset's vertical field of view (radians, the wider eye's), once
 // NextEye has located the eyes; 0 before that and without a headset.
