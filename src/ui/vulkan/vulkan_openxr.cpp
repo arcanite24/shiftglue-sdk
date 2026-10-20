@@ -433,6 +433,37 @@ struct State {
   // eye alone jittered.
   VkFence copy_fence = VK_NULL_HANDLE;
   Pending fenced = Pending::kNone;
+
+  // Stereo pairs go through slots of our own: the game copies each eye into
+  // one as it is drawn, and each headset frame copies the next whole pair
+  // into the swapchains, acquired and released inside that frame, so both
+  // eyes reach the runtime the same way at the same moment. Copying into
+  // the swapchains from the game's swap (a left eye a frame before its
+  // right, released together later) put the right eye a frame out from its
+  // head pose in Virtual Desktop now and then: in a headset recording it
+  // moved 0, 8, 16 or 24 px a frame as the head turned, the left a steady 8.
+  struct Slot {
+    VkImage eye[2] = {};
+    VkDeviceMemory memory[2] = {};
+    uint32_t width = 0, height = 0;
+    XrPosef pose[2] = {};
+    XrFovf fov[2] = {};
+    uint32_t left_tag = UINT32_MAX;
+    bool has_left = false, complete = false;
+    VkFence fence = VK_NULL_HANDLE;
+    uint64_t serial = 0, complete_ns = 0;
+  };
+  static constexpr int kSlots = 3;
+  Slot slots[kSlots];
+  int filling = -1, shown_slot = -1;
+  uint64_t slot_serial = 0, shown_serial = 0;
+  // The copy BeginGuestFrame set up completes the slot being filled.
+  bool pending_slot = false;
+  // The headset thread's copies into the swapchains.
+  VkCommandPool xr_pool = VK_NULL_HANDLE;
+  VkCommandBuffer xr_cmd[2] = {};
+  VkFence xr_cmd_fence[2] = {};
+  int xr_cmd_next = 0;
   // What the headset shows: the eyes' latest released pair, or the screen.
   bool show_stereo = false, show_screen = false;
   // Pairs released (GuestFrameSubmitted) and the latest shown, and when the
@@ -652,6 +683,10 @@ void DestroySession() {
   s.held_left_tag = UINT32_MAX;
   s.pending = Pending::kNone;
   s.fenced = Pending::kNone;
+  s.pending_slot = false;
+  s.filling = s.shown_slot = -1;
+  s.shown_serial = s.slot_serial;
+  for (State::Slot& slot : s.slots) slot.complete = slot.has_left = false;
   s.show_stereo = s.show_screen = false;
   if (s.view != XR_NULL_HANDLE) xrDestroySpace(s.view);
   if (XrSpace seat = s.seat.exchange(XR_NULL_HANDLE); seat != XR_NULL_HANDLE) xrDestroySpace(seat);
@@ -790,12 +825,12 @@ bool EnsureTarget(Target& target, uint32_t width, uint32_t height, const char* n
 // is not taking frames (Virtual Desktop losing the headset) held each game
 // frame for the full wait. On a timeout the image stays acquired and the
 // next frame waits for it again.
-bool Acquire(Target& target) {
+bool Acquire(Target& target, int64_t timeout_ns = 2'000'000) {
   State& s = S();
   if (target.acquired) {
     if (target.ready) return true;
     XrSwapchainImageWaitInfo image_wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-    image_wait.timeout = 2'000'000;  // 2 ms
+    image_wait.timeout = timeout_ns;
     const XrResult result = xrWaitSwapchainImage(target.swapchain, &image_wait);
     target.ready = result == XR_SUCCESS;
     return target.ready;
@@ -811,7 +846,7 @@ bool Acquire(Target& target) {
   }
   target.acquired = true;
   XrSwapchainImageWaitInfo image_wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-  image_wait.timeout = 2'000'000;  // 2 ms
+  image_wait.timeout = timeout_ns;
   const XrResult result = xrWaitSwapchainImage(target.swapchain, &image_wait);
   target.ready = result == XR_SUCCESS;
   if (XR_FAILED(result)) Check(result, "xrWaitSwapchainImage");
@@ -826,6 +861,179 @@ void Release(Target& target) {
   XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
   target.released |=
       Check(xrReleaseSwapchainImage(target.swapchain, &release_info), "xrReleaseSwapchainImage");
+}
+
+// Under the state mutex: the slot's images at this size (8-bit UNORM, like
+// the staging image; they end each game copy as color attachments).
+bool EnsureSlot(State::Slot& slot, uint32_t width, uint32_t height) {
+  State& s = S();
+  if (slot.eye[0] != VK_NULL_HANDLE && slot.width == width && slot.height == height) return true;
+  for (int eye = 0; eye < 2; ++eye) {
+    if (slot.eye[eye] != VK_NULL_HANDLE) s.retired.emplace_back(slot.eye[eye], slot.memory[eye]);
+    slot.eye[eye] = VK_NULL_HANDLE;
+  }
+  for (int eye = 0; eye < 2; ++eye) {
+    VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.format = s.staging_format;
+    image_info.extent = {width, height, 1};
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!util::CreateDedicatedAllocationImage(s.device, image_info,
+                                              util::MemoryPurpose::kDeviceLocal, slot.eye[eye],
+                                              slot.memory[eye])) {
+      REXLOG_WARN("OpenXR: could not create a {}x{} eye image", width, height);
+      slot.eye[eye] = VK_NULL_HANDLE;
+      return false;
+    }
+  }
+  slot.width = width;
+  slot.height = height;
+  return true;
+}
+
+// Under the state mutex: the newest whole pair not shown yet whose copy has
+// run, or -1.
+int ReadySlot() {
+  State& s = S();
+  int best = -1;
+  for (int i = 0; i < State::kSlots; ++i) {
+    const State::Slot& slot = s.slots[i];
+    if (!slot.complete || slot.serial <= s.shown_serial || slot.fence == VK_NULL_HANDLE) continue;
+    if (s.device->functions().vkGetFenceStatus(s.device->device(), slot.fence) != VK_SUCCESS) {
+      continue;
+    }
+    if (best < 0 || slot.serial > s.slots[best].serial) best = i;
+  }
+  return best;
+}
+
+// Under the state mutex: a slot for a new pair, neither shown nor the next
+// to show (three slots: one on the headset, one waiting, one filling).
+int FillSlot() {
+  State& s = S();
+  int waiting = -1;
+  for (int i = 0; i < State::kSlots; ++i) {
+    const State::Slot& slot = s.slots[i];
+    if (slot.complete && slot.serial > s.shown_serial &&
+        (waiting < 0 || slot.serial > s.slots[waiting].serial)) {
+      waiting = i;
+    }
+  }
+  for (int i = 0; i < State::kSlots; ++i) {
+    if (i != s.shown_slot && i != waiting) return i;
+  }
+  return -1;
+}
+
+// Under the state mutex, on the headset thread inside its frame: copies the
+// slot's pair into the eye swapchains and releases both.
+bool CopySlot(State::Slot& slot) {
+  State& s = S();
+  const VulkanDevice::Functions& dfn = s.device->functions();
+  const VkDevice device = s.device->device();
+  Target& left = s.targets[kLeft];
+  Target& right = s.targets[kRight];
+  if (!EnsureTarget(left, slot.width, slot.height, "left eye") ||
+      !EnsureTarget(right, slot.width, slot.height, "right eye") ||
+      !Acquire(left, 20'000'000) || !Acquire(right, 20'000'000)) {
+    return false;
+  }
+  if (s.xr_pool == VK_NULL_HANDLE) {
+    VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pool_info.queueFamilyIndex = s.device->queue_family_graphics_compute();
+    if (dfn.vkCreateCommandPool(device, &pool_info, nullptr, &s.xr_pool) != VK_SUCCESS) {
+      s.xr_pool = VK_NULL_HANDLE;
+      return false;
+    }
+    VkCommandBufferAllocateInfo allocate_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocate_info.commandPool = s.xr_pool;
+    allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocate_info.commandBufferCount = 2;
+    dfn.vkAllocateCommandBuffers(device, &allocate_info, s.xr_cmd);
+    for (VkFence& fence : s.xr_cmd_fence) {
+      VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+      fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+      dfn.vkCreateFence(device, &fence_info, nullptr, &fence);
+    }
+  }
+  const int c = s.xr_cmd_next;
+  s.xr_cmd_next ^= 1;
+  dfn.vkWaitForFences(device, 1, &s.xr_cmd_fence[c], VK_TRUE, 100'000'000);
+  dfn.vkResetFences(device, 1, &s.xr_cmd_fence[c]);
+  const VkCommandBuffer cmd = s.xr_cmd[c];
+  VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  dfn.vkBeginCommandBuffer(cmd, &begin_info);
+  const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  auto barrier = [&](VkImage image, VkAccessFlags from_access, VkAccessFlags to_access,
+                     VkImageLayout from, VkImageLayout to) {
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask = from_access;
+    b.dstAccessMask = to_access;
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = range;
+    return b;
+  };
+  const VkImage targets[2] = {left.images[left.index].image, right.images[right.index].image};
+  VkImageMemoryBarrier before[4];
+  for (int eye = 0; eye < 2; ++eye) {
+    before[eye] =
+        barrier(slot.eye[eye], VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    before[2 + eye] = barrier(targets[eye], 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                              VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  }
+  dfn.vkCmdPipelineBarrier(cmd,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT |
+                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 4, before);
+  VkImageCopy copy{};
+  copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  copy.dstSubresource = copy.srcSubresource;
+  copy.extent = {slot.width, slot.height, 1};
+  for (int eye = 0; eye < 2; ++eye) {
+    dfn.vkCmdCopyImage(cmd, slot.eye[eye], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, targets[eye],
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+  }
+  VkImageMemoryBarrier after[4];
+  for (int eye = 0; eye < 2; ++eye) {
+    after[eye] = barrier(targets[eye], VK_ACCESS_TRANSFER_WRITE_BIT,
+                         VK_ACCESS_COLOR_ATTACHMENT_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    // Back as the game's copy leaves its images.
+    after[2 + eye] = barrier(slot.eye[eye], VK_ACCESS_TRANSFER_READ_BIT, 0,
+                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+  }
+  dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                               VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           0, 0, nullptr, 0, nullptr, 4, after);
+  dfn.vkEndCommandBuffer(cmd);
+  const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
+  VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  submit.commandBufferCount = 1;
+  submit.pCommandBuffers = &cmd;
+  if (dfn.vkQueueSubmit(queue.queue(), 1, &submit, s.xr_cmd_fence[c]) != VK_SUCCESS) {
+    // Signalled for the next use.
+    dfn.vkQueueSubmit(queue.queue(), 0, nullptr, s.xr_cmd_fence[c]);
+    return false;
+  }
+  Release(left);
+  Release(right);
+  return true;
 }
 
 bool EnsureCaptureBuffer(uint32_t width, uint32_t height) {
@@ -994,26 +1202,26 @@ void FrameLoop() {
     // read as constant judder at full frame rate.
     const int64_t period = frame_state.predictedDisplayPeriod;
     FinishFenced(false);
+    int next = ReadySlot();
     if (s.show_stereo && period > 0) {
       const uint64_t wait_ns = SteadyNs();
       const auto deadline =
           std::chrono::steady_clock::now() + std::chrono::nanoseconds(period * 6 / 10);
-      while (s.released_pairs == s.shown_pairs && !s.stop &&
-             std::chrono::steady_clock::now() < deadline) {
+      while (next < 0 && !s.stop && std::chrono::steady_clock::now() < deadline) {
         s.pair_released.wait_for(lock, std::chrono::microseconds(500));
-        FinishFenced(false);
+        next = ReadySlot();
       }
-      if (s.released_pairs == s.shown_pairs) ++s.repeats;
-      if (s.released_pairs != s.shown_pairs) {
+      if (next < 0) {
+        ++s.repeats;
+      } else {
         // Keep pairs arriving a third of a frame in (a small step at a time).
-        const int64_t phase = int64_t(s.last_release_ns) - int64_t(wait_ns);
+        const int64_t phase = int64_t(s.slots[next].complete_ns) - int64_t(wait_ns);
         s.pair_phase.Add(double(phase) / 1e6);
         int64_t error = phase - period / 3;
         error = std::clamp<int64_t>(error, -period / 2, period / 2);
         xr::NudgeVblankPhase(-error / 8);
       }
     }
-    s.shown_pairs = s.released_pairs;
     const auto locked = std::chrono::steady_clock::now();
     s.wait_frame.Add(std::chrono::duration<double, std::milli>(wait_end - wait_start).count());
     s.wait_lock.Add(std::chrono::duration<double, std::milli>(locked - wait_end).count());
@@ -1023,9 +1231,24 @@ void FrameLoop() {
         PlaceSeat(frame_state.predictedDisplayTime)) {
       s.recenter = false;
     }
+    {
+      const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
+      XrFrameBeginInfo begin_info{XR_TYPE_FRAME_BEGIN_INFO};
+      if (failed(xrBeginFrame(s.session, &begin_info), "xrBeginFrame")) continue;
+    }
+    // The next pair into the swapchains, inside this frame.
+    if (next >= 0 && CopySlot(s.slots[next])) {
+      State::Slot& slot = s.slots[next];
+      for (int eye = 0; eye < 2; ++eye) {
+        s.shown_pose[eye] = slot.pose[eye];
+        s.shown_fov[eye] = slot.fov[eye];
+      }
+      s.shown_slot = next;
+      s.shown_serial = slot.serial;
+      s.show_stereo = true;
+      ++s.pairs;
+    }
     const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
-    XrFrameBeginInfo begin_info{XR_TYPE_FRAME_BEGIN_INFO};
-    if (failed(xrBeginFrame(s.session, &begin_info), "xrBeginFrame")) continue;
     XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
     XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     XrCompositionLayerProjectionView views[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
@@ -1196,6 +1419,25 @@ void OnDeviceDestroying() {
     dfn.vkDestroyFence(s.device->device(), s.copy_fence, nullptr);
     s.copy_fence = VK_NULL_HANDLE;
   }
+  for (State::Slot& slot : s.slots) {
+    for (int eye = 0; eye < 2; ++eye) {
+      if (slot.eye[eye] != VK_NULL_HANDLE) {
+        dfn.vkDestroyImage(s.device->device(), slot.eye[eye], nullptr);
+        dfn.vkFreeMemory(s.device->device(), slot.memory[eye], nullptr);
+        slot.eye[eye] = VK_NULL_HANDLE;
+      }
+    }
+    if (slot.fence != VK_NULL_HANDLE) dfn.vkDestroyFence(s.device->device(), slot.fence, nullptr);
+    slot.fence = VK_NULL_HANDLE;
+  }
+  for (VkFence& fence : s.xr_cmd_fence) {
+    if (fence != VK_NULL_HANDLE) dfn.vkDestroyFence(s.device->device(), fence, nullptr);
+    fence = VK_NULL_HANDLE;
+  }
+  if (s.xr_pool != VK_NULL_HANDLE) {
+    dfn.vkDestroyCommandPool(s.device->device(), s.xr_pool, nullptr);
+    s.xr_pool = VK_NULL_HANDLE;
+  }
   s.device = nullptr;
 }
 
@@ -1335,14 +1577,50 @@ bool BeginGuestFrame(uint32_t width, uint32_t height, const Lens& lens, FrameCop
     return false;
   }
   const bool stereo = REXCVAR_GET(xr_stereo) && tagged;
-  const TargetIndex index = stereo ? (request.eye ? kRight : kLeft) : kScreen;
-  if (index == kRight &&
-      (!s.targets[kLeft].acquired || s.held_left_tag != (request.tag + kTagCount - 1) % kTagCount)) {
-    // Its left frame was not copied (a camera change, or the first frame):
-    // the headset keeps the last pair.
-    ++s.unpaired;
-    return false;
+  if (stereo) {
+    // Into a slot; the headset's frame copies the whole pair on.
+    State::Slot* slot = nullptr;
+    if (request.eye == 0) {
+      const int i = s.filling >= 0 ? s.filling : FillSlot();
+      if (i < 0 || !EnsureSlot(s.slots[i], width, height)) return false;
+      s.filling = i;
+      slot = &s.slots[i];
+      slot->has_left = true;
+      slot->complete = false;
+      slot->left_tag = request.tag;
+    } else {
+      if (s.filling < 0 || !s.slots[s.filling].has_left ||
+          s.slots[s.filling].left_tag != (request.tag + kTagCount - 1) % kTagCount ||
+          s.slots[s.filling].width != width || s.slots[s.filling].height != height) {
+        // Its left frame was not copied (a camera change, or the first
+        // frame): the headset keeps the last pair.
+        ++s.unpaired;
+        return false;
+      }
+      slot = &s.slots[s.filling];
+      s.pending_slot = true;
+    }
+    const int eye = request.eye & 1;
+    slot->pose[eye].position = {request.position[0], request.position[1], request.position[2]};
+    slot->pose[eye].orientation = {request.orientation[0], request.orientation[1],
+                                   request.orientation[2], request.orientation[3]};
+    const float half_x = lens.fov_x * 0.5f, half_y = lens.fov_y * 0.5f;
+    slot->fov[eye] = {-half_x, half_x, half_y, -half_y};
+    if (s.capture_left > 0 && EnsureCaptureBuffer(width, height)) {
+      out.capture = s.capture_buffer;
+      s.capture_recorded = true;
+      s.capture_request = request;
+      s.capture_lens = lens;
+      s.capture_requested_ns = requested_ns;
+      s.capture_recorded_ns = SteadyNs();
+      s.capture_width = width;
+      s.capture_height = height;
+    }
+    out.staging = s.staging;
+    out.target = slot->eye[eye];
+    return true;
   }
+  const TargetIndex index = kScreen;
   static const char* const kNames[] = {"left eye", "right eye", "screen"};
   Target& target = s.targets[index];
   if (!EnsureTarget(target, width, height, kNames[index]) || !Acquire(target)) return false;
@@ -1381,6 +1659,23 @@ void GuestFrameSubmitted() {
   const VulkanDevice::Functions& dfn = s.device->functions();
   {
     const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
+    if (s.pending_slot && s.filling >= 0) {
+      // The pair is whole once the GPU has run its copy (ReadySlot).
+      State::Slot& slot = s.slots[s.filling];
+      if (slot.fence == VK_NULL_HANDLE) {
+        VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        dfn.vkCreateFence(s.device->device(), &fence_info, nullptr, &slot.fence);
+      } else {
+        dfn.vkResetFences(s.device->device(), 1, &slot.fence);
+      }
+      dfn.vkQueueSubmit(queue.queue(), 0, nullptr, slot.fence);
+      slot.complete = true;
+      slot.has_left = false;
+      slot.serial = ++s.slot_serial;
+      slot.complete_ns = SteadyNs();
+      s.filling = -1;
+    }
+    s.pending_slot = false;
     if (s.pending != Pending::kNone) {
       // Signalled once the GPU has run everything on the queue, the copy
       // included; FinishFenced then hands the images over.
