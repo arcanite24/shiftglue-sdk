@@ -1517,12 +1517,19 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t depth_control = 0;
     // UP-1.7: whether the pixel shader writes the object slot.
     bool object_slot = false;
+    // LS-4.5: whether the draw renders a shared 4x alias at twice the scale.
+    bool doubled_scale = false;
     SpirvShaderTranslator::Modification vertex_modification;
     SpirvShaderTranslator::Modification pixel_modification;
     VulkanShader::VulkanTranslation* vertex_translation = nullptr;
     VulkanShader::VulkanTranslation* pixel_translation = nullptr;
   };
   std::unique_ptr<TranslationMemo[]> translation_memos_{new TranslationMemo[kStateMemoCount]};
+  // LS-4.5 (Fh1NativeExecutor::DrawAsDoubledScale): the current draw renders
+  // a 4x MSAA surface into its single-sampled storage at twice the draw
+  // resolution scale; its viewport, scissor, depth bias and system constants
+  // use the doubled scale.
+  bool draw_doubled_scale_ = false;
   // Host viewport information by memo state.
   struct ViewportMemo {
     uint64_t state_epoch = 0;
