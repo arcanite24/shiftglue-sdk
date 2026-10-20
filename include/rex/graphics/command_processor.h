@@ -398,6 +398,11 @@ class CommandProcessor {
   // shader loads, swaps) in the same order. Packets whose effects the CPU
   // sees wait for the recorder first. Backends opt in.
   virtual bool SupportsRecordThread() const { return false; }
+  // Whether the decoder waits for the recorder after the swap of `frame` (the
+  // recorder's observation_frame_sequence_ at it), so that what the recorder
+  // sets up at that swap, such as a frame dump's packet recorder, is in place
+  // before the next packet decodes.
+  virtual bool RecordSyncAfterSwap(uint64_t frame) const { return false; }
   bool record_split() const { return record_split_; }
   // The register file the decoder reads: the shadow while split.
   RegisterFile& decode_regs() { return record_split_ ? *decode_register_file_ : *register_file_; }
@@ -738,6 +743,9 @@ class CommandProcessor {
   // draw and its failure reporting.
   void ExecuteDrawRecord(const DrawRecord& record);
   uint32_t record_batch_draws_ = 0;
+  // The decoder's count of swaps: observation_frame_sequence_ as the recorder
+  // will have it when it runs the swap being decoded.
+  uint64_t decode_frame_sequence_ = 1;
   void StartRecordThread();
   void StopRecordThread();
   void RecordThreadMain();
