@@ -134,6 +134,11 @@ REXCVAR_DEFINE_INT32(gpu_d3d_program_probe, 0, "GPU",
                      "draws only their first triangle and 2 skips their draw commands (wrong "
                      "image), to bound the GPU time those lists cost (NA-3.2, Vulkan)")
     .range(0, 2);
+REXCVAR_DEFINE_STRING(fh1_debug_draw_constants_path, "", "GPU",
+                      "Diagnostics: write every draw's shader hashes and the float constants "
+                      "its shaders read to this file (for frame replays: comparing two frames' "
+                      "draws, such as a stereo pair's)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_native_gpu_profile_draws, false, "GPU",
                     "Diagnostics: with fh1_native_gpu_profile, also time every draw by its "
                     "pixel shader (Vulkan)")
@@ -6600,6 +6605,43 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   texture_inputs_generation_ += texture_cache_->unchanged_request_hits() == texture_hits_before;
   texture_section_skip_allowed_ = unchanged_inputs;
   texture_section_verify_ = unchanged_verify;
+  // fh1_debug_draw_constants_path: per draw, "DRAW", its index, the vertex
+  // and pixel shader hashes, then each float constant the shaders read (its
+  // register 0-511 and four floats).
+  {
+    static const std::string constants_path = REXCVAR_GET(fh1_debug_draw_constants_path);
+    if (!constants_path.empty()) {
+      static FILE* constants_file = std::fopen(constants_path.c_str(), "wb");
+      static uint32_t constants_draw = 0;
+      if (constants_file) {
+        std::vector<uint32_t> used;
+        for (uint32_t stage = 0; stage < 2; ++stage) {
+          const Shader* shader = stage ? static_cast<const Shader*>(pixel_shader)
+                                       : static_cast<const Shader*>(vertex_shader);
+          if (!shader) continue;
+          const auto& map = shader->constant_register_map();
+          for (uint32_t i = 0; i < 256; ++i) {
+            if (map.float_dynamic_addressing || (map.float_bitmap[i >> 6] >> (i & 63)) & 1) {
+              used.push_back(stage * 256 + i);
+            }
+          }
+        }
+        const uint32_t header[2] = {0x57415244u, constants_draw++};
+        const uint64_t hashes[2] = {vertex_shader->ucode_data_hash(),
+                                    pixel_shader ? pixel_shader->ucode_data_hash() : 0};
+        const uint32_t count = uint32_t(used.size());
+        std::fwrite(header, sizeof(header), 1, constants_file);
+        std::fwrite(hashes, sizeof(hashes), 1, constants_file);
+        std::fwrite(&count, sizeof(count), 1, constants_file);
+        for (uint32_t index : used) {
+          std::fwrite(&index, sizeof(index), 1, constants_file);
+          std::fwrite(&regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X + index * 4], 16, 1,
+                      constants_file);
+        }
+        std::fflush(constants_file);
+      }
+    }
+  }
   if (frame_dump_ && frame_dump_->recording()) {
     // Frame dumps: the guest ranges the draw reads.
     const bool guest_dma_indices = primitive_processing_result.index_buffer_type ==
