@@ -50,6 +50,11 @@ REXCVAR_DEFINE_INT32(xr_simulate_hz, 45, "Display",
                      "HeadsetFrameHz), as Virtual Desktop's spacewarp at 90 Hz does")
     .range(0, 240)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(xr_simulate_yaw, 0.0, "Display",
+                      "Testing: xr_simulate's head turns left and right this many degrees, once "
+                      "every 2 s")
+    .range(0.0, 90.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(xr_simulate_fov, 1.6, "Display",
                       "Vertical field of view in radians xr_simulate reports for its headset")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -139,10 +144,15 @@ bool FindRequest(const Lens& lens, EyeRequest& out, uint64_t* requested_ns = nul
     last_setting = setting;
     if (remaining > 0) {
       --remaining;
-      REXLOG_INFO("OpenXR frame log: tag {} eye {} camera ({:.4f}, {:.4f}, {:.4f}) right ({:.3f}, "
-                  "{:.3f}, {:.3f})",
+      const double qx = out.orientation[0], qy = out.orientation[1], qz = out.orientation[2],
+                   qw = out.orientation[3];
+      const double request_yaw =
+          std::atan2(2.0 * (qw * qy + qx * qz), 1.0 - 2.0 * (qy * qy + qx * qx)) * 57.29577951308232;
+      const double right_heading = std::atan2(lens.right[2], lens.right[0]) * 57.29577951308232;
+      REXLOG_INFO("OpenXR frame log: tag {} eye {} camera ({:.4f}, {:.4f}, {:.4f}) right ({:.4f}, "
+                  "{:.4f}, {:.4f}) requested yaw {:.3f} rendered right heading {:.3f}",
                   tag, out.eye, lens.position[0], lens.position[1], lens.position[2],
-                  lens.right[0], lens.right[1], lens.right[2]);
+                  lens.right[0], lens.right[1], lens.right[2], request_yaw, right_heading);
     }
   }
   ++b.decoded[out.eye & 1];
@@ -250,6 +260,18 @@ void LogDecoding(const char* where) {
   b.timed = b.intervals = 0;
   b.pair_motion_sum = b.pair_motion_max = 0.0;
   b.pairs = 0;
+}
+
+// xr_simulate's head: turning about the vertical (xr_simulate_yaw), as an
+// orientation quaternion.
+void SimulatedOrientation(float orientation[4]) {
+  const double amplitude = REXCVAR_GET(xr_simulate_yaw) / 57.29577951308232;
+  const double t = double(SteadyNs()) / 1e9;
+  const double yaw = amplitude * std::sin(t * 3.141592653589793);
+  orientation[0] = 0.0f;
+  orientation[1] = float(std::sin(yaw * 0.5));
+  orientation[2] = 0.0f;
+  orientation[3] = float(std::cos(yaw * 0.5));
 }
 
 // Stores and returns a new request for `eye` at this pose.
@@ -1171,7 +1193,8 @@ bool NextEye(EyeRequest& out) {
     xr::SetHeadsetFrameHz(uint32_t(REXCVAR_GET(xr_simulate_hz)));
     const float half = float(REXCVAR_GET(xr_simulate_ipd)) * 0.5f;
     const float position[3] = {eye ? half : -half, 0.0f, 0.0f};
-    const float orientation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    float orientation[4];
+    SimulatedOrientation(orientation);
     out = Record(eye, position, orientation);
     return true;
   }
@@ -1368,7 +1391,8 @@ bool NextEye(EyeRequest& out) {
   xr::SetHeadsetFrameHz(uint32_t(REXCVAR_GET(xr_simulate_hz)));
   const float half = float(REXCVAR_GET(xr_simulate_ipd)) * 0.5f;
   const float position[3] = {eye ? half : -half, 0.0f, 0.0f};
-  const float orientation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+  float orientation[4];
+  SimulatedOrientation(orientation);
   out = Record(eye, position, orientation);
   return true;
 }
