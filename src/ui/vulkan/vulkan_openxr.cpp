@@ -264,10 +264,11 @@ void LogDecoding(const char* where) {
 
 // xr_simulate's head: turning about the vertical (xr_simulate_yaw), as an
 // orientation quaternion.
-void SimulatedOrientation(float orientation[4]) {
+// As the headset's eyes, a pair's two eyes share the left eye's moment.
+void SimulatedOrientation(int eye, float orientation[4]) {
+  static double yaw = 0.0;
   const double amplitude = REXCVAR_GET(xr_simulate_yaw) / 57.29577951308232;
-  const double t = double(SteadyNs()) / 1e9;
-  const double yaw = amplitude * std::sin(t * 3.141592653589793);
+  if (eye == 0) yaw = amplitude * std::sin(double(SteadyNs()) / 1e9 * 3.141592653589793);
   orientation[0] = 0.0f;
   orientation[1] = float(std::sin(yaw * 0.5));
   orientation[2] = 0.0f;
@@ -332,6 +333,8 @@ namespace rex {
 namespace ui {
 namespace vulkan {
 namespace openxr {
+
+void FinishFenced(bool wait);
 
 namespace {
 
@@ -424,6 +427,12 @@ struct State {
   // requested after it is copied, then both are released together.
   uint32_t held_left_tag = UINT32_MAX;
   Pending pending = Pending::kNone;
+  // A copy on the queue waits for this fence before its images go to the
+  // runtime: Virtual Desktop read a right eye's image before its copy had
+  // run (the left one, copied a frame earlier, always had), and the right
+  // eye alone jittered.
+  VkFence copy_fence = VK_NULL_HANDLE;
+  Pending fenced = Pending::kNone;
   // What the headset shows: the eyes' latest released pair, or the screen.
   bool show_stereo = false, show_screen = false;
   // Pairs released (GuestFrameSubmitted) and the latest shown, and when the
@@ -642,6 +651,7 @@ void DestroySession() {
   for (Target& target : s.targets) DestroyTarget(target);
   s.held_left_tag = UINT32_MAX;
   s.pending = Pending::kNone;
+  s.fenced = Pending::kNone;
   s.show_stereo = s.show_screen = false;
   if (s.view != XR_NULL_HANDLE) xrDestroySpace(s.view);
   if (XrSpace seat = s.seat.exchange(XR_NULL_HANDLE); seat != XR_NULL_HANDLE) xrDestroySpace(seat);
@@ -983,10 +993,16 @@ void FrameLoop() {
     // boundary otherwise shows twice and its successor not at all, which
     // read as constant judder at full frame rate.
     const int64_t period = frame_state.predictedDisplayPeriod;
+    FinishFenced(false);
     if (s.show_stereo && period > 0) {
       const uint64_t wait_ns = SteadyNs();
-      s.pair_released.wait_for(lock, std::chrono::nanoseconds(period * 6 / 10),
-                               [&] { return s.released_pairs != s.shown_pairs || s.stop; });
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::nanoseconds(period * 6 / 10);
+      while (s.released_pairs == s.shown_pairs && !s.stop &&
+             std::chrono::steady_clock::now() < deadline) {
+        s.pair_released.wait_for(lock, std::chrono::microseconds(500));
+        FinishFenced(false);
+      }
       if (s.released_pairs == s.shown_pairs) ++s.repeats;
       if (s.released_pairs != s.shown_pairs) {
         // Keep pairs arriving a third of a frame in (a small step at a time).
@@ -1155,6 +1171,7 @@ void OnDeviceDestroying() {
   if (s.thread.joinable()) s.thread.join();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (s.session == XR_NULL_HANDLE) return;
+  FinishFenced(true);
   const VulkanDevice::Functions& dfn = s.device->functions();
   {
     const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
@@ -1175,6 +1192,10 @@ void OnDeviceDestroying() {
     dfn.vkFreeMemory(s.device->device(), s.capture_memory, nullptr);
     s.capture_buffer = VK_NULL_HANDLE;
   }
+  if (s.copy_fence != VK_NULL_HANDLE) {
+    dfn.vkDestroyFence(s.device->device(), s.copy_fence, nullptr);
+    s.copy_fence = VK_NULL_HANDLE;
+  }
   s.device = nullptr;
 }
 
@@ -1194,7 +1215,7 @@ bool NextEye(EyeRequest& out) {
     const float half = float(REXCVAR_GET(xr_simulate_ipd)) * 0.5f;
     const float position[3] = {eye ? half : -half, 0.0f, 0.0f};
     float orientation[4];
-    SimulatedOrientation(orientation);
+    SimulatedOrientation(eye, orientation);
     out = Record(eye, position, orientation);
     return true;
   }
@@ -1256,6 +1277,37 @@ bool NextEye(EyeRequest& out) {
   return true;
 }
 
+// Under the state mutex: once the fenced copy has run, hands its images to
+// the runtime and shows them. With `wait`, waits for it (up to 100 ms).
+void FinishFenced(bool wait) {
+  State& s = S();
+  if (s.fenced == Pending::kNone || s.copy_fence == VK_NULL_HANDLE) return;
+  const VulkanDevice::Functions& dfn = s.device->functions();
+  const VkResult status =
+      wait ? dfn.vkWaitForFences(s.device->device(), 1, &s.copy_fence, VK_TRUE, 100'000'000)
+           : dfn.vkGetFenceStatus(s.device->device(), s.copy_fence);
+  if (status != VK_SUCCESS) return;
+  const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
+  if (s.fenced == Pending::kPair) {
+    Release(s.targets[kLeft]);
+    Release(s.targets[kRight]);
+    for (int eye = 0; eye < 2; ++eye) {
+      s.shown_pose[eye] = s.targets[eye].pose;
+      s.shown_fov[eye] = s.targets[eye].fov;
+    }
+    s.show_stereo = true;
+    s.held_left_tag = UINT32_MAX;
+    ++s.pairs;
+    ++s.released_pairs;
+    s.last_release_ns = SteadyNs();
+  } else if (s.fenced == Pending::kScreen) {
+    Release(s.targets[kScreen]);
+    s.show_stereo = false;
+    s.show_screen = true;
+  }
+  s.fenced = Pending::kNone;
+}
+
 bool BeginGuestFrame(uint32_t width, uint32_t height, const Lens& lens, FrameCopy& out) {
   out = {};
   EyeRequest request;
@@ -1268,6 +1320,8 @@ bool BeginGuestFrame(uint32_t width, uint32_t height, const Lens& lens, FrameCop
   }
   if (width == 0 || height == 0) return false;
   std::lock_guard<std::mutex> lock(s.mutex);
+  // The images of the copy before go to the runtime before these are used.
+  FinishFenced(true);
   struct Hold {
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     State::Timing& timing;
@@ -1324,34 +1378,32 @@ void GuestFrameSubmitted() {
   std::lock_guard<std::mutex> lock(s.mutex);
   if (s.session == XR_NULL_HANDLE) return;
   const auto start = std::chrono::steady_clock::now();
-  const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
-  if (s.pending == Pending::kPair) {
-    Release(s.targets[kLeft]);
-    Release(s.targets[kRight]);
-    for (int eye = 0; eye < 2; ++eye) {
-      s.shown_pose[eye] = s.targets[eye].pose;
-      s.shown_fov[eye] = s.targets[eye].fov;
+  const VulkanDevice::Functions& dfn = s.device->functions();
+  {
+    const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
+    if (s.pending != Pending::kNone) {
+      // Signalled once the GPU has run everything on the queue, the copy
+      // included; FinishFenced then hands the images over.
+      if (s.copy_fence == VK_NULL_HANDLE) {
+        VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        dfn.vkCreateFence(s.device->device(), &fence_info, nullptr, &s.copy_fence);
+      } else {
+        dfn.vkResetFences(s.device->device(), 1, &s.copy_fence);
+      }
+      dfn.vkQueueSubmit(queue.queue(), 0, nullptr, s.copy_fence);
+      s.fenced = s.pending;
+      s.pending = Pending::kNone;
     }
-    s.show_stereo = true;
-    s.held_left_tag = UINT32_MAX;
-    ++s.pairs;
-    ++s.released_pairs;
-    s.last_release_ns = SteadyNs();
-    s.pair_released.notify_all();
-  } else if (s.pending == Pending::kScreen) {
-    Release(s.targets[kScreen]);
-    s.show_stereo = false;
-    s.show_screen = true;
+    if (s.capture_recorded) {
+      s.capture_recorded = false;
+      // Still holding the queue: wait for this frame's copy, then save it.
+      dfn.vkQueueWaitIdle(queue.queue());
+      SaveCapture();
+    }
   }
-  s.pending = Pending::kNone;
   s.release_hold.Add(
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
-  if (s.capture_recorded) {
-    s.capture_recorded = false;
-    // Still holding the queue: wait for this frame's copy, then save it.
-    s.device->functions().vkQueueWaitIdle(queue.queue());
-    SaveCapture();
-  }
+  s.pair_released.notify_all();
 }
 
 void Recenter() { S().recenter = true; }
@@ -1392,7 +1444,7 @@ bool NextEye(EyeRequest& out) {
   const float half = float(REXCVAR_GET(xr_simulate_ipd)) * 0.5f;
   const float position[3] = {eye ? half : -half, 0.0f, 0.0f};
   float orientation[4];
-  SimulatedOrientation(orientation);
+  SimulatedOrientation(eye, orientation);
   out = Record(eye, position, orientation);
   return true;
 }
