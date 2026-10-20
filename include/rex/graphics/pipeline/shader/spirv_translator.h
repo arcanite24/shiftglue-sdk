@@ -93,6 +93,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // winning, for a temporal upscaler's per-object motion. Host render
       // targets only.
       uint32_t object_slot_output : 1;
+      // LS-4.5: a 4x MSAA draw rendered into the single-sampled surface that
+      // shares its EDRAM (Fh1NativeExecutor::StorageKey) at twice the draw
+      // resolution scale, each host pixel one guest sample: pixel positions
+      // divide by the doubled scale, and alpha to coverage keeps the bit of
+      // the guest sample the pixel stands for.
+      uint32_t msaa_as_doubled_scale : 1;
     } pixel;
     uint64_t value = 0;
 
@@ -566,6 +572,17 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
   Modification GetSpirvShaderModification() const {
     return Modification(current_translation().modification());
+  }
+  // The host pixels a guest pixel spans: the draw resolution scale, doubled
+  // for a 4x MSAA draw rendered as single-sampled at twice the scale.
+  uint32_t PixelScaleX() const {
+    return draw_resolution_scale_x_ << PixelScaleShift();
+  }
+  uint32_t PixelScaleY() const {
+    return draw_resolution_scale_y_ << PixelScaleShift();
+  }
+  uint32_t PixelScaleShift() const {
+    return is_pixel_shader() && GetSpirvShaderModification().pixel.msaa_as_doubled_scale ? 1 : 0;
   }
 
   bool IsSpirvVertexShader() const {
