@@ -97,6 +97,9 @@ class Fh1FrameDump {
   std::unique_ptr<Fh1FrameDumpMirror> mirror_;
   uint64_t frame_;
   std::filesystem::path path_;
+  // fh1_frame_dump_count: the first frame's path, and the frames written.
+  std::filesystem::path first_path_;
+  uint32_t written_ = 0;
   bool recording_ = false;
   bool done_ = false;
 
