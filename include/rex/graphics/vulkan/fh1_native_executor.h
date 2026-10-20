@@ -85,21 +85,23 @@ class Fh1NativeExecutor {
   // tiles resolved are copied down to the EDRAM rows of their surfaces, where
   // the last tile leaves them on the console.
   void EndUntiledTiling();
-  // The host sample count of surfaces the guest renders with this many
-  // samples (fh1_msaa_single_sample, fh1_msaa_2x).
-  // LS-4.5 (fh1_share_msaa_aliases): FH1 reads its 1280x720 1x depth (and
-  // other 1x surfaces at pitch 16) as 640x360 4x MSAA surfaces at the same
-  // EDRAM base: guest 4x pixel (x, y) sample s is 1x pixel (2x + (s & 1),
-  // 2y + (s >> 1)). Such a 4x surface is stored as its 1x surface, and its
-  // draws render into it single-sampled at twice the draw resolution scale,
-  // so switching between the views transfers nothing.
+  // LS-4.5 (fh1_share_msaa_aliases): FH1 reads 1x surfaces as 4x MSAA ones
+  // of half the width and height at the same EDRAM base: its 1280x720 ones
+  // at pitch 16 (the scene and sun shadow depth) as 640x360, and its
+  // 1040-wide D24S8 at pitch 13 as 520 wide. Guest 4x pixel (x, y) sample s
+  // is 1x pixel (2x + (s & 1), 2y + (s >> 1)), so such a 4x surface is
+  // stored as its 1x surface, and its draws render into it single-sampled
+  // at twice the draw resolution scale: switching between the views
+  // transfers nothing.
   bool IsSharedMsaaAlias(uint32_t msaa, uint32_t pitch_tiles) const {
     return share_msaa_aliases_ && msaa == uint32_t(xenos::MsaaSamples::k4X) &&
-           pitch_tiles == kSharedMsaaAliasPitchTiles;
+           (pitch_tiles == 16 || pitch_tiles == 13);
   }
   // The current draw's targets are a shared 4x alias (rendered at twice the
   // scale with one sample).
   bool DrawAsDoubledScale() const;
+  // The host sample count of surfaces the guest renders with this many
+  // samples (fh1_msaa_single_sample, fh1_msaa_2x).
   xenos::MsaaSamples HostMsaaSamples(xenos::MsaaSamples guest) const {
     if (guest == xenos::MsaaSamples::k1X || single_sample_msaa_) return xenos::MsaaSamples::k1X;
     return two_sample_msaa_ && guest == xenos::MsaaSamples::k4X ? xenos::MsaaSamples::k2X
@@ -752,9 +754,8 @@ class Fh1NativeExecutor {
   uint64_t frame_ = 0;
   // fh1_scaled_msaa_single_sample at a scale above 1x.
   bool single_sample_msaa_ = false;
-  // fh1_share_msaa_aliases: 4x surfaces at this pitch are stored as their 1x
-  // surfaces (IsSharedMsaaAlias).
-  static constexpr uint32_t kSharedMsaaAliasPitchTiles = 16;
+  // fh1_share_msaa_aliases: 4x surfaces at the aliased pitches are stored as
+  // their 1x surfaces (IsSharedMsaaAlias).
   bool share_msaa_aliases_ = false;
   bool two_sample_msaa_ = false;
   // The device exports stencil from shaders: depth transfers take one pass.

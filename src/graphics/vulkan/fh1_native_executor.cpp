@@ -61,7 +61,7 @@ REXCVAR_DEFINE_BOOL(fh1_async_specialized_passes, true, "GPU",
                     "driver cache)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_share_msaa_aliases, false, "GPU",
-                    "Store FH1's 640x360 4x MSAA views of its 1280x720 1x surfaces (pitch 16) "
+                    "Store FH1's half-size 4x MSAA views of its 1x surfaces at pitches 16 and 13 "
                     "in the 1x surfaces, rendering their draws single-sampled at twice the "
                     "scale, instead of transferring the EDRAM contents at every switch between "
                     "the views (Vulkan FH1 native executor, LS-4.5). Off by default: with "
