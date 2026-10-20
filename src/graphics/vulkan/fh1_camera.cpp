@@ -272,8 +272,9 @@ uint32_t Fh1NativeExecutor::CurrentDepthKey() const {
   const auto depth_info = register_file_.Get<reg::RB_DEPTH_INFO>();
   const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
   const uint32_t msaa = uint32_t(surface_info.msaa_samples);
-  return MakeDepthKey(depth_info.depth_base, Fh1PitchTiles(surface_info.surface_pitch, msaa), msaa,
-                      depth_info.depth_format)
+  return StorageKey(MakeDepthKey(depth_info.depth_base,
+                                 Fh1PitchTiles(surface_info.surface_pitch, msaa), msaa,
+                                 depth_info.depth_format))
       .Pack();
 }
 
@@ -319,13 +320,7 @@ bool Fh1NativeExecutor::GetSceneJitter(float& x, float& y) const {
     return true;
   }
   if (!draw_uses_camera_matrix_) return false;
-  const auto depth_info = register_file_.Get<reg::RB_DEPTH_INFO>();
-  const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
-  const uint32_t msaa = uint32_t(surface_info.msaa_samples);
-  if (MakeDepthKey(depth_info.depth_base, Fh1PitchTiles(surface_info.surface_pitch, msaa), msaa,
-                   depth_info.depth_format)
-              .Pack() != camera_scene_depth_ ||
-      CurrentColorKey() != camera_scene_color_) {
+  if (CurrentDepthKey() != camera_scene_depth_ || CurrentColorKey() != camera_scene_color_) {
     return false;
   }
   x = jitter_x_;

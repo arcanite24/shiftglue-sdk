@@ -6261,6 +6261,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
                                          : pixel_shader && fh1_native_executor_ &&
                                                fh1_native_executor_->IsSceneObjectDraw(*vertex_shader);
     object_slot_draws_ += uint32_t(object_slot && !i);
+    const bool doubled_scale = fh1_native_executor_ && fh1_native_executor_->DrawAsDoubledScale();
+    draw_doubled_scale_ = doubled_scale;
     if (program_hit) {
       // NA-2.4: the recorded modifications and translations (ready when
       // recorded, and translations are never dropped).
@@ -6282,7 +6284,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
           translation_memo.interpolator_mask == interpolator_mask &&
           translation_memo.ps_param_gen_pos == ps_param_gen_pos &&
           translation_memo.depth_control == normalized_depth_control.value &&
-          translation_memo.object_slot == object_slot) {
+          translation_memo.object_slot == object_slot &&
+          translation_memo.doubled_scale == doubled_scale) {
         vertex_shader_modification = translation_memo.vertex_modification;
         pixel_shader_modification = translation_memo.pixel_modification;
         vertex_shader_translation = translation_memo.vertex_translation;
@@ -6296,8 +6299,13 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
                                *pixel_shader, interpolator_mask, ps_param_gen_pos,
                                normalized_depth_control)
                          : SpirvShaderTranslator::Modification(0);
-        if (object_slot) {
+        // The object slot image has the guest output's pixels, which a doubled
+        // draw's do not match (FH1's cars draw to the scene, never doubled).
+        if (object_slot && !doubled_scale) {
           pixel_shader_modification.pixel.object_slot_output = 1;
+        }
+        if (pixel_shader && doubled_scale) {
+          pixel_shader_modification.pixel.msaa_as_doubled_scale = 1;
         }
 
         // Translate the shaders now to obtain the sampler bindings.
@@ -6336,6 +6344,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         }
         translation_memo.state_epoch = memo_translation ? memo_state : 0;
         translation_memo.object_slot = object_slot;
+        translation_memo.doubled_scale = doubled_scale;
         translation_memo.vertex_shader = vertex_shader;
         translation_memo.pixel_shader = pixel_shader;
         translation_memo.host_vertex_shader_type =
@@ -6868,8 +6877,10 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   DrawCostMark(kCostPipeline);
   bool host_render_targets_used =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+  // A shared 4x alias renders single-sampled at twice the scale.
+  const uint32_t draw_scale_shift = draw_doubled_scale_ ? 1 : 0;
+  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x() << draw_scale_shift;
+  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y() << draw_scale_shift;
 
   // Get dynamic rasterizer state.
   draw_util::ViewportInfo viewport_info;
@@ -9351,8 +9362,12 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
   const RegisterFile& regs = *register_file_;
-  uint32_t draw_resolution_scale_x = texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1;
-  uint32_t draw_resolution_scale_y = texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1;
+  // A shared 4x alias renders single-sampled at twice the scale.
+  const uint32_t draw_scale_shift = draw_doubled_scale_ ? 1 : 0;
+  uint32_t draw_resolution_scale_x =
+      (texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1) << draw_scale_shift;
+  uint32_t draw_resolution_scale_y =
+      (texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1) << draw_scale_shift;
 
   // Window parameters.
   // http://ftp.tku.edu.tw/NetBSD/NetBSD-current/xsrc/external/mit/xf86-video-ati/dist/src/r600_reg_auto_r6xx.h
@@ -9649,8 +9664,10 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   }
 
   const RegisterFile& regs = *register_file_;
-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+  // A shared 4x alias renders single-sampled at twice the scale.
+  const uint32_t draw_scale_shift = draw_doubled_scale_ ? 1 : 0;
+  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x() << draw_scale_shift;
+  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y() << draw_scale_shift;
 
   // Everything below derives from render state block registers (covered by
   // the render state epoch), the two per-draw registers read here and the
@@ -9848,9 +9865,12 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   // MSAA sample count: the host's, where the FH1 executor stores the guest's
   // surfaces with fewer samples (alpha to coverage and per-sample shading
   // address host samples).
+  // A shared 4x alias keeps the guest's 4x: its pixels are the guest samples,
+  // and alpha to coverage takes each one's bit (msaa_as_doubled_scale).
   const xenos::MsaaSamples host_msaa_samples =
-      fh1_native_executor_ ? fh1_native_executor_->HostMsaaSamples(rb_surface_info.msaa_samples)
-                           : rb_surface_info.msaa_samples;
+      fh1_native_executor_ && !draw_doubled_scale_
+          ? fh1_native_executor_->HostMsaaSamples(rb_surface_info.msaa_samples)
+          : rb_surface_info.msaa_samples;
   flags |= uint32_t(host_msaa_samples) << SpirvShaderTranslator::kSysFlag_MsaaSamples_Shift;
   // Depth format.
   if (rb_depth_info.depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {

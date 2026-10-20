@@ -60,6 +60,14 @@ REXCVAR_DEFINE_BOOL(fh1_async_specialized_passes, true, "GPU",
                     "GPU commands thread for it (tens of milliseconds a pipeline on a cold "
                     "driver cache)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_share_msaa_aliases, false, "GPU",
+                    "Store FH1's 640x360 4x MSAA views of its 1280x720 1x surfaces (pitch 16) "
+                    "in the 1x surfaces, rendering their draws single-sampled at twice the "
+                    "scale, instead of transferring the EDRAM contents at every switch between "
+                    "the views (Vulkan FH1 native executor, LS-4.5). Off by default: with "
+                    "fh1_msaa_single_sample those passes do about 4x the pixel work, measured "
+                    "only on an RTX 3090")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_msaa_single_sample, true, "GPU",
                     "Keep the guest's 2x and 4x MSAA surfaces as single-sampled images at any "
                     "resolution scale (Vulkan): at 1x the game renders without MSAA - harder "
@@ -446,6 +454,7 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   if (!config_.memory || !config_.textures || !config_.render_targets) return false;
   async_specialize_ = REXCVAR_GET(fh1_async_specialized_passes);
   scale_ = config_.textures->draw_resolution_scale_x();
+  share_msaa_aliases_ = REXCVAR_GET(fh1_share_msaa_aliases);
   untile_height_ = config_.untile_height;
   UpdateCoarseShading();
   single_sample_msaa_ = (scale_ >= 2 && REXCVAR_GET(fh1_scaled_msaa_single_sample)) ||
@@ -2005,19 +2014,26 @@ bool Fh1NativeExecutor::DrawMayWriteNonzeroStencil(reg::RB_DEPTHCONTROL depth_co
 }
 
 bool Fh1NativeExecutor::ClaimDepthOverwriteTiles(const SurfaceKey& key, uint32_t length,
-                                                 bool stencil_overwritten, bool stencil_written) {
+                                                 bool stencil_overwritten, bool stencil_written,
+                                                 uint32_t rect_shift) {
   const uint32_t msaa_x_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
   const uint32_t msaa_y_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
   const uint32_t tile_width = xenos::kEdramTileWidthSamples >> msaa_x_log2;
   const uint32_t tile_height = xenos::kEdramTileHeightSamples >> msaa_y_log2;
-  for (const auto& rect : depth_overwrite_.rects()) {
+  // In the storage surface's pixels.
+  auto rects = depth_overwrite_.rects();
+  for (auto& rect : rects) {
+    for (int32_t& value : rect.outer) value <<= rect_shift;
+    for (int32_t& value : rect.inner) value <<= rect_shift;
+  }
+  for (const auto& rect : rects) {
     const uint32_t column_end = (uint32_t(rect.outer[2]) + tile_width - 1) / tile_width;
     const uint32_t row_end = (uint32_t(rect.outer[3]) + tile_height - 1) / tile_height;
     if (column_end > key.pitch_tiles || (row_end - 1) * key.pitch_tiles + column_end > length) {
       return false;
     }
   }
-  for (const auto& rect : depth_overwrite_.rects()) {
+  for (const auto& rect : rects) {
     ClaimOverwrittenDepthTiles(key, rect.inner, stencil_overwritten);
     const uint32_t column_first = uint32_t(rect.outer[0]) / tile_width;
     const uint32_t column_end = (uint32_t(rect.outer[2]) + tile_width - 1) / tile_width;
@@ -2145,14 +2161,16 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
   if (draw.rasterization_done && pitch_tiles) {
     if (draw.normalized_depth_control.z_enable || draw.normalized_depth_control.stencil_enable) {
       const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
-      keys[0] = MakeDepthKey(depth_info.depth_base, pitch_tiles, msaa, depth_info.depth_format);
+      keys[0] = StorageKey(
+          MakeDepthKey(depth_info.depth_base, pitch_tiles, msaa, depth_info.depth_format));
       used_bits |= 1;
     }
     for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
       if (!(draw.normalized_color_mask & (0xFu << (4 * i)))) continue;
       const auto color_info =
           regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
-      keys[1 + i] = MakeColorKey(color_info.color_base, pitch_tiles, msaa, color_info.color_format);
+      keys[1 + i] = StorageKey(
+          MakeColorKey(color_info.color_base, pitch_tiles, msaa, color_info.color_format));
       used_bits |= 1u << (1 + i);
     }
     for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
@@ -2169,6 +2187,9 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
   if (!used_bits) return;
 
   const uint32_t msaa_y_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k2X));
+  // A shared 4x alias's storage has two rows a guest row (the EDRAM tiles
+  // are the same).
+  const uint32_t storage_shift = IsSharedMsaaAlias(msaa, pitch_tiles) ? 1 : 0;
   auto length_for_height = [&](uint32_t height) {
     return ((height << msaa_y_log2) + xenos::kEdramTileHeightSamples - 1) /
            xenos::kEdramTileHeightSamples * pitch_tiles;
@@ -2210,7 +2231,7 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
   if (same_targets && length_tiles_32bpp <= same_targets->length_tiles) return;
 
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
-    if ((used_bits & (1u << i)) && !GetOrCreateSurface(keys[i], height_used)) {
+    if ((used_bits & (1u << i)) && !GetOrCreateSurface(keys[i], height_used << storage_shift)) {
       used_bits &= ~(1u << i);
     }
   }
@@ -2234,8 +2255,8 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
                                    : xenos::kEdramTileCount + bases[0].first;
     const uint32_t length =
         std::min(length_tiles_32bpp << uint32_t(key.Is64bpp()), next_base - key.base_tiles);
-    if (depth_overwritten &&
-        ClaimDepthOverwriteTiles(key, length, stencil_overwritten, depth_stencil_written)) {
+    if (depth_overwritten && ClaimDepthOverwriteTiles(key, length, stencil_overwritten,
+                                                      depth_stencil_written, storage_shift)) {
       continue;
     }
     ClaimTiles(key.base_tiles, length, key.Pack());
@@ -2273,7 +2294,7 @@ bool Fh1NativeExecutor::BindTargets(VulkanRenderTargetCache::RenderPassKey& key_
   const uint32_t used_bits = pending_used_bits_;
   const SurfaceKey* keys = pending_keys_;
   const uint64_t rendering_id = DrawRenderingId(used_bits);
-  key_out.msaa_samples = single_sample_msaa_
+  key_out.msaa_samples = single_sample_msaa_ || DrawAsDoubledScale()
                              ? xenos::MsaaSamples::k1X
                              : register_file_.Get<reg::RB_SURFACE_INFO>().msaa_samples;
   if (two_sample_msaa_ && key_out.msaa_samples == xenos::MsaaSamples::k4X) {
@@ -2353,6 +2374,13 @@ void Fh1NativeExecutor::UpdateCoarseShading() {
     if (!valid(width) || !valid(height)) continue;
     coarse_shading_.emplace_back(entry.substr(0, equals), VkExtent2D{width, height});
   }
+}
+
+bool Fh1NativeExecutor::DrawAsDoubledScale() const {
+  if (!share_msaa_aliases_ || !initialized_) return false;
+  const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
+  const uint32_t msaa = uint32_t(surface_info.msaa_samples);
+  return IsSharedMsaaAlias(msaa, Fh1PitchTiles(surface_info.surface_pitch, msaa));
 }
 
 uint64_t Fh1NativeExecutor::DrawRenderingId(uint32_t used_bits) const {
@@ -2478,8 +2506,13 @@ void Fh1NativeExecutor::BeginDrawRendering() {
   if (width == UINT32_MAX) {
     // No attachments: the surface pitch bounds the draw.
     const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
-    const uint32_t msaa = uint32_t(surface_info.msaa_samples);
-    const uint32_t pitch_tiles = std::max(Fh1PitchTiles(surface_info.surface_pitch, msaa), 1u);
+    const uint32_t guest_msaa = uint32_t(surface_info.msaa_samples);
+    const uint32_t pitch_tiles =
+        std::max(Fh1PitchTiles(surface_info.surface_pitch, guest_msaa), 1u);
+    // A shared 4x alias renders in its 1x storage's pixels.
+    const uint32_t msaa = IsSharedMsaaAlias(guest_msaa, pitch_tiles)
+                              ? uint32_t(xenos::MsaaSamples::k1X)
+                              : guest_msaa;
     const uint32_t msaa_x_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k4X));
     width = pitch_tiles * (xenos::kEdramTileWidthSamples >> msaa_x_log2) * scale_;
     height = SurfaceHeight(pitch_tiles, msaa) * scale_;
@@ -3110,9 +3143,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
     const auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
     const uint32_t msaa = uint32_t(surface_info.msaa_samples);
-    if (MakeDepthKey(depth_info.depth_base, Fh1PitchTiles(surface_info.surface_pitch, msaa),
-                     msaa, depth_info.depth_format)
-            .Pack() == camera_scene_depth_) {
+    if (CurrentDepthKey() == camera_scene_depth_) {
       SnapshotCameraDepth(uint32_t(
           std::max(0, -int32_t(regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset))));
     }
@@ -3367,24 +3398,30 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
 
   // Clears target the surface configured at the original base and take
   // ownership of the cleared tiles.
-  const uint32_t msaa_x_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k4X));
-  const uint32_t msaa_y_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k2X));
-  auto clear = [&](const SurfaceKey& key, uint32_t value, uint32_t value_lo) {
-    Surface* surface = GetOrCreateSurface(key, std::max(uint32_t(y1), 1u));
+  auto clear = [&](const SurfaceKey& guest_key, uint32_t value, uint32_t value_lo) {
+    // A shared 4x alias is cleared in its 1x storage, two pixels a guest
+    // pixel along each axis.
+    const SurfaceKey key = StorageKey(guest_key);
+    const uint32_t shift = key.msaa != guest_key.msaa ? 1 : 0;
+    const int32_t left = rect.left << shift, top = rect.top << shift;
+    const int32_t right = rect.right << shift, bottom = rect.bottom << shift;
+    const uint32_t msaa_x_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
+    const uint32_t msaa_y_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
+    Surface* surface = GetOrCreateSurface(key, std::max(uint32_t(bottom), 1u));
     if (!surface) return Skip("resolve_clear_surface");
     const uint32_t is_64bpp = key.Is64bpp() ? 1 : 0;
     const uint32_t tile_width = (xenos::kEdramTileWidthSamples >> msaa_x_log2) >> is_64bpp;
     const uint32_t tile_height = xenos::kEdramTileHeightSamples >> msaa_y_log2;
     const uint32_t pitch = key.pitch_tiles << is_64bpp;
-    const uint32_t column_first = uint32_t(x0) / tile_width;
-    const uint32_t column_end = (uint32_t(x1) + tile_width - 1) / tile_width;
-    const uint32_t inner_first = (uint32_t(x0) + tile_width - 1) / tile_width;
-    const uint32_t inner_end = std::max(inner_first, uint32_t(x1) / tile_width);
-    for (uint32_t row = uint32_t(y0) / tile_height;
-         row < (uint32_t(y1) + tile_height - 1) / tile_height; ++row) {
+    const uint32_t column_first = uint32_t(left) / tile_width;
+    const uint32_t column_end = (uint32_t(right) + tile_width - 1) / tile_width;
+    const uint32_t inner_first = (uint32_t(left) + tile_width - 1) / tile_width;
+    const uint32_t inner_end = std::max(inner_first, uint32_t(right) / tile_width);
+    for (uint32_t row = uint32_t(top) / tile_height;
+         row < (uint32_t(bottom) + tile_height - 1) / tile_height; ++row) {
       const uint32_t row_base = key.base_tiles + row * pitch;
       const bool row_covered =
-          row * tile_height >= uint32_t(y0) && (row + 1) * tile_height <= uint32_t(y1);
+          row * tile_height >= uint32_t(top) && (row + 1) * tile_height <= uint32_t(bottom);
       if (!row_covered || inner_first >= inner_end) {
         ClaimTiles(row_base + column_first, column_end - column_first, key.Pack());
         continue;
@@ -3397,11 +3434,11 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
         ClaimTiles(row_base + inner_end, column_end - inner_end, key.Pack());
       }
     }
-    for (uint32_t row = uint32_t(y0) / tile_height;
-         row < (uint32_t(y1) + tile_height - 1) / tile_height; ++row) {
+    for (uint32_t row = uint32_t(top) / tile_height;
+         row < (uint32_t(bottom) + tile_height - 1) / tile_height; ++row) {
       const uint32_t row_base = key.base_tiles + row * pitch;
       const bool row_covered =
-          row * tile_height >= uint32_t(y0) && (row + 1) * tile_height <= uint32_t(y1);
+          row * tile_height >= uint32_t(top) && (row + 1) * tile_height <= uint32_t(bottom);
       if (!key.is_depth || (value & 0xFF)) {
         MarkTileStencil(row_base + column_first, column_end - column_first, true);
       } else if (row_covered && inner_first < inner_end) {
@@ -3409,12 +3446,12 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
       }
     }
     FlushTransfers();
-    Rect clear_rect = rect;
+    Rect clear_rect = {left, top, right, bottom};
     if (untile_band) {
-      clear_rect.top += int32_t(untile_band);
-      clear_rect.bottom += int32_t(untile_band);
+      clear_rect.top += int32_t(untile_band << shift);
+      clear_rect.bottom += int32_t(untile_band << shift);
       uint32_t& band = untile_bands_[key.Pack()];
-      band = std::max(band, untile_band);
+      band = std::max(band, untile_band << shift);
     }
     ClearSurfaceRect(*surface, clear_rect, value, value_lo);
     Count(key.is_depth ? "clear_depth" : "clear_color");
@@ -3499,9 +3536,10 @@ void Fh1NativeExecutor::MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw) {
   const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
   const uint32_t msaa = uint32_t(surface_info.msaa_samples);
   // The HUD's view shares the scene's surface.
-  Surface* surface = FindSurface(MakeColorKey(color_info.color_base,
-                                              Fh1PitchTiles(surface_info.surface_pitch, msaa),
-                                              msaa, color_info.color_format)
+  Surface* surface = FindSurface(StorageKey(MakeColorKey(color_info.color_base,
+                                                         Fh1PitchTiles(surface_info.surface_pitch,
+                                                                       msaa),
+                                                         msaa, color_info.color_format))
                                      .Pack());
   if (!surface || surface->samples != 1) {
     hud_snapshot_taken_ = false;
