@@ -50,6 +50,9 @@ REXCVAR_DEFINE_INT32(xr_simulate_hz, 45, "Display",
                      "HeadsetFrameHz), as Virtual Desktop's spacewarp at 90 Hz does")
     .range(0, 240)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(xr_right_eye_first, false, "Display",
+                    "Testing: render each stereo pair's right eye first and its left second")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(xr_simulate_yaw, 0.0, "Display",
                       "Testing: xr_simulate's head turns left and right this many degrees, once "
                       "every 2 s")
@@ -205,7 +208,7 @@ bool FindRequest(const Lens& lens, EyeRequest& out, uint64_t* requested_ns = nul
         }
       }
     }
-    if (out.eye == 1 && b.previous_request.eye == 0 &&
+    if (out.eye == 1 - FirstEye() && b.previous_request.eye == FirstEye() &&
         out.tag == (b.previous_request.tag + 1) % kTagCount) {
       double residual = 0.0;
       for (int i = 0; i < 3; ++i) {
@@ -268,7 +271,7 @@ void LogDecoding(const char* where) {
 void SimulatedOrientation(int eye, float orientation[4]) {
   static double yaw = 0.0;
   const double amplitude = REXCVAR_GET(xr_simulate_yaw) / 57.29577951308232;
-  if (eye == 0) yaw = amplitude * std::sin(double(SteadyNs()) / 1e9 * 3.141592653589793);
+  if (eye == FirstEye()) yaw = amplitude * std::sin(double(SteadyNs()) / 1e9 * 3.141592653589793);
   orientation[0] = 0.0f;
   orientation[1] = float(std::sin(yaw * 0.5));
   orientation[2] = 0.0f;
@@ -290,6 +293,8 @@ EyeRequest Record(int eye, const float position[3], const float orientation[4]) 
 }
 
 }  // namespace
+
+int FirstEye() { return REXCVAR_GET(xr_right_eye_first) ? 1 : 0; }
 
 float HeadsetFovY() {
   if (REXCVAR_GET(xr_simulate)) return float(REXCVAR_GET(xr_simulate_fov));
@@ -1451,7 +1456,7 @@ bool NextEye(EyeRequest& out) {
     std::lock_guard<std::mutex> lock(B().mutex);
     return B().sequence;
   }();
-  const int eye = int(sequence & 1);
+  const int eye = int(sequence & 1) ^ FirstEye();
   if (REXCVAR_GET(xr_simulate)) {
     xr::SetHeadsetFrameHz(uint32_t(REXCVAR_GET(xr_simulate_hz)));
     const float half = float(REXCVAR_GET(xr_simulate_ipd)) * 0.5f;
@@ -1463,8 +1468,8 @@ bool NextEye(EyeRequest& out) {
   }
   State& s = S();
   if (!REXCVAR_GET(xr_stereo) || !s.running.load(std::memory_order_relaxed)) return false;
-  if (eye == 1 && s.have_right_view) {
-    // The pair's right eye, located with its left.
+  if (eye != FirstEye() && s.have_right_view) {
+    // The pair's second eye, located with its first.
     s.have_right_view = false;
     out = Record(eye, s.right_position, s.right_orientation);
     return true;
@@ -1504,8 +1509,8 @@ bool NextEye(EyeRequest& out) {
   const float position[3] = {pose.position.x, pose.position.y, pose.position.z};
   const float orientation[4] = {pose.orientation.x, pose.orientation.y, pose.orientation.z,
                                 pose.orientation.w};
-  if (eye == 0) {
-    const XrPosef& right = views[1].pose;
+  if (eye == FirstEye()) {
+    const XrPosef& right = views[1 - eye].pose;
     s.right_position[0] = right.position.x;
     s.right_position[1] = right.position.y;
     s.right_position[2] = right.position.z;
@@ -1580,7 +1585,7 @@ bool BeginGuestFrame(uint32_t width, uint32_t height, const Lens& lens, FrameCop
   if (stereo) {
     // Into a slot; the headset's frame copies the whole pair on.
     State::Slot* slot = nullptr;
-    if (request.eye == 0) {
+    if (request.eye == FirstEye()) {
       const int i = s.filling >= 0 ? s.filling : FillSlot();
       if (i < 0 || !EnsureSlot(s.slots[i], width, height)) return false;
       s.filling = i;
@@ -1734,7 +1739,7 @@ bool NextEye(EyeRequest& out) {
     std::lock_guard<std::mutex> lock(B().mutex);
     return B().sequence;
   }();
-  const int eye = int(sequence & 1);
+  const int eye = int(sequence & 1) ^ FirstEye();
   xr::SetHeadsetFrameHz(uint32_t(REXCVAR_GET(xr_simulate_hz)));
   const float half = float(REXCVAR_GET(xr_simulate_ipd)) * 0.5f;
   const float position[3] = {eye ? half : -half, 0.0f, 0.0f};
