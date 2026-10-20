@@ -55,6 +55,15 @@ REXCVAR_DEFINE_DOUBLE(xr_test_eye_spread, 1.0, "Display",
                       "centre, so captures show which eye each image was rendered for")
     .range(1.0, 20.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(xr_test_yaw, 0.0, "Display",
+                      "Testing: turn the headset's pose left and right this many degrees, once "
+                      "every 2 s, on top of the real head, so a still headset captures turning")
+    .range(0.0, 90.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(xr_shared_eye_pose, true, "Display",
+                    "In VR stereo, the second eye of a pair takes the pose located with the "
+                    "first; off, each eye locates its own")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(xr_right_eye_first, false, "Display",
                     "Testing: render each stereo pair's right eye first and its left second")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -466,6 +475,8 @@ struct State {
   static constexpr int kSlots = 3;
   Slot slots[kSlots];
   int filling = -1, shown_slot = -1;
+  // The slot the headset thread copies from, outside the state mutex.
+  int copying_slot = -1;
   uint64_t slot_serial = 0, shown_serial = 0;
   // The copy BeginGuestFrame set up completes the slot being filled.
   bool pending_slot = false;
@@ -937,7 +948,7 @@ int FillSlot() {
     }
   }
   for (int i = 0; i < State::kSlots; ++i) {
-    if (i != s.shown_slot && i != waiting) return i;
+    if (i != s.shown_slot && i != waiting && i != s.copying_slot) return i;
   }
   return -1;
 }
@@ -1241,13 +1252,25 @@ void FrameLoop() {
         PlaceSeat(frame_state.predictedDisplayTime)) {
       s.recenter = false;
     }
+    // The runtime's calls below can stall (Virtual Desktop losing the
+    // headset took 100-200 ms in begin and end): the state mutex is not held
+    // across them, or the game's copies wait on it and the game stalls. The
+    // headset thread alone uses the eye swapchains, and the slot it copies
+    // stays out of FillSlot's reach meanwhile.
+    s.copying_slot = next;
+    lock.unlock();
+    bool begun = false;
     {
       const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
       XrFrameBeginInfo begin_info{XR_TYPE_FRAME_BEGIN_INFO};
-      if (failed(xrBeginFrame(s.session, &begin_info), "xrBeginFrame")) continue;
+      begun = !failed(xrBeginFrame(s.session, &begin_info), "xrBeginFrame");
     }
     // The next pair into the swapchains, inside this frame.
-    if (next >= 0 && CopySlot(s.slots[next])) {
+    const bool copied = begun && next >= 0 && CopySlot(s.slots[next]);
+    lock.lock();
+    s.copying_slot = -1;
+    if (!begun) continue;
+    if (copied) {
       State::Slot& slot = s.slots[next];
       for (int eye = 0; eye < 2; ++eye) {
         s.shown_pose[eye] = slot.pose[eye];
@@ -1258,7 +1281,6 @@ void FrameLoop() {
       s.show_stereo = true;
       ++s.pairs;
     }
-    const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
     XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
     XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     XrCompositionLayerProjectionView views[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
@@ -1295,12 +1317,21 @@ void FrameLoop() {
     end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     end_info.layerCount = layer_count;
     end_info.layers = layers;
-    XrResult ended = xrEndFrame(s.session, &end_info);
-    if (XR_FAILED(ended) && layer_count) {
-      // The frame is still open: end it without layers.
-      end_info.layerCount = 0;
-      xrEndFrame(s.session, &end_info);
+    // The screen's swapchain is the game thread's: the layer is ended under
+    // the mutex then, the eyes' without it.
+    const bool screen_layer = layer_count && layers[0] == reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
+    if (!screen_layer) lock.unlock();
+    XrResult ended;
+    {
+      const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
+      ended = xrEndFrame(s.session, &end_info);
+      if (XR_FAILED(ended) && layer_count) {
+        // The frame is still open: end it without layers.
+        end_info.layerCount = 0;
+        xrEndFrame(s.session, &end_info);
+      }
     }
+    if (!lock.owns_lock()) lock.lock();
     if (!failed(ended, "xrEndFrame") && layer_count) ++s.frames;
     s.begin_end.Add(
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - locked).count());
@@ -1473,7 +1504,7 @@ bool NextEye(EyeRequest& out) {
   }
   State& s = S();
   if (!REXCVAR_GET(xr_stereo) || !s.running.load(std::memory_order_relaxed)) return false;
-  if (eye != FirstEye() && s.have_right_view) {
+  if (eye != FirstEye() && s.have_right_view && REXCVAR_GET(xr_shared_eye_pose)) {
     // The pair's second eye, located with its first.
     s.have_right_view = false;
     out = Record(eye, s.right_position, s.right_orientation);
@@ -1510,6 +1541,27 @@ bool NextEye(EyeRequest& out) {
   }
   B().headset_fov_y = fov_y;
   B().headset_fov_x = fov_x;
+  if (const double amplitude = REXCVAR_GET(xr_test_yaw); amplitude > 0.0) {
+    // About the vertical through the head's centre, in the seat.
+    const double yaw = amplitude / 57.29577951308232 *
+                       std::sin(double(SteadyNs()) / 1e9 * 3.141592653589793);
+    const float c = float(std::cos(yaw)), sn = float(std::sin(yaw));
+    const XrQuaternionf turn{0.0f, float(std::sin(yaw * 0.5)), 0.0f, float(std::cos(yaw * 0.5))};
+    XrVector3f& a = views[0].pose.position;
+    XrVector3f& b = views[1].pose.position;
+    const XrVector3f centre{(a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f, (a.z + b.z) * 0.5f};
+    for (XrView& view : views) {
+      XrVector3f& p = view.pose.position;
+      const float dx = p.x - centre.x, dz = p.z - centre.z;
+      p.x = centre.x + c * dx + sn * dz;
+      p.z = centre.z - sn * dx + c * dz;
+      const XrQuaternionf q = view.pose.orientation;
+      view.pose.orientation = {turn.w * q.x + turn.x * q.w + turn.y * q.z - turn.z * q.y,
+                               turn.w * q.y - turn.x * q.z + turn.y * q.w + turn.z * q.x,
+                               turn.w * q.z + turn.x * q.y - turn.y * q.x + turn.z * q.w,
+                               turn.w * q.w - turn.x * q.x - turn.y * q.y - turn.z * q.z};
+    }
+  }
   if (const double spread = REXCVAR_GET(xr_test_eye_spread); spread != 1.0) {
     XrVector3f& a = views[0].pose.position;
     XrVector3f& b = views[1].pose.position;
