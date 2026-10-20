@@ -139,6 +139,15 @@ REXCVAR_DEFINE_STRING(fh1_debug_draw_constants_path, "", "GPU",
                       "its shaders read to this file (for frame replays: comparing two frames' "
                       "draws, such as a stereo pair's)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(fh1_debug_draw_state_path, "", "GPU",
+                      "Diagnostics: write a CSV line per draw (its index in the frame, shader "
+                      "hashes, alpha test, alpha to coverage, pixel kill, MSAA, primitive, index "
+                      "count) to this file, for finding which draws use which coverage technique")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(fh1_debug_skip_coverage, "", "GPU",
+                      "Diagnostics: skip the draws that use alpha to coverage (a2c), the alpha "
+                      "test (alphatest) or a pixel kill (kill), to see what they draw")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_native_gpu_profile_draws, false, "GPU",
                     "Diagnostics: with fh1_native_gpu_profile, also time every draw by its "
                     "pixel shader (Vulkan)")
@@ -6639,6 +6648,41 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
                       constants_file);
         }
         std::fflush(constants_file);
+      }
+    }
+  }
+  {
+    static const std::string state_path = REXCVAR_GET(fh1_debug_draw_state_path);
+    if (!state_path.empty()) {
+      static FILE* state_file = [] {
+        FILE* file = std::fopen(state_path.c_str(), "w");
+        if (file) {
+          std::fputs("draw,vs,ps,alpha_test,alpha_func,alpha_to_coverage,kills,msaa,prim,indices\n",
+                     file);
+        }
+        return file;
+      }();
+      static uint32_t state_draw = 0;
+      if (state_file) {
+        const auto colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+        std::fprintf(state_file, "%u,%016llX,%016llX,%u,%u,%u,%u,%u,%u,%u\n", state_draw++,
+                     (unsigned long long)vertex_shader->ucode_data_hash(),
+                     (unsigned long long)(pixel_shader ? pixel_shader->ucode_data_hash() : 0),
+                     uint32_t(colorcontrol.alpha_test_enable), uint32_t(colorcontrol.alpha_func),
+                     uint32_t(colorcontrol.alpha_to_mask_enable),
+                     uint32_t(pixel_shader && pixel_shader->kills_pixels()),
+                     uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples),
+                     uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type), index_count);
+        std::fflush(state_file);
+      }
+    }
+    static const std::string skip_coverage = REXCVAR_GET(fh1_debug_skip_coverage);
+    if (!skip_coverage.empty()) {
+      const auto colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+      if ((skip_coverage == "a2c" && colorcontrol.alpha_to_mask_enable) ||
+          (skip_coverage == "alphatest" && colorcontrol.alpha_test_enable) ||
+          (skip_coverage == "kill" && pixel_shader && pixel_shader->kills_pixels())) {
+        return true;
       }
     }
   }
