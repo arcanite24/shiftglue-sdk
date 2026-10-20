@@ -60,6 +60,12 @@ REXCVAR_DEFINE_BOOL(fh1_async_specialized_passes, true, "GPU",
                     "GPU commands thread for it (tens of milliseconds a pipeline on a cold "
                     "driver cache)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_color_overwrite_claims, true, "GPU",
+                    "A depth-overwriting rectangle draw that also writes every channel of a "
+                    "color target without blending claims that target's tiles without a "
+                    "transfer too, as its depth does (FH1 clears color, depth and stencil "
+                    "with one such draw; Vulkan FH1 native executor)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_share_msaa_aliases, false, "GPU",
                     "Store FH1's half-size 4x MSAA views of its 1x surfaces at pitches 16 and 13 "
                     "in the 1x surfaces, rendering their draws single-sampled at twice the "
@@ -123,6 +129,10 @@ REXCVAR_DEFINE_BOOL(fh1_debug_skip_stencil_transfers, false, "GPU",
                     "Diagnostics: transfer depth without its stencil bit passes on devices "
                     "without stencil export (wrong stencil), to bound what they cost")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(fh1_debug_trace_transfers, "", "GPU",
+                      "Diagnostics: log the state of the draw that causes each transfer between "
+                      "these surfaces (<source>=<destination> descriptions)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(fh1_debug_skip_transfers, "", "GPU",
                       "Diagnostics: skip transfers between these surfaces, as "
                       "<source>=<destination> descriptions (wrong image if they are needed)")
@@ -1561,6 +1571,28 @@ void Fh1NativeExecutor::TransferRects(Surface& dest, uint32_t previous_owner, co
       return;
     }
   }
+  {
+    static const std::string trace_pairs = REXCVAR_GET(fh1_debug_trace_transfers);
+    static uint32_t trace_logs = 0;
+    const std::string pair = source->key.Describe() + "=" + dest.key.Describe();
+    if (!trace_pairs.empty() && trace_pairs.find(pair) != std::string::npos && trace_logs < 60) {
+      ++trace_logs;
+      const RegisterFile& regs = register_file_;
+      std::string rect_text;
+      for (uint32_t i = 0; i < rect_count; ++i) {
+        rect_text += fmt::format(" [{},{} {}x{}]", rects[i].left, rects[i].top,
+                                 rects[i].right - rects[i].left, rects[i].bottom - rects[i].top);
+      }
+      REXGPU_INFO("FH1 transfer trace {} draw {}: rects{} of {}x{}; depthcontrol {:08X} "
+                  "colorcontrol {:08X} blend0 {:08X} colormask {:08X} initiator {:08X} "
+                  "indices {} copy {:08X}",
+                  pair, draws_, rect_text, dest.width, dest.height,
+                  regs[XE_GPU_REG_RB_DEPTHCONTROL], regs[XE_GPU_REG_RB_COLORCONTROL],
+                  regs[XE_GPU_REG_RB_BLENDCONTROL0], regs[XE_GPU_REG_RB_COLOR_MASK],
+                  regs[XE_GPU_REG_VGT_DRAW_INITIATOR], regs[XE_GPU_REG_VGT_DMA_SIZE],
+                  regs[XE_GPU_REG_RB_COPY_CONTROL]);
+    }
+  }
   Count("transfer");
   ++transfer_count_;
   const bool source_stencil =
@@ -2131,7 +2163,9 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1DrawInfo& draw) {
   }
   PrepareTargetsImpl(draw);
   const bool may_overwrite_depth =
-      pending_used_bits_ == 1 && draw.normalized_depth_control.z_enable &&
+      (pending_used_bits_ == 1 ||
+       ((pending_used_bits_ & 1) && REXCVAR_GET(fh1_color_overwrite_claims))) &&
+      draw.normalized_depth_control.z_enable &&
       draw.normalized_depth_control.z_write_enable &&
       draw.normalized_depth_control.zfunc == xenos::CompareFunction::kAlways;
   if (memo_allowed && !may_overwrite_depth) {
@@ -2245,9 +2279,29 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
   }
   std::sort(bases.begin(), bases.end());
   bool stencil_overwritten = false;
+  const bool color_claims = REXCVAR_GET(fh1_color_overwrite_claims);
   const bool depth_overwritten =
-      used_bits == 1 &&
+      (used_bits == 1 || ((used_bits & 1) && color_claims)) &&
       depth_overwrite_.Derive(draw, REXCVAR_GET(half_pixel_offset), stencil_overwritten);
+  // A color target the overwriting draw replaces in its rectangles: every
+  // channel written (the normalized mask counts channels the format lacks),
+  // no blending, written by the pixel shader. Derive has ruled out kills,
+  // alpha test, alpha to coverage and sample masks.
+  auto color_overwritten = [&](uint32_t target) {
+    if (!color_claims || !target || !draw.pixel_shader ||
+        !draw.pixel_shader->writes_color_target(int(target - 1)) ||
+        ((draw.normalized_color_mask >> (4 * (target - 1))) & 0xF) != 0xF) {
+      return false;
+    }
+    const auto blend = regs.Get<reg::RB_BLENDCONTROL>(
+        reg::RB_BLENDCONTROL::rt_register_indices[target - 1]);
+    return blend.color_srcblend == xenos::BlendFactor::kOne &&
+           blend.color_destblend == xenos::BlendFactor::kZero &&
+           blend.color_comb_fcn == xenos::BlendOp::kAdd &&
+           blend.alpha_srcblend == xenos::BlendFactor::kOne &&
+           blend.alpha_destblend == xenos::BlendFactor::kZero &&
+           blend.alpha_comb_fcn == xenos::BlendOp::kAdd;
+  };
   for (size_t i = 0; i < bases.size(); ++i) {
     const SurfaceKey& key = keys[bases[i].second];
     const uint32_t next_base = i + 1 < bases.size()
@@ -2255,8 +2309,19 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
                                    : xenos::kEdramTileCount + bases[0].first;
     const uint32_t length =
         std::min(length_tiles_32bpp << uint32_t(key.Is64bpp()), next_base - key.base_tiles);
-    if (depth_overwritten && ClaimDepthOverwriteTiles(key, length, stencil_overwritten,
-                                                      depth_stencil_written, storage_shift)) {
+    if (depth_overwritten && key.is_depth &&
+        ClaimDepthOverwriteTiles(key, length, stencil_overwritten, depth_stencil_written,
+                                 storage_shift)) {
+      continue;
+    }
+    // A color target has no stencil to keep, and its tiles are marked as
+    // possibly holding stencil, as any color claim marks them. The tile
+    // helpers count 32bpp tiles (80 samples wide), so 64bpp targets keep
+    // their transfers.
+    if (depth_overwritten && !key.is_depth && !key.Is64bpp() &&
+        color_overwritten(bases[i].second) &&
+        ClaimDepthOverwriteTiles(key, length, true, true, storage_shift)) {
+      Count("color_overwrite_claim");
       continue;
     }
     ClaimTiles(key.base_tiles, length, key.Pack());
