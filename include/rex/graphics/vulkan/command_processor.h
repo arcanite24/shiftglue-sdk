@@ -467,7 +467,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   // This swap's provider while VR's DLSS is on, else null.
   ui::vulkan::VulkanUpscaler* xr_upscaler_ = nullptr;
   XrUpscaleCamera xr_upscale_cameras_[2];
-  // The one this swap's camera pass writes; the other is this swap's image's.
+  // The pair this swap's camera pass writes and its DLSS reads; the next
+  // swap's takes the other.
   uint32_t xr_upscale_camera_next_ = 0;
   VkImage xr_upscale_output_ = VK_NULL_HANDLE;
   VkImageView xr_upscale_output_view_ = VK_NULL_HANDLE;
@@ -479,6 +480,20 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t xr_upscale_last_us_[2] = {};
   uint64_t xr_upscale_dispatches_ = 0;
   uint64_t xr_upscale_misses_ = 0;
+  // xr_upscale_inputs_dir: a captured frame's DLSS inputs (the image, depth
+  // and motion), read back for SaveXrUpscaleInputs once its copy has run.
+  VkBuffer xr_inputs_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory xr_inputs_memory_ = VK_NULL_HANDLE;
+  VkDeviceSize xr_inputs_size_ = 0;
+  struct XrInputsPending {
+    bool pending = false;
+    int eye = -1;
+    uint32_t width = 0, height = 0;
+    float jitter_x = 0, jitter_y = 0;
+    bool reset = false;
+  } xr_inputs_pending_;
+  uint32_t xr_inputs_saved_ = 0;
+  void SaveXrUpscaleInputs();
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -1160,12 +1175,6 @@ class VulkanCommandProcessor : public CommandProcessor {
   // The FH1 native renderer (NP-12.4); guest draws, copies and clears go
   // through it instead of the render target cache when it initialized.
   std::unique_ptr<Fh1NativeExecutor> fh1_native_executor_;
-  // The lens of the frame drawn before the latest swap: the next swap shows
-  // that frame (IssueSwapImpl).
-  ui::vulkan::openxr::Lens xr_lens_drawn_;
-  // Swaps whose image the headset did not get, the title having presented
-  // the image before again (IssueSwapImpl).
-  uint64_t xr_repeated_images_ = 0;
   // fh1_frame_dump_frame: records one frame for offline replay (at 1x).
   std::unique_ptr<Fh1FrameDump> frame_dump_;
   std::shared_ptr<Fh1FrameInspector> inspector_ = std::make_shared<Fh1FrameInspector>();

@@ -211,7 +211,7 @@ class Fh1NativeExecutor {
   // from the next frame (0: none).
   void SetJitterPhases(uint32_t phases) { jitter_phases_ = phases; }
   // VR's temporal upscaling, the eyes taking turns frame by frame: with the
-  // eye a frame's lens tags (openxr::LensEye), each eye's camera and objects
+  // eye a frame was drawn for (openxr::LensEye), each eye's camera and objects
   // reproject to that eye's previous frame instead of the other eye's, and
   // each eye walks a jitter sequence of its own (the odd and even samples of
   // one Halton(2) sequence lie in opposite halves). Null for one view.
