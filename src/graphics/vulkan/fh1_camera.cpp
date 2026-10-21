@@ -421,18 +421,43 @@ void Fh1NativeExecutor::FinishCameraFrame() {
         Invert(ToMatrix(current), current_inverse)) {
       const Matrix candidate = Multiply(ToMatrix(previous->first), current_inverse);
       // A jump of the view between frames is a cut even when the world
-      // carries over.
-      double change = 0.0;
-      for (int r = 0; r < 2; ++r) {
-        for (int c = 0; c < 4; ++c) {
-          change = std::max(change, std::abs(candidate[r * 4 + c] - (r == c ? 1.0 : 0.0)));
+      // carries over: points 2, 10 and 100 m away moving a quarter of the
+      // screen or more, or to behind the camera. (The matrix's own entries
+      // are no measure: with a 0.1 m near plane, driving moves its depth
+      // column by more than any turn, and in VR an eye's previous frame is
+      // two frames back; at speed nearly every frame counted as a cut.)
+      bool jump = false;
+      for (const double distance : {2.0, 10.0, 100.0}) {
+        // The matrix's clip z is the usual D3D depth.
+        const double z = camera.far_plane > camera.near_plane
+                             ? camera.far_plane * (distance - camera.near_plane) /
+                                   (distance * (camera.far_plane - camera.near_plane))
+                             : 1.0 - camera.near_plane / distance;
+        for (const double x : {-0.6, 0.0, 0.6}) {
+          for (const double y : {-0.6, 0.6}) {
+            const double v[4] = {x, y, z, 1.0};
+            double out[4] = {};
+            for (int r = 0; r < 4; ++r) {
+              for (int c = 0; c < 4; ++c) out[r] += candidate[r * 4 + c] * v[c];
+            }
+            if (!(out[3] > 1.0e-6) || std::abs(out[0] / out[3] - x) >= 0.5 ||
+                std::abs(out[1] / out[3] - y) >= 0.5) {
+              jump = true;
+            }
+          }
         }
       }
-      if (change < 0.25) {
+      if (!jump) {
         reprojection = candidate;
         camera.cut = false;
+      } else {
+        Count("camera_cut_jump");
       }
+    } else {
+      Count("camera_cut_unmatched");
     }
+  } else {
+    Count("camera_cut_unmatched");
   }
   for (size_t i = 0; i < 16; ++i) camera.reprojection[i] = float(reprojection[i]);
   if (camera.cut) Count("camera_cut");
