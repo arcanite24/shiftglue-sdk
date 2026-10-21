@@ -66,6 +66,7 @@ void SharedMemory::InitializeCommon() {
   num_system_page_flags_ = ((kBufferSize >> page_size_log2_) + 63) / 64;
   system_page_flags_valid_.assign(num_system_page_flags_, 0);
   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
+  block_invalidation_epochs_ = std::vector<std::atomic<uint32_t>>(num_system_page_flags_);
 
   memory_invalidation_callback_handle_ =
       memory_.RegisterPhysicalMemoryInvalidationCallback(MemoryInvalidationCallbackThunk, this);
@@ -120,6 +121,7 @@ void SharedMemory::ShutdownCommon() {
   system_page_flags_valid_and_gpu_written_.clear();
   system_page_flags_valid_and_gpu_written_.shrink_to_fit();
   num_system_page_flags_ = 0;
+  block_invalidation_epochs_ = std::vector<std::atomic<uint32_t>>();
 }
 
 void SharedMemory::InvalidateAllPages() {
@@ -128,6 +130,20 @@ void SharedMemory::InvalidateAllPages() {
   std::fill(system_page_flags_valid_.begin(), system_page_flags_valid_.end(), uint64_t(0));
   std::fill(system_page_flags_valid_and_gpu_written_.begin(),
             system_page_flags_valid_and_gpu_written_.end(), uint64_t(0));
+  const uint32_t epoch = invalidation_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+  for (std::atomic<uint32_t>& block : block_invalidation_epochs_) {
+    block.store(epoch, std::memory_order_release);
+  }
+}
+
+bool SharedMemory::InvalidatedSince(uint32_t page_first, uint32_t page_last,
+                                    uint32_t epoch) const {
+  for (uint32_t i = page_first >> 6; i <= (page_last >> 6) && i < num_system_page_flags_; ++i) {
+    if (int32_t(block_invalidation_epochs_[i].load(std::memory_order_acquire) - epoch) > 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
@@ -784,7 +800,10 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   }
 
   bool any_kept = false;
+  const uint32_t invalidation_epoch =
+      invalidation_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
   for (uint32_t i = block_first; i <= block_last; ++i) {
+    block_invalidation_epochs_[i].store(invalidation_epoch, std::memory_order_release);
     uint64_t invalidate_bits = UINT64_MAX;
     if (i == block_first) {
       invalidate_bits &= ~((uint64_t(1) << (page_first & 63)) - 1);

@@ -110,6 +110,14 @@ class SharedMemory {
   }
   UploadKind upload_kind() const { return upload_kind_; }
 
+  // Upload hoisting: a count of CPU invalidations, and for each block of 64
+  // pages the count at its last one. A page invalidated no later than `epoch`
+  // and still invalid has not been read by the GPU since.
+  uint32_t invalidation_epoch() const {
+    return invalidation_epoch_.load(std::memory_order_acquire);
+  }
+  bool InvalidatedSince(uint32_t page_first, uint32_t page_last, uint32_t epoch) const;
+
   // Command-processor thread only. Copy CPU-authoritative bytes, rejecting any
   // GPU-written page and leaving destination unchanged on rejection. Callers
   // must already watch the range. Enables write protection before copying to
@@ -241,6 +249,8 @@ class SharedMemory {
   // Subset of valid pages containing data written by the GPU.
   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
   uint32_t num_system_page_flags_ = 0;
+  std::atomic<uint32_t> invalidation_epoch_{0};
+  std::vector<std::atomic<uint32_t>> block_invalidation_epochs_;
 
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);
