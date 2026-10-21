@@ -178,6 +178,9 @@ bool Fits(EffectCall kind, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
 
 std::atomic<uint32_t> g_log_set{0}, g_log_update{0}, g_log_op{0}, g_log_unknown{0};
 
+void DispatchEffectCall(EffectCall kind, uint32_t caller, ffb::Sink* sink, uint32_t a, uint32_t b,
+                        uint32_t c, uint32_t d);
+
 uint32_t HandleEffectCall(EffectCall named, const char* export_name, uint32_t handle, uint32_t a,
                           uint32_t b, uint32_t c, uint32_t d) {
   const uint32_t caller = GuestCaller();
@@ -198,13 +201,21 @@ uint32_t HandleEffectCall(EffectCall named, const char* export_name, uint32_t ha
         REXKRNL_WARN("Wheel FFB: unrecognised call: {} (from {:08X})", detail, caller);
       }
       ffb_trace::RecordWheelCall("ffb_unknown", caller, a, b, c, 0, detail);
-      return X_STATUS_SUCCESS;
+      // No overlapped can be identified to complete, so fail the call rather
+      // than leave a caller waiting on one that never signals.
+      return X_STATUS_INVALID_PARAMETER;
     }
     REXKRNL_INFO("Wheel FFB: {} called with the arguments of another effect call; handled as such",
                  export_name);
   }
 
-  ffb::Sink* sink = ffb::GetSink();
+  // The sink stays registered until the call is done (the driver clears it on exit).
+  ffb::WithSink([&](ffb::Sink* sink) { DispatchEffectCall(kind, caller, sink, a, b, c, d); });
+  return X_STATUS_SUCCESS;
+}
+
+void DispatchEffectCall(EffectCall kind, uint32_t caller, ffb::Sink* sink, uint32_t a, uint32_t b,
+                        uint32_t c, uint32_t d) {
   switch (kind) {
     case EffectCall::kSet: {
       for (uint32_t i = 0; i < b; i++) {
@@ -247,7 +258,6 @@ uint32_t HandleEffectCall(EffectCall named, const char* export_name, uint32_t ha
       break;
     }
   }
-  return X_STATUS_SUCCESS;
 }
 
 std::atomic<uint32_t> g_log_info{0}, g_log_control{0}, g_log_gain{0}, g_log_rumble{0},
@@ -260,16 +270,17 @@ std::atomic<uint32_t> g_log_info{0}, g_log_control{0}, g_log_gain{0}, g_log_rumb
 // another local.
 u32 XInputdFFGetDeviceInfo_entry(u32 handle, u32 info) {
   constexpr uint32_t kEffectSlots = 16;
-  ffb::Sink* sink = ffb::GetSink();
   if (GuestRange(info, 8)) {
     StoreGuest32(info, 0);
     StoreGuest32(info + 4, kEffectSlots);
   }
   if (LogThis(g_log_info, 4)) {
+    bool host_ffb = false;
+    ffb::WithSink([&](ffb::Sink* sink) { host_ffb = sink && sink->HasForceFeedback(); });
     REXKRNL_INFO(
         "Wheel FFB: device info requested (handle {:08X}); {} effect slots, host force "
         "feedback {}",
-        (uint32_t)handle, kEffectSlots, sink && sink->HasForceFeedback() ? "yes" : "no");
+        (uint32_t)handle, kEffectSlots, host_ffb ? "yes" : "no");
   }
   ffb_trace::RecordWheelCall("ffb_get_info", GuestCaller(), handle, info, kEffectSlots, 0, "");
   return X_STATUS_SUCCESS;
@@ -293,8 +304,10 @@ u32 XInputdFFDeviceControl_entry(u32 handle, u32 command, u32 overlapped) {
     REXKRNL_INFO("Wheel FFB: device control {}", (uint32_t)command);
   }
   ffb_trace::RecordWheelCall("ffb_device_control", GuestCaller(), command, overlapped, 0, 0, "");
-  if (ffb::Sink* sink = ffb::GetSink())
-    sink->DeviceControl(command);
+  ffb::WithSink([&](ffb::Sink* sink) {
+    if (sink)
+      sink->DeviceControl(command);
+  });
   CompleteOverlapped(overlapped);
   return X_STATUS_SUCCESS;
 }
@@ -304,8 +317,10 @@ u32 XInputdFFSetDeviceGain_entry(u32 handle, u32 gain, u32 overlapped) {
     REXKRNL_INFO("Wheel FFB: device gain {}", (uint32_t)gain);
   }
   ffb_trace::RecordWheelCall("ffb_set_gain", GuestCaller(), gain, overlapped, 0, 0, "");
-  if (ffb::Sink* sink = ffb::GetSink())
-    sink->SetDeviceGain(gain);
+  ffb::WithSink([&](ffb::Sink* sink) {
+    if (sink)
+      sink->SetDeviceGain(gain);
+  });
   // Forza Horizon never calls this and its arguments are unconfirmed, so a
   // possible overlapped argument is left alone rather than written.
   return X_STATUS_SUCCESS;
@@ -332,8 +347,10 @@ u32 XInputdFFSetRumble_entry(u32 handle, u32 vibration, u32 overlapped) {
     REXKRNL_INFO("Wheel FFB: rumble {} {}", left, right);
   }
   ffb_trace::RecordWheelCall("ffb_rumble", GuestCaller(), left, right, overlapped, 0, "");
-  if (ffb::Sink* sink = ffb::GetSink())
-    sink->SetRumble(left, right);
+  ffb::WithSink([&](ffb::Sink* sink) {
+    if (sink)
+      sink->SetRumble(left, right);
+  });
   CompleteOverlapped(overlapped);
   return X_STATUS_SUCCESS;
 }
