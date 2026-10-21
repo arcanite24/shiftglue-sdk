@@ -96,6 +96,9 @@ float HeadsetFovX();
 // tagged frame (radians), or 0: lets the host tell its main camera from
 // render-to-texture cameras.
 float PresentedFovY();
+// The eye a frame was requested for, from the tag in its field of view
+// (Lens::fov_y), or -1 when it carries none. Any thread.
+int LensEye(float fov_y);
 
 // The tag in a vertical field of view (rex/ui/xr.h).
 using xr::FovTag;
@@ -136,6 +139,8 @@ struct FrameCopy {
   VkImage staging = VK_NULL_HANDLE;
   VkImage target = VK_NULL_HANDLE;
   VkBuffer capture = VK_NULL_HANDLE;
+  // The eye the frame goes to, or -1 (the screen).
+  int eye = -1;
 };
 bool BeginGuestFrame(uint32_t width, uint32_t height, float display_aspect, const Lens& lens,
                      FrameCopy& out);

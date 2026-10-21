@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -187,6 +188,17 @@ class VulkanPresenter final : public Presenter {
   }
   bool WantsGuestOutputCamera() const override {
     return guest_output_camera_wanted_.load(std::memory_order_relaxed);
+  }
+  // A temporal provider by id ("dlss") when it is available, for upscaling
+  // elsewhere than the presenter's paint (VR's headset copy, in its own
+  // histories); null otherwise.
+  VulkanUpscaler* FindAvailableUpscaler(std::string_view id) const {
+    for (const std::unique_ptr<VulkanUpscaler>& upscaler : upscalers_) {
+      if (upscaler && upscaler->info().available && upscaler->info().id == id) {
+        return upscaler.get();
+      }
+    }
+    return nullptr;
   }
   uint32_t GuestOutputJitterPhases() const override {
     return guest_output_jitter_phases_.load(std::memory_order_relaxed);

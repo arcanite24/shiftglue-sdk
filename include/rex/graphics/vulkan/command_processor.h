@@ -51,6 +51,7 @@
 #include <rex/system/kernel_state.h>
 #include <rex/ui/vulkan/linked_type_descriptor_set_allocator.h>
 #include <rex/ui/vulkan/openxr.h>
+#include <rex/ui/vulkan/upscaler.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/provider.h>
 #include <rex/ui/vulkan/upload_buffer_pool.h>
@@ -419,9 +420,65 @@ class VulkanCommandProcessor : public CommandProcessor {
                      uint32_t frontbuffer_height);
   // The guest output's copy for the VR headset (openxr::BeginGuestFrame), in
   // the swap's submission; the guest output is in the presenter's internal
-  // layout before and after.
-  void RecordXrFrameCopy(VkImage guest_output, uint32_t width, uint32_t height,
+  // layout before and after. The headset's images are output_width x
+  // output_height: with xr_upscaler, DLSS's output for an eye, otherwise the
+  // guest output scaled.
+  void RecordXrFrameCopy(VkImage guest_output, VkImageView guest_output_view, uint32_t width,
+                         uint32_t height, uint32_t output_width, uint32_t output_height,
                          const ui::vulkan::openxr::FrameCopy& copy);
+
+  // VR's DLSS (xr_upscaler): each eye's frames go through a history of the
+  // presenter's DLSS provider of their own, in the headset's copy. An image's
+  // depth and motion come from the swap before it: the title presents the
+  // frame before the one whose draws just ended, so a swap's camera pass
+  // (with the executor's per-eye camera, SetStereoCamera) is the next
+  // swap's image's, the other eye's.
+  struct XrUpscaleCamera {
+    VkImage depth = VK_NULL_HANDLE;
+    VkImage motion = VK_NULL_HANDLE;
+    VkImageView depth_view = VK_NULL_HANDLE;
+    VkImageView motion_view = VK_NULL_HANDLE;
+    VkDeviceMemory depth_memory = VK_NULL_HANDLE;
+    VkDeviceMemory motion_memory = VK_NULL_HANDLE;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    // Written by the camera pass of the swap it was last used in.
+    bool valid = false;
+    int eye = -1;
+    ui::UpscalerCamera camera;
+  };
+  // What a recorded DLSS dispatch needs when the commands run (a tape
+  // callback's data).
+  struct XrUpscaleDispatch {
+    const ui::vulkan::VulkanDevice* device;
+    ui::vulkan::VulkanUpscaler* upscaler;
+    uint32_t history;
+    ui::vulkan::VulkanUpscalerInputs inputs;
+  };
+  static void DispatchXrUpscale(const void* data, VkCommandBuffer command_buffer);
+  bool EnsureXrUpscaleImages(uint32_t render_width, uint32_t render_height,
+                             uint32_t output_width, uint32_t output_height);
+  void DestroyXrUpscaleImages();
+  // The headset's image size for this render size (xr_upscale_ratio).
+  static void XrUpscaleOutputSize(uint32_t width, uint32_t height, uint32_t& output_width,
+                                  uint32_t& output_height);
+  // After a tape callback that records its own pipelines and bindings.
+  void InvalidateBindingsAfterCallback();
+  // This swap's provider while VR's DLSS is on, else null.
+  ui::vulkan::VulkanUpscaler* xr_upscaler_ = nullptr;
+  XrUpscaleCamera xr_upscale_cameras_[2];
+  // The one this swap's camera pass writes; the other is this swap's image's.
+  uint32_t xr_upscale_camera_next_ = 0;
+  VkImage xr_upscale_output_ = VK_NULL_HANDLE;
+  VkImageView xr_upscale_output_view_ = VK_NULL_HANDLE;
+  VkDeviceMemory xr_upscale_output_memory_ = VK_NULL_HANDLE;
+  uint32_t xr_upscale_output_width_ = 0;
+  uint32_t xr_upscale_output_height_ = 0;
+  // Whether each eye's history continues, and when it last moved.
+  bool xr_upscale_history_[2] = {};
+  uint64_t xr_upscale_last_us_[2] = {};
+  uint64_t xr_upscale_dispatches_ = 0;
+  uint64_t xr_upscale_misses_ = 0;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
