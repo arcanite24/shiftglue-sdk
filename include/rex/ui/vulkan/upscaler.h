@@ -55,6 +55,11 @@ class VulkanUpscaler {
   virtual bool Dispatch(VkCommandBuffer command_buffer, const VulkanUpscalerInputs& inputs) = 0;
   // Frees the resources Prepare made (the GPU must be done with them).
   virtual void Release() = 0;
+  // Providers that keep several independent histories (DLSS: the
+  // presenter's and, in VR, one per eye) apply Prepare, Dispatch and Release
+  // to the selected one; 0 is the presenter's.
+  virtual uint32_t history_count() const { return 1; }
+  virtual void SelectHistory(uint32_t index) {}
 };
 
 // The temporal providers built into this build, available or not.
