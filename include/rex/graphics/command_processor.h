@@ -705,6 +705,18 @@ class CommandProcessor {
   bool D3dShaderCacheLoad(xenos::ShaderType shader_type, uint32_t addr, uint32_t size_dwords,
                           const uint32_t* ucode, uint64_t& hash);
   void D3dShaderCacheSwap();
+  // NA-2.4 owned draw programs (gpu_d3d_program, read at each swap: 0 off,
+  // 1-4 the cvar's modes): the decoder brackets each run of a list the
+  // game marked (system/d3d_program.h) with these calls, in order with the
+  // list's draws, so the backend knows which draws a program covers. The key
+  // is the buffer's (physical address << 32 | dwords).
+  virtual bool SupportsDrawPrograms() const { return false; }
+  virtual void DrawProgramBegin(uint64_t key) { (void)key; }
+  virtual void DrawProgramEnd() {}
+  uint32_t d3d_program_mode_ = 0;
+  // The depth of the pilot buffer being decoded (0: none); lists it calls
+  // are part of its program.
+  uint32_t d3d_program_depth_ = 0;
   // Runs a nested buffer from its compiled form; false to decode it.
   bool D3dListExecute(uint32_t ptr, uint32_t count);
   // Verify: the buffer at this depth was modelled; it is decoded now and

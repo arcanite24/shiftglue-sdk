@@ -1,6 +1,7 @@
 #include "d3d_census_decoder.h"
 
 #include <chrono>
+#include <unordered_map>
 #include <vector>
 
 #include <rex/perf/counter.h>
@@ -40,6 +41,8 @@ struct State {
   int64_t time_start_ns = 0;
   // census::Lean(), read when an outermost buffer starts.
   bool lean = false;
+  // Per command buffer this frame (NA-2.2), flushed at the swap.
+  std::unordered_map<uint32_t, census::ListDecoded> lists;
 };
 State state;
 
@@ -198,9 +201,40 @@ void IbEnd(uint32_t depth) {
   }
 }
 
-void Packet(uint32_t offset) {
+// The innermost command buffer being decoded, or null.
+census::ListDecoded* InnermostList() {
+  for (auto it = state.stack.rbegin(); it != state.stack.rend(); ++it) {
+    if (it->context == census::kContextList) return &state.lists[it->object];
+  }
+  return nullptr;
+}
+
+void Packet(uint32_t offset, uint32_t packet) {
   if (state.stack.empty()) return;
   Level& level = state.stack.back();
+  if (!state.lean && (packet >> 30) == 3) {
+    if (census::ListDecoded* list = InnermostList()) {
+      switch ((packet >> 8) & 0x7F) {
+        case 0x46: case 0x58: case 0x5A: case 0x5B:  // EVENT_WRITE family
+          ++list->events;
+          break;
+        case 0x3D: case 0x3E: case 0x45:  // MEM_WRITE, REG_TO_MEM, COND_WRITE
+          ++list->memory_writes;
+          break;
+        case 0x3C:  // WAIT_REG_MEM
+          ++list->waits;
+          break;
+        case 0x2D: case 0x55: case 0x2F:  // SET_CONSTANT(2), LOAD_ALU_CONSTANT
+          ++list->constants;
+          break;
+        case 0x27: case 0x2B:  // IM_LOAD, IM_LOAD_IMMEDIATE
+          ++list->shader_loads;
+          break;
+        default:
+          break;
+      }
+    }
+  }
   // A list's (or D3D's buffer's) draws are classed by the buffer, not by marks.
   if (state.lean && (level.context == census::kContextList ||
                      level.context == census::kContextD3dBuffer)) {
@@ -216,7 +250,10 @@ void Packet(uint32_t offset) {
 
 bool Visible() { return !state.stack.empty() && state.stack.back().visible; }
 
-void Draw(bool drawn) {
+void Draw(bool drawn, bool copy) {
+  if (copy && !state.lean) {
+    if (census::ListDecoded* list = InnermostList()) ++list->copies;
+  }
   if (!drawn) return;
   if (state.stack.empty()) {
     if (census::Enabled()) {
@@ -238,6 +275,9 @@ void Draw(bool drawn) {
     ++state.window.list_drawn_by_state[level.state < census::kListStateCount ? level.state : 0];
     ++state.window.list_drawn_by_origin[level.origin & 31u];
   }
+  if (!state.lean) {
+    if (census::ListDecoded* list = InnermostList()) ++list->draws;
+  }
   if (state.span_open) ++state.span_draws;
 }
 
@@ -250,6 +290,8 @@ void Swap() {
     return;
   }
   if (state.time_class != kNoTimeClass) SwitchTime(state.time_class);
+  for (const auto& [object, counts] : state.lists) census::AddListDecoded(object, counts);
+  state.lists.clear();
   ++state.window.swaps;
   census::AddDecoderWindow(state.window);
   state.window = {};

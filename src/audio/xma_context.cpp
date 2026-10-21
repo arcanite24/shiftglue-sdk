@@ -409,9 +409,11 @@ void XmaContext::NoteNoSpaceStall(const XMA_CONTEXT_DATA& data,
       .input_offset = data.input_buffer_read_offset,
       .remaining_blocks = remaining_subframe_blocks_in_output_buffer_,
       .required_blocks = minimum_subframe_decode_count,
-      .current_buffer = data.current_buffer,
-      .output_read_offset = data.output_buffer_read_offset,
-      .output_write_offset = data.output_buffer_write_offset,
+      // Bit-fields of 1 and 5 bits: Apple clang predates CWG2627 and calls
+      // the implicit conversion narrowing.
+      .current_buffer = static_cast<uint8_t>(data.current_buffer),
+      .output_read_offset = static_cast<uint8_t>(data.output_buffer_read_offset),
+      .output_write_offset = static_cast<uint8_t>(data.output_buffer_write_offset),
       .input_buffer_0_valid = data.input_buffer_0_valid != 0,
       .input_buffer_1_valid = data.input_buffer_1_valid != 0,
   };

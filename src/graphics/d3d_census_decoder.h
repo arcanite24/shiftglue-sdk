@@ -19,11 +19,12 @@ inline bool Active() { return g_active; }
 void IbBegin(uint32_t ptr, uint32_t count, uint32_t depth);
 // The buffer started at `depth` ends.
 void IbEnd(uint32_t depth);
-// A packet starts `offset` bytes into the current buffer.
-void Packet(uint32_t offset);
+// A packet with header `packet` starts `offset` bytes into the current
+// buffer (its type-3 opcode is counted for the command buffer, NA-2.2).
+void Packet(uint32_t offset, uint32_t packet);
 // A draw packet passed its predicate; drawn: it is a draw (not an EDRAM copy)
-// of the first tile or of an untiled pass.
-void Draw(bool drawn);
+// of the first tile or of an untiled pass; copy: an EDRAM copy of the same.
+void Draw(bool drawn, bool copy);
 // DL-1.1: the packet being decoded is in a buffer, or after a mark, whose
 // drawn draws the census counts as visible to an API-level renderer: a draw
 // call (immediate, tiled or internal) or a display list unchanged since its

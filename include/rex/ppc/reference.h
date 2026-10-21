@@ -34,6 +34,60 @@ inline std::vector<RefWrite>& RefLog() {
   return log;
 }
 
+// Seeded faults for the region oracle's own check (rex/ppc/oracle.h): while
+// set, the first store outside [frame_lo, frame_hi) is dropped, or held back
+// until the next such store has been made. The oracle must then report the
+// run as a mismatch.
+struct RefFault {
+  enum Kind : uint8_t { kNone, kDrop, kReorder } kind = kNone;
+  uint32_t frame_lo = 0;
+  uint32_t frame_hi = 0;
+  bool applied = false;
+  bool holding = false;
+  RefWrite held{};
+};
+
+inline RefFault*& RefFaultSlot() {
+  thread_local RefFault* fault = nullptr;
+  return fault;
+}
+
+// Log a store (its old bytes read now) and make it.
+inline void RefCommit(RefWrite w) {
+  std::memcpy(w.old, const_cast<const void*>(w.host), w.size);
+  RefLog().push_back(w);
+  std::memcpy(const_cast<void*>(w.host), w.neu, w.size);
+}
+
+// True when the fault took the store (dropped it, or made it late).
+inline bool RefFaultTake(RefFault& f, const RefWrite& w) {
+  const bool visible = w.guest < f.frame_lo || w.guest >= f.frame_hi;
+  if (!visible || (f.applied && !f.holding))
+    return false;
+  if (f.holding) {
+    RefCommit(w);
+    RefCommit(f.held);
+    f.holding = false;
+    return true;
+  }
+  f.applied = true;
+  if (f.kind == RefFault::kReorder) {
+    f.held = w;
+    f.holding = true;
+  }
+  return true;
+}
+
+// A held store with no later one to swap with is made at the end: nothing
+// was reordered.
+inline void RefFaultFinish(RefFault& f) {
+  if (f.holding) {
+    RefCommit(f.held);
+    f.holding = false;
+    f.applied = false;
+  }
+}
+
 template <typename T>
 inline void RefStore(volatile T* host, uint32_t guest, T value, bool checked = true) {
   RefWrite w{};
@@ -41,11 +95,10 @@ inline void RefStore(volatile T* host, uint32_t guest, T value, bool checked = t
   w.guest = guest;
   w.size = sizeof(T);
   w.checked = checked;
-  T old = *host;
-  std::memcpy(w.old, &old, sizeof(T));
   std::memcpy(w.neu, &value, sizeof(T));
-  RefLog().push_back(w);
-  *host = value;
+  if (RefFault* f = RefFaultSlot(); f && RefFaultTake(*f, w)) [[unlikely]]
+    return;
+  RefCommit(w);
 }
 
 // A store of `size` bytes (a 16-byte vector store: REX_REF_STORE_V128) whose
@@ -56,10 +109,10 @@ inline void RefStoreBytes(void* host, uint32_t guest, const void* value, uint8_t
   w.guest = guest;
   w.size = size;
   w.checked = true;
-  std::memcpy(w.old, host, size);
   std::memcpy(w.neu, value, size);
-  RefLog().push_back(w);
-  std::memcpy(host, value, size);
+  if (RefFault* f = RefFaultSlot(); f && RefFaultTake(*f, w)) [[unlikely]]
+    return;
+  RefCommit(w);
 }
 
 inline void RefLogBegin() { RefLog().clear(); }

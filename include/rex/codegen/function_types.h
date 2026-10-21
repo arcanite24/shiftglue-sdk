@@ -74,6 +74,19 @@ struct EmitContext {
   /// then drops the copy. Null when not emitting a reference.
   bool* referenceBlocked = nullptr;
 
+  /// Region oracle copies (oracle_regions, rex/ppc/oracle.h): the entry
+  /// addresses of every region function. A call to one goes to
+  /// `oraclePrefix + name`; any other call, indirect call or tail call
+  /// becomes REX_ORACLE_OPAQUE, which ends the copy's run. Stores are logged
+  /// as in a reference copy. Null for ordinary emission.
+  const std::unordered_set<uint32_t>* oracleMembers = nullptr;
+  std::string oraclePrefix;
+  /// The candidate copy (`orc_`): this build's options and specialisations.
+  bool oracleCandidate = false;
+  /// A native region copy (`nrg_`): calls that leave the region stay real
+  /// calls instead of REX_ORACLE_OPAQUE, and stores are not logged.
+  bool regionRealCalls = false;
+
   void fold(uint32_t address, uint32_t size) const {
     if (!foldedRanges)
       return;

@@ -129,4 +129,31 @@ if(NOT REXGLUE_PPC_TEST_EXTRA_ASM_DIRS)
     )
 endif()
 
+# The region oracle's interpreter (rex/ppc/interpreter.h) on the same cases:
+# it reads the assembled binaries, maps and #_ directives at run time, so it
+# needs no generated code and checks the interpreter independently of the
+# recompiler (interp_cases.cpp).
+set(PPC_INTERP_ASM_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/asm ${REXGLUE_PPC_TEST_EXTRA_ASM_DIRS})
+string(REPLACE ";" "|" PPC_INTERP_ASM_DIRS "${PPC_INTERP_ASM_DIRS}")
+add_custom_target(ppc_test_binaries DEPENDS ${TEST_BINS} ${TEST_MAPS})
+add_executable(ppc_interp_tests interp_cases.cpp)
+add_dependencies(ppc_interp_tests ppc_test_binaries)
+target_include_directories(ppc_interp_tests PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_compile_definitions(ppc_interp_tests PRIVATE
+    PPC_INTERP_BIN_DIR="${PPC_BIN_DIR}"
+    PPC_INTERP_ASM_DIRS="${PPC_INTERP_ASM_DIRS}"
+    PPC_INTERP_SKIP_FILE="${CMAKE_CURRENT_SOURCE_DIR}/skip.txt")
+target_link_libraries(ppc_interp_tests PRIVATE simde rexruntime fmt::fmt Catch2::Catch2WithMain)
+set_target_properties(ppc_interp_tests PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:rexruntime>)
+if(UNIX AND NOT APPLE)
+    set_target_properties(ppc_interp_tests PROPERTIES
+        INSTALL_RPATH "$ORIGIN"
+        BUILD_WITH_INSTALL_RPATH ON)
+endif()
+target_compile_options(ppc_interp_tests PRIVATE -UTRACY_ENABLE -UREXGLUE_ENABLE_PROFILING)
+if(NOT REXGLUE_PPC_TEST_EXTRA_ASM_DIRS)
+    add_test(NAME ppc.interpreter COMMAND ppc_interp_tests)
+endif()
+
 message(STATUS "Configured PPC test suite with ${NUM_TESTS} test files")

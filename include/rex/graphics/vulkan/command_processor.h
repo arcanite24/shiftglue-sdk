@@ -1532,6 +1532,192 @@ class VulkanCommandProcessor : public CommandProcessor {
     draw_util::ViewportInfo info;
   };
   std::unique_ptr<ViewportMemo[]> viewport_memos_{new ViewportMemo[kStateMemoCount]};
+
+  // NA-2.4 owned draw programs (vulkan_draw_program.cpp, gpu_d3d_program):
+  // for each run of a pilot list (by buffer and the state it starts in), the
+  // derived state of each of its draws in order. A draw whose state hash,
+  // shaders and draw words match its recorded ones takes the recorded
+  // shaders, primitive processing, translations, pipeline and viewport
+  // instead of deriving them; texture, sampler, target, constant and
+  // binding work stays, since it acts on state outside the draw.
+  //
+  // NA-2.3: an indexed program draw reads its indices from an index
+  // version, a copy of the guest range in a device-local arena made once
+  // per generation of the range: the shared memory's watch on the range
+  // (CPU writes and GPU writes such as resolves) ends a generation. Until
+  // then the draw neither processes nor requests the guest range. A written
+  // version is retired, and its space reused once the last submission that
+  // read it has completed: no fence over the arena.
+  struct IndexVersion {
+    uint32_t guest_base = 0;
+    uint32_t bytes = 0;
+    VkDeviceSize offset = 0;
+    uint64_t last_submission = 0;
+    uint64_t verify_hash = 0;  // shadow mode: the guest bytes when copied
+    bool alive = false;
+    // Set by the watch callback (guest or GPU thread, global lock held).
+    std::atomic<bool> written{false};
+  };
+  struct ProgramDraw {
+    bool valid = false;
+    // Inputs: the draw is the recorded one while these hold.
+    uint64_t memo_state = 0;
+    const void* active_vertex_shader = nullptr;
+    const void* active_pixel_shader = nullptr;
+    uint32_t prim_type = 0;
+    uint32_t index_count = 0;
+    uint32_t initiator = 0;
+    uint32_t dma_base = 0;
+    uint32_t dma_size = 0;
+    uint32_t resolution_scale = 0;
+    double hud_squeeze = 0.0;
+    double hud_scale = 0.0;
+    bool major_mode_explicit = false;
+    bool object_slot = false;
+    bool hud_draw = false;
+    // Outputs.
+    VulkanShader* vertex_shader = nullptr;
+    VulkanShader* pixel_shader = nullptr;
+    bool primitive_polygonal = false;
+    bool is_rasterization_done = false;
+    bool coverage_from_shader = false;
+    reg::RB_DEPTHCONTROL depth_control;
+    uint32_t color_mask = 0;
+    PrimitiveProcessor::ProcessingResult primitive;
+    SpirvShaderTranslator::Modification vertex_modification;
+    SpirvShaderTranslator::Modification pixel_modification;
+    VulkanShader::VulkanTranslation* vertex_translation = nullptr;
+    VulkanShader::VulkanTranslation* pixel_translation = nullptr;
+    uint32_t render_pass_key = 0;
+    void* pipeline_handle = nullptr;
+    draw_util::ViewportInfo viewport;
+    uint32_t index_version = UINT32_MAX;
+  };
+  // Draws a program keeps at most (a longer list draws the rest as usual).
+  static constexpr uint32_t kMaxProgramDraws = 4096;
+  struct DrawProgram {
+    std::vector<ProgramDraw> draws;
+    uint32_t last_swap = 0;
+    uint64_t runs = 0;
+    // The settings its draws were recorded under, checked once a run: a
+    // change drops the draws. The derivation reads them, but they only
+    // change between frames.
+    uint32_t resolution_scale = 0;
+    double hud_squeeze = 0.0;
+    double hud_scale = 0.0;
+    bool object_motion = false;
+  };
+  // Key: the buffer (address << 32 | dwords) mixed with the state hash and
+  // shaders at its start, so each pass that runs the list has its own.
+  std::unordered_map<uint64_t, DrawProgram> draw_programs_;
+  DrawProgram* draw_program_ = nullptr;
+  // gpu_d3d_program 4: what a timed run points at (nothing is recorded).
+  DrawProgram draw_program_timed_;
+  // The run's program key, looked up at its first draw (DrawProgramResolve).
+  bool draw_program_pending_ = false;
+  // The run's program has scene object slots to check by draw.
+  bool draw_program_object_motion_ = false;
+  uint64_t draw_program_pending_key_ = 0;
+  struct ProgramCacheEntry {
+    uint64_t key = 0;
+    DrawProgram* program = nullptr;
+  };
+  static constexpr size_t kProgramCacheSize = 256;
+  std::array<ProgramCacheEntry, kProgramCacheSize> draw_program_cache_{};
+  uint32_t draw_program_draw_ = 0;  // the next draw's index in the program
+  uint32_t draw_program_mode_ = 0;
+  uint32_t draw_program_swaps_ = 0;
+  // Versions are never removed (a retired one keeps its slot), so a
+  // program draw's version index stays valid and the watch callback's
+  // pointer too.
+  std::deque<IndexVersion> index_versions_;
+  std::unordered_map<uint64_t, uint32_t> index_version_by_range_;
+  struct RetiredIndexVersion {
+    VkDeviceSize offset, size;
+    // The last submission that reads it, and the current one when retired.
+    uint64_t last_submission, retired_submission;
+    std::chrono::steady_clock::time_point retired;
+  };
+  std::deque<RetiredIndexVersion> retired_index_versions_;
+  // The arena: device-local, first fit over the free ranges (offset, size).
+  static constexpr VkDeviceSize kIndexArenaSize = VkDeviceSize(16) << 20;
+  VkBuffer index_arena_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory index_arena_memory_ = VK_NULL_HANDLE;
+  bool index_arena_failed_ = false;
+  std::map<VkDeviceSize, VkDeviceSize> index_arena_free_;
+  struct DrawProgramStats {
+    uint64_t runs = 0, programs_made = 0, evicted = 0;
+    uint64_t draws = 0, hits = 0, recorded = 0, unrecordable = 0;
+    uint64_t miss[6] = {};  // by DrawProgramMiss
+    uint64_t index_hits = 0, index_stale = 0;
+    // The old derivation run for a draw inside a program (performance mode:
+    // misses only), by step.
+    uint64_t derived_analysis = 0, derived_primitives = 0, derived_translation = 0,
+             derived_pipeline = 0, derived_viewport = 0;
+    uint64_t shadow_compared = 0, shadow_mismatches = 0, shadow_index_mismatches = 0;
+    uint64_t versions_made = 0, version_bytes = 0, versions_retired = 0, versions_freed = 0,
+             arena_full = 0;
+    uint64_t retire_submissions = 0;
+    double retire_ms = 0.0, retire_ms_max = 0.0;
+    // With gpu_draw_cost_model, by mode (an in-run A/B toggles it).
+    // By mode: the timed draws, and the program lookups at list entry.
+    uint64_t issue_ns[5] = {}, issue_draws[5] = {}, begin_ns[5] = {};
+    uint32_t logs = 0;
+  } draw_program_stats_;
+  enum DrawProgramMiss : uint32_t {
+    kMissNew,         // no draw recorded at this index
+    kMissState,       // state hash or shaders differ
+    kMissDraw,        // draw words differ
+    kMissSettings,    // resolution scale, HUD or object slot differ
+    kMissIndex,       // the index version was retired
+    kMissTargets,     // the render pass differs
+  };
+  // What a drawn draw derived, for DrawProgramRecord.
+  struct ProgramDrawOutputs {
+    uint64_t memo_state;
+    xenos::PrimitiveType prim_type;
+    uint32_t index_count;
+    bool major_mode_explicit;
+    bool indexed;
+    VulkanShader* vertex_shader;
+    VulkanShader* pixel_shader;
+    bool primitive_polygonal;
+    bool is_rasterization_done;
+    reg::RB_DEPTHCONTROL depth_control;
+    uint32_t color_mask;
+    const PrimitiveProcessor::ProcessingResult* primitive;
+    SpirvShaderTranslator::Modification vertex_modification;
+    SpirvShaderTranslator::Modification pixel_modification;
+    VulkanShader::VulkanTranslation* vertex_translation;
+    VulkanShader::VulkanTranslation* pixel_translation;
+    uint32_t render_pass_key;
+    void* pipeline_handle;
+    const draw_util::ViewportInfo* viewport;
+    uint32_t resolution_scale;
+    double hud_squeeze;
+    double hud_scale;
+    bool object_slot;
+    bool indices_owned;
+    uint32_t index_version;
+  };
+  // Records the draw into its program slot, or in shadow mode (compare)
+  // compares it with the recorded one first and counts what differs.
+  void DrawProgramRecord(ProgramDraw& draw, bool recordable, bool compare,
+                         const ProgramDrawOutputs& outputs);
+  bool SupportsDrawPrograms() const override { return true; }
+  void DrawProgramBegin(uint64_t key) override;
+  void DrawProgramResolve();
+  void DrawProgramEnd() override;
+  void DrawProgramFrame();
+  bool EnsureIndexArena();
+  // The live version of [guest_base, + bytes), made (watch, request, copy)
+  // if there is none; UINT32_MAX if it cannot be made.
+  uint32_t AcquireIndexVersion(uint32_t guest_base, uint32_t bytes);
+  void RetireIndexVersion(uint32_t version);
+  void FreeRetiredIndexVersions();
+  static void IndexVersionWritten(const std::unique_lock<std::recursive_mutex>& global_lock,
+                                  void* context, void* data, uint64_t argument,
+                                  bool invalidated_by_gpu);
   // Pixel texture sets are pushed rather than allocated and written when the
   // device has VK_KHR_push_descriptor and the set has at most
   // kMaxPushedTextureBindings bindings (the minimum maxPushDescriptors).

@@ -173,6 +173,18 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
         cfg.referenceFunctions.push_back(static_cast<uint32_t>(*val));
     }
   }
+  if (auto regions = toml["oracle_regions"].as_array()) {
+    for (const auto& elem : *regions) {
+      if (auto val = elem.value<int64_t>())
+        cfg.oracleRegions.push_back(static_cast<uint32_t>(*val));
+    }
+  }
+  if (auto regions = toml["native_regions"].as_array()) {
+    for (const auto& elem : *regions) {
+      if (auto val = elem.value<int64_t>())
+        cfg.nativeRegions.push_back(static_cast<uint32_t>(*val));
+    }
+  }
   if (auto overridden = toml["host_overridden_functions"].as_array()) {
     for (const auto& elem : *overridden) {
       if (auto val = elem.value<int64_t>())
@@ -531,6 +543,11 @@ bool FinalizeConfig(RecompilerConfig& cfg) {
     cfg.referenceFunctions.erase(
         std::unique(cfg.referenceFunctions.begin(), cfg.referenceFunctions.end()),
         cfg.referenceFunctions.end());
+  }
+  if (!cfg.oracleRegions.empty()) {
+    std::sort(cfg.oracleRegions.begin(), cfg.oracleRegions.end());
+    cfg.oracleRegions.erase(std::unique(cfg.oracleRegions.begin(), cfg.oracleRegions.end()),
+                            cfg.oracleRegions.end());
   }
   if (!cfg.hostOverriddenFunctions.empty()) {
     std::sort(cfg.hostOverriddenFunctions.begin(), cfg.hostOverriddenFunctions.end());

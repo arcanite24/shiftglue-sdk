@@ -45,6 +45,21 @@ every run without failing the suite. The reasons there fall in two groups:
 
 A case that starts passing should leave the list.
 
+## Interpreter run
+
+`ppc_interp_tests` runs the same corpus through the region oracle's
+interpreter (`rex/ppc/interpreter.h`) instead of the recompiled code, so
+the two implementations are checked against the same expectations
+independently. It parses each case's directives at run time and needs no
+generated sources. A case with an instruction the interpreter does not
+implement is counted as unsupported, not failed; the oracle refuses such a
+region the same way. The reciprocal estimates (`fres`, `frsqrte`, `vrefp`,
+`vrsqrtefp`) compute the exact value, as the generator does, so a value
+difference there is counted apart, but a NaN operand must still come back
+as the hardware returns it. With the hardware corpus it passes 63,714
+cases with none failing. `PPC_INTERP_FILTER=<substring>` limits the suites;
+`PPC_INTERP_VERBOSE=1` prints every failure.
+
 ## Provenance
 
 The suite started as the 167 files of xenia's `src/xenia/cpu/ppc/testing`

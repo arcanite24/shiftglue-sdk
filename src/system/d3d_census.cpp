@@ -229,4 +229,27 @@ void TakeDecoderWindow(DecoderWindow* out) {
   g_decoder_window = {};
 }
 
+namespace {
+std::mutex g_list_decoded_mutex;
+std::unordered_map<uint32_t, ListDecoded> g_list_decoded;
+}  // namespace
+
+void AddListDecoded(uint32_t object, const ListDecoded& counts) {
+  std::lock_guard<std::mutex> lock(g_list_decoded_mutex);
+  ListDecoded& sum = g_list_decoded[object];
+  sum.draws += counts.draws;
+  sum.copies += counts.copies;
+  sum.events += counts.events;
+  sum.memory_writes += counts.memory_writes;
+  sum.waits += counts.waits;
+  sum.constants += counts.constants;
+  sum.shader_loads += counts.shader_loads;
+}
+
+void TakeListDecoded(std::vector<std::pair<uint32_t, ListDecoded>>* out) {
+  std::lock_guard<std::mutex> lock(g_list_decoded_mutex);
+  out->assign(g_list_decoded.begin(), g_list_decoded.end());
+  g_list_decoded.clear();
+}
+
 }  // namespace rex::system::d3d_census

@@ -61,7 +61,17 @@ bool BuilderContext::localizeNonVolatiles() const {
 }
 
 bool BuilderContext::isReferenceCopy() const {
-  return emitCtx.namePrefix == "ref_";
+  return emitCtx.namePrefix == "ref_" ||
+         (emitCtx.oracleMembers != nullptr && !emitCtx.regionRealCalls);
+}
+
+// Region oracle copies: the callee inside the region's copies, or "" when the
+// call leaves the region (the caller then emits REX_ORACLE_OPAQUE).
+std::string BuilderContext::oracleCallee(const rex::codegen::FunctionNode& fn) const {
+  if (!emitCtx.oracleMembers || fn.authority() == rex::codegen::FunctionAuthority::IMPORT ||
+      !emitCtx.oracleMembers->count(static_cast<uint32_t>(fn.base())))
+    return {};
+  return emitCtx.oraclePrefix + fn.name();
 }
 
 bool BuilderContext::isSaveRestoreHelper(std::string_view name) {
@@ -388,6 +398,17 @@ std::string BuilderContext::calleeSymbol(const rex::codegen::FunctionNode& fn) c
 
 void BuilderContext::emit_function_call(uint32_t address) {
   const auto& cfg = config();
+  // A native region copy calls region functions' copies but makes every
+  // other call for real.
+  const bool oracle = emitCtx.oracleMembers != nullptr && !emitCtx.regionRealCalls;
+  const bool region = emitCtx.oracleMembers != nullptr;
+  auto opaque = [&](std::string_view indent) {
+    println("{}REX_ORACLE_OPAQUE(ctx, base, 0x{:08X}u, 0x{:08X}u);", indent, address, base);
+  };
+  if (oracle && (address == cfg.longJmpAddress || address == cfg.setJmpAddress)) {
+    opaque("\t");
+    return;
+  }
 
   if (address == cfg.longJmpAddress) {
     // Use custom ppc_longjmp that uses guest address as key (not for storage)
@@ -427,10 +448,24 @@ void BuilderContext::emit_function_call(uint32_t address) {
       // A reference copy (NN-5.1) inlines the helpers as they are, so their
       // stack stores go through the logged macros and the copy can be rolled
       // back; a call would write the frame behind the log's back.
-      if ((localizeNonVolatiles() || isReferenceCopy()) && isSaveRestoreHelper(name)) {
+      if ((localizeNonVolatiles() || isReferenceCopy() || emitCtx.oracleMembers) &&
+          isSaveRestoreHelper(name)) {
         inlineSaveRestoreHelper(*targetFn, "\t", false);
         return;
       }
+
+      // A region oracle copy stays inside the region's copies.
+      std::string inside;
+      if (region) {
+        inside = oracleCallee(*targetFn);
+        if (inside.empty() && oracle) {
+          opaque("\t");
+          return;
+        }
+        if (!inside.empty())
+          emitCtx.reference(inside);
+      }
+      const std::string& target_symbol = inside.empty() ? callee : inside;
 
       // An SEH funclet runs on its owner's frame and reads whatever non-volatiles
       // the owner left live, and a share_registers function reads the caller's
@@ -440,7 +475,7 @@ void BuilderContext::emit_function_call(uint32_t address) {
       if (targetFn->sharesRegisters() && localizeNonVolatiles()) {
         publishLocalNonVolatiles("\t");
         emitCtx.reference(name);
-        println("\t{}(ctx, base);", callee);
+        println("\t{}(ctx, base);", target_symbol);
         reloadLocalNonVolatiles("\t");
         return;
       }
@@ -452,13 +487,17 @@ void BuilderContext::emit_function_call(uint32_t address) {
       emitCtx.reference(name);
       if (poison)
         println("\tREX_ABI_POISON_PRE(0x{:08X});", base);
-      println("\t{}(ctx, base);", callee);
+      println("\t{}(ctx, base);", target_symbol);
       if (poison)
         println("\tREX_ABI_POISON_POST(0x{:08X});", base);
       return;
     }
 
     if (target->isImport()) {
+      if (oracle) {
+        opaque("\t");
+        return;
+      }
       const auto& importTarget = std::get<CallTarget::ToImport>(target->value);
       std::string func_name;
 
@@ -509,6 +548,17 @@ void BuilderContext::emit_function_call(uint32_t address) {
 
 void BuilderContext::emit_tail_function_call(uint32_t address, std::string_view indent) {
   const auto& cfg = config();
+  // A native region copy calls region functions' copies but makes every
+  // other call for real.
+  const bool oracle = emitCtx.oracleMembers != nullptr && !emitCtx.regionRealCalls;
+  const bool region = emitCtx.oracleMembers != nullptr;
+  auto opaque = [&] {
+    println("{}REX_ORACLE_OPAQUE(ctx, base, 0x{:08X}u, 0x{:08X}u);", indent, address, base);
+  };
+  if (oracle && (address == cfg.longJmpAddress || address == cfg.setJmpAddress)) {
+    opaque();
+    return;
+  }
 
   if (address == cfg.longJmpAddress || address == cfg.setJmpAddress) {
     emit_function_call(address);
@@ -525,7 +575,8 @@ void BuilderContext::emit_tail_function_call(uint32_t address, std::string_view 
       const std::string callee = calleeSymbol(*targetFn);
       if (locals.hostSaveFirst && emitHostLocalSaveRestore(name, indent, true))
         return;
-      if ((localizeNonVolatiles() || isReferenceCopy()) && isSaveRestoreHelper(name)) {
+      if ((localizeNonVolatiles() || isReferenceCopy() || emitCtx.oracleMembers) &&
+          isSaveRestoreHelper(name)) {
         inlineSaveRestoreHelper(*targetFn, indent, true);
         return;
       }
@@ -535,12 +586,28 @@ void BuilderContext::emit_tail_function_call(uint32_t address, std::string_view 
       if (targetFn->sharesRegisters() && localizeNonVolatiles()) {
         publishLocalNonVolatiles(indent);
       }
+      if (region) {
+        const std::string inside = oracleCallee(*targetFn);
+        if (inside.empty() && oracle) {
+          opaque();
+          return;
+        }
+        if (!inside.empty()) {
+          emitCtx.reference(inside);
+          println("{}REX_TAIL_CALL({});", indent, inside);
+          return;
+        }
+      }
       emitCtx.reference(name);
       println("{}REX_TAIL_CALL({});", indent, callee);
       return;
     }
 
     if (target->isImport()) {
+      if (oracle) {
+        opaque();
+        return;
+      }
       const auto& importTarget = std::get<CallTarget::ToImport>(target->value);
       std::string func_name;
       auto at_pos = importTarget.name.find('@');

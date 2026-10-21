@@ -1,12 +1,12 @@
 /**
  * DLSS Super Resolution and DLAA through NVIDIA NGX on Vulkan.
  *
- * Built only with REXGLUE_DLSS (cmake/rexglue_dlss.cmake), which downloads
- * NVIDIA's NGX headers and static loader at configure time; nothing of the
- * DLSS SDK is committed. The DLSS model, nvngx_dlss.dll, is never built in
- * or shipped: NGX loads the one the player puts in upscalers/dlss/<version>/
- * next to the executable (newest version first) or names with
- * present_dlss_runtime. NGX needs a few NVIDIA instance and device
+ * Built with REXGLUE_DLSS_PROVIDER (cmake/rexglue_dlss.cmake, on by default
+ * on 64-bit Windows), which downloads NVIDIA's NGX headers, static loader
+ * and DLSS runtime at configure time; nothing of the DLSS SDK is committed.
+ * The game stages nvngx_dlss.dll in upscalers/dlss/<version>/ next to the
+ * executable, and NGX loads the newest version there (a player may add a
+ * newer one) or the one present_dlss_runtime names. NGX needs a few NVIDIA instance and device
  * extensions, which instance and device creation ask for through
  * GetVulkanUpscaler*Extensions.
  */

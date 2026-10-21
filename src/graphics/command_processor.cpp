@@ -44,6 +44,7 @@
 #include <rex/cs_scheduler.h>
 #include <rex/system/d3d_census.h>
 #include <rex/system/d3d_draw.h>
+#include <rex/system/d3d_program.h>
 #include <rex/system/gpu_write_signal.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/thread_state.h>
@@ -118,6 +119,18 @@ REXCVAR_DEFINE_BOOL(gpu_record_merge_constant_runs, true, "GPU",
                     "With gpu_record_thread, the decoder extends the last recorded float "
                     "constant run over a gap of up to 16 registers (their current values) "
                     "instead of recording another run, so the recorder handles fewer runs")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(gpu_d3d_program, 0, "GPU",
+                     "NA-2.4 (issue #753): draw the command buffers the game marks as pilot "
+                     "lists from an owned draw program: the backend keeps each draw's derived "
+                     "state (shaders, primitive processing, translations, pipeline, viewport) "
+                     "and reuses it while the draw's state hash, shaders and draw words hold "
+                     "(0: off; 1: shadow, derive as usual and compare with the program; 2: "
+                     "performance, draw from the program; 3: baseline, record and count but "
+                     "derive as usual, for A/B runs; 4: timed only, the lists bracketed and "
+                     "timed but no program looked up, the reference for the complete cost). "
+                     "Read at each swap; Vulkan")
+    .range(0, 4)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(gpu_template_stats, false, "GPU",
                     "Diagnostics (DR-4.2): with gpu_record_thread, compare every draw's "
@@ -1828,6 +1841,22 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
       if (d3d_census_decoder::Active()) d3d_census_decoder::IbEnd(depth);
     }
   } census_guard{trace_ib_depth_};
+  // NA-2.4: a pilot list's draws run from the backend's program for it.
+  struct ProgramGuard {
+    CommandProcessor* processor = nullptr;
+    ~ProgramGuard() {
+      if (!processor) return;
+      processor->RecordCall([p = processor]() { p->DrawProgramEnd(); });
+      processor->d3d_program_depth_ = 0;
+    }
+  } program_guard;
+  if (d3d_program_mode_ && trace_ib_depth_ >= 2 && !d3d_program_depth_ &&
+      system::d3d_program::IsList(ptr)) {
+    d3d_program_depth_ = trace_ib_depth_;
+    program_guard.processor = this;
+    const uint64_t key = uint64_t(ptr & 0x1FFFFFFFu) << 32 | count;
+    RecordCall([this, key]() { DrawProgramBegin(key); });
+  }
 
   for (uint32_t level = 0; level < replay_probe.active; ++level) {
     replay_probe.levels[level].nested.emplace_back(ptr, count);
@@ -2228,7 +2257,7 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
     return true;
   }
   if (d3d_census_decoder::Active()) {
-    d3d_census_decoder::Packet(packet_offset);
+    d3d_census_decoder::Packet(packet_offset, packet);
   }
   if (packet_recorder_) {
     uint32_t dword_count = 1;
@@ -2357,6 +2386,10 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     if (d3d_draw_) D3dDrawSwap();
     D3dListSwap();
     D3dShaderCacheSwap();
+    d3d_program_mode_ =
+        SupportsDrawPrograms() ? uint32_t(std::max(REXCVAR_GET(gpu_d3d_program), 0)) : 0;
+    system::d3d_program::SetMode(d3d_program_mode_);
+    system::d3d_program::Swap();
   }
   const int32_t trace_bins_vblank = REXCVAR_GET(gpu_trace_bins_vblank);
   const bool trace_bins = trace_bins_vblank >= 0 && trace_swaps_ == uint32_t(trace_bins_vblank);
@@ -3458,7 +3491,8 @@ bool CommandProcessor::D3dCensusDraw(memory::RingBuffer* reader, uint32_t count)
         decode_regs().Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy;
     // Drawn for the census: a draw, not an EDRAM copy, of the first tile (or
     // of no tiling pass), the draws the untiled Android path keeps.
-    d3d_census_decoder::Draw(TilingPassOfSelect() <= 0 && !copy);
+    d3d_census_decoder::Draw(TilingPassOfSelect() <= 0 && !copy,
+                             TilingPassOfSelect() <= 0 && copy);
     if (copy && d3d_skip_visible_ >= 3 && d3d_census_decoder::Visible()) {
       static uint64_t visible_copies = 0;
       const uint64_t copies = ++visible_copies;

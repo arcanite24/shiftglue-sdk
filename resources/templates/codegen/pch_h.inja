@@ -34,6 +34,7 @@
 #include <rex/ppc/abi_poison.h>
 #include <rex/ppc/probe.h>
 #include <rex/ppc/reference.h>
+#include <rex/ppc/oracle.h>
 #include <rex/image_info.h>
 #include <rex/logging.h>
 #include <rex/chrono/clock.h>

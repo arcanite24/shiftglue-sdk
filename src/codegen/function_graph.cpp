@@ -2583,7 +2583,11 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx, bool allowSpecializati
   // NN-5.1 per-function specialisation. Reference copies and the save/restore
   // helpers are never specialised; a listed function that cannot keep its
   // registers in locals is emitted as usual (the reason goes to the stats).
-  const bool specialize = allowSpecialization && ctx.namePrefix.empty() && !name_.starts_with("__");
+  // A region oracle's candidate copy (orc_) is the optimized form and keeps
+  // the specialisations.
+  const bool specialize = allowSpecialization &&
+                          (ctx.namePrefix.empty() || ctx.oracleCandidate) &&
+                          !name_.starts_with("__");
   if (specialize && ctx.config.isRegisterLocalsFunction(static_cast<uint32_t>(base()))) {
     const SpecializeReason why = RegisterLocalsRefusal(*this, ctx, !resumeAddresses.empty());
     if (why == SpecializeReason::kApplied) {
@@ -2816,14 +2820,34 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx, bool allowSpecializati
         if (ctx.referenceBlocked) {
           // A reference copy must be rolled back by its store log alone: no
           // stores outside the macros, no atomics, no calls, no global state.
+          // A region oracle copy may call the region's own copies (they log
+          // too) and stops at every other call (REX_ORACLE_OPAQUE, an
+          // indirect call included), but not at a mid-asm hook, whose host
+          // code would read and write the guest behind the log.
           const std::string_view mnemonic = insn.opcode->name;
           const std::string_view added(body.data() + bodyBefore, body.size() - bodyBefore);
+          const bool oracle = ctx.oracleMembers != nullptr;
+          auto foreignCall = [&] {
+            if (!oracle)
+              return added.find("(ctx, base);") != std::string_view::npos ||
+                     added.find("REX_TAIL_CALL(") != std::string_view::npos ||
+                     added.find("REX_CALL_INDIRECT") != std::string_view::npos;
+            for (size_t at = added.find("(ctx, base);"); at != std::string_view::npos;
+                 at = added.find("(ctx, base);", at + 1)) {
+              size_t start = at;
+              while (start > 0 && (std::isalnum(static_cast<unsigned char>(added[start - 1])) ||
+                                   added[start - 1] == '_'))
+                --start;
+              if (!added.substr(start, at - start).starts_with(ctx.oraclePrefix))
+                return true;
+            }
+            return false;
+          };
+          if (oracle && hookIt != ctx.config.midAsmHooks.end())
+            *ctx.referenceBlocked = true;
           if (mnemonic.starts_with("stwcx") ||
               mnemonic.starts_with("stdcx") || mnemonic.starts_with("dcbz") || mnemonic == "sc" ||
-              mnemonic.starts_with("mtmsr") || added.find("REX_MM_STORE") != std::string_view::npos ||
-              added.find("(ctx, base);") != std::string_view::npos ||
-              added.find("REX_TAIL_CALL(") != std::string_view::npos ||
-              added.find("REX_CALL_INDIRECT") != std::string_view::npos ||
+              mnemonic.starts_with("mtmsr") || added.find("REX_MM_STORE") != std::string_view::npos || foreignCall() ||
               added.find("GLOBAL_LOCK") != std::string_view::npos ||
               added.find("ppc_setjmp") != std::string_view::npos ||
               added.find("ppc_longjmp") != std::string_view::npos ||
@@ -2859,7 +2883,20 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx, bool allowSpecializati
       const uint32_t opcode = PPC_OP(lastInstruction);
       const bool hasExplicitTransfer =
           (opcode == PPC_OP_B || opcode == PPC_OP_CTR) && !PPC_BL(lastInstruction);
-      if (!hasExplicitTransfer) {
+      if (!hasExplicitTransfer && ctx.oracleMembers &&
+          (!ctx.regionRealCalls || ctx.oracleMembers->count(fallthroughTarget->base()))) {
+        // A region copy falls through into the next function's copy, or
+        // leaves the region there (a native region copy leaves it for real,
+        // below).
+        if (ctx.oracleMembers->count(fallthroughTarget->base())) {
+          ctx.reference(ctx.oraclePrefix + fallthroughTarget->name());
+          emit_println(body, "\tREX_TAIL_CALL({}{});", ctx.oraclePrefix,
+                       fallthroughTarget->name());
+        } else {
+          emit_println(body, "\tREX_ORACLE_OPAQUE(ctx, base, 0x{:08X}u, 0x{:08X}u);",
+                       fallthroughTarget->base(), end() - 4);
+        }
+      } else if (!hasExplicitTransfer) {
         ctx.reference(fallthroughTarget->name());
         emit_println(body, "\tREX_TAIL_CALL({});", fallthroughTarget->name());
       }
@@ -2927,7 +2964,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx, bool allowSpecializati
       (body.find("ctx.fpscr.enableFlushMode") != std::string::npos ||
        body.find("ctx.fpscr.disableFlushMode") != std::string::npos)) {
     EmitContext ieeeCtx = ctx;
-    ieeeCtx.namePrefix = "ieee_";
+    ieeeCtx.namePrefix = "ieee_" + ctx.namePrefix;
     ieeeCtx.referenceBlocked = nullptr;
     ieeeCopy = emitCpp(ieeeCtx, false);
     ieeeName = "ieee_" + name;

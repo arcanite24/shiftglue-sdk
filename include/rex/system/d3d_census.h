@@ -13,6 +13,8 @@
 // the game module both link it.
 
 #include <cstdint>
+#include <utility>
+#include <vector>
 
 namespace rex::system::d3d_census {
 
@@ -152,6 +154,23 @@ struct DecoderWindow {
 };
 void AddDecoderWindow(const DecoderWindow& window);
 void TakeDecoderWindow(DecoderWindow* out);
+
+// What the decoder saw inside one command buffer's runs (the pass census,
+// NA-2.2): its drawn draws (first tile, as `drawn`), EDRAM copies, and the
+// packets that have an effect outside the draw state.
+struct ListDecoded {
+  uint64_t draws = 0;
+  uint64_t copies = 0;
+  uint64_t events = 0;         // EVENT_WRITE, _SHD, _EXT, _ZPD
+  uint64_t memory_writes = 0;  // MEM_WRITE, REG_TO_MEM, COND_WRITE
+  uint64_t waits = 0;          // WAIT_REG_MEM
+  uint64_t constants = 0;      // SET_CONSTANT(2), LOAD_ALU_CONSTANT
+  uint64_t shader_loads = 0;   // IM_LOAD, IM_LOAD_IMMEDIATE
+};
+// Called by the decoder once a frame for each command buffer it saw.
+void AddListDecoded(uint32_t object, const ListDecoded& counts);
+// The sums since the last call, by command buffer object.
+void TakeListDecoded(std::vector<std::pair<uint32_t, ListDecoded>>* out);
 
 struct WriterWindow {
   // [list or outer][class]

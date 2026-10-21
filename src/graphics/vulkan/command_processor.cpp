@@ -128,6 +128,11 @@ REXCVAR_DEFINE_BOOL(fh1_debug_skip_draw_calls, false, "GPU",
                     "Diagnostics: record every draw's state but not its draw command (wrong "
                     "image), to bound what the GPU spends per draw (Vulkan)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(gpu_d3d_program_probe, 0, "GPU",
+                     "Diagnostics: for the draws inside the lists gpu_d3d_program marks, 1 "
+                     "draws only their first triangle and 2 skips their draw commands (wrong "
+                     "image), to bound the GPU time those lists cost (NA-3.2, Vulkan)")
+    .range(0, 2);
 REXCVAR_DEFINE_BOOL(fh1_native_gpu_profile_draws, false, "GPU",
                     "Diagnostics: with fh1_native_gpu_profile, also time every draw by its "
                     "pixel shader (Vulkan)")
@@ -2869,6 +2874,17 @@ void VulkanCommandProcessor::ShutdownContext() {
 
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyQueryPool, device,
                                          frame_timing_query_pool_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, index_arena_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, index_arena_memory_);
+  draw_programs_.clear();
+  draw_program_cache_ = {};
+  draw_program_pending_ = false;
+  draw_program_ = nullptr;
+  // Versions stay (watches may still point at them), dead.
+  for (IndexVersion& version : index_versions_) version.alive = false;
+  index_version_by_range_.clear();
+  retired_index_versions_.clear();
+  index_arena_free_.clear();
   sampler_cache_vertex_.clear();
   sampler_cache_pixel_.clear();
   for (FrameTimingSlot& slot : frame_timing_slots_) {
@@ -3699,6 +3715,7 @@ bool VulkanCommandProcessor::EnsureSwapCamera() {
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   DrawCostFrame();
+  DrawProgramFrame();
   IssueSwapImpl(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   // Settings that rebuild host objects apply between frames.
   if (object_slot_wanted_width_ &&
@@ -5802,12 +5819,24 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   draw_cost_.enabled = REXCVAR_GET(gpu_draw_cost_model);
   const uint64_t issue_start = draw_cost_.enabled ? DrawCostNow() : 0;
+  // NA-2.4: what a pilot list's draws cost, in nanoseconds on every host.
+  const bool program_timed = draw_cost_.enabled && draw_program_;
+  const auto program_start =
+      program_timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
   const bool issued =
       IssueDrawImpl(prim_type, index_count, index_buffer_info, major_mode_explicit);
   if (draw_cost_.enabled) {
     draw_cost_.frame_issue_ns += DrawCostNow() - issue_start;
     ++draw_cost_.frame_draws;
     draw_cost_.sampling = false;
+  }
+  if (program_timed) {
+    const uint32_t mode = std::min<uint32_t>(draw_program_mode_, 4);
+    draw_program_stats_.issue_ns[mode] +=
+        uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now() - program_start)
+                     .count());
+    ++draw_program_stats_.issue_draws[mode];
   }
   // Hand the worker a part of the frame now and then, when ending the
   // submission neither ends a guest occlusion query nor waits for pipelines.
@@ -5858,6 +5887,14 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         uint32_t(regs.Get<reg::RB_MODECONTROL>().edram_mode));
     return false;
   };
+  // The HUD scale and safe zone shrink or grow the HUD around the centre,
+  // only for HUD draws over this frame's scene (fh1_native_executor).
+  auto hud_scale_now = [&]() {
+    return fh1_native_executor_ && fh1_native_executor_->IsHudDraw() &&
+                   !REXCVAR_GET(fh1_hud_scale_suspended)
+               ? REXCVAR_GET(fh1_hud_scale) * (1.0 - 2.0 * REXCVAR_GET(fh1_hud_safe_zone))
+               : 1.0;
+  };
 
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
@@ -5877,168 +5914,261 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     return true;
   }
 
+  // Item-2 ceiling (fh1_visibility_oracle_skip): the draw by its shaders,
+  // index range, count and targets.
+  if (fh1_native_executor_ && fh1_native_executor_->VisActive()) {
+    uint64_t key = uint64_t(uintptr_t(active_vertex_shader()));
+    const auto mix = [&key](uint64_t value) {
+      key = (key ^ value) * 0x100000001B3ull;
+      key ^= key >> 29;
+    };
+    mix(uint64_t(uintptr_t(active_pixel_shader())));
+    mix(uint64_t(regs.values[XE_GPU_REG_VGT_DMA_BASE]) << 32 |
+        regs.values[XE_GPU_REG_VGT_DMA_SIZE]);
+    mix(uint64_t(index_count) << 8 | uint32_t(prim_type));
+    mix(uint64_t(regs.values[XE_GPU_REG_RB_COLOR_INFO]) << 32 |
+        regs.values[XE_GPU_REG_RB_DEPTH_INFO]);
+    if (fh1_native_executor_->VisOracleSkip(key)) return true;
+  }
+
+  // NA-2.4: a draw inside a pilot list's program (after the copies and the
+  // skipped later tiles, which never reach it). It is the recorded draw
+  // while its state hash, shaders, draw words and the settings the
+  // derivation reads are the recorded ones (and its index version holds).
+  ProgramDraw* program_draw = nullptr;
+  bool program_matched = false;  // the recorded draw (any mode)
+  bool program_hit = false;      // performance mode: drawn from the program
+  bool program_compare = false;  // shadow mode: derived, then compared
+  if (draw_program_ && draw_program_mode_ != 4 && draw_program_draw_ < kMaxProgramDraws) {
+    if (draw_program_pending_) DrawProgramResolve();
+    DrawProgram& program = *draw_program_;
+    const uint32_t index = draw_program_draw_++;
+    if (index >= program.draws.size()) program.draws.resize(index + 1);
+    program_draw = &program.draws[index];
+    const ProgramDraw& pd = *program_draw;
+    DrawProgramStats& s = draw_program_stats_;
+    ++s.draws;
+    uint32_t miss = kMissNew;
+    if (pd.valid) {
+      const bool indexed = index_buffer_info != nullptr;
+      if (pd.memo_state != memo_state || pd.active_vertex_shader != active_vertex_shader() ||
+          pd.active_pixel_shader != active_pixel_shader()) {
+        miss = kMissState;
+      } else if (pd.prim_type != uint32_t(prim_type) || pd.index_count != index_count ||
+                 pd.major_mode_explicit != major_mode_explicit ||
+                 pd.initiator != regs.values[XE_GPU_REG_VGT_DRAW_INITIATOR] ||
+                 (indexed && (pd.dma_base != regs.values[XE_GPU_REG_VGT_DMA_BASE] ||
+                              pd.dma_size != regs.values[XE_GPU_REG_VGT_DMA_SIZE]))) {
+        miss = kMissDraw;
+      } else if (pd.hud_draw != (fh1_native_executor_ && fh1_native_executor_->IsHudDraw()) ||
+                 (draw_program_object_motion_ &&
+                  pd.object_slot != (pd.pixel_shader &&
+                                     fh1_native_executor_->IsSceneObjectDraw(*pd.vertex_shader)))) {
+        // The other settings are checked once a run (DrawProgramResolve).
+        miss = kMissSettings;
+      } else if (pd.index_version != UINT32_MAX &&
+                 (!index_versions_[pd.index_version].alive ||
+                  index_versions_[pd.index_version].written.load(std::memory_order_acquire))) {
+        RetireIndexVersion(pd.index_version);
+        ++s.index_stale;
+        miss = kMissIndex;
+      } else {
+        miss = UINT32_MAX;
+      }
+    }
+    if (miss == UINT32_MAX) {
+      ++s.hits;
+      program_matched = true;
+      program_hit = draw_program_mode_ == 2;
+      program_compare = draw_program_mode_ == 1;
+    } else {
+      ++s.miss[miss];
+    }
+  }
+  // Cleared where the derivation took a path a program cannot replay.
+  bool program_recordable = program_draw != nullptr;
+
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
 
   const ui::vulkan::VulkanDevice::Properties& device_properties = GetVulkanDevice()->properties();
 
   memexport_ranges_.clear();
 
-  // Vertex shader analysis.
-  auto vertex_shader = static_cast<VulkanShader*>(active_vertex_shader());
-  if (!vertex_shader) {
-    // Always need a vertex shader.
-    return draw_fail("missing_vertex_shader");
-  }
-  pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
-  bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
-  if (memexport_used_vertex) {
-    if (!device_properties.vertexPipelineStoresAndAtomics) {
-      REXGPU_ERROR(
-          "Vertex shader memexport draw encountered without "
-          "vertexPipelineStoresAndAtomics support");
-      return false;
-    }
-    draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
-  }
-
-  // Pixel shader analysis.
-  bool primitive_polygonal = draw_util::IsPrimitivePolygonal(regs);
-  bool is_rasterization_done = draw_util::IsRasterizationPotentiallyDone(regs, primitive_polygonal);
-  if (surface_pitch_is_zero && is_rasterization_done) {
-    // Doesn't actually draw.
-    // Unlikely that zero would even really be legal though.
-    return true;
-  }
+  VulkanShader* vertex_shader;
   VulkanShader* pixel_shader = nullptr;
-  if (is_rasterization_done) {
-    // See xenos::EdramMode for explanation why the pixel shader is only used
-    // when it's kColorDepth here.
-    if (edram_mode == xenos::EdramMode::kColorDepth) {
-      pixel_shader = static_cast<VulkanShader*>(active_pixel_shader());
-      if (pixel_shader) {
-        pipeline_cache_->AnalyzeShaderUcode(*pixel_shader);
-        if (!draw_util::IsPixelShaderNeededWithRasterization(*pixel_shader, regs)) {
-          pixel_shader = nullptr;
-        }
-      }
-    }
-  } else {
-    // Disabling pixel shader for this case is also required by the pipeline
-    // cache.
-    if (!memexport_used_vertex) {
-      // This draw has no effect.
-      return true;
-    }
-  }
-  bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
-  // LS-3.3: what the draw's host work did, for TemplateStatsDrawHost below.
-  const bool template_stats = REXCVAR_GET(gpu_template_stats);
-  const uint64_t template_transfers_before =
-      template_stats && fh1_native_executor_ ? fh1_native_executor_->transfer_count() : 0;
-  const uint64_t template_uploads_before =
-      template_stats ? shared_memory_->upload_request_count() : 0;
-  if (template_stats) {
-    // What a compiled replay would key on: everything the draw's derivation
-    // reads except the float, bool and loop constants it uploads. Five parts,
-    // so the statistics can tell which one varies.
-    auto mix = [](uint64_t& hash, uint64_t value) {
-      hash = (hash ^ value) * UINT64_C(0xBF58476D1CE4E5B9);
-      hash ^= hash >> 31;
-    };
-    uint64_t parts[6] = {state_hash_, 0, 0, 0, 0, 0};
-    mix(parts[1], uint64_t(uintptr_t(vertex_shader)));
-    mix(parts[1], uint64_t(uintptr_t(pixel_shader)));
-    mix(parts[1], uint64_t(prim_type) << 32 | index_count);
-    mix(parts[1], uint64_t(edram_mode) << 1 | uint64_t(major_mode_explicit));
-    if (index_buffer_info) {
-      mix(parts[2], uint64_t(index_buffer_info->guest_base) << 32 | index_buffer_info->count);
-      mix(parts[2], uint64_t(index_buffer_info->format) << 8 |
-                        uint64_t(index_buffer_info->endianness));
-    }
-    for (const VulkanShader* shader : {vertex_shader, pixel_shader}) {
-      if (!shader) continue;
-      for (const Shader::TextureBinding& binding : shader->texture_bindings()) {
-        const uint32_t* words =
-            &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + binding.fetch_constant * 6];
-        for (uint32_t i = 0; i < 6; i += 2) {
-          mix(parts[3], uint64_t(words[i]) << 32 | words[i + 1]);
-        }
-      }
-    }
-    const Shader::ConstantRegisterMap& vertex_map = vertex_shader->constant_register_map();
-    for (uint32_t i = 0; i < 3; ++i) {
-      uint32_t bits = vertex_map.vertex_fetch_bitmap[i];
-      uint32_t bit;
-      while (rex::bit_scan_forward(bits, &bit)) {
-        bits &= ~(UINT32_C(1) << bit);
-        const uint32_t* words =
-            &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + (i * 32 + bit) * 2];
-        mix(parts[4], uint64_t(words[0]) << 32 | words[1]);
-      }
-    }
-    // Part 5: the float, bool and loop constants the shaders read.
-    for (const VulkanShader* shader : {vertex_shader, pixel_shader}) {
-      if (!shader) continue;
-      const Shader::ConstantRegisterMap& map = shader->constant_register_map();
-      const uint32_t* base = &regs.values[shader == vertex_shader
-                                              ? XE_GPU_REG_SHADER_CONSTANT_000_X
-                                              : XE_GPU_REG_SHADER_CONSTANT_256_X];
-      for (uint32_t word = 0; word < 4; ++word) {
-        uint64_t bits = map.float_bitmap[word];
-        while (bits) {
-          const uint32_t bit = uint32_t(std::countr_zero(bits));
-          bits &= bits - 1;
-          const uint32_t* c = base + (word * 64 + bit) * 4;
-          mix(parts[5], uint64_t(c[0]) << 32 | c[1]);
-          mix(parts[5], uint64_t(c[2]) << 32 | c[3]);
-        }
-      }
-    }
-    for (uint32_t i = 0; i < 8 + 32; ++i) {
-      mix(parts[5], regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + i]);
-    }
-    TemplateStatsDraw(parts);
-  }
-  if (memexport_used_pixel) {
-    if (!device_properties.fragmentStoresAndAtomics) {
-      REXGPU_ERROR(
-          "Pixel shader memexport draw encountered without "
-          "fragmentStoresAndAtomics support");
-      return false;
-    }
-    draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
-  }
-  reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
-
+  bool memexport_used_vertex = false, memexport_used_pixel = false;
+  bool primitive_polygonal, is_rasterization_done;
+  reg::RB_DEPTHCONTROL normalized_depth_control;
   uint32_t ps_param_gen_pos = UINT32_MAX;
-  uint32_t interpolator_mask =
-      pixel_shader ? (vertex_shader->writes_interpolators() &
-                      pixel_shader->GetInterpolatorInputMask(regs.Get<reg::SQ_PROGRAM_CNTL>(),
-                                                             regs.Get<reg::SQ_CONTEXT_MISC>(),
-                                                             ps_param_gen_pos))
-                   : 0;
-
-  // The memo tables (about 1 MB together) miss the cache on most draws:
-  // fetch the entries this draw will read while primitives and samplers are
-  // processed. A wrong guess (the pipeline's render pass key is the last
-  // draw's) only costs the prefetch.
-  uint32_t normalized_color_mask =
-      pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
-                   : 0;
+  uint32_t interpolator_mask = 0;
+  uint32_t normalized_color_mask;
+  // LS-3.3: what the draw's host work did, for TemplateStatsDrawHost below.
+  const bool template_stats = !program_hit && REXCVAR_GET(gpu_template_stats);
+  uint64_t template_transfers_before = 0, template_uploads_before = 0;
   auto prefetch = [](const void* entry, size_t size) {
     const char* bytes = static_cast<const char*>(entry);
     for (size_t offset = 0; offset < size; offset += 64) {
       __builtin_prefetch(bytes + offset);
     }
   };
-  prefetch(&translation_memos_[StateMemoSlot(
-               memo_state, uint64_t(uintptr_t(vertex_shader)),
-               uint64_t(uintptr_t(pixel_shader)) ^ uint64_t(interpolator_mask) << 1)],
-           sizeof(TranslationMemo));
-  prefetch(&viewport_memos_[StateMemoSlot(
-               memo_state, uint64_t(uintptr_t(pixel_shader)),
-               uint64_t(normalized_depth_control.value) << 32 | normalized_color_mask)],
-           sizeof(ViewportMemo));
+  if (program_hit) {
+    // NA-2.4: the recorded analysis.
+    const ProgramDraw& pd = *program_draw;
+    vertex_shader = pd.vertex_shader;
+    pixel_shader = pd.pixel_shader;
+    primitive_polygonal = pd.primitive_polygonal;
+    is_rasterization_done = pd.is_rasterization_done;
+    normalized_depth_control = pd.depth_control;
+    normalized_color_mask = pd.color_mask;
+  } else {
+    if (program_draw) ++draw_program_stats_.derived_analysis;
+    // Vertex shader analysis.
+    vertex_shader = static_cast<VulkanShader*>(active_vertex_shader());
+    if (!vertex_shader) {
+      // Always need a vertex shader.
+      return draw_fail("missing_vertex_shader");
+    }
+    pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+    memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
+    if (memexport_used_vertex) {
+      if (!device_properties.vertexPipelineStoresAndAtomics) {
+        REXGPU_ERROR(
+            "Vertex shader memexport draw encountered without "
+            "vertexPipelineStoresAndAtomics support");
+        return false;
+      }
+      draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
+    }
+
+    // Pixel shader analysis.
+    primitive_polygonal = draw_util::IsPrimitivePolygonal(regs);
+    is_rasterization_done = draw_util::IsRasterizationPotentiallyDone(regs, primitive_polygonal);
+    if (surface_pitch_is_zero && is_rasterization_done) {
+      // Doesn't actually draw.
+      // Unlikely that zero would even really be legal though.
+      return true;
+    }
+    if (is_rasterization_done) {
+      // See xenos::EdramMode for explanation why the pixel shader is only used
+      // when it's kColorDepth here.
+      if (edram_mode == xenos::EdramMode::kColorDepth) {
+        pixel_shader = static_cast<VulkanShader*>(active_pixel_shader());
+        if (pixel_shader) {
+          pipeline_cache_->AnalyzeShaderUcode(*pixel_shader);
+          if (!draw_util::IsPixelShaderNeededWithRasterization(*pixel_shader, regs)) {
+            pixel_shader = nullptr;
+          }
+        }
+      }
+    } else {
+      // Disabling pixel shader for this case is also required by the pipeline
+      // cache.
+      if (!memexport_used_vertex) {
+        // This draw has no effect.
+        return true;
+      }
+    }
+    memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
+    template_transfers_before =
+        template_stats && fh1_native_executor_ ? fh1_native_executor_->transfer_count() : 0;
+    template_uploads_before =
+        template_stats ? shared_memory_->upload_request_count() : 0;
+    if (template_stats) {
+      // What a compiled replay would key on: everything the draw's derivation
+      // reads except the float, bool and loop constants it uploads. Five parts,
+      // so the statistics can tell which one varies.
+      auto mix = [](uint64_t& hash, uint64_t value) {
+        hash = (hash ^ value) * UINT64_C(0xBF58476D1CE4E5B9);
+        hash ^= hash >> 31;
+      };
+      uint64_t parts[6] = {state_hash_, 0, 0, 0, 0, 0};
+      mix(parts[1], uint64_t(uintptr_t(vertex_shader)));
+      mix(parts[1], uint64_t(uintptr_t(pixel_shader)));
+      mix(parts[1], uint64_t(prim_type) << 32 | index_count);
+      mix(parts[1], uint64_t(edram_mode) << 1 | uint64_t(major_mode_explicit));
+      if (index_buffer_info) {
+        mix(parts[2], uint64_t(index_buffer_info->guest_base) << 32 | index_buffer_info->count);
+        mix(parts[2], uint64_t(index_buffer_info->format) << 8 |
+                          uint64_t(index_buffer_info->endianness));
+      }
+      for (const VulkanShader* shader : {vertex_shader, pixel_shader}) {
+        if (!shader) continue;
+        for (const Shader::TextureBinding& binding : shader->texture_bindings()) {
+          const uint32_t* words =
+              &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + binding.fetch_constant * 6];
+          for (uint32_t i = 0; i < 6; i += 2) {
+            mix(parts[3], uint64_t(words[i]) << 32 | words[i + 1]);
+          }
+        }
+      }
+      const Shader::ConstantRegisterMap& vertex_map = vertex_shader->constant_register_map();
+      for (uint32_t i = 0; i < 3; ++i) {
+        uint32_t bits = vertex_map.vertex_fetch_bitmap[i];
+        uint32_t bit;
+        while (rex::bit_scan_forward(bits, &bit)) {
+          bits &= ~(UINT32_C(1) << bit);
+          const uint32_t* words =
+              &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + (i * 32 + bit) * 2];
+          mix(parts[4], uint64_t(words[0]) << 32 | words[1]);
+        }
+      }
+      // Part 5: the float, bool and loop constants the shaders read.
+      for (const VulkanShader* shader : {vertex_shader, pixel_shader}) {
+        if (!shader) continue;
+        const Shader::ConstantRegisterMap& map = shader->constant_register_map();
+        const uint32_t* base = &regs.values[shader == vertex_shader
+                                                ? XE_GPU_REG_SHADER_CONSTANT_000_X
+                                                : XE_GPU_REG_SHADER_CONSTANT_256_X];
+        for (uint32_t word = 0; word < 4; ++word) {
+          uint64_t bits = map.float_bitmap[word];
+          while (bits) {
+            const uint32_t bit = uint32_t(std::countr_zero(bits));
+            bits &= bits - 1;
+            const uint32_t* c = base + (word * 64 + bit) * 4;
+            mix(parts[5], uint64_t(c[0]) << 32 | c[1]);
+            mix(parts[5], uint64_t(c[2]) << 32 | c[3]);
+          }
+        }
+      }
+      for (uint32_t i = 0; i < 8 + 32; ++i) {
+        mix(parts[5], regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + i]);
+      }
+      TemplateStatsDraw(parts);
+    }
+    if (memexport_used_pixel) {
+      if (!device_properties.fragmentStoresAndAtomics) {
+        REXGPU_ERROR(
+            "Pixel shader memexport draw encountered without "
+            "fragmentStoresAndAtomics support");
+        return false;
+      }
+      draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
+    }
+    normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
+
+    interpolator_mask =
+        pixel_shader ? (vertex_shader->writes_interpolators() &
+                        pixel_shader->GetInterpolatorInputMask(regs.Get<reg::SQ_PROGRAM_CNTL>(),
+                                                               regs.Get<reg::SQ_CONTEXT_MISC>(),
+                                                               ps_param_gen_pos))
+                     : 0;
+
+    // The memo tables (about 1 MB together) miss the cache on most draws:
+    // fetch the entries this draw will read while primitives and samplers are
+    // processed. A wrong guess (the pipeline's render pass key is the last
+    // draw's) only costs the prefetch.
+    normalized_color_mask =
+        pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
+                     : 0;
+    prefetch(&translation_memos_[StateMemoSlot(
+                 memo_state, uint64_t(uintptr_t(vertex_shader)),
+                 uint64_t(uintptr_t(pixel_shader)) ^ uint64_t(interpolator_mask) << 1)],
+             sizeof(TranslationMemo));
+    prefetch(&viewport_memos_[StateMemoSlot(
+                 memo_state, uint64_t(uintptr_t(pixel_shader)),
+                 uint64_t(normalized_depth_control.value) << 32 | normalized_color_mask)],
+             sizeof(ViewportMemo));
+  }
 
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
   SpirvShaderTranslator::Modification vertex_shader_modification;
@@ -6068,8 +6198,14 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     }
 
     // Process primitives.
-    if (!primitive_processor_->Process(primitive_processing_result)) {
-      return draw_fail("primitive_processing");
+    if (program_hit) {
+      // NA-2.4: the recorded result; its index range is in a live version.
+      primitive_processing_result = program_draw->primitive;
+    } else {
+      draw_program_stats_.derived_primitives += program_draw && !i;
+      if (!primitive_processor_->Process(primitive_processing_result)) {
+        return draw_fail("primitive_processing");
+      }
     }
     DrawCostMark(kCostPrimitives);
     if (!primitive_processing_result.host_draw_vertex_count) {
@@ -6102,88 +6238,100 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     // register state and shaders are the last draw's.
     const uint32_t guest_prim_type = uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type);
     // UP-1.7: scene draws write their object slot.
-    const bool object_slot = pixel_shader && fh1_native_executor_ &&
-                             fh1_native_executor_->IsSceneObjectDraw(*vertex_shader);
+    const bool object_slot = program_hit ? program_draw->object_slot
+                                         : pixel_shader && fh1_native_executor_ &&
+                                               fh1_native_executor_->IsSceneObjectDraw(*vertex_shader);
     object_slot_draws_ += uint32_t(object_slot && !i);
-    TranslationMemo& translation_memo = translation_memos_[StateMemoSlot(
-        memo_state, uint64_t(uintptr_t(vertex_shader)),
-        uint64_t(uintptr_t(pixel_shader)) ^ uint64_t(interpolator_mask) << 1)];
-    if (translation_memo.state_epoch == memo_state &&
-        translation_memo.guest_prim_type == guest_prim_type &&
-        translation_memo.vertex_shader == vertex_shader &&
-        translation_memo.pixel_shader == pixel_shader &&
-        translation_memo.host_vertex_shader_type ==
-            uint32_t(primitive_processing_result.host_vertex_shader_type) &&
-        translation_memo.interpolator_mask == interpolator_mask &&
-        translation_memo.ps_param_gen_pos == ps_param_gen_pos &&
-        translation_memo.depth_control == normalized_depth_control.value &&
-        translation_memo.object_slot == object_slot) {
-      vertex_shader_modification = translation_memo.vertex_modification;
-      pixel_shader_modification = translation_memo.pixel_modification;
-      vertex_shader_translation = translation_memo.vertex_translation;
-      pixel_shader_translation = translation_memo.pixel_translation;
+    if (program_hit) {
+      // NA-2.4: the recorded modifications and translations (ready when
+      // recorded, and translations are never dropped).
+      vertex_shader_modification = program_draw->vertex_modification;
+      pixel_shader_modification = program_draw->pixel_modification;
+      vertex_shader_translation = program_draw->vertex_translation;
+      pixel_shader_translation = program_draw->pixel_translation;
     } else {
-      vertex_shader_modification = pipeline_cache_->GetCurrentVertexShaderModification(
-          *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask,
-          ps_param_gen_pos != UINT32_MAX);
-      pixel_shader_modification =
-          pixel_shader ? pipeline_cache_->GetCurrentPixelShaderModification(
-                             *pixel_shader, interpolator_mask, ps_param_gen_pos,
-                             normalized_depth_control)
-                       : SpirvShaderTranslator::Modification(0);
-      if (object_slot) {
-        pixel_shader_modification.pixel.object_slot_output = 1;
-      }
-
-      // Translate the shaders now to obtain the sampler bindings.
-      vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
-          vertex_shader->GetOrCreateTranslation(vertex_shader_modification.value));
-      pixel_shader_translation =
-          pixel_shader ? static_cast<VulkanShader::VulkanTranslation*>(
-                             pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
-                       : nullptr;
-      VulkanPipelineCache::TranslationRequest translation_request =
-          pipeline_cache_->RequestShadersTranslated(vertex_shader_translation,
-                                                    pixel_shader_translation);
-      bool memo_translation = true;
-      if (object_slot &&
-          translation_request == VulkanPipelineCache::TranslationRequest::kPending) {
-        // The slot-writing variant is translated for the first time: drawn
-        // without the slot (camera motion) until it is ready.
-        pixel_shader_modification.pixel.object_slot_output = 0;
-        pixel_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
-            pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value));
-        translation_request = pipeline_cache_->RequestShadersTranslated(
-            vertex_shader_translation, pixel_shader_translation);
-        memo_translation = false;
-        ++object_slot_fallback_draws_;
-      }
-      if (translation_request != VulkanPipelineCache::TranslationRequest::kReady) {
-        translation_memo.state_epoch = 0;
-        if (translation_request == VulkanPipelineCache::TranslationRequest::kPending) {
-          // A worker is translating a shader seen for the first time: skipped
-          // like a draw whose pipeline is still being built.
-          frame_used_async_placeholder_pipeline_ = true;
-          return true;
+      draw_program_stats_.derived_translation += program_draw && !i;
+      TranslationMemo& translation_memo = translation_memos_[StateMemoSlot(
+          memo_state, uint64_t(uintptr_t(vertex_shader)),
+          uint64_t(uintptr_t(pixel_shader)) ^ uint64_t(interpolator_mask) << 1)];
+      if (translation_memo.state_epoch == memo_state &&
+          translation_memo.guest_prim_type == guest_prim_type &&
+          translation_memo.vertex_shader == vertex_shader &&
+          translation_memo.pixel_shader == pixel_shader &&
+          translation_memo.host_vertex_shader_type ==
+              uint32_t(primitive_processing_result.host_vertex_shader_type) &&
+          translation_memo.interpolator_mask == interpolator_mask &&
+          translation_memo.ps_param_gen_pos == ps_param_gen_pos &&
+          translation_memo.depth_control == normalized_depth_control.value &&
+          translation_memo.object_slot == object_slot) {
+        vertex_shader_modification = translation_memo.vertex_modification;
+        pixel_shader_modification = translation_memo.pixel_modification;
+        vertex_shader_translation = translation_memo.vertex_translation;
+        pixel_shader_translation = translation_memo.pixel_translation;
+      } else {
+        vertex_shader_modification = pipeline_cache_->GetCurrentVertexShaderModification(
+            *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask,
+            ps_param_gen_pos != UINT32_MAX);
+        pixel_shader_modification =
+            pixel_shader ? pipeline_cache_->GetCurrentPixelShaderModification(
+                               *pixel_shader, interpolator_mask, ps_param_gen_pos,
+                               normalized_depth_control)
+                         : SpirvShaderTranslator::Modification(0);
+        if (object_slot) {
+          pixel_shader_modification.pixel.object_slot_output = 1;
         }
-        return draw_fail("shader_translation");
+
+        // Translate the shaders now to obtain the sampler bindings.
+        vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
+            vertex_shader->GetOrCreateTranslation(vertex_shader_modification.value));
+        pixel_shader_translation =
+            pixel_shader ? static_cast<VulkanShader::VulkanTranslation*>(
+                               pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
+                         : nullptr;
+        VulkanPipelineCache::TranslationRequest translation_request =
+            pipeline_cache_->RequestShadersTranslated(vertex_shader_translation,
+                                                      pixel_shader_translation);
+        bool memo_translation = true;
+        if (object_slot &&
+            translation_request == VulkanPipelineCache::TranslationRequest::kPending) {
+          // The slot-writing variant is translated for the first time: drawn
+          // without the slot (camera motion) until it is ready.
+          pixel_shader_modification.pixel.object_slot_output = 0;
+          pixel_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
+              pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value));
+          translation_request = pipeline_cache_->RequestShadersTranslated(
+              vertex_shader_translation, pixel_shader_translation);
+          memo_translation = false;
+          program_recordable = false;
+          ++object_slot_fallback_draws_;
+        }
+        if (translation_request != VulkanPipelineCache::TranslationRequest::kReady) {
+          translation_memo.state_epoch = 0;
+          if (translation_request == VulkanPipelineCache::TranslationRequest::kPending) {
+            // A worker is translating a shader seen for the first time: skipped
+            // like a draw whose pipeline is still being built.
+            frame_used_async_placeholder_pipeline_ = true;
+            return true;
+          }
+          return draw_fail("shader_translation");
+        }
+        translation_memo.state_epoch = memo_translation ? memo_state : 0;
+        translation_memo.object_slot = object_slot;
+        translation_memo.vertex_shader = vertex_shader;
+        translation_memo.pixel_shader = pixel_shader;
+        translation_memo.host_vertex_shader_type =
+            uint32_t(primitive_processing_result.host_vertex_shader_type);
+        translation_memo.guest_prim_type = guest_prim_type;
+        translation_memo.interpolator_mask = interpolator_mask;
+        translation_memo.ps_param_gen_pos = ps_param_gen_pos;
+        translation_memo.depth_control = normalized_depth_control.value;
+        translation_memo.vertex_modification = vertex_shader_modification;
+        translation_memo.pixel_modification = pixel_shader_modification;
+        translation_memo.vertex_translation = vertex_shader_translation;
+        translation_memo.pixel_translation = pixel_shader_translation;
       }
-      translation_memo.state_epoch = memo_translation ? memo_state : 0;
-      translation_memo.object_slot = object_slot;
-      translation_memo.vertex_shader = vertex_shader;
-      translation_memo.pixel_shader = pixel_shader;
-      translation_memo.host_vertex_shader_type =
-          uint32_t(primitive_processing_result.host_vertex_shader_type);
-      translation_memo.guest_prim_type = guest_prim_type;
-      translation_memo.interpolator_mask = interpolator_mask;
-      translation_memo.ps_param_gen_pos = ps_param_gen_pos;
-      translation_memo.depth_control = normalized_depth_control.value;
-      translation_memo.vertex_modification = vertex_shader_modification;
-      translation_memo.pixel_modification = pixel_shader_modification;
-      translation_memo.vertex_translation = vertex_shader_translation;
-      translation_memo.pixel_translation = pixel_shader_translation;
     }
-    if (!i) {
+    if (!i && !program_hit) {
       prefetch(&pipeline_memos_[StateMemoSlot(
                    memo_state, uint64_t(uintptr_t(vertex_shader_translation)),
                    uint64_t(uintptr_t(pixel_shader_translation)) ^
@@ -6440,9 +6588,10 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   }
 
   DrawCostMark(kCostTextures);
-  const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
+  const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider = nullptr;
   // Set up the render targets - this may perform dispatches and draws.
   Fh1DrawInfo fh1_draw;
+  reg::RB_DEPTHCONTROL census_depth_control;
   VulkanRenderTargetCache::RenderPassKey fh1_render_pass_key;
   if (fh1_native_executor_) {
     {
@@ -6465,6 +6614,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         }
       }
     }
+    census_depth_control = normalized_depth_control;
+    if (fh1_native_executor_->VisNoDepth()) normalized_depth_control.z_enable = 0;
     fh1_draw.memexport = memexport_writes_possible;
     fh1_draw.occlusion_query_active = active_occlusion_query_.valid;
     fh1_draw.rasterization_done = is_rasterization_done;
@@ -6497,58 +6648,70 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   // Create the pipeline (for this, need the render pass from the render target
   // cache), translating the shaders - doing this now to obtain the used
   // textures.
-  VkPipeline pipeline;
+  VkPipeline pipeline = VK_NULL_HANDLE;
   void* pipeline_handle = nullptr;
   const VulkanRenderTargetCache::RenderPassKey pipeline_render_pass_key =
       fh1_native_executor_ ? fh1_render_pass_key
                            : render_target_cache_->last_update_render_pass_key();
   last_pipeline_render_pass_key_ = pipeline_render_pass_key.key;
-  PipelineMemo& memo = pipeline_memos_[StateMemoSlot(
-      memo_state, uint64_t(uintptr_t(vertex_shader_translation)),
-      uint64_t(uintptr_t(pixel_shader_translation)) ^
-          uint64_t(pipeline_render_pass_key.key) << 3 ^ uint64_t(normalized_color_mask) << 35)];
-  if (memo.handle && memo.state_epoch == memo_state &&
-      memo.vertex_translation == vertex_shader_translation &&
-      memo.pixel_translation == pixel_shader_translation &&
-      memo.host_primitive_type == uint32_t(primitive_processing_result.host_primitive_type) &&
-      memo.tessellation_mode == uint32_t(primitive_processing_result.tessellation_mode) &&
-      memo.host_primitive_reset_enabled ==
-          primitive_processing_result.host_primitive_reset_enabled &&
-      memo.normalized_depth_control == normalized_depth_control.value &&
-      memo.normalized_color_mask == normalized_color_mask &&
-      memo.render_pass_key == pipeline_render_pass_key.key) {
-    // The description would be the same: the register state it reads has not
-    // changed, nor have the shaders, primitive or render pass.
-    pipeline = memo.pipeline;
-    pipeline_layout_provider = memo.layout;
-    pipeline_handle = memo.handle;
+  // NA-2.4: the recorded pipeline while the render pass is the recorded one
+  // (the handle follows asynchronous hot swaps below).
+  const bool program_pipeline =
+      program_hit && program_draw->render_pass_key == pipeline_render_pass_key.key;
+  if (program_hit && !program_pipeline) ++draw_program_stats_.miss[kMissTargets];
+  if (program_pipeline) {
+    pipeline_handle = program_draw->pipeline_handle;
   } else {
-    if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
-                                            primitive_processing_result, normalized_depth_control,
-                                            normalized_color_mask, pipeline_render_pass_key,
-                                            pipeline, pipeline_layout_provider,
-                                            &pipeline_handle)) {
-      memo.handle = nullptr;
-      return draw_fail("configure_pipeline");
+    draw_program_stats_.derived_pipeline += program_draw != nullptr;
+    PipelineMemo& memo = pipeline_memos_[StateMemoSlot(
+        memo_state, uint64_t(uintptr_t(vertex_shader_translation)),
+        uint64_t(uintptr_t(pixel_shader_translation)) ^
+            uint64_t(pipeline_render_pass_key.key) << 3 ^ uint64_t(normalized_color_mask) << 35)];
+    if (memo.handle && memo.state_epoch == memo_state &&
+        memo.vertex_translation == vertex_shader_translation &&
+        memo.pixel_translation == pixel_shader_translation &&
+        memo.host_primitive_type == uint32_t(primitive_processing_result.host_primitive_type) &&
+        memo.tessellation_mode == uint32_t(primitive_processing_result.tessellation_mode) &&
+        memo.host_primitive_reset_enabled ==
+            primitive_processing_result.host_primitive_reset_enabled &&
+        memo.normalized_depth_control == normalized_depth_control.value &&
+        memo.normalized_color_mask == normalized_color_mask &&
+        memo.render_pass_key == pipeline_render_pass_key.key) {
+      // The description would be the same: the register state it reads has not
+      // changed, nor have the shaders, primitive or render pass.
+      pipeline = memo.pipeline;
+      pipeline_layout_provider = memo.layout;
+      pipeline_handle = memo.handle;
+    } else {
+      if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
+                                              primitive_processing_result, normalized_depth_control,
+                                              normalized_color_mask, pipeline_render_pass_key,
+                                              pipeline, pipeline_layout_provider,
+                                              &pipeline_handle)) {
+        memo.handle = nullptr;
+        return draw_fail("configure_pipeline");
+      }
+      memo.state_epoch = memo_state;
+      memo.vertex_translation = vertex_shader_translation;
+      memo.pixel_translation = pixel_shader_translation;
+      memo.host_primitive_type = uint32_t(primitive_processing_result.host_primitive_type);
+      memo.tessellation_mode = uint32_t(primitive_processing_result.tessellation_mode);
+      memo.host_primitive_reset_enabled = primitive_processing_result.host_primitive_reset_enabled;
+      memo.normalized_depth_control = normalized_depth_control.value;
+      memo.normalized_color_mask = normalized_color_mask;
+      memo.render_pass_key = pipeline_render_pass_key.key;
+      memo.pipeline = pipeline;
+      memo.layout = pipeline_layout_provider;
+      memo.handle = pipeline_handle;
     }
-    memo.state_epoch = memo_state;
-    memo.vertex_translation = vertex_shader_translation;
-    memo.pixel_translation = pixel_shader_translation;
-    memo.host_primitive_type = uint32_t(primitive_processing_result.host_primitive_type);
-    memo.tessellation_mode = uint32_t(primitive_processing_result.tessellation_mode);
-    memo.host_primitive_reset_enabled = primitive_processing_result.host_primitive_reset_enabled;
-    memo.normalized_depth_control = normalized_depth_control.value;
-    memo.normalized_color_mask = normalized_color_mask;
-    memo.render_pass_key = pipeline_render_pass_key.key;
-    memo.pipeline = pipeline;
-    memo.layout = pipeline_layout_provider;
-    memo.handle = pipeline_handle;
   }
   bool pipeline_is_placeholder = false;
   // Reload the current handle state to observe async hot-swap completions that
   // may happen between pipeline configuration and binding.
   pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline, pipeline_layout_provider,
                                                 &pipeline_is_placeholder);
+  // A program keeps only built pipelines.
+  if (pipeline_is_placeholder) program_recordable = false;
   if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder &&
       pixel_shader_modification.pixel.object_slot_output) {
     // UP-1.7: the slot-writing variant's pipeline is new even when the base
@@ -6693,51 +6856,54 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   const double hud_squeeze = REXCVAR_GET(fh1_hud_squeeze);
   // The HUD scale and safe zone shrink or grow the HUD around the centre,
   // only for HUD draws over this frame's scene (fh1_native_executor).
-  const double hud_scale =
-      fh1_native_executor_ && fh1_native_executor_->IsHudDraw() &&
-              !REXCVAR_GET(fh1_hud_scale_suspended)
-          ? REXCVAR_GET(fh1_hud_scale) * (1.0 - 2.0 * REXCVAR_GET(fh1_hud_safe_zone))
-          : 1.0;
+  const double hud_scale = hud_scale_now();
   const uint32_t viewport_resolution_scale = draw_resolution_scale_x | draw_resolution_scale_y << 16;
-  ViewportMemo& viewport_memo = viewport_memos_[StateMemoSlot(
-      memo_state, uint64_t(uintptr_t(pixel_shader)),
-      uint64_t(normalized_depth_control.value) << 32 | normalized_color_mask)];
-  if (viewport_memo.state_epoch == memo_state && viewport_memo.pixel_shader == pixel_shader &&
-      viewport_memo.depth_control == normalized_depth_control.value &&
-      viewport_memo.color_mask == normalized_color_mask &&
-      viewport_memo.resolution_scale == viewport_resolution_scale &&
-      viewport_memo.hud_squeeze == hud_squeeze && viewport_memo.hud_scale == hud_scale) {
-    viewport_info = viewport_memo.info;
+  if (program_hit) {
+    viewport_info = program_draw->viewport;
   } else {
-    draw_util::GetHostViewportInfo(
-        regs, draw_resolution_scale_x, draw_resolution_scale_y, false,
-        device_properties.maxViewportDimensions[0], device_properties.maxViewportDimensions[1],
-        true, normalized_depth_control,
-        host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader(),
-        host_render_targets_used, pixel_shader && pixel_shader->writes_depth(), viewport_info);
-    // FH1's HUD under Hor+, as on D3D12 (fh1_hud_squeeze): its draws into the
-    // front buffer's 2_10_10_10_AS_10_10_10_10 view keep 16:9 proportions.
-    if (hud_squeeze > 1.0 && normalized_color_mask &&
-        regs.Get<reg::RB_COLOR_INFO>(XE_GPU_REG_RB_COLOR_INFO).color_format ==
-            xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10) {
-      viewport_info.ndc_scale[0] = float(viewport_info.ndc_scale[0] / hud_squeeze);
-      viewport_info.ndc_offset[0] = float(viewport_info.ndc_offset[0] / hud_squeeze);
-    }
-    if (hud_scale != 1.0) {
-      for (uint32_t i = 0; i < 2; ++i) {
-        viewport_info.ndc_scale[i] = float(viewport_info.ndc_scale[i] * hud_scale);
-        viewport_info.ndc_offset[i] = float(viewport_info.ndc_offset[i] * hud_scale);
+    draw_program_stats_.derived_viewport += program_draw != nullptr;
+    ViewportMemo& viewport_memo = viewport_memos_[StateMemoSlot(
+        memo_state, uint64_t(uintptr_t(pixel_shader)),
+        uint64_t(normalized_depth_control.value) << 32 | normalized_color_mask)];
+    if (viewport_memo.state_epoch == memo_state && viewport_memo.pixel_shader == pixel_shader &&
+        viewport_memo.depth_control == normalized_depth_control.value &&
+        viewport_memo.color_mask == normalized_color_mask &&
+        viewport_memo.resolution_scale == viewport_resolution_scale &&
+        viewport_memo.hud_squeeze == hud_squeeze && viewport_memo.hud_scale == hud_scale) {
+      viewport_info = viewport_memo.info;
+    } else {
+      draw_util::GetHostViewportInfo(
+          regs, draw_resolution_scale_x, draw_resolution_scale_y, false,
+          device_properties.maxViewportDimensions[0], device_properties.maxViewportDimensions[1],
+          true, normalized_depth_control,
+          host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader(),
+          host_render_targets_used, pixel_shader && pixel_shader->writes_depth(), viewport_info);
+      // FH1's HUD under Hor+, as on D3D12 (fh1_hud_squeeze): its draws into the
+      // front buffer's 2_10_10_10_AS_10_10_10_10 view keep 16:9 proportions.
+      if (hud_squeeze > 1.0 && normalized_color_mask &&
+          regs.Get<reg::RB_COLOR_INFO>(XE_GPU_REG_RB_COLOR_INFO).color_format ==
+              xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10) {
+        viewport_info.ndc_scale[0] = float(viewport_info.ndc_scale[0] / hud_squeeze);
+        viewport_info.ndc_offset[0] = float(viewport_info.ndc_offset[0] / hud_squeeze);
       }
+      if (hud_scale != 1.0) {
+        for (uint32_t i = 0; i < 2; ++i) {
+          viewport_info.ndc_scale[i] = float(viewport_info.ndc_scale[i] * hud_scale);
+          viewport_info.ndc_offset[i] = float(viewport_info.ndc_offset[i] * hud_scale);
+        }
+      }
+      viewport_memo.state_epoch = memo_state;
+      viewport_memo.pixel_shader = pixel_shader;
+      viewport_memo.depth_control = normalized_depth_control.value;
+      viewport_memo.color_mask = normalized_color_mask;
+      viewport_memo.resolution_scale = viewport_resolution_scale;
+      viewport_memo.hud_squeeze = hud_squeeze;
+      viewport_memo.hud_scale = hud_scale;
+      viewport_memo.info = viewport_info;
     }
-    viewport_memo.state_epoch = memo_state;
-    viewport_memo.pixel_shader = pixel_shader;
-    viewport_memo.depth_control = normalized_depth_control.value;
-    viewport_memo.color_mask = normalized_color_mask;
-    viewport_memo.resolution_scale = viewport_resolution_scale;
-    viewport_memo.hud_squeeze = hud_squeeze;
-    viewport_memo.hud_scale = hud_scale;
-    viewport_memo.info = viewport_info;
   }
+  // Recorded before the jitter, which is the frame's.
+  const draw_util::ViewportInfo program_viewport = viewport_info;
   // UP-1.5: a temporal upscaler's sub-pixel jitter, on the scene's draws
   // only (a host pixel is 2 / extent in NDC).
   float jitter_x, jitter_y;
@@ -6754,7 +6920,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   // rate: alpha-tested and killing draws are shaded per block too, their
   // edges in steps of the block.
   draw_coverage_from_shader_ =
-      pixel_shader &&
+      program_hit ? program_draw->coverage_from_shader : pixel_shader &&
       (REXCVAR_GET(fh1_coarse_shading_alpha_test)
            ? bool(regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable)
            : (pixel_shader->kills_pixels() ||
@@ -6897,6 +7063,26 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     }
   }
 
+  // NA-2.3: the recorded draw's index version, or one made for the draw
+  // being recorded (the copy is ordered before the draw like the scratch
+  // copy below).
+  uint32_t program_index_version = UINT32_MAX;
+  const bool program_indices_owned =
+      primitive_processing_result.index_buffer_type ==
+          PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA &&
+      !shader_32bit_index_dma && !memexport_writes_possible;
+  if (program_hit) {
+    program_index_version = program_draw->index_version;
+  } else if (program_recordable && program_indices_owned &&
+             (!program_matched || program_compare)) {
+    const uint32_t index_bytes =
+        primitive_processing_result.host_draw_vertex_count *
+        (primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16 ? 2 : 4);
+    program_index_version =
+        AcquireIndexVersion(primitive_processing_result.guest_index_base, index_bytes);
+    if (program_index_version == UINT32_MAX) program_recordable = false;
+  }
+
   ScratchBufferAcquisition guest_dma_index_scratch_buffer;
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA &&
@@ -6969,18 +7155,25 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   if (fh1_native_executor_) {
     fh1_native_executor_->DiscoverShaderDraw(vertex_shader_translation, pixel_shader_translation);
   }
+  // Draws inside the lists gpu_d3d_program marks, for the NA-3.2 ceiling.
+  const int32_t program_probe = draw_program_ ? REXCVAR_GET(gpu_d3d_program_probe) : 0;
   uint64_t draw_gpu_timing = UINT64_MAX;
   if (fh1_native_executor_ && REXCVAR_GET(fh1_native_gpu_profile_draws)) {
     draw_gpu_timing = fh1_native_executor_->BeginLabelGpuTiming(
         fmt::format("P {:016X}", pixel_shader ? pixel_shader->ucode_data_hash() : 0).c_str());
   }
+  const uint32_t vis_query =
+      fh1_native_executor_
+          ? fh1_native_executor_->VisBegin(fh1_draw, census_depth_control,
+                                           primitive_processing_result.host_draw_vertex_count)
+          : UINT32_MAX;
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
       shader_32bit_index_dma) {
     ++pending_draw_calls_;
-    if (!REXCVAR_GET(fh1_debug_skip_draw_calls)) deferred_command_buffer_.CmdVkDraw(
-        REXCVAR_GET(fh1_debug_tiny_draws)
+    if (!REXCVAR_GET(fh1_debug_skip_draw_calls) && program_probe != 2) deferred_command_buffer_.CmdVkDraw(
+        (REXCVAR_GET(fh1_debug_tiny_draws) || program_probe == 1)
             ? std::min(primitive_processing_result.host_draw_vertex_count, uint32_t(3))
             : primitive_processing_result.host_draw_vertex_count,
         1, 0, 0);
@@ -6988,7 +7181,13 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     std::pair<VkBuffer, VkDeviceSize> index_buffer;
     switch (primitive_processing_result.index_buffer_type) {
       case PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA:
-        if (guest_dma_index_scratch_buffer.buffer() != VK_NULL_HANDLE) {
+        if (program_hit && program_index_version != UINT32_MAX) {
+          IndexVersion& version = index_versions_[program_index_version];
+          index_buffer.first = index_arena_buffer_;
+          index_buffer.second = version.offset;
+          version.last_submission = GetCurrentSubmission();
+          ++draw_program_stats_.index_hits;
+        } else if (guest_dma_index_scratch_buffer.buffer() != VK_NULL_HANDLE) {
           index_buffer.first = guest_dma_index_scratch_buffer.buffer();
           index_buffer.second = 0;
         } else {
@@ -7015,8 +7214,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
             ? VK_INDEX_TYPE_UINT16
             : VK_INDEX_TYPE_UINT32);
     ++pending_draw_calls_;
-    if (!REXCVAR_GET(fh1_debug_skip_draw_calls)) deferred_command_buffer_.CmdVkDrawIndexed(
-        REXCVAR_GET(fh1_debug_tiny_draws)
+    if (!REXCVAR_GET(fh1_debug_skip_draw_calls) && program_probe != 2) deferred_command_buffer_.CmdVkDrawIndexed(
+        (REXCVAR_GET(fh1_debug_tiny_draws) || program_probe == 1)
             ? std::min(primitive_processing_result.host_draw_vertex_count, uint32_t(3))
             : primitive_processing_result.host_draw_vertex_count,
         1,
@@ -7030,6 +7229,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
 #endif
   Checkpoint(CheckpointKind::kDrawEnd);
   if (fh1_native_executor_) {
+    fh1_native_executor_->VisEnd(vis_query);
     fh1_native_executor_->EndLabelGpuTiming(draw_gpu_timing);
     fh1_native_executor_->NativeDrawIssued(fh1_draw);
   }
@@ -7061,6 +7261,22 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         IssueDraw_MemexportReadbackFullPath(memexport_total_size);
       }
     }
+  }
+
+  if (program_draw && !program_hit && (!program_matched || program_compare)) {
+    DrawProgramRecord(*program_draw, program_recordable, program_compare,
+                      ProgramDrawOutputs{memo_state, prim_type, index_count, major_mode_explicit,
+                                         index_buffer_info != nullptr, vertex_shader,
+                                         pixel_shader, primitive_polygonal, is_rasterization_done,
+                                         normalized_depth_control, normalized_color_mask,
+                                         &primitive_processing_result,
+                                         vertex_shader_modification, pixel_shader_modification,
+                                         vertex_shader_translation, pixel_shader_translation,
+                                         pipeline_render_pass_key.key, pipeline_handle,
+                                         &program_viewport, viewport_resolution_scale,
+                                         hud_squeeze, hud_scale,
+                                         pixel_shader_modification.pixel.object_slot_output != 0,
+                                         program_indices_owned, program_index_version});
   }
 
   DrawCostMark(kCostDraw);

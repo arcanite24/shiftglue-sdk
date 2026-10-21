@@ -159,6 +159,7 @@ struct BuilderContext {
   bool localizeNonVolatiles() const;
   /// True while emitting a `ref_` reference copy for the lockstep verifier.
   bool isReferenceCopy() const;
+  std::string oracleCallee(const rex::codegen::FunctionNode& fn) const;
   /// `__savegprlr_N`, `__restfpr_N` and the other register save/restore helpers.
   static bool isSaveRestoreHelper(std::string_view name);
   /// Write the localized non-volatile GPRs, FPRs and VRs referenced so far to
