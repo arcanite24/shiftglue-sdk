@@ -5281,6 +5281,9 @@ void VulkanCommandProcessor::SubmitBarriersAndBeginFh1Rendering(
     return;
   }
   EndRenderPass();
+  fh1_hoist_slot_ = deferred_command_buffer_.GetSize();
+  fh1_hoist_epoch_ = shared_memory_ ? shared_memory_->invalidation_epoch() : 0;
+  fh1_hoist_slot_valid_ = true;
   deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
   PERF_counter_inc(kGpuRenderings);
   const char* const next_rendering_label = next_rendering_label_;
@@ -5449,6 +5452,7 @@ void VulkanCommandProcessor::FlushCpuVisibleResults() {
 void VulkanCommandProcessor::EndRenderPass(std::source_location caller) {
   assert_true(submission_open_);
   current_fh1_rendering_id_ = 0;
+  fh1_hoist_slot_valid_ = false;
   if (!in_render_pass_) {
     return;
   }
@@ -6210,6 +6214,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   VulkanShader::VulkanTranslation* vertex_shader_translation;
   VulkanShader::VulkanTranslation* pixel_shader_translation;
   bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
+  // Memory export may write pages an upload would be moved ahead of.
+  if (memexport_writes_possible) fh1_hoist_slot_valid_ = false;
 
   DrawCostMark(kCostAnalysis);
   // Two iterations because a submission (even the current one - in which case
@@ -8413,6 +8419,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // the end of the submission (when async pipeline object creation requests
     // are fulfilled).
     deferred_command_buffer_.Reset();
+    fh1_hoist_slot_valid_ = false;
 
     // Reset cached state of the command buffer.
     dynamic_viewport_update_needed_ = true;
@@ -8682,6 +8689,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
         tape = std::make_unique<DeferredCommandBuffer>(*this);
       }
       tape->Swap(deferred_command_buffer_);
+      fh1_hoist_slot_valid_ = false;
       {
         std::lock_guard<std::mutex> lock(submission_worker_mutex_);
         SubmissionJob job{std::move(tape), command_buffer, current_submission_wait_semaphores_,
