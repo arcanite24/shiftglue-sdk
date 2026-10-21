@@ -343,8 +343,11 @@ int LensEye(float fov_y) {
   Bookkeeping& b = B();
   std::lock_guard<std::mutex> lock(b.mutex);
   const uint32_t tag = FovTag(fov_y);
-  if (tag >= kTagCount || !b.ring[tag].valid) return -1;
-  return b.ring[tag].request.eye & 1;
+  if (tag >= kTagCount) return -1;
+  // The frame was drawn for the eye of the request before the one it tags.
+  const uint32_t drawn = (tag + kTagCount - 1) % kTagCount;
+  if (!b.ring[drawn].valid) return -1;
+  return b.ring[drawn].request.eye & 1;
 }
 
 }  // namespace openxr
