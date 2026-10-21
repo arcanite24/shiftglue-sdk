@@ -183,6 +183,8 @@ class Fh1NativeExecutor {
     // (UpscalerFrame).
     float jitter_x;
     float jitter_y;
+    // With SetStereoCamera, the eye the frame was drawn for; -1 otherwise.
+    int eye = -1;
   };
   void SetCameraTrackingEnabled(bool enabled) { camera_tracking_enabled_ = enabled; }
   // After OnSwap: the swapped frame's depth (guest z in [0, 1], R32_SFLOAT,
@@ -208,6 +210,13 @@ class Fh1NativeExecutor {
   // UP-1.5: jitter the scene with a Halton(2, 3) sequence of this length
   // from the next frame (0: none).
   void SetJitterPhases(uint32_t phases) { jitter_phases_ = phases; }
+  // VR's temporal upscaling, the eyes taking turns frame by frame: with the
+  // eye a frame's lens tags (openxr::LensEye), each eye's camera and objects
+  // reproject to that eye's previous frame instead of the other eye's, and
+  // each eye walks a jitter sequence of its own (the odd and even samples of
+  // one Halton(2) sequence lie in opposite halves). Null for one view.
+  using LensEyeFunction = int (*)(float fov_y);
+  void SetStereoCamera(LensEyeFunction lens_eye) { lens_eye_ = lens_eye; }
   // Whether the current draw goes to the scene's color and depth surfaces,
   // and if so this frame's jitter, in host pixels of the surface.
   bool GetSceneJitter(float& x, float& y) const;
@@ -594,6 +603,13 @@ class Fh1NativeExecutor {
   std::vector<CameraDraw> camera_draws_;
   // The previous frame's scene objects and their matrices.
   std::unordered_map<uint64_t, std::array<float, 16>> camera_previous_objects_;
+  // SetStereoCamera: each eye's previous frame's scene objects and object
+  // matrices, and the eye the next frame is expected to be (the other one).
+  LensEyeFunction lens_eye_ = nullptr;
+  std::unordered_map<uint64_t, std::array<float, 16>> camera_previous_objects_eye_[2];
+  std::unordered_map<uint64_t, std::array<float, 16>> object_wvp_eye_[2];
+  int next_eye_ = -1;
+  uint32_t jitter_index_eye_[2] = {};
   Camera camera_ready_ = {};
   bool camera_ready_valid_ = false;
   bool lens_valid_ = false;

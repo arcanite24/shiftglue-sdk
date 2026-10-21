@@ -56,6 +56,11 @@ REXCVAR_DEFINE_INT32(xr_rate_change_ms, 500, "Display",
                      "rate on single frames); 0 follows every frame")
     .range(0, 5000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(xr_simulate_copies, false, "Display",
+                    "Testing: with xr_simulate and no runtime, copy each stereo frame as for "
+                    "a headset (upscaled with xr_upscaler) into an image of its eye, so "
+                    "xr_capture_request saves what a headset would get. Read at start")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_DOUBLE(xr_test_eye_spread, 1.0, "Display",
                       "Testing: spread the headset's eyes this many times wider about the head's "
                       "centre, so captures show which eye each image was rendered for")
@@ -334,6 +339,14 @@ float HeadsetFovX() {
 }
 float PresentedFovY() { return B().presented_fov_y.load(std::memory_order_relaxed); }
 
+int LensEye(float fov_y) {
+  Bookkeeping& b = B();
+  std::lock_guard<std::mutex> lock(b.mutex);
+  const uint32_t tag = FovTag(fov_y);
+  if (tag >= kTagCount || !b.ring[tag].valid) return -1;
+  return b.ring[tag].request.eye & 1;
+}
+
 }  // namespace openxr
 }  // namespace vulkan
 }  // namespace ui
@@ -468,6 +481,13 @@ struct State {
   // sRGB. A blit into an 8-bit UNORM image keeps the encoded values, and a
   // raw copy of those bits into the sRGB image then shows them as sRGB.
   VkImage staging = VK_NULL_HANDLE;
+  // xr_simulate_copies: no session; each eye's copy goes to an image of its
+  // own instead of a headset slot.
+  bool simulated_copies = false;
+  VkImage simulated_target[2] = {};
+  VkDeviceMemory simulated_memory[2] = {};
+  uint32_t simulated_width = 0;
+  uint32_t simulated_height = 0;
   VkDeviceMemory staging_memory = VK_NULL_HANDLE;
   uint32_t staging_width = 0, staging_height = 0;
   // Images replaced on a resize, freed at exit (the GPU may still read them).
@@ -947,6 +967,42 @@ void PollEvents() {
     }
     event = {XR_TYPE_EVENT_DATA_BUFFER};
   }
+}
+
+// xr_simulate_copies: the eyes' images, as a headset slot's.
+bool EnsureSimulatedTargets(uint32_t width, uint32_t height) {
+  State& s = S();
+  if (s.simulated_target[0] != VK_NULL_HANDLE && s.simulated_width == width &&
+      s.simulated_height == height) {
+    return true;
+  }
+  for (int eye = 0; eye < 2; ++eye) {
+    if (s.simulated_target[eye] != VK_NULL_HANDLE) {
+      s.retired.emplace_back(s.simulated_target[eye], s.simulated_memory[eye]);
+      s.simulated_target[eye] = VK_NULL_HANDLE;
+    }
+    VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.format = s.staging_format;
+    image_info.extent = {width, height, 1};
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!util::CreateDedicatedAllocationImage(s.device, image_info,
+                                              util::MemoryPurpose::kDeviceLocal,
+                                              s.simulated_target[eye],
+                                              s.simulated_memory[eye])) {
+      s.simulated_target[eye] = VK_NULL_HANDLE;
+      return false;
+    }
+  }
+  s.simulated_width = width;
+  s.simulated_height = height;
+  return true;
 }
 
 bool ChooseFormat() {
@@ -1690,6 +1746,15 @@ bool CreateDevice(VkInstance instance, VkPhysicalDevice physical_device,
 void OnDeviceCreated(const VulkanInstance* instance, const VulkanDevice* device) {
   std::lock_guard<std::mutex> lock(S().mutex);
   State& s = S();
+  if (device && s.session == XR_NULL_HANDLE && REXCVAR_GET(xr_simulate) &&
+      REXCVAR_GET(xr_simulate_copies)) {
+    s.device = device;
+    s.simulated_copies = true;
+    s.swapchain_format = VK_FORMAT_R8G8B8A8_SRGB;
+    s.staging_format = VK_FORMAT_R8G8B8A8_UNORM;
+    REXLOG_INFO("OpenXR: simulated copies (xr_simulate_copies)");
+    return;
+  }
   if (s.instance == XR_NULL_HANDLE || s.session != XR_NULL_HANDLE || !device) return;
   VkPhysicalDevice wanted = VK_NULL_HANDLE;
   if (s.enable2) {
@@ -1963,6 +2028,27 @@ bool BeginGuestFrame(uint32_t width, uint32_t height, float display_aspect, cons
                      .count());
     }
   } hold{std::chrono::steady_clock::now(), s.guest_hold};
+  if (s.simulated_copies) {
+    if (!tagged || !REXCVAR_GET(xr_stereo) || !EnsureStaging(width, height) ||
+        !EnsureSimulatedTargets(width, height)) {
+      return false;
+    }
+    const int eye = request.eye & 1;
+    if (s.capture_left > 0 && EnsureCaptureBuffer(width, height)) {
+      out.capture = s.capture_buffer;
+      s.capture_recorded = true;
+      s.capture_request = request;
+      s.capture_lens = lens;
+      s.capture_requested_ns = requested_ns;
+      s.capture_recorded_ns = SteadyNs();
+      s.capture_width = width;
+      s.capture_height = height;
+    }
+    out.staging = s.staging;
+    out.target = s.simulated_target[eye];
+    out.eye = eye;
+    return true;
+  }
   if (!s.running || !s.visible || s.session == XR_NULL_HANDLE || !s.device || !ChooseFormat() ||
       !EnsureStaging(width, height)) {
     return false;
@@ -2009,6 +2095,7 @@ bool BeginGuestFrame(uint32_t width, uint32_t height, float display_aspect, cons
     }
     out.staging = s.staging;
     out.target = slot->eye[eye];
+    out.eye = eye;
     return true;
   }
   const TargetIndex index = kScreen;
@@ -2050,7 +2137,7 @@ bool BeginGuestFrame(uint32_t width, uint32_t height, float display_aspect, cons
 void GuestFrameSubmitted() {
   State& s = S();
   std::lock_guard<std::mutex> lock(s.mutex);
-  if (s.session == XR_NULL_HANDLE) return;
+  if (s.session == XR_NULL_HANDLE && !s.simulated_copies) return;
   const auto start = std::chrono::steady_clock::now();
   const VulkanDevice::Functions& dfn = s.device->functions();
   {

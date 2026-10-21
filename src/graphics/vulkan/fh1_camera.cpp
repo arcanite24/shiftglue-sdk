@@ -300,9 +300,11 @@ void Fh1NativeExecutor::AdvanceJitter() {
   camera_ready_.jitter_x = -jitter_x_;
   camera_ready_.jitter_y = -jitter_y_;
   if (jitter_phases_) {
-    jitter_index_ = (jitter_index_ + 1) % jitter_phases_;
-    jitter_x_ = Halton(jitter_index_ + 1, 2) - 0.5f;
-    jitter_y_ = Halton(jitter_index_ + 1, 3) - 0.5f;
+    // With SetStereoCamera, the sequence of the eye the next frame is for.
+    uint32_t& index = next_eye_ >= 0 ? jitter_index_eye_[next_eye_] : jitter_index_;
+    index = (index + 1) % jitter_phases_;
+    jitter_x_ = Halton(index + 1, 2) - 0.5f;
+    jitter_y_ = Halton(index + 1, 3) - 0.5f;
   } else {
     jitter_x_ = 0.0f;
     jitter_y_ = 0.0f;
@@ -336,13 +338,32 @@ void Fh1NativeExecutor::FinishCameraFrame() {
   object_reprojections_.clear();
   object_slot_by_matrix_.clear();
   object_occurrences_.clear();
-  object_previous_wvp_ = std::move(object_current_wvp_);
+  // This frame's object matrices: the next frame's previous ones, or with
+  // SetStereoCamera those of this frame's eye, and the other eye's become
+  // the next frame's.
+  std::unordered_map<uint64_t, std::array<float, 16>> finished_wvp =
+      std::move(object_current_wvp_);
   object_current_wvp_.clear();
+  auto finish_objects = [&](int eye) {
+    if (lens_eye_ && eye >= 0) {
+      object_wvp_eye_[eye] = std::move(finished_wvp);
+      next_eye_ = eye ^ 1;
+      object_previous_wvp_ = std::move(object_wvp_eye_[next_eye_]);
+    } else {
+      object_previous_wvp_ = std::move(finished_wvp);
+      next_eye_ = -1;
+    }
+  };
+  auto lose_eyes = [&] {
+    for (auto& objects : camera_previous_objects_eye_) objects.clear();
+    finish_objects(-1);
+  };
   object_reprojections_ready_.clear();
   if (!camera_tracking_enabled_ || camera_draws_.empty()) {
     camera_scene_depth_valid_ = false;
     camera_draws_.clear();
     camera_previous_objects_.clear();
+    lose_eyes();
     return;
   }
   // The scene's depth: the one most of the matrix draws test against.
@@ -382,6 +403,7 @@ void Fh1NativeExecutor::FinishCameraFrame() {
                        [](const auto& a, const auto& b) { return a.second < b.second; });
   if (world == groups.end() || world->second < kCameraMinWorldDraws) {
     camera_previous_objects_.clear();
+    lose_eyes();
     return;
   }
   const std::array<float, 16>& current = world->first;
@@ -393,9 +415,14 @@ void Fh1NativeExecutor::FinishCameraFrame() {
   const double w_length = RowLength(current, 3);
   if (y_scale <= 0.0 || w_length <= 0.0) {
     camera_previous_objects_ = std::move(objects);
+    lose_eyes();
     return;
   }
   camera.fov_y = float(2.0 * std::atan(1.0 / y_scale));
+  const int eye = lens_eye_ ? lens_eye_(camera.fov_y) : -1;
+  camera.eye = eye;
+  std::unordered_map<uint64_t, std::array<float, 16>>& previous_objects =
+      eye >= 0 ? camera_previous_objects_eye_[eye] : camera_previous_objects_;
   // The OpenXR output reads the tag its host put in the field of view.
   const double x_scale = RowLength(current, 0);
   if (x_scale > 0.0) {
@@ -433,8 +460,8 @@ void Fh1NativeExecutor::FinishCameraFrame() {
   size_t matched = 0;
   for (const auto& [object, wvp] : objects) {
     if (wvp != current) continue;
-    auto previous = camera_previous_objects_.find(object);
-    if (previous == camera_previous_objects_.end()) continue;
+    auto previous = previous_objects.find(object);
+    if (previous == previous_objects.end()) continue;
     ++previous_matches[previous->second];
     ++matched;
   }
@@ -499,7 +526,8 @@ void Fh1NativeExecutor::FinishCameraFrame() {
   }
   camera_ready_ = camera;
   camera_ready_valid_ = true;
-  camera_previous_objects_ = std::move(objects);
+  previous_objects = std::move(objects);
+  finish_objects(eye);
   if (!camera.cut) {
     if (object_reprojections.size() > 1) Count("camera_object_frame");
     if ((frame_ % 600) == 0) {
