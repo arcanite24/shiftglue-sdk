@@ -447,7 +447,9 @@ void Fh1NativeExecutor::FinishCameraFrame() {
         for (int k = 0; k < 3; ++k) m[r][k] = k == c ? b[r] : a[r][k];
       }
       lens_position_[c] = float(det3(m) / d);
-      lens_right_[c] = float(current[c] / x_scale);
+      // The scene is drawn turned 180 degrees (clip x is the screen's
+      // negated), so the x row points to the viewer's left.
+      lens_right_[c] = float(-current[c] / x_scale);
     }
   }
   const double k = z_length / w_length;

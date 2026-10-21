@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <iterator>
 #include <mutex>
 #include <string>
@@ -306,6 +307,10 @@ REXCVAR_DEFINE_DOUBLE(xr_upscale_ratio, 1.5, "Display",
                       "size along each axis (DLSS's Quality mode is 1.5)")
     .range(1.0, 3.0)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(xr_upscale_inputs_dir, "", "Display",
+                      "Testing: with xr_upscaler, save each frame xr_capture_request captures "
+                      "as DLSS gets it (the image, depth and motion, raw) in this directory")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                     "device (falls back to render passes otherwise)")
@@ -3873,6 +3878,9 @@ void VulkanCommandProcessor::DestroyXrUpscaleImages() {
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, xr_inputs_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, xr_inputs_memory_);
+  xr_inputs_size_ = 0;
   for (XrUpscaleCamera& camera : xr_upscale_cameras_) {
     ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, camera.depth_view);
     ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, camera.depth);
@@ -3910,6 +3918,41 @@ void VulkanCommandProcessor::DispatchXrUpscale(const void* data, VkCommandBuffer
   }
 }
 
+void VulkanCommandProcessor::SaveXrUpscaleInputs() {
+  // After GuestFrameSubmitted, which waits for a captured frame's copy.
+  if (!xr_inputs_pending_.pending) return;
+  xr_inputs_pending_.pending = false;
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  void* mapped = nullptr;
+  if (dfn.vkMapMemory(vulkan_device->device(), xr_inputs_memory_, 0, VK_WHOLE_SIZE, 0,
+                      &mapped) != VK_SUCCESS) {
+    return;
+  }
+  VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+  range.memory = xr_inputs_memory_;
+  range.size = VK_WHOLE_SIZE;
+  dfn.vkInvalidateMappedMemoryRanges(vulkan_device->device(), 1, &range);
+  const XrInputsPending& p = xr_inputs_pending_;
+  const std::string directory = REXCVAR_GET(xr_upscale_inputs_dir);
+  std::filesystem::create_directories(directory);
+  const std::string base = directory + "/" + std::to_string(xr_inputs_saved_++) +
+                           (p.eye ? "-right" : "-left");
+  const size_t plane = size_t(p.width) * p.height * 4;
+  const char* names[] = {"-color.a2b10g10r10", "-depth.r32f", "-motion.rg16f"};
+  for (int i = 0; i < 3; ++i) {
+    std::ofstream file(base + names[i], std::ios::binary);
+    file.write(static_cast<const char*>(mapped) + plane * i, std::streamsize(plane));
+  }
+  dfn.vkUnmapMemory(vulkan_device->device(), xr_inputs_memory_);
+  std::ofstream log(directory + "/inputs.jsonl", std::ios::app);
+  log << fmt::format(
+      "{{\"base\":\"{}\",\"eye\":{},\"width\":{},\"height\":{},\"jitter\":[{:.4f},{:.4f}],"
+      "\"reset\":{}}}\n",
+      base.substr(directory.size() + 1), p.eye, p.width, p.height, p.jitter_x, p.jitter_y,
+      p.reset ? "true" : "false");
+}
+
 void VulkanCommandProcessor::RecordXrFrameCopy(VkImage guest_output,
                                                VkImageView guest_output_view, uint32_t width,
                                                uint32_t height, uint32_t output_width,
@@ -3931,16 +3974,16 @@ void VulkanCommandProcessor::RecordXrFrameCopy(VkImage guest_output,
     return b;
   };
 
-  // VR's DLSS: an eye's image with the depth and motion of the swap before
-  // (XrUpscaleCamera) into the output image, which is then copied as the
-  // guest output is otherwise.
+  // VR's DLSS: an eye's image with the depth and motion of this swap's
+  // camera pass (XrUpscaleCamera), from the same frame's draws, into the
+  // output image, which is then copied as the guest output is otherwise.
   const XrUpscaleCamera* upscale_camera = nullptr;
   if (xr_upscaler_ && copy.eye >= 0 && xr_upscale_output_ != VK_NULL_HANDLE &&
       xr_upscale_output_width_ == output_width && xr_upscale_output_height_ == output_height) {
-    const XrUpscaleCamera& previous = xr_upscale_cameras_[xr_upscale_camera_next_ ^ 1];
-    if (previous.valid && previous.eye == copy.eye && previous.width == width &&
-        previous.height == height) {
-      upscale_camera = &previous;
+    const XrUpscaleCamera& camera = xr_upscale_cameras_[xr_upscale_camera_next_];
+    if (camera.valid && camera.eye == copy.eye && camera.width == width &&
+        camera.height == height) {
+      upscale_camera = &camera;
     } else {
       ++xr_upscale_misses_;
     }
@@ -3950,6 +3993,69 @@ void VulkanCommandProcessor::RecordXrFrameCopy(VkImage guest_output,
   }
   VkImage source = guest_output;
   uint32_t source_width = width, source_height = height;
+  if (upscale_camera && copy.capture != VK_NULL_HANDLE &&
+      !REXCVAR_GET(xr_upscale_inputs_dir).empty()) {
+    // xr_upscale_inputs_dir: this frame's DLSS inputs, read back.
+    const VkDeviceSize plane = VkDeviceSize(width) * height * 4;
+    if (xr_inputs_size_ < plane * 3) {
+      const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+      if (xr_inputs_buffer_ != VK_NULL_HANDLE) {
+        vulkan_device->functions().vkDestroyBuffer(vulkan_device->device(), xr_inputs_buffer_,
+                                                   nullptr);
+        vulkan_device->functions().vkFreeMemory(vulkan_device->device(), xr_inputs_memory_,
+                                                nullptr);
+        xr_inputs_buffer_ = VK_NULL_HANDLE;
+        xr_inputs_memory_ = VK_NULL_HANDLE;
+      }
+      xr_inputs_size_ = ui::vulkan::util::CreateDedicatedAllocationBuffer(
+                            vulkan_device, plane * 3, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                            ui::vulkan::util::MemoryPurpose::kReadback, xr_inputs_buffer_,
+                            xr_inputs_memory_)
+                            ? plane * 3
+                            : 0;
+    }
+    if (xr_inputs_size_ >= plane * 3) {
+      const VkImage images[] = {guest_output, upscale_camera->depth, upscale_camera->motion};
+      VkImageMemoryBarrier to_copy[3], from_copy[3];
+      for (int i = 0; i < 3; ++i) {
+        to_copy[i] = barrier(images[i], Presenter::kGuestOutputInternalAccessMask,
+                             VK_ACCESS_TRANSFER_READ_BIT, Presenter::kGuestOutputInternalLayout,
+                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        from_copy[i] = barrier(images[i], VK_ACCESS_TRANSFER_READ_BIT,
+                               Presenter::kGuestOutputInternalAccessMask,
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               Presenter::kGuestOutputInternalLayout);
+      }
+      deferred_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                                                    nullptr, 0, nullptr, 3, to_copy);
+      for (int i = 0; i < 3; ++i) {
+        VkBufferImageCopy region{};
+        region.bufferOffset = plane * i;
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {width, height, 1};
+        deferred_command_buffer_.CmdVkCopyImageToBuffer(
+            images[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, xr_inputs_buffer_, region);
+      }
+      VkBufferMemoryBarrier to_host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+      to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+      to_host.srcQueueFamilyIndex = to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      to_host.buffer = xr_inputs_buffer_;
+      to_host.size = VK_WHOLE_SIZE;
+      deferred_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT |
+                                                        VK_PIPELINE_STAGE_HOST_BIT,
+                                                    0, 0, nullptr, 1, &to_host, 3, from_copy);
+      xr_inputs_pending_.pending = true;
+      xr_inputs_pending_.eye = copy.eye;
+      xr_inputs_pending_.width = width;
+      xr_inputs_pending_.height = height;
+      xr_inputs_pending_.jitter_x = upscale_camera->camera.jitter_x;
+      xr_inputs_pending_.jitter_y = upscale_camera->camera.jitter_y;
+      xr_inputs_pending_.reset = !xr_upscale_history_[copy.eye & 1] || upscale_camera->camera.cut;
+    }
+  }
   if (upscale_camera) {
     const int eye = copy.eye & 1;
     const VkImageMemoryBarrier to_upscale[] = {
@@ -4371,35 +4477,24 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
           fh1_native_executor_->TakeCameraFrame(guest_output_width, guest_output_height, camera);
     }
   }
-
-  // The lens of the frame this swap shows. The executor's lens is of the
-  // frame whose draws just ended, but the title presents the frame before
-  // it: with eyes a metre apart (xr_simulate), each image showed the other
-  // eye than this frame's lens tags, and with the previous lens the one it
-  // tags.
-  ui::vulkan::openxr::Lens xr_lens = xr_lens_drawn_;
-  xr_lens_drawn_ = {};
+  // The lens of the frame this swap shows: the frame whose draws just ended
+  // (with its jitter, measured on simulated still frames: the image's shift
+  // follows that frame's jitter, correlation 0.97, not the frame before's).
+  // Its field of view carries the tag of the camera update after the one
+  // its eye was drawn for, so it goes to the eye and pose of the tag before:
+  // with eyes a metre apart (xr_simulate), each image showed the other eye
+  // than its own tag's, and after a dropped camera update the previous
+  // frame's tag gave the other eye too.
+  ui::vulkan::openxr::Lens xr_lens;
   if (fh1_native_executor_) {
-    xr_lens_drawn_.valid =
-        fh1_native_executor_->TakeLens(xr_lens_drawn_.fov_x, xr_lens_drawn_.fov_y);
-    xr_lens_drawn_.has_position =
-        fh1_native_executor_->TakeLensPosition(xr_lens_drawn_.position, xr_lens_drawn_.right);
-  }
-  // When the title drops a camera update (the frame just drawn does not
-  // carry the tag after the shown lens's), it presents the image before
-  // again instead of the shown lens's frame: the other eye's, in stereo,
-  // which went to this eye (xr_simulate captures, about one swap in 400 with
-  // VR's DLSS). The headset keeps its last pair for this one.
-  bool xr_image_repeated = false;
-  if (xr_lens.valid && xr_lens_drawn_.valid) {
-    const uint32_t shown_tag = ui::vulkan::openxr::FovTag(xr_lens.fov_y);
-    const uint32_t drawn_tag = ui::vulkan::openxr::FovTag(xr_lens_drawn_.fov_y);
-    xr_image_repeated = shown_tag < ui::vulkan::openxr::kTagCount &&
-                        drawn_tag < ui::vulkan::openxr::kTagCount &&
-                        drawn_tag != (shown_tag + 1) % ui::vulkan::openxr::kTagCount;
-    if (xr_image_repeated && (xr_repeated_images_++ % 100) == 0) {
-      REXGPU_INFO("VR: {} repeated images kept from the headset (a camera update dropped)",
-                  xr_repeated_images_);
+    xr_lens.valid = fh1_native_executor_->TakeLens(xr_lens.fov_x, xr_lens.fov_y);
+    xr_lens.has_position =
+        fh1_native_executor_->TakeLensPosition(xr_lens.position, xr_lens.right);
+    const uint32_t tag = ui::vulkan::openxr::FovTag(xr_lens.fov_y);
+    if (xr_lens.valid && tag < ui::vulkan::openxr::kTagCount) {
+      xr_lens.fov_y = float(ui::vulkan::openxr::TagFov(
+          xr_lens.fov_y, (tag + ui::vulkan::openxr::kTagCount - 1) %
+                             ui::vulkan::openxr::kTagCount));
     }
   }
   // The headset's screen shows the guest frame's shape, whatever the draw
@@ -4410,8 +4505,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
           : 0.0f;
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
-      [this, xr_lens, xr_image_repeated, xr_display_aspect, xr_upscale, xr_output_width,
-       xr_output_height, guest_output_width, guest_output_height, display_width,
+      [this, xr_lens, xr_display_aspect, xr_upscale, xr_output_width, xr_output_height,
+       guest_output_width, guest_output_height, display_width,
        display_height, frontbuffer_format, swap_texture_view, swap_post_effect,
        swap_source_needs_rb_swap, hud_snapshot_view, hdr_active, scene_fxaa, scene_lut,
        hudless_wanted, camera_depth_view,
@@ -4959,7 +5054,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
           }
 
           // UP-1.3 and UP-1.4: the depth and camera motion beside it, or with
-          // VR's DLSS in its own pair of images, for the next swap's image.
+          // VR's DLSS in its own pair of images, for this swap's image.
           XrUpscaleCamera* xr_camera =
               xr_upscale ? &xr_upscale_cameras_[xr_upscale_camera_next_] : nullptr;
           if (xr_camera) xr_camera->valid = false;
@@ -5104,7 +5199,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                                    VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
             object_slot_image_initialized_ = true;
             for (VkImage image : {camera_depth_image, camera_motion_image}) {
-              // VR's are read by the next swap's DLSS, in a compute pass.
+              // VR's are read by this swap's DLSS, in a compute pass.
               PushImageMemoryBarrier(image, guest_output_subresource_range,
                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                      xr_camera
@@ -5298,16 +5393,15 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
 
         // The headset's copy of every frame (rex/ui/vulkan/openxr.h).
         ui::vulkan::openxr::FrameCopy xr_copy;
-        const bool xr_frame =
-            !xr_image_repeated &&
-            ui::vulkan::openxr::BeginGuestFrame(xr_output_width, xr_output_height,
-                                                xr_display_aspect, xr_lens, xr_copy);
+        const bool xr_frame = ui::vulkan::openxr::BeginGuestFrame(
+            xr_output_width, xr_output_height, xr_display_aspect, xr_lens, xr_copy);
         if (xr_frame) {
           RecordXrFrameCopy(vulkan_context.image(), vulkan_context.image_view(),
                             guest_output_width, guest_output_height, xr_output_width,
                             xr_output_height, xr_copy);
         }
-        // The next swap's image is this swap's camera pass's.
+        // The next swap's camera pass writes the other pair, which this
+        // swap's DLSS is not reading.
         if (xr_upscale) xr_upscale_camera_next_ ^= 1;
 
         // Need to submit all the commands before giving the image back to the
@@ -5345,13 +5439,15 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
         if (xr_frame) {
           // The headset may show the frame once its copy is on the queue.
           if (present_deferred_presenter_) {
-            pending_present_notify_ = [notify = std::move(pending_present_notify_)]() {
+            pending_present_notify_ = [this, notify = std::move(pending_present_notify_)]() {
               ui::vulkan::openxr::GuestFrameSubmitted();
+              SaveXrUpscaleInputs();
               if (notify) notify();
             };
           } else {
             if (async_submission_) AwaitSubmissionWorker();
             ui::vulkan::openxr::GuestFrameSubmitted();
+            SaveXrUpscaleInputs();
           }
         }
         ++presented_output_frames_;

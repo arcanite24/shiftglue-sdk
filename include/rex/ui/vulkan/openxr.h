@@ -96,8 +96,10 @@ float HeadsetFovX();
 // tagged frame (radians), or 0: lets the host tell its main camera from
 // render-to-texture cameras.
 float PresentedFovY();
-// The eye a frame was requested for, from the tag in its field of view
-// (Lens::fov_y), or -1 when it carries none. Any thread.
+// The eye a frame was drawn for, from the tag in its field of view
+// (Lens::fov_y): the eye of the request before the tagged one (the tag runs
+// one camera update ahead of the eye's position). -1 when it carries none.
+// Any thread.
 int LensEye(float fov_y);
 
 // The tag in a vertical field of view (rex/ui/xr.h).
