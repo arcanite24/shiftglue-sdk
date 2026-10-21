@@ -155,6 +155,10 @@ REXCVAR_DEFINE_BOOL(fh1_debug_skip_clears, false, "GPU",
                     "Diagnostics: skip every EDRAM clear (wrong image), to bound what clears "
                     "cost")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(fh1_debug_skip_resolves, "", "GPU",
+                      "Diagnostics: skip the resolve dispatches whose source and size, written "
+                      "<surface>@<width>x<height>, are in this list, to see what they feed")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_debug_skip_resolve_dispatches, false, "GPU",
                     "Diagnostics: keep every resolve's barriers but not its compute dispatch "
                     "(wrong image), to bound what the resolve shaders cost (Vulkan)")
@@ -2935,7 +2939,14 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   command_processor_.BeginDebugLabel(image_view != VK_NULL_HANDLE ? "fh1 resolve and texture"
                                                                   : "fh1 resolve");
   // 16x16 groups, as fh1_native_resolve_memory.cs.hlsl's Vulkan variants.
-  if (!REXCVAR_GET(fh1_debug_skip_resolve_dispatches)) {
+  static const std::string skip_resolves = REXCVAR_GET(fh1_debug_skip_resolves);
+  const bool skip_this =
+      !skip_resolves.empty() &&
+      skip_resolves.find(fmt::format("{}@{}x{}", surface.key.Describe(),
+                                     source.rect.right - source.rect.left,
+                                     source.rect.bottom - source.rect.top)) != std::string::npos;
+  if (skip_this) Count("debug_resolve_skipped");
+  if (!REXCVAR_GET(fh1_debug_skip_resolve_dispatches) && !skip_this) {
     command_buffer.CmdVkDispatch((uint32_t(rect.right - rect.left) + 15) / 16,
                                  (uint32_t(rect.bottom - rect.top) + 15) / 16, 1);
   }
