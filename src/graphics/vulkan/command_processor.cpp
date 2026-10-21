@@ -144,6 +144,10 @@ REXCVAR_DEFINE_STRING(fh1_debug_draw_state_path, "", "GPU",
                       "hashes, alpha test, alpha to coverage, pixel kill, MSAA, primitive, index "
                       "count) to this file, for finding which draws use which coverage technique")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_UINT64(fh1_debug_skip_pixel_shader, 0, "GPU",
+                      "Diagnostics: skip the draws with this pixel shader (its ucode hash, as "
+                      "the per-shader GPU profile names it), to bound what it costs")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_STRING(fh1_debug_skip_coverage, "", "GPU",
                       "Diagnostics: skip the draws that use alpha to coverage (a2c; a2cdither: "
                       "only those with per-pixel dither offsets), the alpha test (alphatest) or "
@@ -6696,6 +6700,11 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
                      uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type), index_count);
         std::fflush(state_file);
       }
+    }
+    if (const uint64_t skip_pixel_shader = REXCVAR_GET(fh1_debug_skip_pixel_shader);
+        skip_pixel_shader && pixel_shader &&
+        pixel_shader->ucode_data_hash() == skip_pixel_shader) {
+      return true;
     }
     static const std::string skip_coverage = REXCVAR_GET(fh1_debug_skip_coverage);
     if (!skip_coverage.empty()) {
