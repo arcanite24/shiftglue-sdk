@@ -4399,6 +4399,23 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
     xr_lens_drawn_.has_position =
         fh1_native_executor_->TakeLensPosition(xr_lens_drawn_.position, xr_lens_drawn_.right);
   }
+  // When the title drops a camera update (the frame just drawn does not
+  // carry the tag after the shown lens's), it presents the image before
+  // again instead of the shown lens's frame: the other eye's, in stereo,
+  // which went to this eye (xr_simulate captures, about one swap in 400 with
+  // VR's DLSS). The headset keeps its last pair for this one.
+  bool xr_image_repeated = false;
+  if (xr_lens.valid && xr_lens_drawn_.valid) {
+    const uint32_t shown_tag = ui::vulkan::openxr::FovTag(xr_lens.fov_y);
+    const uint32_t drawn_tag = ui::vulkan::openxr::FovTag(xr_lens_drawn_.fov_y);
+    xr_image_repeated = shown_tag < ui::vulkan::openxr::kTagCount &&
+                        drawn_tag < ui::vulkan::openxr::kTagCount &&
+                        drawn_tag != (shown_tag + 1) % ui::vulkan::openxr::kTagCount;
+    if (xr_image_repeated && (xr_repeated_images_++ % 100) == 0) {
+      REXGPU_INFO("VR: {} repeated images kept from the headset (a camera update dropped)",
+                  xr_repeated_images_);
+    }
+  }
   // The headset's screen shows the guest frame's shape, whatever the draw
   // resolution scale.
   const float xr_display_aspect =
@@ -4407,8 +4424,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
           : 0.0f;
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
-      [this, xr_lens, xr_display_aspect, xr_upscale, xr_output_width, xr_output_height,
-       guest_output_width, guest_output_height, display_width,
+      [this, xr_lens, xr_image_repeated, xr_display_aspect, xr_upscale, xr_output_width,
+       xr_output_height, guest_output_width, guest_output_height, display_width,
        display_height, frontbuffer_format, swap_texture_view, swap_post_effect,
        swap_source_needs_rb_swap, hud_snapshot_view, hdr_active, scene_fxaa, scene_lut,
        hudless_wanted, camera_depth_view,
@@ -5295,8 +5312,10 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
 
         // The headset's copy of every frame (rex/ui/vulkan/openxr.h).
         ui::vulkan::openxr::FrameCopy xr_copy;
-        const bool xr_frame = ui::vulkan::openxr::BeginGuestFrame(
-            xr_output_width, xr_output_height, xr_display_aspect, xr_lens, xr_copy);
+        const bool xr_frame =
+            !xr_image_repeated &&
+            ui::vulkan::openxr::BeginGuestFrame(xr_output_width, xr_output_height,
+                                                xr_display_aspect, xr_lens, xr_copy);
         if (xr_frame) {
           RecordXrFrameCopy(vulkan_context.image(), vulkan_context.image_view(),
                             guest_output_width, guest_output_height, xr_output_width,
