@@ -4107,11 +4107,18 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
     xr_lens_drawn_.has_position =
         fh1_native_executor_->TakeLensPosition(xr_lens_drawn_.position, xr_lens_drawn_.right);
   }
+  // The headset's screen shows the guest frame's shape, whatever the draw
+  // resolution scale.
+  const float xr_display_aspect =
+      frontbuffer_width_unscaled && frontbuffer_height_unscaled
+          ? float(frontbuffer_width_unscaled) / float(frontbuffer_height_unscaled)
+          : 0.0f;
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
-      [this, xr_lens, guest_output_width, guest_output_height, display_width, display_height,
-       frontbuffer_format, swap_texture_view, swap_post_effect, swap_source_needs_rb_swap,
-       hud_snapshot_view, hdr_active, scene_fxaa, scene_lut, hudless_wanted, camera_depth_view,
+      [this, xr_lens, xr_display_aspect, guest_output_width, guest_output_height, display_width,
+       display_height, frontbuffer_format, swap_texture_view, swap_post_effect,
+       swap_source_needs_rb_swap, hud_snapshot_view, hdr_active, scene_fxaa, scene_lut,
+       hudless_wanted, camera_depth_view,
        camera](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         // In case the swap command is the only one in the frame.
         if (!BeginSubmission(true)) {
@@ -4969,7 +4976,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
         // The headset's copy of every frame (rex/ui/vulkan/openxr.h).
         ui::vulkan::openxr::FrameCopy xr_copy;
         const bool xr_frame = ui::vulkan::openxr::BeginGuestFrame(
-            guest_output_width, guest_output_height, xr_lens, xr_copy);
+            guest_output_width, guest_output_height, xr_display_aspect, xr_lens, xr_copy);
         if (xr_frame) {
           RecordXrFrameCopy(vulkan_context.image(), guest_output_width, guest_output_height,
                             xr_copy);
