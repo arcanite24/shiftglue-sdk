@@ -163,6 +163,20 @@ class DeferredCommandBuffer {
     std::memcpy(rects_arg, rects, sizeof(VkClearRect) * rect_count);
   }
 
+  // Calls `callback` with a copy of `size` bytes of `data` (trivially
+  // copyable) and the command buffer when the commands are executed, for
+  // work that records itself (DLSS through NGX). The command processor's
+  // cached bindings do not survive it (InvalidateBindingsAfterCallback).
+  using Callback = void (*)(const void* data, VkCommandBuffer command_buffer);
+  void CmdCallback(Callback callback, const void* data, size_t size) {
+    const size_t header_size = rex::align(sizeof(ArgsCallback), alignof(uintmax_t));
+    uint8_t* args_ptr =
+        reinterpret_cast<uint8_t*>(WriteCommand(Command::kCallback, header_size + size));
+    auto& args = *reinterpret_cast<ArgsCallback*>(args_ptr);
+    args.callback = callback;
+    std::memcpy(args_ptr + header_size, data, size);
+  }
+
   VkImageSubresourceRange* CmdClearColorImageEmplace(VkImage image, VkImageLayout image_layout,
                                                      const VkClearColorValue* color,
                                                      uint32_t range_count) {
@@ -457,6 +471,7 @@ class DeferredCommandBuffer {
 
  private:
   enum class Command {
+    kCallback,
     kVkBeginRenderPass,
     kVkBeginQuery,
     kVkBindDescriptorSets,
@@ -503,6 +518,11 @@ class DeferredCommandBuffer {
   };
   static constexpr size_t kCommandHeaderSizeElements =
       (sizeof(CommandHeader) + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
+
+  struct ArgsCallback {
+    Callback callback;
+    // Followed by the data, aligned.
+  };
 
   struct ArgsVkBeginRenderPass {
     VkRenderPass render_pass;
