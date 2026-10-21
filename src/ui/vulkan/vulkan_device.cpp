@@ -1097,8 +1097,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   // Create the device.
 
-  const VkResult device_create_result =
-      ifn.vkCreateDevice(physical_device, &device_create_info, nullptr, &device->device_);
+  // In VR the runtime may create it (openxr::CreateDevice).
+  VkResult device_create_result;
+  if (!openxr::CreateDevice(vulkan_instance->instance(), physical_device, device_create_info,
+                            device->device_, device_create_result)) {
+    device_create_result =
+        ifn.vkCreateDevice(physical_device, &device_create_info, nullptr, &device->device_);
+  }
   if (device_create_result != VK_SUCCESS) {
     REXLOG_ERROR(
         "Failed to create a Vulkan logical device from the physical device "
