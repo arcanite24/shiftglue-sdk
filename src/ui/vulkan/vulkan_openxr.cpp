@@ -377,6 +377,8 @@ struct Target {
   // What the frame in the acquired image was rendered with (eyes).
   XrPosef pose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
   XrFovf fov{};
+  // The screen: its frame's width / height as shown (0: the pixels').
+  float display_aspect = 0.0f;
 };
 
 enum TargetIndex { kLeft, kRight, kScreen, kTargetCount };
@@ -1338,7 +1340,10 @@ void FrameLoop() {
       quad.subImage.imageRect = {{0, 0}, {int32_t(screen.width), int32_t(screen.height)}};
       quad.pose.orientation.w = 1.0f;
       quad.pose.position.z = -float(REXCVAR_GET(xr_screen_distance));
-      quad.size = {width_m, width_m * float(screen.height) / float(screen.width)};
+      const float aspect = screen.display_aspect > 0.0f
+                               ? screen.display_aspect
+                               : float(screen.width) / float(screen.height);
+      quad.size = {width_m, width_m / aspect};
       layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
     }
     XrFrameEndInfo end_info{XR_TYPE_FRAME_END_INFO};
@@ -1651,7 +1656,8 @@ void FinishFenced(bool wait) {
   s.fenced = Pending::kNone;
 }
 
-bool BeginGuestFrame(uint32_t width, uint32_t height, const Lens& lens, FrameCopy& out) {
+bool BeginGuestFrame(uint32_t width, uint32_t height, float display_aspect, const Lens& lens,
+                     FrameCopy& out) {
   out = {};
   EyeRequest request;
   uint64_t requested_ns = 0;
@@ -1725,6 +1731,11 @@ bool BeginGuestFrame(uint32_t width, uint32_t height, const Lens& lens, FrameCop
   static const char* const kNames[] = {"left eye", "right eye", "screen"};
   Target& target = s.targets[index];
   if (!EnsureTarget(target, width, height, kNames[index]) || !Acquire(target)) return false;
+  if (target.display_aspect != display_aspect) {
+    REXLOG_INFO("OpenXR: screen {}x{} shown at {:.3f}:1", width, height,
+                display_aspect > 0.0f ? display_aspect : float(width) / float(height));
+    target.display_aspect = display_aspect;
+  }
   if (stereo) {
     target.pose.position = {request.position[0], request.position[1], request.position[2]};
     target.pose.orientation = {request.orientation[0], request.orientation[1],
@@ -1844,7 +1855,7 @@ bool NextEye(EyeRequest& out) {
   out = Record(eye, position, orientation);
   return true;
 }
-bool BeginGuestFrame(uint32_t, uint32_t, const Lens& lens, FrameCopy& out) {
+bool BeginGuestFrame(uint32_t, uint32_t, float, const Lens& lens, FrameCopy& out) {
   out = {};
   if (!REXCVAR_GET(xr_simulate)) return false;
   EyeRequest request;

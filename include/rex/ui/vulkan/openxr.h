@@ -115,12 +115,16 @@ struct Lens {
 // left eye's frame stays unseen until the right one requested after it is
 // copied, and both reach the headset together. False when there is nothing
 // to copy: no session, or a right eye whose left frame was not copied.
+// `display_aspect` is the frame's width / height as shown (the unscaled
+// guest frame's): at an uneven draw resolution scale the pixels are not
+// square, and the screen layer keeps this shape (0: the pixels').
 struct FrameCopy {
   VkImage staging = VK_NULL_HANDLE;
   VkImage target = VK_NULL_HANDLE;
   VkBuffer capture = VK_NULL_HANDLE;
 };
-bool BeginGuestFrame(uint32_t width, uint32_t height, const Lens& lens, FrameCopy& out);
+bool BeginGuestFrame(uint32_t width, uint32_t height, float display_aspect, const Lens& lens,
+                     FrameCopy& out);
 void GuestFrameSubmitted();
 
 // Makes where the head is now, facing level, the seat: the origin of the eye
