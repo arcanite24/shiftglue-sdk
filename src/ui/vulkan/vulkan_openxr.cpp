@@ -118,6 +118,9 @@ struct Bookkeeping {
   Requested ring[kTagCount];
   // Log: frames decoded per eye, untagged, lens missing.
   uint64_t decoded[2] = {}, untagged = 0, no_lens = 0, last_logged = 0;
+  // Frames in a row with the tag of the frame before, and frames not taken
+  // for stereo because their tag stood still (FindRequest).
+  uint64_t tag_repeats = 0, stale = 0;
   // Eye check: between consecutive decoded frames, does the camera move
   // sideways the way their requests do? Frame to frame (the change of the
   // move, so steady car motion cancels), and within a pair (a left frame and
@@ -166,6 +169,17 @@ bool FindRequest(const Lens& lens, EyeRequest& out, uint64_t* requested_ns = nul
   const uint32_t tag = FovTag(lens.fov_y);
   if (tag >= kTagCount || !b.ring[tag].valid) {
     ++b.untagged;
+    return false;
+  }
+  // Live stereo moves the tag on every camera update. A view the host does
+  // not drive (an outpost's menu) can still decode as a tag, any field of
+  // view landing on one about a tenth of the time, and then every frame
+  // went to one eye and the headset kept its last pair until the menu
+  // closed. A tag standing still for 30 frames (0.3 s at 100 fps, longer
+  // than a hitch) is a screen instead.
+  b.tag_repeats = b.last_tag == tag ? b.tag_repeats + 1 : 0;
+  if (b.tag_repeats >= 30) {
+    ++b.stale;
     return false;
   }
   out = b.ring[tag].request;
@@ -276,15 +290,15 @@ bool FindRequest(const Lens& lens, EyeRequest& out, uint64_t* requested_ns = nul
 void LogDecoding(const char* where) {
   Bookkeeping& b = B();
   std::lock_guard<std::mutex> lock(b.mutex);
-  const uint64_t total = b.decoded[0] + b.decoded[1] + b.untagged + b.no_lens;
+  const uint64_t total = b.decoded[0] + b.decoded[1] + b.untagged + b.stale + b.no_lens;
   if (total < b.last_logged + 300) return;
   b.last_logged = total;
   REXLOG_INFO(
-      "OpenXR {}: {} requested, presented left {} right {}, untagged {}, no lens {}; "
+      "OpenXR {}: {} requested, presented left {} right {}, untagged {}, stale tag {}, no lens {}; "
       "eye check {} right, {} wrong; frame age {:.1f} ms (max {:.1f}), each eye every {:.1f} ms; "
       "world motion between paired eyes {:.1f} mm (max {:.1f}) over {} pairs; pair check {} "
       "right, {} wrong",
-      where, b.sequence, b.decoded[0], b.decoded[1], b.untagged, b.no_lens, b.eye_match,
+      where, b.sequence, b.decoded[0], b.decoded[1], b.untagged, b.stale, b.no_lens, b.eye_match,
       b.eye_mismatch, b.timed ? b.age_sum_ms / double(b.timed) : 0.0, b.age_max_ms,
       b.intervals ? b.interval_sum_ms / double(b.intervals) : 0.0,
       b.pairs ? 1000.0 * b.pair_motion_sum / double(b.pairs) : 0.0, 1000.0 * b.pair_motion_max,
