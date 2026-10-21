@@ -287,6 +287,16 @@ class VulkanCommandProcessor : public CommandProcessor {
     return in_render_pass_ && id && current_fh1_rendering_id_ == id;
   }
   bool in_render_pass() const { return in_render_pass_; }
+  // vulkan_hoist_split_uploads: the stream position just before the open FH1
+  // rendering began, where uploads can go instead of ending it, and the
+  // shared memory invalidation count when it began.
+  bool Fh1UploadHoistSlot(size_t& slot, uint32_t& epoch) const {
+    if (!fh1_hoist_slot_valid_ || !in_render_pass_) return false;
+    slot = fh1_hoist_slot_;
+    epoch = fh1_hoist_epoch_;
+    return true;
+  }
+  void Fh1AdvanceUploadHoistSlot(size_t words) { fh1_hoist_slot_ += words; }
   system::GraphicsShaderTranslationObserver GetShaderTranslationObserver() const;
   // Submits the open submission, waits for every queue operation and reopens
   // the submission if one was open (FH1 resolve read-backs).
@@ -1753,6 +1763,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkRenderPass current_render_pass_;
   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
   bool in_render_pass_ = false;
+  size_t fh1_hoist_slot_ = 0;
+  uint32_t fh1_hoist_epoch_ = 0;
+  bool fh1_hoist_slot_valid_ = false;
 #if defined(REXGPU_FH1_ORDERED_CENSUS)
   uint64_t ordered_census_pass_ = 0;
 #endif
