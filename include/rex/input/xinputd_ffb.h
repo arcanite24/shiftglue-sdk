@@ -21,6 +21,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <string>
 
 namespace rex::input::xinputd_ffb {
@@ -90,7 +91,12 @@ class Sink {
   virtual void SetRumble(uint16_t left, uint16_t right) = 0;
 };
 
+// SetSink waits for calls in flight through WithSink, so after SetSink(nullptr)
+// returns the old sink is no longer used and can be destroyed.
 void SetSink(Sink* sink);
 Sink* GetSink();
+// Runs fn with the registered sink (nullptr when none) while holding it registered.
+// fn must not call SetSink.
+void WithSink(const std::function<void(Sink*)>& fn);
 
 }  // namespace rex::input::xinputd_ffb

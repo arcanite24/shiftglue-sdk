@@ -7,7 +7,8 @@
 
 #include <rex/input/xinputd_ffb.h>
 
-#include <atomic>
+#include <mutex>
+#include <shared_mutex>
 
 #include <fmt/format.h>
 
@@ -15,7 +16,8 @@ namespace rex::input::xinputd_ffb {
 
 namespace {
 
-std::atomic<Sink*> g_sink{nullptr};
+std::shared_mutex g_sink_mutex;
+Sink* g_sink = nullptr;
 
 uint32_t LoadBE32(const uint8_t* p) {
   return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
@@ -96,11 +98,18 @@ std::string HexWords(const Effect& e) {
 }
 
 void SetSink(Sink* sink) {
-  g_sink.store(sink, std::memory_order_release);
+  std::unique_lock lock(g_sink_mutex);
+  g_sink = sink;
 }
 
 Sink* GetSink() {
-  return g_sink.load(std::memory_order_acquire);
+  std::shared_lock lock(g_sink_mutex);
+  return g_sink;
+}
+
+void WithSink(const std::function<void(Sink*)>& fn) {
+  std::shared_lock lock(g_sink_mutex);
+  fn(g_sink);
 }
 
 }  // namespace rex::input::xinputd_ffb
