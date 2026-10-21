@@ -1064,7 +1064,11 @@ bool Acquire(Target& target, int64_t timeout_ns = 2'000'000) {
   return target.ready;
 }
 
-// With the queue held.
+// With HoldQueueForRuntime's hold, never inside our own queue lock: when the
+// runtime's queue calls lock it themselves, it takes its own locks first and
+// the queue's inside (Virtual Desktop's xrEndFrame), so holding the queue
+// across a runtime call deadlocked against that order (entering a menu
+// from the cockpit froze the game).
 void Release(Target& target) {
   if (!target.acquired || !target.ready) return;
   target.acquired = false;
@@ -1238,15 +1242,18 @@ bool CopySlot(State::Slot& slot) {
                                VK_PIPELINE_STAGE_TRANSFER_BIT,
                            0, 0, nullptr, 0, nullptr, 4, after);
   dfn.vkEndCommandBuffer(cmd);
-  const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
-  VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-  submit.commandBufferCount = 1;
-  submit.pCommandBuffers = &cmd;
-  if (dfn.vkQueueSubmit(queue.queue(), 1, &submit, s.xr_cmd_fence[c]) != VK_SUCCESS) {
-    // Signalled for the next use.
-    dfn.vkQueueSubmit(queue.queue(), 0, nullptr, s.xr_cmd_fence[c]);
-    return false;
+  {
+    const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    if (dfn.vkQueueSubmit(queue.queue(), 1, &submit, s.xr_cmd_fence[c]) != VK_SUCCESS) {
+      // Signalled for the next use.
+      dfn.vkQueueSubmit(queue.queue(), 0, nullptr, s.xr_cmd_fence[c]);
+      return false;
+    }
   }
+  const auto queue = HoldQueueForRuntime();
   Release(left);
   Release(right);
   return true;
@@ -1912,7 +1919,7 @@ void FinishFenced(bool wait) {
       wait ? dfn.vkWaitForFences(s.device->device(), 1, &s.copy_fence, VK_TRUE, 100'000'000)
            : dfn.vkGetFenceStatus(s.device->device(), s.copy_fence);
   if (status != VK_SUCCESS) return;
-  const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
+  const auto queue = HoldQueueForRuntime();
   if (s.fenced == Pending::kPair) {
     Release(s.targets[kLeft]);
     Release(s.targets[kRight]);
