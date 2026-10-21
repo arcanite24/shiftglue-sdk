@@ -50,6 +50,12 @@ REXCVAR_DEFINE_INT32(xr_simulate_hz, 45, "Display",
                      "HeadsetFrameHz), as Virtual Desktop's spacewarp at 90 Hz does")
     .range(0, 240)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(xr_rate_change_ms, 500, "Display",
+                     "In VR, how long the headset must ask for a new frame rate before the "
+                     "game's pacing follows it (Virtual Desktop's spacewarp asks for the full "
+                     "rate on single frames); 0 follows every frame")
+    .range(0, 5000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(xr_test_eye_spread, 1.0, "Display",
                       "Testing: spread the headset's eyes this many times wider about the head's "
                       "centre, so captures show which eye each image was rendered for")
@@ -543,6 +549,13 @@ struct State {
   std::chrono::steady_clock::time_point last_pose_log{};
   uint64_t frames = 0, pairs = 0, unpaired = 0;
   std::atomic<uint32_t> headset_hz{0};
+  // Headset thread: the rate the game is paced to, a new rate the headset
+  // has asked for on consecutive frames and for how many, and the frames
+  // since the last status line that asked for another rate than the pace.
+  uint32_t paced_hz = 0;
+  uint32_t candidate_hz = 0;
+  uint32_t candidate_frames = 0;
+  uint32_t off_rate_frames = 0;
   // Where the headset thread's time goes, and how long the game's copy
   // holds the state lock (acquiring a swapchain image waits in it).
   struct Timing {
@@ -1338,12 +1351,13 @@ void LogPose() {
       "{} headset frames, {} eye pairs shown, {} right eyes without their left; headset thread "
       "waits {} for the headset, {} for the lock and the next pair, {} in begin and end; the game's copy holds "
       "the lock {}, its release {}; pairs arrive {} into the headset's frame, {} frames "
-      "repeated a pair, the game kept up on {}",
+      "repeated a pair, the game kept up on {}, {} frames asked for another rate",
       p.position.x, p.position.y, p.position.z, p.orientation.x, p.orientation.y,
       p.orientation.z, p.orientation.w, s.headset_hz.load(), xr::HeadsetRefreshHz(), s.frames,
       s.pairs, s.unpaired, s.wait_frame.Text(),
       s.wait_lock.Text(), s.begin_end.Text(), s.guest_hold.Text(), s.release_hold.Text(),
-      s.pair_phase.Text(), s.repeats, s.kept_up_frames);
+      s.pair_phase.Text(), s.repeats, s.kept_up_frames, s.off_rate_frames);
+  s.off_rate_frames = 0;
   s.pair_phase = {};
   s.repeats = 0;
   s.kept_up_frames = 0;
@@ -1392,9 +1406,39 @@ void FrameLoop() {
             ? uint32_t(std::lround(1e9 / double(frame_state.predictedDisplayPeriod)))
             : 0u;
     s.headset_hz = headset_hz;
-    xr::SetHeadsetFrameHz(headset_hz);
+    // Virtual Desktop's runtime doubles the period only while it counts
+    // spacewarp as active, so with SSW on (even "always enabled") single
+    // frames ask for the full rate. Following each changed the game's step
+    // and frame rate for a frame or two: a late pair, a world step out of
+    // turn, which read as lag (a 100 Hz SSW drive: 316 frames stepped at
+    // 10 ms against 22 in one before the game got faster). The pace takes
+    // a new rate once it has been asked for xr_rate_change_ms in a row.
+    if (headset_hz == s.paced_hz) {
+      s.candidate_frames = 0;
+    } else if (!s.paced_hz || !headset_hz) {
+      s.paced_hz = headset_hz;
+      s.candidate_frames = 0;
+    } else {
+      ++s.off_rate_frames;
+      if (headset_hz != s.candidate_hz) {
+        s.candidate_hz = headset_hz;
+        s.candidate_frames = 0;
+      }
+      if (uint64_t(++s.candidate_frames) * 1000 >=
+          uint64_t(std::max(0, REXCVAR_GET(xr_rate_change_ms))) * headset_hz) {
+        REXLOG_INFO("OpenXR: the headset asks for {} Hz (was {} Hz); the game follows",
+                    headset_hz, s.paced_hz);
+        s.paced_hz = headset_hz;
+        s.candidate_frames = 0;
+      }
+    }
+    // A frame at another rate than the pace is an extra one between the
+    // game's: no pair is due, so it neither waits for one nor steers the
+    // phase, and it does not count against the game keeping up.
+    const bool off_rate = s.paced_hz && headset_hz != s.paced_hz;
+    xr::SetHeadsetFrameHz(s.paced_hz);
     xr::SetHeadsetRefreshHz(REXCVAR_GET(xr_match_refresh)
-                                ? headset_hz * (s.show_stereo ? 2u : 1u)
+                                ? s.paced_hz * (s.show_stereo ? 2u : 1u)
                                 : 0u);
     s.next_display_time = frame_state.predictedDisplayTime + frame_state.predictedDisplayPeriod;
     s.display_period = frame_state.predictedDisplayPeriod;
@@ -1411,11 +1455,18 @@ void FrameLoop() {
     // 20 frames). Behind it (at 3x, about 60 pairs a second for 72 frames),
     // waiting for a pair that is not coming delays the headset's frame and
     // lets the game overwrite pairs never shown: take what is ready instead.
-    s.pair_rate = s.pair_rate * 0.95 + double(s.slot_serial - s.released_at_frame) * 0.05;
-    s.released_at_frame = s.slot_serial;
+    if (!off_rate) {
+      s.pair_rate = s.pair_rate * 0.95 + double(s.slot_serial - s.released_at_frame) * 0.05;
+      s.released_at_frame = s.slot_serial;
+    }
     const bool kept_up = s.pair_rate >= 0.95;
     if (kept_up) ++s.kept_up_frames;
-    if (s.show_stereo && period > 0 && (kept_up || REXCVAR_GET(xr_pair_wait_when_behind))) {
+    if (off_rate) {
+      // An extra frame shows the last pair again: a ready one waits for the
+      // next frame at the pace, or that one would repeat instead.
+      next = -1;
+    } else if (s.show_stereo && period > 0 &&
+               (kept_up || REXCVAR_GET(xr_pair_wait_when_behind))) {
       const uint64_t wait_ns = SteadyNs();
       const auto deadline =
           std::chrono::steady_clock::now() + std::chrono::nanoseconds(period * 6 / 10);
