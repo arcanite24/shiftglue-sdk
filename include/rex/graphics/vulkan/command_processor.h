@@ -1163,6 +1163,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   // The lens of the frame drawn before the latest swap: the next swap shows
   // that frame (IssueSwapImpl).
   ui::vulkan::openxr::Lens xr_lens_drawn_;
+  // Swaps whose image the headset did not get, the title having presented
+  // the image before again (IssueSwapImpl).
+  uint64_t xr_repeated_images_ = 0;
   // fh1_frame_dump_frame: records one frame for offline replay (at 1x).
   std::unique_ptr<Fh1FrameDump> frame_dump_;
   std::shared_ptr<Fh1FrameInspector> inspector_ = std::make_shared<Fh1FrameInspector>();
