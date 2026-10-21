@@ -60,6 +60,11 @@ REXCVAR_DEFINE_DOUBLE(xr_test_yaw, 0.0, "Display",
                       "every 2 s, on top of the real head, so a still headset captures turning")
     .range(0.0, 90.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(xr_pair_wait_when_behind, false, "Display",
+                    "Keep waiting for the next eye pair, and nudging the game's frames into "
+                    "phase, when the game is not giving a new pair every headset frame (off: "
+                    "the headset takes the latest pair and does not wait)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(xr_shared_eye_pose, true, "Display",
                     "In VR stereo, the second eye of a pair takes the pose located with the "
                     "first; off, each eye locates its own")
@@ -472,7 +477,10 @@ struct State {
     VkFence fence = VK_NULL_HANDLE;
     uint64_t serial = 0, complete_ns = 0;
   };
-  static constexpr int kSlots = 3;
+  // Five: at 3x a pair is still being copied on the GPU when the next one
+  // is filled, and with three the unshown one was overwritten before it was
+  // ever shown (about a third of the pairs).
+  static constexpr int kSlots = 5;
   Slot slots[kSlots];
   int filling = -1, shown_slot = -1;
   // The slot the headset thread copies from, outside the state mutex.
@@ -533,6 +541,11 @@ struct State {
   // before), and the frames that showed the previous pair again.
   Timing pair_phase;
   uint64_t repeats = 0;
+  // xr_pair_wait_when_behind: new pairs a headset frame (a running mean),
+  // the released count at the last frame, and the frames the game kept up.
+  double pair_rate = 1.0;
+  uint64_t released_at_frame = 0;
+  uint64_t kept_up_frames = 0;
 };
 
 // Never destroyed: the headset's thread may still run at exit.
@@ -935,22 +948,27 @@ int ReadySlot() {
   return best;
 }
 
-// Under the state mutex: a slot for a new pair, neither shown nor the next
-// to show (three slots: one on the headset, one waiting, one filling).
+// Under the state mutex: a slot for a new pair. Never the shown or copying
+// one, nor the newest pair not yet shown; a free or stale slot first, then
+// the oldest pair not yet shown.
 int FillSlot() {
   State& s = S();
-  int waiting = -1;
+  int newest = -1;
   for (int i = 0; i < State::kSlots; ++i) {
     const State::Slot& slot = s.slots[i];
     if (slot.complete && slot.serial > s.shown_serial &&
-        (waiting < 0 || slot.serial > s.slots[waiting].serial)) {
-      waiting = i;
+        (newest < 0 || slot.serial > s.slots[newest].serial)) {
+      newest = i;
     }
   }
+  int oldest = -1;
   for (int i = 0; i < State::kSlots; ++i) {
-    if (i != s.shown_slot && i != waiting && i != s.copying_slot) return i;
+    if (i == s.shown_slot || i == newest || i == s.copying_slot) continue;
+    const State::Slot& slot = s.slots[i];
+    if (!slot.complete || slot.serial <= s.shown_serial) return i;
+    if (oldest < 0 || slot.serial < s.slots[oldest].serial) oldest = i;
   }
-  return -1;
+  return oldest;
 }
 
 // Under the state mutex, on the headset thread inside its frame: copies the
@@ -1156,14 +1174,15 @@ void LogPose() {
       "{} headset frames, {} eye pairs shown, {} right eyes without their left; headset thread "
       "waits {} for the headset, {} for the lock and the next pair, {} in begin and end; the game's copy holds "
       "the lock {}, its release {}; pairs arrive {} into the headset's frame, {} frames "
-      "repeated a pair",
+      "repeated a pair, the game kept up on {}",
       p.position.x, p.position.y, p.position.z, p.orientation.x, p.orientation.y,
       p.orientation.z, p.orientation.w, s.headset_hz.load(), xr::HeadsetRefreshHz(), s.frames,
       s.pairs, s.unpaired, s.wait_frame.Text(),
       s.wait_lock.Text(), s.begin_end.Text(), s.guest_hold.Text(), s.release_hold.Text(),
-      s.pair_phase.Text(), s.repeats);
+      s.pair_phase.Text(), s.repeats, s.kept_up_frames);
   s.pair_phase = {};
   s.repeats = 0;
+  s.kept_up_frames = 0;
   s.frames = s.pairs = s.unpaired = 0;
   s.wait_frame = s.wait_lock = s.begin_end = s.guest_hold = s.release_hold = {};
 }
@@ -1224,7 +1243,15 @@ void FrameLoop() {
     const int64_t period = frame_state.predictedDisplayPeriod;
     FinishFenced(false);
     int next = ReadySlot();
-    if (s.show_stereo && period > 0) {
+    // Whether the game gives a new pair every headset frame (a mean over about
+    // 20 frames). Behind it (at 3x, about 60 pairs a second for 72 frames),
+    // waiting for a pair that is not coming delays the headset's frame and
+    // lets the game overwrite pairs never shown: take what is ready instead.
+    s.pair_rate = s.pair_rate * 0.95 + double(s.slot_serial - s.released_at_frame) * 0.05;
+    s.released_at_frame = s.slot_serial;
+    const bool kept_up = s.pair_rate >= 0.95;
+    if (kept_up) ++s.kept_up_frames;
+    if (s.show_stereo && period > 0 && (kept_up || REXCVAR_GET(xr_pair_wait_when_behind))) {
       const uint64_t wait_ns = SteadyNs();
       const auto deadline =
           std::chrono::steady_clock::now() + std::chrono::nanoseconds(period * 6 / 10);
@@ -1242,6 +1269,8 @@ void FrameLoop() {
         error = std::clamp<int64_t>(error, -period / 2, period / 2);
         xr::NudgeVblankPhase(-error / 8);
       }
+    } else if (s.show_stereo && period > 0 && next < 0) {
+      ++s.repeats;
     }
     const auto locked = std::chrono::steady_clock::now();
     s.wait_frame.Add(std::chrono::duration<double, std::milli>(wait_end - wait_start).count());
