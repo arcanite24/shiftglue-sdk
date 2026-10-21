@@ -49,6 +49,20 @@ namespace openxr {
 std::vector<const char*> InstanceExtensions();
 std::vector<const char*> DeviceExtensions(VkInstance instance, VkPhysicalDevice physical_device);
 
+// With XR_KHR_vulkan_enable2 (xr_vulkan_enable2, when the runtime offers it)
+// the runtime creates the instance and, on the headset's GPU, the device,
+// adding what it needs; the extension lists above are then empty. Its queue
+// calls go through a dispatch that takes the device's queue lock for each
+// call. False when the runtime does not create it (VR off, the original
+// binding, another GPU): the caller creates it itself. True with the
+// runtime's VkResult in result_out otherwise.
+bool CreateInstance(PFN_vkGetInstanceProcAddr get_instance_proc_addr,
+                    const VkInstanceCreateInfo& create_info, VkInstance& instance_out,
+                    VkResult& result_out);
+bool CreateDevice(VkInstance instance, VkPhysicalDevice physical_device,
+                  const VkDeviceCreateInfo& create_info, VkDevice& device_out,
+                  VkResult& result_out);
+
 // Opens the session on the presenter's device, once, and starts its thread.
 void OnDeviceCreated(const VulkanInstance* instance, const VulkanDevice* device);
 // Ends the session and its thread before the device is destroyed.

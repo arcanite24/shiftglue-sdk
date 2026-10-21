@@ -333,6 +333,16 @@ float PresentedFovY() { return B().presented_fov_y.load(std::memory_order_relaxe
 }  // namespace ui
 }  // namespace rex
 
+REXCVAR_DEFINE_BOOL(xr_vulkan_enable2, true, "Display",
+                    "In VR, let the runtime create the Vulkan instance and device "
+                    "(XR_KHR_vulkan_enable2) when it offers that, so that its queue calls go "
+                    "through the game's queue lock one by one and its frame calls need not hold "
+                    "the game's queue. Read at start")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(xr_frame_calls_hold_queue, false, "Display",
+                    "In VR, hold the game's queue across the runtime's frame and swapchain "
+                    "calls even when its own queue calls take the lock (diagnostics)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 #if REX_HAS_OPENXR
 
 #include <array>
@@ -340,6 +350,7 @@ float PresentedFovY() { return B().presented_fov_y.load(std::memory_order_relaxe
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <condition_variable>
 #include <thread>
@@ -396,6 +407,13 @@ struct State {
   PFN_xrGetVulkanDeviceExtensionsKHR get_device_extensions = nullptr;
   PFN_xrGetVulkanGraphicsDeviceKHR get_graphics_device = nullptr;
   PFN_xrGetVulkanGraphicsRequirementsKHR get_graphics_requirements = nullptr;
+  // XR_KHR_vulkan_enable2: the runtime creates the instance and the device.
+  bool enable2 = false;
+  PFN_xrCreateVulkanInstanceKHR create_vulkan_instance = nullptr;
+  PFN_xrCreateVulkanDeviceKHR create_vulkan_device = nullptr;
+  PFN_xrGetVulkanGraphicsDevice2KHR get_graphics_device2 = nullptr;
+  VkInstance runtime_instance = VK_NULL_HANDLE;
+  VkDevice runtime_device = VK_NULL_HANDLE;
   // Extension names handed to Vulkan, kept for the life of the process.
   std::deque<std::string> names;
 
@@ -556,6 +574,136 @@ State& S() {
   return *state;
 }
 
+// The runtime's Vulkan functions under XR_KHR_vulkan_enable2: it looks them up
+// through RuntimeGetInstanceProcAddr, which hands out the queue calls wrapped
+// to take the device's lock on that queue for the call alone. The game's
+// threads use the same lock, so the runtime's frame calls need not hold the
+// queue throughout: Virtual Desktop's xrEndFrame waits there for the queue to
+// reach its signal, and the game could not submit meanwhile, so the GPU ran
+// dry and the game fell behind for the rest of the session.
+struct RuntimeDispatch {
+  PFN_vkGetInstanceProcAddr get_instance_proc_addr = nullptr;
+  PFN_vkGetDeviceProcAddr get_device_proc_addr = nullptr;
+  PFN_vkQueueSubmit queue_submit = nullptr;
+  PFN_vkQueueSubmit2 queue_submit2 = nullptr;
+  PFN_vkQueueSubmit2 queue_submit2_khr = nullptr;
+  PFN_vkQueueWaitIdle queue_wait_idle = nullptr;
+  PFN_vkQueueBindSparse queue_bind_sparse = nullptr;
+  std::atomic<const VulkanDevice*> device{nullptr};
+  // Queue calls the runtime made through these: it uses this dispatch.
+  std::atomic<uint64_t> calls{0};
+};
+
+RuntimeDispatch& D() {
+  static RuntimeDispatch* dispatch = new RuntimeDispatch;
+  return *dispatch;
+}
+
+std::unique_lock<std::recursive_mutex> LockRuntimeQueue(VkQueue queue) {
+  if (!D().calls.fetch_add(1, std::memory_order_relaxed)) {
+    REXLOG_INFO("OpenXR: the runtime's queue calls take the game's queue lock; its frame "
+                "calls no longer hold the queue");
+  }
+  if (const VulkanDevice* device = D().device.load(std::memory_order_acquire)) {
+    for (const VulkanDevice::QueueFamily& family : device->queue_families()) {
+      for (const auto& candidate : family.queues) {
+        if (candidate && candidate->queue == queue) {
+          return std::unique_lock<std::recursive_mutex>(candidate->mutex);
+        }
+      }
+    }
+  }
+  return {};
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL RuntimeQueueSubmit(VkQueue queue, uint32_t count,
+                                                  const VkSubmitInfo* submits, VkFence fence) {
+  const auto lock = LockRuntimeQueue(queue);
+  return D().queue_submit(queue, count, submits, fence);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL RuntimeQueueSubmit2(VkQueue queue, uint32_t count,
+                                                   const VkSubmitInfo2* submits, VkFence fence) {
+  const auto lock = LockRuntimeQueue(queue);
+  return D().queue_submit2(queue, count, submits, fence);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL RuntimeQueueSubmit2KHR(VkQueue queue, uint32_t count,
+                                                      const VkSubmitInfo2* submits,
+                                                      VkFence fence) {
+  const auto lock = LockRuntimeQueue(queue);
+  return D().queue_submit2_khr(queue, count, submits, fence);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL RuntimeQueueWaitIdle(VkQueue queue) {
+  const auto lock = LockRuntimeQueue(queue);
+  return D().queue_wait_idle(queue);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL RuntimeQueueBindSparse(VkQueue queue, uint32_t count,
+                                                      const VkBindSparseInfo* infos,
+                                                      VkFence fence) {
+  const auto lock = LockRuntimeQueue(queue);
+  return D().queue_bind_sparse(queue, count, infos, fence);
+}
+
+// The wrapper for a queue function, keeping the real one; nullptr for others.
+PFN_vkVoidFunction WrapQueueFunction(const char* name, PFN_vkVoidFunction real) {
+  if (!real) return nullptr;
+  RuntimeDispatch& d = D();
+  if (!std::strcmp(name, "vkQueueSubmit")) {
+    d.queue_submit = PFN_vkQueueSubmit(real);
+    return PFN_vkVoidFunction(&RuntimeQueueSubmit);
+  }
+  if (!std::strcmp(name, "vkQueueSubmit2")) {
+    d.queue_submit2 = PFN_vkQueueSubmit2(real);
+    return PFN_vkVoidFunction(&RuntimeQueueSubmit2);
+  }
+  if (!std::strcmp(name, "vkQueueSubmit2KHR")) {
+    d.queue_submit2_khr = PFN_vkQueueSubmit2(real);
+    return PFN_vkVoidFunction(&RuntimeQueueSubmit2KHR);
+  }
+  if (!std::strcmp(name, "vkQueueWaitIdle")) {
+    d.queue_wait_idle = PFN_vkQueueWaitIdle(real);
+    return PFN_vkVoidFunction(&RuntimeQueueWaitIdle);
+  }
+  if (!std::strcmp(name, "vkQueueBindSparse")) {
+    d.queue_bind_sparse = PFN_vkQueueBindSparse(real);
+    return PFN_vkVoidFunction(&RuntimeQueueBindSparse);
+  }
+  return nullptr;
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL RuntimeGetDeviceProcAddr(VkDevice device,
+                                                                 const char* name) {
+  const PFN_vkVoidFunction real = D().get_device_proc_addr(device, name);
+  const PFN_vkVoidFunction wrapped = WrapQueueFunction(name, real);
+  return wrapped ? wrapped : real;
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL RuntimeGetInstanceProcAddr(VkInstance instance,
+                                                                   const char* name) {
+  const PFN_vkVoidFunction real = D().get_instance_proc_addr(instance, name);
+  if (real && !std::strcmp(name, "vkGetDeviceProcAddr")) {
+    D().get_device_proc_addr = PFN_vkGetDeviceProcAddr(real);
+    return PFN_vkVoidFunction(&RuntimeGetDeviceProcAddr);
+  }
+  const PFN_vkVoidFunction wrapped = WrapQueueFunction(name, real);
+  return wrapped ? wrapped : real;
+}
+
+// The game's queue across one of the runtime's calls, unless the runtime's own
+// queue calls take the lock (it has made one through RuntimeDispatch).
+std::optional<VulkanDevice::Queue::Acquisition> HoldQueueForRuntime() {
+  State& s = S();
+  std::optional<VulkanDevice::Queue::Acquisition> hold;
+  if (!s.enable2 || !D().calls.load(std::memory_order_relaxed) ||
+      REXCVAR_GET(xr_frame_calls_hold_queue)) {
+    hold.emplace(s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0));
+  }
+  return hold;
+}
+
 // The space eye poses, layers and logs use: the seat once set, else LOCAL.
 XrSpace Seat() {
   const XrSpace seat = S().seat.load(std::memory_order_acquire);
@@ -635,7 +783,7 @@ bool EnsureInstance() {
   }
   std::vector<XrExtensionProperties> extensions(count, {XR_TYPE_EXTENSION_PROPERTIES});
   xrEnumerateInstanceExtensionProperties(nullptr, count, &count, extensions.data());
-  bool has_vulkan = false;
+  bool has_vulkan = false, has_vulkan2 = false;
   {
     std::string names;
     for (const auto& extension : extensions) {
@@ -646,8 +794,10 @@ bool EnsureInstance() {
   }
   for (const auto& extension : extensions) {
     has_vulkan |= std::strcmp(extension.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0;
+    has_vulkan2 |= std::strcmp(extension.extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME) == 0;
   }
-  if (!has_vulkan) {
+  s.enable2 = has_vulkan2 && REXCVAR_GET(xr_vulkan_enable2);
+  if (!has_vulkan && !s.enable2) {
     REXLOG_WARN("OpenXR: the runtime has no {}; VR is off", XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
     return false;
   }
@@ -657,7 +807,8 @@ bool EnsureInstance() {
                XR_MAX_APPLICATION_NAME_SIZE - 1);
   std::strncpy(create_info.applicationInfo.engineName, "ReXGlue", XR_MAX_ENGINE_NAME_SIZE - 1);
   create_info.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
-  const char* enabled[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME};
+  const char* enabled[] = {s.enable2 ? XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME
+                                    : XR_KHR_VULKAN_ENABLE_EXTENSION_NAME};
   create_info.enabledExtensionCount = 1;
   create_info.enabledExtensionNames = enabled;
   if (!Check(xrCreateInstance(&create_info, &s.instance), "xrCreateInstance")) return false;
@@ -671,12 +822,21 @@ bool EnsureInstance() {
   }
   XrSystemGetInfo system_info{XR_TYPE_SYSTEM_GET_INFO};
   system_info.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+  const bool procs =
+      s.enable2
+          ? Proc(s.instance, "xrCreateVulkanInstanceKHR", s.create_vulkan_instance) &&
+                Proc(s.instance, "xrCreateVulkanDeviceKHR", s.create_vulkan_device) &&
+                Proc(s.instance, "xrGetVulkanGraphicsDevice2KHR", s.get_graphics_device2) &&
+                Proc(s.instance, "xrGetVulkanGraphicsRequirements2KHR",
+                     s.get_graphics_requirements)
+          : Proc(s.instance, "xrGetVulkanInstanceExtensionsKHR", s.get_instance_extensions) &&
+                Proc(s.instance, "xrGetVulkanDeviceExtensionsKHR", s.get_device_extensions) &&
+                Proc(s.instance, "xrGetVulkanGraphicsDeviceKHR", s.get_graphics_device) &&
+                Proc(s.instance, "xrGetVulkanGraphicsRequirementsKHR",
+                     s.get_graphics_requirements);
   if (!Check(xrGetSystem(s.instance, &system_info, &s.system),
              "finding a headset (is it connected and awake?)") ||
-      !Proc(s.instance, "xrGetVulkanInstanceExtensionsKHR", s.get_instance_extensions) ||
-      !Proc(s.instance, "xrGetVulkanDeviceExtensionsKHR", s.get_device_extensions) ||
-      !Proc(s.instance, "xrGetVulkanGraphicsDeviceKHR", s.get_graphics_device) ||
-      !Proc(s.instance, "xrGetVulkanGraphicsRequirementsKHR", s.get_graphics_requirements)) {
+      !procs) {
     xrDestroyInstance(s.instance);
     s.instance = XR_NULL_HANDLE;
     return false;
@@ -685,6 +845,8 @@ bool EnsureInstance() {
   if (XR_SUCCEEDED(xrGetSystemProperties(s.instance, s.system, &system_properties))) {
     REXLOG_INFO("OpenXR: headset {}", system_properties.systemName);
   }
+  REXLOG_INFO("OpenXR: Vulkan through {}", s.enable2 ? XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME
+                                                    : XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
   return true;
 }
 
@@ -872,8 +1034,8 @@ bool Acquire(Target& target, int64_t timeout_ns = 2'000'000) {
     return target.ready;
   }
   {
-    // The runtime may use the game's queue here (XR_KHR_vulkan_enable).
-    const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
+    // The runtime may use the game's queue here.
+    const auto queue = HoldQueueForRuntime();
     XrSwapchainImageAcquireInfo acquire_info{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
     if (!Check(xrAcquireSwapchainImage(target.swapchain, &acquire_info, &target.index),
                "xrAcquireSwapchainImage")) {
@@ -1292,7 +1454,7 @@ void FrameLoop() {
     lock.unlock();
     bool begun = false;
     {
-      const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
+      const auto queue = HoldQueueForRuntime();
       XrFrameBeginInfo begin_info{XR_TYPE_FRAME_BEGIN_INFO};
       begun = !failed(xrBeginFrame(s.session, &begin_info), "xrBeginFrame");
     }
@@ -1357,7 +1519,7 @@ void FrameLoop() {
     if (!screen_layer) lock.unlock();
     XrResult ended;
     {
-      const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
+      const auto queue = HoldQueueForRuntime();
       ended = xrEndFrame(s.session, &end_info);
       if (XR_FAILED(ended) && layer_count) {
         // The frame is still open: end it without layers.
@@ -1392,7 +1554,8 @@ void ShutdownForExit() {
 
 std::vector<const char*> InstanceExtensions() {
   std::lock_guard<std::mutex> lock(S().mutex);
-  if (!EnsureInstance()) return {};
+  // XR_KHR_vulkan_enable2: the runtime adds its own in CreateInstance.
+  if (!EnsureInstance() || S().enable2) return {};
   std::vector<const char*> names = Names(ExtensionList(S().get_instance_extensions));
   for (const char* name : names) REXLOG_INFO("OpenXR: the runtime wants instance extension {}", name);
   return names;
@@ -1401,7 +1564,7 @@ std::vector<const char*> InstanceExtensions() {
 std::vector<const char*> DeviceExtensions(VkInstance instance, VkPhysicalDevice physical_device) {
   std::lock_guard<std::mutex> lock(S().mutex);
   State& s = S();
-  if (s.instance == XR_NULL_HANDLE) return {};
+  if (s.instance == XR_NULL_HANDLE || s.enable2) return {};
   // Only for the GPU the headset is on.
   VkPhysicalDevice wanted = VK_NULL_HANDLE;
   if (!Check(s.get_graphics_device(s.instance, s.system, instance, &wanted), "finding its GPU") ||
@@ -1413,12 +1576,70 @@ std::vector<const char*> DeviceExtensions(VkInstance instance, VkPhysicalDevice 
   return names;
 }
 
+bool CreateInstance(PFN_vkGetInstanceProcAddr get_instance_proc_addr,
+                    const VkInstanceCreateInfo& create_info, VkInstance& instance_out,
+                    VkResult& result_out) {
+  std::lock_guard<std::mutex> lock(S().mutex);
+  State& s = S();
+  if (!EnsureInstance() || !s.enable2) return false;
+  // Asked for before the instance, as XR_KHR_vulkan_enable2 requires.
+  XrGraphicsRequirementsVulkan2KHR requirements{XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN2_KHR};
+  if (!Check(s.get_graphics_requirements(s.instance, s.system, &requirements),
+             "xrGetVulkanGraphicsRequirements2KHR")) {
+    return false;
+  }
+  D().get_instance_proc_addr = get_instance_proc_addr;
+  XrVulkanInstanceCreateInfoKHR xr_info{XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR};
+  xr_info.systemId = s.system;
+  xr_info.pfnGetInstanceProcAddr = &RuntimeGetInstanceProcAddr;
+  xr_info.vulkanCreateInfo = &create_info;
+  if (!Check(s.create_vulkan_instance(s.instance, &xr_info, &instance_out, &result_out),
+             "xrCreateVulkanInstanceKHR")) {
+    return false;
+  }
+  if (result_out == VK_SUCCESS) s.runtime_instance = instance_out;
+  return true;
+}
+
+bool CreateDevice(VkInstance instance, VkPhysicalDevice physical_device,
+                  const VkDeviceCreateInfo& create_info, VkDevice& device_out,
+                  VkResult& result_out) {
+  std::lock_guard<std::mutex> lock(S().mutex);
+  State& s = S();
+  if (s.instance == XR_NULL_HANDLE || !s.enable2 || instance != s.runtime_instance) return false;
+  // Only on the GPU the headset is on; another stays the caller's (VR off).
+  XrVulkanGraphicsDeviceGetInfoKHR get_info{XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR};
+  get_info.systemId = s.system;
+  get_info.vulkanInstance = instance;
+  VkPhysicalDevice wanted = VK_NULL_HANDLE;
+  if (!Check(s.get_graphics_device2(s.instance, &get_info, &wanted), "finding its GPU") ||
+      wanted != physical_device) {
+    return false;
+  }
+  XrVulkanDeviceCreateInfoKHR xr_info{XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR};
+  xr_info.systemId = s.system;
+  xr_info.pfnGetInstanceProcAddr = &RuntimeGetInstanceProcAddr;
+  xr_info.vulkanPhysicalDevice = physical_device;
+  xr_info.vulkanCreateInfo = &create_info;
+  if (!Check(s.create_vulkan_device(s.instance, &xr_info, &device_out, &result_out),
+             "xrCreateVulkanDeviceKHR")) {
+    return false;
+  }
+  if (result_out == VK_SUCCESS) s.runtime_device = device_out;
+  return true;
+}
+
 void OnDeviceCreated(const VulkanInstance* instance, const VulkanDevice* device) {
   std::lock_guard<std::mutex> lock(S().mutex);
   State& s = S();
   if (s.instance == XR_NULL_HANDLE || s.session != XR_NULL_HANDLE || !device) return;
   VkPhysicalDevice wanted = VK_NULL_HANDLE;
-  s.get_graphics_device(s.instance, s.system, instance->instance(), &wanted);
+  if (s.enable2) {
+    // The runtime made the device (CreateDevice) only on the headset's GPU.
+    if (device->device() == s.runtime_device) wanted = device->physical_device();
+  } else {
+    s.get_graphics_device(s.instance, s.system, instance->instance(), &wanted);
+  }
   if (wanted != device->physical_device()) {
     REXLOG_WARN("OpenXR: the headset is on another GPU than the game's; VR is off "
                 "(choose that GPU with vulkan_device)");
@@ -1432,17 +1653,21 @@ void OnDeviceCreated(const VulkanInstance* instance, const VulkanDevice* device)
     REXLOG_WARN("OpenXR: this GPU cannot blit the guest output's format; VR is off");
     return;
   }
+  // XR_KHR_vulkan_enable2 asked for them before the instance.
   XrGraphicsRequirementsVulkanKHR requirements{XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
-  if (!Check(s.get_graphics_requirements(s.instance, s.system, &requirements),
-             "xrGetVulkanGraphicsRequirementsKHR")) {
+  if (!s.enable2 && !Check(s.get_graphics_requirements(s.instance, s.system, &requirements),
+                          "xrGetVulkanGraphicsRequirementsKHR")) {
     return;
   }
+  // XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR is the same structure and type.
   XrGraphicsBindingVulkanKHR binding{XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
   binding.instance = instance->instance();
   binding.physicalDevice = device->physical_device();
   binding.device = device->device();
   binding.queueFamilyIndex = device->queue_family_graphics_compute();
   binding.queueIndex = 0;
+  // The runtime's queue calls from here on take this device's queue lock.
+  D().device.store(device, std::memory_order_release);
   XrSessionCreateInfo session_info{XR_TYPE_SESSION_CREATE_INFO};
   session_info.next = &binding;
   session_info.systemId = s.system;
@@ -1478,6 +1703,7 @@ void OnDeviceDestroying() {
     dfn.vkQueueWaitIdle(queue.queue());
   }
   DestroySession();
+  D().device.store(nullptr, std::memory_order_release);
   if (s.staging != VK_NULL_HANDLE) s.retired.emplace_back(s.staging, s.staging_memory);
   for (const auto& [image, memory] : s.retired) {
     dfn.vkDestroyImage(s.device->device(), image, nullptr);
@@ -1837,6 +2063,13 @@ namespace openxr {
 
 std::vector<const char*> InstanceExtensions() { return {}; }
 std::vector<const char*> DeviceExtensions(VkInstance, VkPhysicalDevice) { return {}; }
+bool CreateInstance(PFN_vkGetInstanceProcAddr, const VkInstanceCreateInfo&, VkInstance&,
+                    VkResult&) {
+  return false;
+}
+bool CreateDevice(VkInstance, VkPhysicalDevice, const VkDeviceCreateInfo&, VkDevice&, VkResult&) {
+  return false;
+}
 void OnDeviceCreated(const VulkanInstance*, const VulkanDevice*) {}
 void OnDeviceDestroying() {}
 bool StereoWanted() { return REXCVAR_GET(xr_simulate); }
