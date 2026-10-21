@@ -196,6 +196,13 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                                       args.stride, args.flags);
       } break;
 
+      case Command::kCallback: {
+        auto& args = *reinterpret_cast<const ArgsCallback*>(stream);
+        args.callback(reinterpret_cast<const uint8_t*>(stream) +
+                          rex::align(sizeof(ArgsCallback), alignof(uintmax_t)),
+                      command_buffer);
+      } break;
+
       case Command::kVkDispatch: {
         auto& args = *reinterpret_cast<const ArgsVkDispatch*>(stream);
         dfn.vkCmdDispatch(command_buffer, args.group_count_x, args.group_count_y,
