@@ -84,6 +84,10 @@ struct EyeRequest {
   uint32_t tag = 0;
   float position[3] = {};
   float orientation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+  // The eye's field of view on the headset, radians (left and down
+  // negative): left, right, up, down. Often not centred (Meta's runtime: a
+  // Quest 3 eye reaches 14 degrees further out than in). All zero: none.
+  float fov[4] = {};
 };
 // The next frame's eye and pose; the eyes alternate. Call once per title
 // frame, from any thread; false (and nothing requested) while stereo is off.
@@ -91,10 +95,12 @@ bool NextEye(EyeRequest& out);
 // The eye each pair starts with: 0 (left), or 1 with xr_right_eye_first.
 int FirstEye();
 
-// The headset's vertical field of view (radians, the wider eye's), once
-// NextEye has located the eyes; 0 before that and without a headset.
+// The vertical field of view to render each eye with (radians): centred on
+// the eye's direction and wide enough for both eyes' own fields of view, once
+// NextEye has located the eyes; 0 before that and without a headset. The
+// headset's copy then cuts each eye's own out of it (FrameCopy::crop).
 float HeadsetFovY();
-// And horizontal (the wider eye's), for the host's render aspect.
+// And horizontal, for the host's render aspect.
 float HeadsetFovX();
 // The vertical field of view of the main view of the latest presented
 // tagged frame (radians), or 0: lets the host tell its main camera from
@@ -129,11 +135,17 @@ struct Lens {
 // BeginGuestFrame decodes the lens's tag (and logs, also for xr_simulate) and
 // says where the frame goes. The caller then records in the frame's command
 // buffer:
-// - the guest output blitted, nearest, into `staging` (from an undefined
-//   layout to a transfer destination, then a transfer source; same size);
+// - the guest output's `crop` (left, top, right, bottom, shares of its size:
+//   the part the eye's field of view sees) blitted into `staging`, nearest
+//   when it is the whole image, else linear (from an undefined layout to a
+//   transfer destination, then a transfer source);
 // - `staging` copied into `target` (from an undefined layout to a transfer
 //   destination, then color attachment optimal);
-// - with `capture`, `staging` copied into that buffer for the host.
+// - with `capture`, `staging` copied into that buffer for the host;
+// - with `hud` (an eye's frame, HudPanelWanted), the frame's HUD layer
+//   blitted, linear, into it (premultiplied alpha, `hud_width` x
+//   `hud_height`, from an undefined layout to a transfer destination, then a
+//   transfer source), or cleared to transparent when the frame has none.
 // GuestFrameSubmitted goes after that command buffer has been submitted. A
 // left eye's frame stays unseen until the right one requested after it is
 // copied, and both reach the headset together. False when there is nothing
