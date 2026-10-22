@@ -953,6 +953,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_FEATURE(sampleRateShading)
     XE_UI_VULKAN_FEATURE(depthClamp)
     XE_UI_VULKAN_FEATURE(fillModeNonSolid)
+    XE_UI_VULKAN_FEATURE(textureCompressionBC)
+    XE_UI_VULKAN_FEATURE(textureCompressionASTC_LDR)
     XE_UI_VULKAN_FEATURE(samplerAnisotropy)
     XE_UI_VULKAN_FEATURE(occlusionQueryPrecise)
     XE_UI_VULKAN_FEATURE(vertexPipelineStoresAndAtomics)
