@@ -5902,12 +5902,22 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     draw_cost_.last = DrawCostNow();
   }
   auto draw_fail = [&](const char* stage) {
+    // After a lost device every draw fails: 15 rotated logs of this in 3 s
+    // (2026-10-22) took the lines before the loss with them. The first 100,
+    // then one in 10000, counted again from a loss or a recovery so earlier
+    // harmless failures never hide the ones after it.
+    if (draw_failures_device_lost_ != device_lost_) {
+      draw_failures_device_lost_ = device_lost_;
+      draw_failures_ = 0;
+    }
+    const uint64_t failure = draw_failures_++;
+    if (failure >= 100 && failure % 10000) return false;
     auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
     REXGPU_ERROR(
-        "Vulkan IssueDraw failed at {} "
+        "Vulkan IssueDraw failed at {} (failure {}) "
         "(prim_type={}, index_count={}, source_select={}, major_mode={}, explicit_major={}, "
         "path_select={}, tess_mode={}, edram_mode={})",
-        stage, uint32_t(prim_type), index_count, uint32_t(vgt_draw_initiator.source_select),
+        stage, failure + 1, uint32_t(prim_type), index_count, uint32_t(vgt_draw_initiator.source_select),
         uint32_t(vgt_draw_initiator.major_mode), uint32_t(major_mode_explicit),
         uint32_t(regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select),
         uint32_t(regs.Get<reg::VGT_HOS_CNTL>().tess_mode),

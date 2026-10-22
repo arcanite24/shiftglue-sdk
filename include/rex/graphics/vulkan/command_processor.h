@@ -883,6 +883,9 @@ class VulkanCommandProcessor : public CommandProcessor {
                                          VkWriteDescriptorSet* descriptor_set_writes_out);
 
   bool device_lost_ = false;
+  // IssueDraw failures logged since device_lost_ last changed (rate limit).
+  uint64_t draw_failures_ = 0;
+  bool draw_failures_device_lost_ = false;
 
   bool cache_clear_requested_ = false;
 
