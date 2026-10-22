@@ -4285,16 +4285,20 @@ void VulkanCommandProcessor::RecordXrFrameCopy(VkImage guest_output,
       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, before_count, before);
   // Scaled (linear) when the headset's images are larger than the frame and
   // DLSS did not make it.
+  // Only the part the eye's field of view sees (FrameCopy::crop).
   VkImageBlit blit{};
   blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  blit.srcOffsets[1] = {int32_t(source_width), int32_t(source_height), 1};
+  blit.srcOffsets[0] = {int32_t(std::lround(copy.crop[0] * float(source_width))),
+                        int32_t(std::lround(copy.crop[1] * float(source_height))), 0};
+  blit.srcOffsets[1] = {int32_t(std::lround(copy.crop[2] * float(source_width))),
+                        int32_t(std::lround(copy.crop[3] * float(source_height))), 1};
   blit.dstSubresource = blit.srcSubresource;
   blit.dstOffsets[1] = {int32_t(output_width), int32_t(output_height), 1};
-  deferred_command_buffer_.CmdVkBlitImage(
-      source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, copy.staging,
-      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, blit,
-      source_width == output_width && source_height == output_height ? VK_FILTER_NEAREST
-                                                                     : VK_FILTER_LINEAR);
+  const bool same_size = blit.srcOffsets[1].x - blit.srcOffsets[0].x == int32_t(output_width) &&
+                         blit.srcOffsets[1].y - blit.srcOffsets[0].y == int32_t(output_height);
+  deferred_command_buffer_.CmdVkBlitImage(source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                          copy.staging, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                          blit, same_size ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
   VkImageMemoryBarrier middle[2];
   uint32_t middle_count = 0;
   middle[middle_count++] =

@@ -91,6 +91,46 @@ REXCVAR_DEFINE_DOUBLE(xr_simulate_yaw, 0.0, "Display",
 REXCVAR_DEFINE_DOUBLE(xr_simulate_fov, 1.6, "Display",
                       "Vertical field of view in radians xr_simulate reports for its headset")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(xr_simulate_fov_outward, 0.0, "Display",
+                      "Testing: radians each xr_simulate eye's field of view is turned outward "
+                      "(Meta's runtime reports a Quest 3's 0.122)")
+    .range(-0.5, 0.5)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(xr_hud_panel, true, "Display",
+                    "In VR stereo, show the game's HUD (speedometer, map, banners) on a "
+                    "floating panel in front of the seat instead of hiding it")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(xr_hud_distance, 1.2, "Display",
+                      "Distance in metres from the seat to the VR HUD panel")
+    .range(0.3, 10.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(xr_hud_width, 1.1, "Display", "Width of the VR HUD panel in metres")
+    .range(0.1, 10.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(xr_hud_height, -0.1, "Display",
+                      "Height in metres of the VR HUD panel's centre above the seat's eye "
+                      "level (negative: below)")
+    .range(-5.0, 5.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(xr_hud_bands, "0.5:0.3", "Display",
+                      "Horizontal bands of the VR HUD panel raised out of the view through the "
+                      "windscreen, from the top: \"end:metres\" pairs, each band ending at that "
+                      "share of the HUD's height (banners and skill chains are in the top half), "
+                      "the rows below the last band staying put; empty keeps one panel")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(xr_hud_boxes, "0.25,0.75,0.75,0.95:0.18;0.30,0.25,0.70,0.43:-0.14",
+                      "Display",
+                      "Boxes of the VR HUD panel moved on their own, over the bands: "
+                      "\"left,top,right,bottom:metres\" in shares of the HUD's width and height, "
+                      "separated by ';', negative metres lowering. The defaults put the speed "
+                      "trap readout (bottom centre, between the map and the speedometer) and the "
+                      "event and location prompts (\"SIGN ME UP!\", \"ENTER NOW\", below the "
+                      "skill chain) at the same height, on the windscreen's lower edge")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(xr_hud_follow_head, false, "Display",
+                    "Keep the VR HUD panel in front of the head as it turns, instead of in "
+                    "front of the seat")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex {
 namespace ui {
@@ -323,7 +363,52 @@ void SimulatedOrientation(int eye, float orientation[4]) {
 }
 
 // Stores and returns a new request for `eye` at this pose.
-EyeRequest Record(int eye, const float position[3], const float orientation[4]) {
+// a * b, quaternions as (x, y, z, w).
+void MulQuat(const float a[4], const float b[4], float out[4]) {
+  const float x = a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1];
+  const float y = a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0];
+  const float z = a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3];
+  const float w = a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2];
+  out[0] = x, out[1] = y, out[2] = z, out[3] = w;
+}
+
+// An eye whose field of view is off centre (a Quest 3's, in Meta's runtime
+// and Virtual Desktop's alike: 14 degrees further out than in, 11 further
+// down than up) is turned to face its middle, its field of view then centred
+// on that: the game renders the same centred view as for a centred eye, the
+// headset is told the turned pose, and every pixel is one the eye sees.
+// (Rendering one centred view wide enough for the off-centre field and
+// cutting each eye's part out cost a fifth of the pixels each way.)
+void CentreEye(float orientation[4], float fov[4]) {
+  if (!(fov[1] > fov[0] && fov[2] > fov[3])) return;
+  // Left (about +y) by the middle's angle left, then up (about +x).
+  const float yaw = -(fov[0] + fov[1]) * 0.5f, pitch = (fov[2] + fov[3]) * 0.5f;
+  const float turn_left[4] = {0.0f, std::sin(yaw * 0.5f), 0.0f, std::cos(yaw * 0.5f)};
+  const float turn_up[4] = {std::sin(pitch * 0.5f), 0.0f, 0.0f, std::cos(pitch * 0.5f)};
+  float turned[4];
+  MulQuat(orientation, turn_left, turned);
+  MulQuat(turned, turn_up, orientation);
+  const float half_x = (fov[1] - fov[0]) * 0.5f, half_y = (fov[2] - fov[3]) * 0.5f;
+  fov[0] = -half_x;
+  fov[1] = half_x;
+  fov[2] = half_y;
+  fov[3] = -half_y;
+}
+
+// xr_simulate's eye fields of view: xr_simulate_fov tall, a Quest 3's 1.2
+// times as wide, each eye's centre turned xr_simulate_fov_outward out.
+void SimulatedFov(int eye, float fov[4]) {
+  const double half_y = REXCVAR_GET(xr_simulate_fov) * 0.5;
+  const double half_x = std::atan(std::tan(half_y) * 1.2);
+  const double outward = REXCVAR_GET(xr_simulate_fov_outward) * (eye ? 1.0 : -1.0);
+  fov[0] = float(-half_x + outward);
+  fov[1] = float(half_x + outward);
+  fov[2] = float(half_y);
+  fov[3] = float(-half_y);
+}
+
+EyeRequest Record(int eye, const float position[3], const float orientation[4],
+                  const float fov[4]) {
   Bookkeeping& b = B();
   std::lock_guard<std::mutex> lock(b.mutex);
   EyeRequest request;
@@ -331,6 +416,7 @@ EyeRequest Record(int eye, const float position[3], const float orientation[4]) 
   request.tag = uint32_t(b.sequence % kTagCount);
   for (int i = 0; i < 3; ++i) request.position[i] = position[i];
   for (int i = 0; i < 4; ++i) request.orientation[i] = orientation[i];
+  for (int i = 0; i < 4; ++i) request.fov[i] = fov[i];
   b.ring[request.tag] = {true, request, SteadyNs()};
   ++b.sequence;
   return request;
@@ -346,8 +432,10 @@ float HeadsetFovY() {
 }
 float HeadsetFovX() {
   if (REXCVAR_GET(xr_simulate)) {
-    // A Quest 3 eye is about 1.2 times as wide as tall.
-    return float(2.0 * std::atan(std::tan(REXCVAR_GET(xr_simulate_fov) * 0.5) * 1.2));
+    float fov[4], orientation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    SimulatedFov(0, fov);
+    CentreEye(orientation, fov);
+    return 2.0f * std::max(-fov[0], fov[1]);
   }
   return B().headset_fov_x.load(std::memory_order_relaxed);
 }
@@ -486,6 +574,7 @@ struct State {
   bool have_right_view = false;
   float right_position[3] = {};
   float right_orientation[4] = {};
+  float right_fov[4] = {};
 
   // The headset's frames: a thread of their own, at the headset's rate,
   // whatever the game's frame rate.
@@ -2108,7 +2197,10 @@ bool NextEye(EyeRequest& out) {
     const float position[3] = {eye ? half : -half, 0.0f, 0.0f};
     float orientation[4];
     SimulatedOrientation(eye, orientation);
-    out = Record(eye, position, orientation);
+    float fov[4];
+    SimulatedFov(eye, fov);
+    CentreEye(orientation, fov);
+    out = Record(eye, position, orientation, fov);
     return true;
   }
   State& s = S();
@@ -2116,7 +2208,7 @@ bool NextEye(EyeRequest& out) {
   if (eye != FirstEye() && s.have_right_view && REXCVAR_GET(xr_shared_eye_pose)) {
     // The pair's second eye, located with its first.
     s.have_right_view = false;
-    out = Record(eye, s.right_position, s.right_orientation);
+    out = Record(eye, s.right_position, s.right_orientation, s.right_fov);
     return true;
   }
   s.have_right_view = false;
@@ -2143,13 +2235,43 @@ bool NextEye(EyeRequest& out) {
       !(view_state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
     return false;
   }
+  for (XrView& view : views) {
+    float orientation[4] = {view.pose.orientation.x, view.pose.orientation.y,
+                            view.pose.orientation.z, view.pose.orientation.w};
+    float fov[4] = {view.fov.angleLeft, view.fov.angleRight, view.fov.angleUp,
+                    view.fov.angleDown};
+    CentreEye(orientation, fov);
+    view.pose.orientation = {orientation[0], orientation[1], orientation[2], orientation[3]};
+    view.fov = {fov[0], fov[1], fov[2], fov[3]};
+  }
+  // The game renders a centred view reaching each eye's furthest angle on
+  // every side (centred eyes: their own); the headset's copy cuts each eye's
+  // own field out of it (EyeFov), all of it for a centred eye.
   float fov_y = 0.0f, fov_x = 0.0f;
   for (const XrView& view : views) {
-    fov_y = std::max(fov_y, view.fov.angleUp - view.fov.angleDown);
-    fov_x = std::max(fov_x, view.fov.angleRight - view.fov.angleLeft);
+    fov_y = std::max(fov_y, 2.0f * std::max(view.fov.angleUp, -view.fov.angleDown));
+    fov_x = std::max(fov_x, 2.0f * std::max(view.fov.angleRight, -view.fov.angleLeft));
   }
   B().headset_fov_y = fov_y;
   B().headset_fov_x = fov_x;
+  {
+    // Each eye's own angles, when they change: Meta's runtime and Virtual
+    // Desktop's may not report the same shape for the same headset.
+    static float logged[8] = {};
+    const float angles[8] = {views[0].fov.angleLeft, views[0].fov.angleRight,
+                             views[0].fov.angleUp,   views[0].fov.angleDown,
+                             views[1].fov.angleLeft, views[1].fov.angleRight,
+                             views[1].fov.angleUp,   views[1].fov.angleDown};
+    bool changed = false;
+    for (int i = 0; i < 8; ++i) changed |= std::abs(angles[i] - logged[i]) > 0.001f;
+    if (changed) {
+      std::copy(std::begin(angles), std::end(angles), logged);
+      REXLOG_INFO("OpenXR: eye fields of view (left, right, up, down, radians): left eye "
+                  "{:.4f} {:.4f} {:.4f} {:.4f}, right eye {:.4f} {:.4f} {:.4f} {:.4f}",
+                  angles[0], angles[1], angles[2], angles[3], angles[4], angles[5], angles[6],
+                  angles[7]);
+    }
+  }
   if (const double amplitude = REXCVAR_GET(xr_test_yaw); amplitude > 0.0) {
     // About the vertical through the head's centre, in the seat.
     const double yaw = amplitude / 57.29577951308232 *
@@ -2194,9 +2316,15 @@ bool NextEye(EyeRequest& out) {
     s.right_orientation[1] = right.orientation.y;
     s.right_orientation[2] = right.orientation.z;
     s.right_orientation[3] = right.orientation.w;
+    s.right_fov[0] = views[1 - eye].fov.angleLeft;
+    s.right_fov[1] = views[1 - eye].fov.angleRight;
+    s.right_fov[2] = views[1 - eye].fov.angleUp;
+    s.right_fov[3] = views[1 - eye].fov.angleDown;
     s.have_right_view = true;
   }
-  out = Record(eye, position, orientation);
+  const float fov[4] = {views[eye].fov.angleLeft, views[eye].fov.angleRight, views[eye].fov.angleUp,
+                        views[eye].fov.angleDown};
+  out = Record(eye, position, orientation, fov);
   return true;
 }
 
@@ -2229,6 +2357,41 @@ void FinishFenced(bool wait) {
     s.show_screen = true;
   }
   s.fenced = Pending::kNone;
+}
+
+// The field of view an eye's image is shown with, and the part of the
+// rendered frame (`crop`, shares of its size) that it sees. The game renders
+// a centred view (`lens`, reaching every eye's furthest angle: HeadsetFovX);
+// the eye's own (request.fov) is often off centre, and Meta's runtime showed
+// the centred image over it: each eye's view 7 degrees out, double vision,
+// and the world sliding and zooming as the head turned (2026-10-22). With no
+// eye field of view (the screen, older requests) the whole frame.
+XrFovf EyeFov(const Lens& lens, const EyeRequest& request, float crop[4]) {
+  const float half_x = lens.fov_x * 0.5f, half_y = lens.fov_y * 0.5f;
+  crop[0] = crop[1] = 0.0f;
+  crop[2] = crop[3] = 1.0f;
+  const float* f = request.fov;
+  if (!(f[1] > f[0] && f[2] > f[3]) || !(half_x > 0.0f && half_y > 0.0f)) {
+    return {-half_x, half_x, half_y, -half_y};
+  }
+  // In tangents across the rendered image: x from -tx (left edge) to tx,
+  // y from ty (top) to -ty; an eye reaching past what was rendered keeps
+  // what there is.
+  const float tx = std::tan(half_x), ty = std::tan(half_y);
+  const float left = std::max(std::tan(f[0]), -tx), right = std::min(std::tan(f[1]), tx);
+  const float up = std::min(std::tan(f[2]), ty), down = std::max(std::tan(f[3]), -ty);
+  crop[0] = (left + tx) / (2.0f * tx);
+  crop[2] = (right + tx) / (2.0f * tx);
+  crop[1] = (ty - up) / (2.0f * ty);
+  crop[3] = (ty - down) / (2.0f * ty);
+  // A centred eye (Virtual Desktop's) takes the whole frame: the measured
+  // lens can differ from the requested by a hair, which would shift the copy
+  // by a pixel and filter it.
+  for (int i = 0; i < 4; ++i) {
+    const float edge = i < 2 ? 0.0f : 1.0f;
+    if (std::abs(crop[i] - edge) < 0.002f) crop[i] = edge;
+  }
+  return {std::atan(left), std::atan(right), std::atan(up), std::atan(down)};
 }
 
 bool BeginGuestFrame(uint32_t width, uint32_t height, float display_aspect, const Lens& lens,
@@ -2273,6 +2436,7 @@ bool BeginGuestFrame(uint32_t width, uint32_t height, float display_aspect, cons
     out.staging = s.staging;
     out.target = s.simulated_target[eye];
     out.eye = eye;
+    EyeFov(lens, request, out.crop);
     return true;
   }
   if (!s.running || !s.visible || s.session == XR_NULL_HANDLE || !s.device || !ChooseFormat() ||
@@ -2307,8 +2471,7 @@ bool BeginGuestFrame(uint32_t width, uint32_t height, float display_aspect, cons
     slot->pose[eye].position = {request.position[0], request.position[1], request.position[2]};
     slot->pose[eye].orientation = {request.orientation[0], request.orientation[1],
                                    request.orientation[2], request.orientation[3]};
-    const float half_x = lens.fov_x * 0.5f, half_y = lens.fov_y * 0.5f;
-    slot->fov[eye] = {-half_x, half_x, half_y, -half_y};
+    slot->fov[eye] = EyeFov(lens, request, out.crop);
     if (s.capture_left > 0 && EnsureCaptureBuffer(width, height)) {
       out.capture = s.capture_buffer;
       s.capture_recorded = true;
@@ -2470,7 +2633,10 @@ bool NextEye(EyeRequest& out) {
   const float position[3] = {eye ? half : -half, 0.0f, 0.0f};
   float orientation[4];
   SimulatedOrientation(eye, orientation);
-  out = Record(eye, position, orientation);
+  float fov[4];
+  SimulatedFov(eye, fov);
+  CentreEye(orientation, fov);
+  out = Record(eye, position, orientation, fov);
   return true;
 }
 bool BeginGuestFrame(uint32_t, uint32_t, float, const Lens& lens, FrameCopy& out) {
