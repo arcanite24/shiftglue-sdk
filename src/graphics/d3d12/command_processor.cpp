@@ -2379,6 +2379,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   uint32_t normalized_color_mask =
       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                    : 0;
+  draw_util::ApplyFh1GlowDepthTest(regs, normalized_color_mask, normalized_depth_control);
   // A draw that tests and writes neither depth nor stencil, writes no color
   // and exports no memory outside an occlusion query has no guest-visible
   // output (FH1 issues thousands of such constant point draws per frame).

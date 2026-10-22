@@ -108,6 +108,15 @@ extern const int8_t kD3D10StandardSamplePositions4x[4][2];
 
 reg::RB_DEPTHCONTROL GetNormalizedDepthControl(const RegisterFile& regs);
 
+// FH1 draws its street lamp and car headlight glows (additive sprites,
+// blending SRC_ALPHA/ONE) with the depth test enabled but an ALWAYS function,
+// so they show through the car and the terrain; its other glows test depth.
+// With fh1_glow_depth_test, such a draw tests depth like those
+// (GREATER_EQUAL: FH1's depth is reversed). Takes the normalized depth control
+// and color mask of the draw.
+void ApplyFh1GlowDepthTest(const RegisterFile& regs, uint32_t normalized_color_mask,
+                           reg::RB_DEPTHCONTROL& normalized_depth_control);
+
 // Direct3D 9 and Xenos constant polygon offset is an absolute floating-point
 // value.
 // It's possibly treated just as an absolute offset by the Xenos too - the

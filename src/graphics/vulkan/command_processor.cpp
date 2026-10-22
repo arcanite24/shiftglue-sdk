@@ -6178,6 +6178,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     normalized_color_mask =
         pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                      : 0;
+    draw_util::ApplyFh1GlowDepthTest(regs, normalized_color_mask, normalized_depth_control);
     prefetch(&translation_memos_[StateMemoSlot(
                  memo_state, uint64_t(uintptr_t(vertex_shader)),
                  uint64_t(uintptr_t(pixel_shader)) ^ uint64_t(interpolator_mask) << 1)],

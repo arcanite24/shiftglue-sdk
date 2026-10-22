@@ -30,6 +30,12 @@
 
 REXCVAR_DEFINE_BOOL(half_pixel_offset, true, "GPU", "Enable half pixel offset");
 
+REXCVAR_DEFINE_BOOL(fh1_glow_depth_test, true, "GPU",
+                    "Hide FH1's street lamp and car headlight glows behind the car and the "
+                    "terrain: the depth test the title leaves at ALWAYS for them is done like "
+                    "for its other glows")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(resolve_resolution_scale_fill_half_pixel_offset, true, "GPU",
                     "Fill half pixel offset during resolution scale resolve");
 
@@ -150,6 +156,23 @@ reg::RB_DEPTHCONTROL GetNormalizedDepthControl(const RegisterFile& regs) {
   // Stencil is more complex and is expected to be usually enabled explicitly
   // when needed.
   return depthcontrol;
+}
+
+void ApplyFh1GlowDepthTest(const RegisterFile& regs, uint32_t normalized_color_mask,
+                           reg::RB_DEPTHCONTROL& normalized_depth_control) {
+  if (!REXCVAR_GET(fh1_glow_depth_test) || !normalized_color_mask ||
+      regs[XE_GPU_REG_RB_BLENDCONTROL0] != 0x01060106 ||
+      regs.Get<reg::RB_MODECONTROL>().edram_mode != xenos::EdramMode::kColorDepth) {
+    return;
+  }
+  // GetNormalizedDepthControl turns this test off; the guest register still
+  // has it.
+  const auto depth_control = regs.Get<reg::RB_DEPTHCONTROL>();
+  if (depth_control.z_enable && !depth_control.z_write_enable &&
+      depth_control.zfunc == xenos::CompareFunction::kAlways) {
+    normalized_depth_control.z_enable = 1;
+    normalized_depth_control.zfunc = xenos::CompareFunction::kGreaterEqual;
+  }
 }
 
 // https://docs.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_standard_multisample_quality_levels
