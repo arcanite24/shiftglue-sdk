@@ -544,6 +544,8 @@ struct State {
   std::deque<std::string> names;
 
   const VulkanDevice* device = nullptr;
+  // Headset frames in a row whose xrEndFrame took over 150 ms.
+  uint32_t stalled_ends = 0;
   XrSession session = XR_NULL_HANDLE;
   XrSpace local = XR_NULL_HANDLE;
   XrSpace view = XR_NULL_HANDLE;
@@ -706,6 +708,11 @@ struct State {
       return fmt::format("{:.2f} ms (max {:.1f})", count ? sum_ms / double(count) : 0.0, max_ms);
     }
   } wait_frame, wait_lock, begin_end, guest_hold, release_hold;
+  // Inside begin and end: the runtime's xrBeginFrame and xrEndFrame, and the
+  // pair's copy waiting for its command buffer's last run (the GPU queue's
+  // latency, two headset frames back) and for the swapchain images.
+  Timing begin_call, end_call, copy_gpu_wait, copy_acquire;
+  uint64_t copy_fence_timeouts = 0;
   // When each shown pair arrived after its headset frame started (negative:
   // before), and the frames that showed the previous pair again.
   Timing pair_phase;
@@ -1447,11 +1454,14 @@ bool CopySlot(State::Slot& slot) {
   const VkDevice device = s.device->device();
   Target& left = s.targets[kLeft];
   Target& right = s.targets[kRight];
-  if (!EnsureTarget(left, slot.width, slot.height, "left eye") ||
-      !EnsureTarget(right, slot.width, slot.height, "right eye") ||
-      !Acquire(left, 20'000'000) || !Acquire(right, 20'000'000)) {
-    return false;
-  }
+  const auto acquire_start = std::chrono::steady_clock::now();
+  const bool acquired = EnsureTarget(left, slot.width, slot.height, "left eye") &&
+                        EnsureTarget(right, slot.width, slot.height, "right eye") &&
+                        Acquire(left, 20'000'000) && Acquire(right, 20'000'000);
+  s.copy_acquire.Add(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                               acquire_start)
+                         .count());
+  if (!acquired) return false;
   if (s.xr_pool == VK_NULL_HANDLE) {
     VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -1472,8 +1482,20 @@ bool CopySlot(State::Slot& slot) {
     }
   }
   const int c = s.xr_cmd_next;
+  const auto fence_start = std::chrono::steady_clock::now();
+  const VkResult fence_status =
+      dfn.vkWaitForFences(device, 1, &s.xr_cmd_fence[c], VK_TRUE, 100'000'000);
+  s.copy_gpu_wait.Add(
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fence_start)
+          .count());
+  if (fence_status != VK_SUCCESS) {
+    // Its last copy is still queued: re-recording or resetting it now is
+    // invalid. The headset shows the last pair again; the images stay
+    // acquired for the next frame.
+    ++s.copy_fence_timeouts;
+    return false;
+  }
   s.xr_cmd_next ^= 1;
-  dfn.vkWaitForFences(device, 1, &s.xr_cmd_fence[c], VK_TRUE, 100'000'000);
   dfn.vkResetFences(device, 1, &s.xr_cmd_fence[c]);
   const VkCommandBuffer cmd = s.xr_cmd[c];
   VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -1675,12 +1697,17 @@ void LogPose() {
       "{} headset frames, {} eye pairs shown, {} right eyes without their left; headset thread "
       "waits {} for the headset, {} for the lock and the next pair, {} in begin and end; the game's copy holds "
       "the lock {}, its release {}; pairs arrive {} into the headset's frame, {} frames "
-      "repeated a pair, the game kept up on {}, {} frames asked for another rate",
+      "repeated a pair, the game kept up on {}, {} frames asked for another rate; within begin "
+      "and end: xrBeginFrame {}, xrEndFrame {}, the copy's wait for the GPU {} ({} timed "
+      "out), for the swapchain images {}",
       p.position.x, p.position.y, p.position.z, p.orientation.x, p.orientation.y,
       p.orientation.z, p.orientation.w, s.headset_hz.load(), xr::HeadsetRefreshHz(), s.frames,
       s.pairs, s.unpaired, s.wait_frame.Text(),
       s.wait_lock.Text(), s.begin_end.Text(), s.guest_hold.Text(), s.release_hold.Text(),
-      s.pair_phase.Text(), s.repeats, s.kept_up_frames, s.off_rate_frames);
+      s.pair_phase.Text(), s.repeats, s.kept_up_frames, s.off_rate_frames, s.begin_call.Text(),
+      s.end_call.Text(), s.copy_gpu_wait.Text(), s.copy_fence_timeouts, s.copy_acquire.Text());
+  s.begin_call = s.end_call = s.copy_gpu_wait = s.copy_acquire = {};
+  s.copy_fence_timeouts = 0;
   s.off_rate_frames = 0;
   s.pair_phase = {};
   s.repeats = 0;
@@ -1831,7 +1858,11 @@ void FrameLoop() {
     {
       const auto queue = HoldQueueForRuntime();
       XrFrameBeginInfo begin_info{XR_TYPE_FRAME_BEGIN_INFO};
+      const auto begin_start = std::chrono::steady_clock::now();
       begun = !failed(xrBeginFrame(s.session, &begin_info), "xrBeginFrame");
+      s.begin_call.Add(std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - begin_start)
+                           .count());
     }
     // The next pair into the swapchains, inside this frame.
     const bool copied = begun && next >= 0 && CopySlot(s.slots[next]);
@@ -1945,9 +1976,15 @@ void FrameLoop() {
     const bool screen_layer = layer_count && layers[0] == reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
     if (!screen_layer) lock.unlock();
     XrResult ended;
+    double end_ms;
     {
       const auto queue = HoldQueueForRuntime();
+      const auto end_start = std::chrono::steady_clock::now();
       ended = xrEndFrame(s.session, &end_info);
+      end_ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - end_start)
+              .count();
+      s.end_call.Add(end_ms);
       if (XR_FAILED(ended) && layer_count) {
         // The frame is still open: end it without layers.
         end_info.layerCount = 0;
@@ -1959,6 +1996,17 @@ void FrameLoop() {
     s.begin_end.Add(
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - locked).count());
     LogPose();
+    // Virtual Desktop over USB at times stops taking frames: every
+    // xrEndFrame then takes about 200 ms (inside its streamer; its OpenXR
+    // layer has no such timeout) while the game, the GPU and the swapchains
+    // keep up, and the headset shows its last frame, its own menu button
+    // dead, until the game quits (2026-10-22, three times; head tracking kept
+    // arriving). Logged once a stall (a new session did not help: lessons.md).
+    s.stalled_ends = end_ms > 150.0 ? s.stalled_ends + 1 : 0;
+    if (s.stalled_ends == 10) {
+      REXLOG_WARN("OpenXR: the runtime has taken over 150 ms in each of the last 10 frame ends "
+                  "(the headset stopped taking frames)");
+    }
   }
 }
 
