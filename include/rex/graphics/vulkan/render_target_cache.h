@@ -65,6 +65,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       xenos::ColorRenderTargetFormat color_3_view_format
           : xenos::kColorRenderTargetFormatBits;    // 24
       uint32_t color_rts_use_transfer_formats : 1;  // 25
+      // FH1's HUD drawn into VR's HUD layer (Fh1NativeExecutor): color 0 is
+      // RGBA16F, and its alpha accumulates the HUD's coverage.
+      uint32_t fh1_hud_layer : 1;  // 26
     };
     uint32_t key = 0;
     struct Hasher {

@@ -26,6 +26,7 @@
 #include <rex/platform.h>
 #include <rex/string.h>
 #include <rex/ui/vulkan/device.h>
+#include <rex/ui/vulkan/openxr.h>
 #include <rex/ui/vulkan/upscaler.h>
 
 REXCVAR_DEFINE_BOOL(vulkan_diagnostic_checkpoints, false, "UI/Vulkan",
@@ -520,6 +521,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   for (const char* name : GetVulkanUpscalerDeviceExtensions(vulkan_instance->instance(),
                                                             physical_device,
                                                             properties.vendorID)) {
+    upscaler_extensions_enabled.push_back(false);
+    requested_extensions.emplace(name, &upscaler_extensions_enabled.back());
+  }
+  // The OpenXR runtime's, on the GPU the headset is on (xr_enabled).
+  for (const char* name : openxr::DeviceExtensions(vulkan_instance->instance(), physical_device)) {
     upscaler_extensions_enabled.push_back(false);
     requested_extensions.emplace(name, &upscaler_extensions_enabled.back());
   }
@@ -1091,8 +1097,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   // Create the device.
 
-  const VkResult device_create_result =
-      ifn.vkCreateDevice(physical_device, &device_create_info, nullptr, &device->device_);
+  // In VR the runtime may create it (openxr::CreateDevice).
+  VkResult device_create_result;
+  if (!openxr::CreateDevice(vulkan_instance->instance(), physical_device, device_create_info,
+                            device->device_, device_create_result)) {
+    device_create_result =
+        ifn.vkCreateDevice(physical_device, &device_create_info, nullptr, &device->device_);
+  }
   if (device_create_result != VK_SUCCESS) {
     REXLOG_ERROR(
         "Failed to create a Vulkan logical device from the physical device "

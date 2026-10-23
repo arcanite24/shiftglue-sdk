@@ -4483,6 +4483,22 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
           color_blend_attachment.alphaBlendOp = kBlendOpMap[uint32_t(color_rt.alpha_blend_op)];
         }
         color_blend_attachment.colorWriteMask = VkColorComponentFlags(color_rt.color_write_mask);
+        if (description.render_pass_key.fh1_hud_layer && color_rt_index == 0 &&
+            (color_rt.color_write_mask & 0b0111)) {
+          // VR's HUD layer, cleared to transparent black: the color blends as
+          // the game's, so it ends premultiplied, and alpha is the coverage,
+          // 1 - (1 - dst) * the destination color factor (the 2-bit alpha of
+          // the front buffer the game draws into holds nothing useful). Over
+          // (1 - source alpha) that is exact, and additive draws leave it.
+          if (color_blend_attachment.blendEnable) {
+            const VkBlendFactor dst = color_blend_attachment.dstColorBlendFactor;
+            color_blend_attachment.srcAlphaBlendFactor =
+                dst == VK_BLEND_FACTOR_ONE ? VK_BLEND_FACTOR_ZERO : VK_BLEND_FACTOR_ONE;
+            color_blend_attachment.dstAlphaBlendFactor = dst;
+            color_blend_attachment.alphaBlendOp = VK_BLEND_OP_ADD;
+          }
+          color_blend_attachment.colorWriteMask |= VK_COLOR_COMPONENT_A_BIT;
+        }
       }
     }
     color_blend_state.attachmentCount = 32 - rex::lzcnt(color_rts_used);
@@ -4536,7 +4552,9 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
         key.color_3_view_format};
     for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
       if (key.depth_and_color_used & (1 << (1 + i))) {
-        color_attachment_formats[i] = render_target_cache_.GetColorVulkanFormat(color_formats[i]);
+        color_attachment_formats[i] = key.fh1_hud_layer && i == 0
+                                          ? VK_FORMAT_R16G16B16A16_SFLOAT
+                                          : render_target_cache_.GetColorVulkanFormat(color_formats[i]);
         color_attachment_count = i + 1;
       }
     }

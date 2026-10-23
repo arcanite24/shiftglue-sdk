@@ -43,6 +43,7 @@
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/keybinds.h>
+#include <rex/ui/xr.h>
 #include <rex/version.h>
 #if REX_PLATFORM_ANDROID
 #include <rex/ui/vulkan/android_gpu_driver.h>
@@ -603,6 +604,8 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
     if (rex::ppc::ProbeDump(path))
       REXLOG_INFO("Probe data written to {}", path.string());
   }
+  // A VR session's thread would otherwise still be in the OpenXR runtime.
+  ui::xr::Shutdown();
   REXLOG_INFO("Title terminated; hard-exiting process.");
   rex::FlushLogging();
   std::_Exit(0);

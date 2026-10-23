@@ -36,8 +36,9 @@ REXCVAR_DEFINE_STRING(present_dlss_runtime, "", "UI/Presenter",
 
 REXCVAR_DEFINE_STRING(present_dlss_preset, "default", "UI/Presenter",
                       "DLSS preset: default (the DLSS runtime's choice per mode, and the one the "
-                      "NVIDIA app's override replaces), j, k, l or m")
-    .allowed({"default", "j", "k", "l", "m"});
+                      "NVIDIA app's override replaces), j, k, l or m; e and f are the older "
+                      "CNN model, deprecated by NVIDIA but cheaper")
+    .allowed({"default", "e", "f", "j", "k", "l", "m"});
 
 REXCVAR_DEFINE_INT32(present_dlss_jitter_sign, 0, "UI/Presenter",
                      "Debug: negate the jitter DLSS is given, 1 for x, 2 for y, 3 for both")
@@ -181,6 +182,8 @@ NVSDK_NGX_PerfQuality_Value PerfQualityForRatio(float ratio) {
 
 NVSDK_NGX_DLSS_Hint_Render_Preset PresetFromCvar() {
   const std::string preset = REXCVAR_GET(present_dlss_preset);
+  if (preset == "e") return NVSDK_NGX_DLSS_Hint_Render_Preset_E;
+  if (preset == "f") return NVSDK_NGX_DLSS_Hint_Render_Preset_F;
   if (preset == "j") return NVSDK_NGX_DLSS_Hint_Render_Preset_J;
   if (preset == "k") return NVSDK_NGX_DLSS_Hint_Render_Preset_K;
   if (preset == "l") return NVSDK_NGX_DLSS_Hint_Render_Preset_L;
@@ -249,7 +252,10 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
   }
 
   ~VulkanDlssUpscaler() override {
-    Release();
+    for (uint32_t i = 0; i < kHistoryCount; ++i) {
+      SelectHistory(i);
+      Release();
+    }
     if (parameters_) {
       NVSDK_NGX_VULKAN_DestroyParameters(parameters_);
       parameters_ = nullptr;
@@ -263,31 +269,37 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
 
   bool Prepare(uint32_t max_render_width, uint32_t max_render_height, uint32_t max_output_width,
                uint32_t max_output_height, bool hdr) override {
+    const std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!info_.available) {
       return false;
     }
     const NVSDK_NGX_DLSS_Hint_Render_Preset preset = PresetFromCvar();
-    if (feature_ && (max_render_width != render_width_ || max_render_height != render_height_ ||
-                     max_output_width != output_width_ || max_output_height != output_height_ ||
-                     hdr != hdr_ || preset != preset_)) {
+    History& history = h();
+    if (history.feature &&
+        (max_render_width != history.render_width ||
+         max_render_height != history.render_height ||
+         max_output_width != history.output_width ||
+         max_output_height != history.output_height || hdr != history.hdr ||
+         preset != history.preset)) {
       Release();
     }
-    render_width_ = max_render_width;
-    render_height_ = max_render_height;
-    output_width_ = max_output_width;
-    output_height_ = max_output_height;
-    hdr_ = hdr;
-    preset_ = preset;
+    h().render_width = max_render_width;
+    h().render_height = max_render_height;
+    h().output_width = max_output_width;
+    h().output_height = max_output_height;
+    h().hdr = hdr;
+    h().preset = preset;
     return true;
   }
 
   bool Dispatch(VkCommandBuffer command_buffer, const VulkanUpscalerInputs& inputs) override {
+    const std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!info_.available || !inputs.color.image || !inputs.output.image ||
         !inputs.depth.image || !inputs.motion_vectors.image) {
       return false;
     }
     const UpscalerFrame& frame = inputs.frame;
-    if (!feature_ && !CreateFeature(command_buffer, frame)) {
+    if (!h().feature && !CreateFeature(command_buffer, frame)) {
       return false;
     }
     const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -329,7 +341,7 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
     eval.InExposureScale = 1.0f;
     eval.InFrameTimeDeltaInMsec = frame.frame_delta_ms;
     const NVSDK_NGX_Result result =
-        NGX_VULKAN_EVALUATE_DLSS_EXT(command_buffer, feature_, parameters_, &eval);
+        NGX_VULKAN_EVALUATE_DLSS_EXT(command_buffer, h().feature, parameters_, &eval);
     if (NVSDK_NGX_FAILED(result)) {
       if (!evaluate_failure_logged_) {
         evaluate_failure_logged_ = true;
@@ -341,18 +353,28 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
   }
 
   void Release() override {
-    if (feature_) {
-      NVSDK_NGX_VULKAN_ReleaseFeature(feature_);
-      feature_ = nullptr;
+    const std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (h().feature) {
+      NVSDK_NGX_VULKAN_ReleaseFeature(h().feature);
+      h().feature = nullptr;
     }
+  }
+
+  uint32_t history_count() const override { return kHistoryCount; }
+  void SelectHistory(uint32_t index) override {
+    const std::lock_guard<std::recursive_mutex> lock(mutex_);
+    history_ = index < kHistoryCount ? index : 0;
+  }
+  std::unique_lock<std::recursive_mutex> LockHistory() override {
+    return std::unique_lock<std::recursive_mutex>(mutex_);
   }
 
  private:
   bool CreateFeature(VkCommandBuffer command_buffer, const UpscalerFrame& frame) {
-    const uint32_t render_width = std::max(render_width_, frame.render_width);
-    const uint32_t render_height = std::max(render_height_, frame.render_height);
-    const uint32_t output_width = std::max(output_width_, frame.output_width);
-    const uint32_t output_height = std::max(output_height_, frame.output_height);
+    const uint32_t render_width = std::max(h().render_width, frame.render_width);
+    const uint32_t render_height = std::max(h().render_height, frame.render_height);
+    const uint32_t output_width = std::max(h().output_width, frame.output_width);
+    const uint32_t output_height = std::max(h().output_height, frame.output_height);
     if (!render_width || !render_height || !output_width || !output_height) {
       return false;
     }
@@ -364,7 +386,7 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
                              NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance,
                              NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance,
                              NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality}) {
-      NVSDK_NGX_Parameter_SetUI(parameters_, name, uint32_t(preset_));
+      NVSDK_NGX_Parameter_SetUI(parameters_, name, uint32_t(h().preset));
     }
     NVSDK_NGX_DLSS_Create_Params create = {};
     create.Feature.InWidth = render_width;
@@ -378,13 +400,13 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
     if (frame.depth_inverted) {
       create.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
     }
-    if (hdr_) {
+    if (h().hdr) {
       create.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
     }
     const NVSDK_NGX_Result result =
-        NGX_VULKAN_CREATE_DLSS_EXT(command_buffer, 1, 1, &feature_, parameters_, &create);
-    if (NVSDK_NGX_FAILED(result) || !feature_) {
-      feature_ = nullptr;
+        NGX_VULKAN_CREATE_DLSS_EXT(command_buffer, 1, 1, &h().feature, parameters_, &create);
+    if (NVSDK_NGX_FAILED(result) || !h().feature) {
+      h().feature = nullptr;
       if (!create_failure_logged_) {
         create_failure_logged_ = true;
         REXLOG_WARN("DLSS: could not create the feature for {}x{} to {}x{} (0x{:08X})",
@@ -392,10 +414,10 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
       }
       return false;
     }
-    depth_inverted_ = frame.depth_inverted;
+    h().depth_inverted = frame.depth_inverted;
     REXLOG_INFO("DLSS: feature for {}x{} to {}x{}, quality {}, preset {}{}", render_width,
-                render_height, output_width, output_height, int(quality), int(preset_),
-                hdr_ ? ", HDR" : "");
+                render_height, output_width, output_height, int(quality), int(h().preset),
+                h().hdr ? ", HDR" : "");
     return true;
   }
 
@@ -403,14 +425,25 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
   UpscalerInfo info_;
   bool initialized_ = false;
   NVSDK_NGX_Parameter* parameters_ = nullptr;
-  NVSDK_NGX_Handle* feature_ = nullptr;
-  uint32_t render_width_ = 0;
-  uint32_t render_height_ = 0;
-  uint32_t output_width_ = 0;
-  uint32_t output_height_ = 0;
-  bool hdr_ = false;
-  bool depth_inverted_ = false;
-  NVSDK_NGX_DLSS_Hint_Render_Preset preset_ = NVSDK_NGX_DLSS_Hint_Render_Preset_Default;
+  // One DLSS feature per history: the presenter's (0) and, in VR, one per
+  // eye, each with its own frames to accumulate.
+  struct History {
+    NVSDK_NGX_Handle* feature = nullptr;
+    uint32_t render_width = 0;
+    uint32_t render_height = 0;
+    uint32_t output_width = 0;
+    uint32_t output_height = 0;
+    bool hdr = false;
+    bool depth_inverted = false;
+    NVSDK_NGX_DLSS_Hint_Render_Preset preset = NVSDK_NGX_DLSS_Hint_Render_Preset_Default;
+  };
+  static constexpr uint32_t kHistoryCount = 3;
+  // The presenter's thread and VR's (the submission worker, DispatchXrUpscale)
+  // share the histories' selection and the NGX parameters.
+  std::recursive_mutex mutex_;
+  History histories_[kHistoryCount];
+  uint32_t history_ = 0;
+  History& h() { return histories_[history_]; }
   bool create_failure_logged_ = false;
   bool evaluate_failure_logged_ = false;
 };

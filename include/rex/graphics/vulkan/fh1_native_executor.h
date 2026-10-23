@@ -85,6 +85,21 @@ class Fh1NativeExecutor {
   // tiles resolved are copied down to the EDRAM rows of their surfaces, where
   // the last tile leaves them on the console.
   void EndUntiledTiling();
+  // LS-4.5 (fh1_share_msaa_aliases): FH1 reads 1x surfaces as 4x MSAA ones
+  // of half the width and height at the same EDRAM base: its 1280x720 ones
+  // at pitch 16 (the scene and sun shadow depth) as 640x360, and its
+  // 1040-wide D24S8 at pitch 13 as 520 wide. Guest 4x pixel (x, y) sample s
+  // is 1x pixel (2x + (s & 1), 2y + (s >> 1)), so such a 4x surface is
+  // stored as its 1x surface, and its draws render into it single-sampled
+  // at twice the draw resolution scale: switching between the views
+  // transfers nothing.
+  bool IsSharedMsaaAlias(uint32_t msaa, uint32_t pitch_tiles) const {
+    return share_msaa_aliases_ && msaa == uint32_t(xenos::MsaaSamples::k4X) &&
+           (pitch_tiles == 16 || pitch_tiles == 13);
+  }
+  // The current draw's targets are a shared 4x alias (rendered at twice the
+  // scale with one sample).
+  bool DrawAsDoubledScale() const;
   // The host sample count of surfaces the guest renders with this many
   // samples (fh1_msaa_single_sample, fh1_msaa_2x).
   xenos::MsaaSamples HostMsaaSamples(xenos::MsaaSamples guest) const {
@@ -132,6 +147,11 @@ class Fh1NativeExecutor {
   // the front buffer's 2_10_10_10_AS_10_10_10_10 view after the scene was
   // composited there this frame (menus over a game world included).
   bool IsHudDraw() const { return hud_draw_; }
+  // Of those, while the HUD layer is enabled (VR's HUD panel), one placed at
+  // a point in the world (IsWorldAnchoredHudDraw); always false otherwise.
+  bool IsWorldAnchoredHud() const { return hud_world_draw_; }
+  // fh1_debug_skip_hud_draws: whether that HUD draw is one to leave out.
+  bool SkipsHudDraw() const;
   // Whether render target 0 is that HUD view now, before
   // MaybeSnapshotBeforeHud sees the draw (for its samplers).
   bool IsHudTarget() const;
@@ -139,6 +159,20 @@ class Fh1NativeExecutor {
   // After OnSwap: the swapped frame's snapshot, made readable from compute
   // shaders, if it covers width x height; null otherwise.
   VkImageView TakeHudSnapshot(uint32_t width, uint32_t height);
+  // VR's HUD panel (xr_hud_panel): while enabled, the HUD's draws (IsHudDraw)
+  // go into an image of their own instead of the front buffer: RGBA16F,
+  // cleared to transparent black at the frame's first HUD draw, the color
+  // premultiplied and the alpha the HUD's coverage (pipeline_cache.cpp). The
+  // swap shows it in the headset, and puts it over the guest output.
+  void SetHudLayerEnabled(bool enabled) { hud_layer_enabled_ = enabled; }
+  struct HudLayer {
+    VkImage image = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    uint32_t width = 0, height = 0;
+  };
+  // After OnSwap: whether the swapped frame drew its HUD into the layer; it
+  // is then in the general layout, readable by compute shaders and transfers.
+  bool TakeHudLayer(HudLayer& out);
 
   // UP-1.3: the camera and depth a temporal upscaler needs (fh1_camera.cpp).
   // While enabled, every scene draw's world-view-projection (vertex float
@@ -161,15 +195,40 @@ class Fh1NativeExecutor {
     // (UpscalerFrame).
     float jitter_x;
     float jitter_y;
+    // With SetStereoCamera, the eye the frame was drawn for; -1 otherwise.
+    int eye = -1;
   };
   void SetCameraTrackingEnabled(bool enabled) { camera_tracking_enabled_ = enabled; }
   // After OnSwap: the swapped frame's depth (guest z in [0, 1], R32_SFLOAT,
   // readable from compute shaders) and camera, if the depth covers width x
   // height; null otherwise.
   VkImageView TakeCameraFrame(uint32_t width, uint32_t height, Camera& camera_out);
+  // After OnSwap, with camera tracking: the swapped frame's main view's full
+  // horizontal and vertical fields of view (radians), from its world's
+  // matrix, for the OpenXR output; false without a world.
+  bool TakeLens(float& fov_x, float& fov_y) const {
+    fov_x = lens_fov_x_;
+    fov_y = lens_fov_y_;
+    return lens_valid_;
+  }
+  // And where its camera was, with its right axis (world units).
+  bool TakeLensPosition(float (&position)[3], float (&right)[3]) const {
+    for (int i = 0; i < 3; ++i) {
+      position[i] = lens_position_[i];
+      right[i] = lens_right_[i];
+    }
+    return lens_valid_ && lens_has_position_;
+  }
   // UP-1.5: jitter the scene with a Halton(2, 3) sequence of this length
   // from the next frame (0: none).
   void SetJitterPhases(uint32_t phases) { jitter_phases_ = phases; }
+  // VR's temporal upscaling, the eyes taking turns frame by frame: with the
+  // eye a frame was drawn for (openxr::LensEye), each eye's camera and objects
+  // reproject to that eye's previous frame instead of the other eye's, and
+  // each eye walks a jitter sequence of its own (the odd and even samples of
+  // one Halton(2) sequence lie in opposite halves). Null for one view.
+  using LensEyeFunction = int (*)(float fov_y);
+  void SetStereoCamera(LensEyeFunction lens_eye) { lens_eye_ = lens_eye; }
   // Whether the current draw goes to the scene's color and depth surfaces,
   // and if so this frame's jitter, in host pixels of the surface.
   bool GetSceneJitter(float& x, float& y) const;
@@ -365,6 +424,12 @@ class Fh1NativeExecutor {
   static SurfaceKey MakeDepthKey(uint32_t base, uint32_t pitch_tiles, uint32_t msaa,
                                  xenos::DepthRenderTargetFormat format);
   uint32_t SurfaceHeight(uint32_t pitch_tiles, uint32_t msaa) const;
+  // The surface a key's contents are stored in: a shared 4x alias's 1x
+  // surface (IsSharedMsaaAlias), otherwise the key's own.
+  SurfaceKey StorageKey(SurfaceKey key) const {
+    if (IsSharedMsaaAlias(key.msaa, key.pitch_tiles)) key.msaa = uint32_t(xenos::MsaaSamples::k1X);
+    return key;
+  }
   // rows: the guest rows the caller is about to claim (0: the whole period).
   Surface* GetOrCreateSurface(const SurfaceKey& key, uint32_t rows = 0);
   // Creates the image, its memory and views at surface.image_height.
@@ -397,8 +462,10 @@ class Fh1NativeExecutor {
   void ClaimTiles(uint32_t base, uint32_t length, uint32_t packed_key, bool transfer = true);
   void MarkTileStencil(uint32_t base, uint32_t length, bool nonzero);
   bool DrawMayWriteNonzeroStencil(reg::RB_DEPTHCONTROL depth_control) const;
+  // rect_shift: the overwrite rectangles are in pixels of a shared 4x alias
+  // (1) whose storage key is key, or of key itself (0).
   bool ClaimDepthOverwriteTiles(const SurfaceKey& key, uint32_t length, bool stencil_overwritten,
-                                bool stencil_written);
+                                bool stencil_written, uint32_t rect_shift);
   void ClaimOverwrittenDepthTiles(const SurfaceKey& key, const std::array<int32_t, 4>& rect,
                                   bool stencil_overwritten);
   void ClaimTileRect(const SurfaceKey& key, uint32_t column_first, uint32_t row_first,
@@ -509,7 +576,11 @@ class Fh1NativeExecutor {
     Surface* surface = nullptr;
   };
   SurfaceFront surface_front_[16];
-  uint32_t scale_ = 1;
+  // The draw resolution scale along each axis (each 1 to 4): a guest pixel is
+  // scale_x_ x scale_y_ host pixels.
+  uint32_t scale_x_ = 1;
+  uint32_t scale_y_ = 1;
+  bool Scaled() const { return scale_x_ > 1 || scale_y_ > 1; }
   // fh1_untile_predicated_tiling: the screen height the images hold, and the
   // last later-tile band resolved from each surface since the tiling began.
   uint32_t untile_height_ = 0;
@@ -525,6 +596,25 @@ class Fh1NativeExecutor {
   bool hud_snapshot_ready_ = false;
   Surface hud_snapshot_;
   void DestroyHudSnapshot();
+  // The frame's HUD draws so far, less one (UINT32_MAX before the first).
+  uint32_t hud_draw_index_ = UINT32_MAX;
+  bool hud_world_draw_ = false;
+  bool hud_layer_enabled_ = false;
+  // This frame's HUD went into hud_layer_ (cleared at its first draw).
+  bool hud_layer_drawn_ = false;
+  bool hud_layer_ready_ = false;
+  // The draw MaybeSnapshotBeforeHud last saw renders into hud_layer_.
+  bool hud_layer_bound_ = false;
+  Surface hud_layer_;
+  // At a HUD draw: hud_layer_ for the scene surface `scene`, cleared at the
+  // frame's first; false (the draw goes to the front buffer) when it cannot.
+  bool BeginHudLayerDraw(const Surface& scene);
+  // A HUD draw placed at a point in the world (a racer's name tag): it stays
+  // in the scene, drawn for each eye, rather than going to the HUD layer.
+  bool IsWorldAnchoredHudDraw(const Fh1DrawInfo& draw) const;
+  void DestroyHudLayer();
+  // The surface a bound slot renders into: hud_layer_ for the HUD's color.
+  Surface* BoundSurface(uint32_t index);
 
   // UP-1.3 camera tracking (fh1_camera.cpp).
   struct CameraDraw {
@@ -544,8 +634,21 @@ class Fh1NativeExecutor {
   std::vector<CameraDraw> camera_draws_;
   // The previous frame's scene objects and their matrices.
   std::unordered_map<uint64_t, std::array<float, 16>> camera_previous_objects_;
+  // SetStereoCamera: each eye's previous frame's scene objects and object
+  // matrices, and the eye the next frame is expected to be (the other one).
+  LensEyeFunction lens_eye_ = nullptr;
+  std::unordered_map<uint64_t, std::array<float, 16>> camera_previous_objects_eye_[2];
+  std::unordered_map<uint64_t, std::array<float, 16>> object_wvp_eye_[2];
+  int next_eye_ = -1;
+  uint32_t jitter_index_eye_[2] = {};
   Camera camera_ready_ = {};
   bool camera_ready_valid_ = false;
+  bool lens_valid_ = false;
+  float lens_fov_x_ = 0.0f;
+  float lens_fov_y_ = 0.0f;
+  bool lens_has_position_ = false;
+  float lens_position_[3] = {};
+  float lens_right_[3] = {};
   // The previous frame's scene depth: the one most matrix draws tested,
   // and the color target those draws used most.
   uint32_t camera_scene_depth_ = 0;
@@ -731,6 +834,9 @@ class Fh1NativeExecutor {
   uint64_t frame_ = 0;
   // fh1_scaled_msaa_single_sample at a scale above 1x.
   bool single_sample_msaa_ = false;
+  // fh1_share_msaa_aliases: 4x surfaces at the aliased pitches are stored as
+  // their 1x surfaces (IsSharedMsaaAlias).
+  bool share_msaa_aliases_ = false;
   bool two_sample_msaa_ = false;
   // The device exports stencil from shaders: depth transfers take one pass.
   bool stencil_export_ = false;

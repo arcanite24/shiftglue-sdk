@@ -17,6 +17,7 @@
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/platform.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/shared_memory.h>
@@ -26,6 +27,17 @@
 #include <rex/perf/counter.h>
 #include <rex/ui/vulkan/util.h>
 
+REXCVAR_DEFINE_BOOL(vulkan_hoist_split_uploads, REX_PLATFORM_WIN32, "GPU/Vulkan",
+                    "Record a vertex or index upload needed during an open FH1 rendering ahead "
+                    "of that rendering, instead of ending it, when no draw in it can have read "
+                    "the uploaded pages (on Windows only until measured elsewhere; on the "
+                    "Adreno 740 the upfront copies cost more than the split)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(vulkan_debug_skip_split_uploads, false, "GPU/Vulkan",
+                    "Diagnostics: drop the uploads that would end an open rendering, leaving "
+                    "the GPU's old copy of the memory (wrong geometry), to bound what the "
+                    "splits cost")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
                     "Use sparse shared memory on Vulkan")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -308,6 +320,59 @@ bool VulkanSharedMemory::UploadRanges(
   for (const std::pair<uint32_t, uint32_t>& upload_range : upload_page_ranges) {
     PERF_counter_add(kGpuUploadBytes, int64_t(upload_range.second) << page_size_log2());
   }
+  if (command_processor_.in_render_pass() && REXCVAR_GET(vulkan_debug_skip_split_uploads)) {
+    for (const std::pair<uint32_t, uint32_t>& upload_range : upload_page_ranges) {
+      MakeRangeValid(upload_range.first << page_size_log2(),
+                     upload_range.second << page_size_log2(), false);
+    }
+    return true;
+  }
+  // vulkan_hoist_split_uploads: vertex and index uploads during an open FH1
+  // rendering go ahead of the rendering in the deferred stream instead of
+  // ending it, when no page of theirs was invalidated after it began (so no
+  // draw in it can have read them).
+  size_t hoist_slot = 0;
+  uint32_t hoist_epoch = 0;
+  const uint32_t page_first = upload_page_ranges.front().first;
+  const uint32_t page_last =
+      upload_page_ranges.back().first + upload_page_ranges.back().second - 1;
+  if (command_processor_.in_render_pass() && REXCVAR_GET(vulkan_hoist_split_uploads) &&
+      (upload_kind() == UploadKind::kVertex || upload_kind() == UploadKind::kIndex) &&
+      command_processor_.Fh1UploadHoistSlot(hoist_slot, hoist_epoch) &&
+      !InvalidatedSince(page_first, page_last, hoist_epoch)) {
+    DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+    const size_t tail = command_buffer.GetSize();
+    VkBufferMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = buffer_;
+    barrier.offset = VkDeviceSize(page_first) << page_size_log2();
+    barrier.size = VkDeviceSize(page_last - page_first + 1) << page_size_log2();
+    // Anything before the slot may have read or written the range.
+    constexpr VkPipelineStageFlags kUses =
+        VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+        VK_PIPELINE_STAGE_TRANSFER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    command_buffer.CmdVkPipelineBarrier(kUses, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1,
+                                        &barrier, 0, nullptr);
+    const bool successful = RecordUploadCopies(upload_page_ranges);
+    // Later writes to the range too (a normal upload, memexport), so they
+    // wait for this copy rather than racing it.
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
+                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    command_buffer.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, kUses, 0, 0, nullptr, 1,
+                                        &barrier, 0, nullptr);
+    const size_t words = command_buffer.GetSize() - tail;
+    command_buffer.MoveTail(hoist_slot, tail);
+    command_processor_.Fh1AdvanceUploadHoistSlot(words);
+    PERF_counter_inc(kGpuUploadsHoisted);
+    return successful;
+  }
   // An upload while a rendering is open ends it: count it by what it was for.
   if (command_processor_.in_render_pass()) {
     switch (upload_kind()) {
@@ -345,6 +410,11 @@ bool VulkanSharedMemory::UploadRanges(
     VulkanCommandProcessor& processor;
     ~EndLabel() { processor.EndDebugLabel(); }
   } end_label{command_processor_};
+  return RecordUploadCopies(upload_page_ranges);
+}
+
+bool VulkanSharedMemory::RecordUploadCopies(
+    const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
   uint64_t submission_current = command_processor_.GetCurrentSubmission();
   bool successful = true;
