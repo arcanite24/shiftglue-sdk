@@ -746,7 +746,11 @@ struct RuntimeDispatch {
   PFN_vkQueueWaitIdle queue_wait_idle = nullptr;
   PFN_vkQueueBindSparse queue_bind_sparse = nullptr;
   std::atomic<const VulkanDevice*> device{nullptr};
-  // Queue calls the runtime made through these: it uses this dispatch.
+  // The runtime looked up its queue calls through these wrappers (it does
+  // when it creates the device, before any frame call), so they take the
+  // queue's lock themselves.
+  std::atomic<bool> wrapped{false};
+  // Queue calls the runtime made through these.
   std::atomic<uint64_t> calls{0};
 };
 
@@ -757,8 +761,7 @@ RuntimeDispatch& D() {
 
 std::unique_lock<std::recursive_mutex> LockRuntimeQueue(VkQueue queue) {
   if (!D().calls.fetch_add(1, std::memory_order_relaxed)) {
-    REXLOG_INFO("OpenXR: the runtime's queue calls take the game's queue lock; its frame "
-                "calls no longer hold the queue");
+    REXLOG_INFO("OpenXR: the runtime's first queue call through the game's queue lock");
   }
   if (const VulkanDevice* device = D().device.load(std::memory_order_acquire)) {
     for (const VulkanDevice::QueueFamily& family : device->queue_families()) {
@@ -807,27 +810,28 @@ VKAPI_ATTR VkResult VKAPI_CALL RuntimeQueueBindSparse(VkQueue queue, uint32_t co
 PFN_vkVoidFunction WrapQueueFunction(const char* name, PFN_vkVoidFunction real) {
   if (!real) return nullptr;
   RuntimeDispatch& d = D();
+  PFN_vkVoidFunction wrapper = nullptr;
   if (!std::strcmp(name, "vkQueueSubmit")) {
     d.queue_submit = PFN_vkQueueSubmit(real);
-    return PFN_vkVoidFunction(&RuntimeQueueSubmit);
-  }
-  if (!std::strcmp(name, "vkQueueSubmit2")) {
+    wrapper = PFN_vkVoidFunction(&RuntimeQueueSubmit);
+  } else if (!std::strcmp(name, "vkQueueSubmit2")) {
     d.queue_submit2 = PFN_vkQueueSubmit2(real);
-    return PFN_vkVoidFunction(&RuntimeQueueSubmit2);
-  }
-  if (!std::strcmp(name, "vkQueueSubmit2KHR")) {
+    wrapper = PFN_vkVoidFunction(&RuntimeQueueSubmit2);
+  } else if (!std::strcmp(name, "vkQueueSubmit2KHR")) {
     d.queue_submit2_khr = PFN_vkQueueSubmit2(real);
-    return PFN_vkVoidFunction(&RuntimeQueueSubmit2KHR);
-  }
-  if (!std::strcmp(name, "vkQueueWaitIdle")) {
+    wrapper = PFN_vkVoidFunction(&RuntimeQueueSubmit2KHR);
+  } else if (!std::strcmp(name, "vkQueueWaitIdle")) {
     d.queue_wait_idle = PFN_vkQueueWaitIdle(real);
-    return PFN_vkVoidFunction(&RuntimeQueueWaitIdle);
-  }
-  if (!std::strcmp(name, "vkQueueBindSparse")) {
+    wrapper = PFN_vkVoidFunction(&RuntimeQueueWaitIdle);
+  } else if (!std::strcmp(name, "vkQueueBindSparse")) {
     d.queue_bind_sparse = PFN_vkQueueBindSparse(real);
-    return PFN_vkVoidFunction(&RuntimeQueueBindSparse);
+    wrapper = PFN_vkVoidFunction(&RuntimeQueueBindSparse);
   }
-  return nullptr;
+  if (wrapper && !d.wrapped.exchange(true, std::memory_order_relaxed)) {
+    REXLOG_INFO("OpenXR: the runtime's queue calls take the game's queue lock; its frame "
+                "calls do not hold the queue");
+  }
+  return wrapper;
 }
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL RuntimeGetDeviceProcAddr(VkDevice device,
@@ -849,11 +853,14 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL RuntimeGetInstanceProcAddr(VkInstance i
 }
 
 // The game's queue across one of the runtime's calls, unless the runtime's own
-// queue calls take the lock (it has made one through RuntimeDispatch).
+// queue calls take the lock (it looked them up through RuntimeDispatch).
+// Deciding on the lookup, not on its first call, leaves no window at the
+// session's start in which a frame call holds the queue while the runtime's
+// first queue call, on another of its threads, waits for it.
 std::optional<VulkanDevice::Queue::Acquisition> HoldQueueForRuntime() {
   State& s = S();
   std::optional<VulkanDevice::Queue::Acquisition> hold;
-  if (!s.enable2 || !D().calls.load(std::memory_order_relaxed) ||
+  if (!s.enable2 || !D().wrapped.load(std::memory_order_relaxed) ||
       REXCVAR_GET(xr_frame_calls_hold_queue)) {
     hold.emplace(s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0));
   }
