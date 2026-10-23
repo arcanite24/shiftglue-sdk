@@ -547,6 +547,9 @@ struct State {
   // Headset frames in a row whose xrEndFrame took over 150 ms.
   uint32_t stalled_ends = 0;
   XrSession session = XR_NULL_HANDLE;
+  // The runtime ended the session (EXITING, LOSS_PENDING): it is destroyed
+  // once no copy into its swapchains is outstanding (DestroyEndedSession).
+  bool session_ended = false;
   XrSpace local = XR_NULL_HANDLE;
   XrSpace view = XR_NULL_HANDLE;
   // The seat: LOCAL moved to where the head was, facing level, at the start
@@ -1059,6 +1062,48 @@ void DestroySession() {
   s.view = s.local = XR_NULL_HANDLE;
   s.session = XR_NULL_HANDLE;
   s.running = false;
+  s.session_ended = false;
+}
+
+// Under the state mutex: destroys a session the runtime ended, once no copy
+// into its swapchains is outstanding. BeginGuestFrame stops handing out
+// targets when it ends (running is false); a screen copy handed out before
+// that but not yet on the queue keeps it until GuestFrameSubmitted fences
+// it, and copies on the GPU (that one, the headset thread's pair copies)
+// are waited for. Destroying the swapchains under them was a use after free.
+void DestroyEndedSession() {
+  State& s = S();
+  if (!s.session_ended || s.session == XR_NULL_HANDLE || s.pending != Pending::kNone) return;
+  if (s.device) {
+    const VulkanDevice::Functions& dfn = s.device->functions();
+    std::vector<VkFence> fences;
+    if (s.fenced != Pending::kNone && s.copy_fence != VK_NULL_HANDLE) {
+      fences.push_back(s.copy_fence);
+    }
+    for (VkFence fence : s.xr_cmd_fence) {
+      if (fence != VK_NULL_HANDLE) fences.push_back(fence);
+    }
+    // A lost device returns at once; a timeout tries again next time.
+    if (!fences.empty() && dfn.vkWaitForFences(s.device->device(), uint32_t(fences.size()),
+                                               fences.data(), VK_TRUE,
+                                               500'000'000) == VK_TIMEOUT) {
+      return;
+    }
+  }
+  DestroySession();
+}
+
+// Under the state mutex: the runtime ended the session. The game stops
+// copying into it at once; it goes once its copies are done.
+void EndSession() {
+  State& s = S();
+  s.running = false;
+  s.visible = false;
+  xr::SetHeadsetRefreshHz(0);
+  xr::SetHeadsetFrameHz(0);
+  s.next_display_time = 0;
+  s.session_ended = true;
+  DestroyEndedSession();
 }
 
 // Under the state mutex.
@@ -1084,7 +1129,7 @@ void PollEvents() {
       } else if (changed.state == XR_SESSION_STATE_EXITING ||
                  changed.state == XR_SESSION_STATE_LOSS_PENDING) {
         REXLOG_INFO("OpenXR: the runtime ended the session; VR is off until restart");
-        DestroySession();
+        EndSession();
       }
     } else if (event.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
       // The headset's own recentre moved LOCAL: seat the player again once
@@ -1093,7 +1138,7 @@ void PollEvents() {
       s.recenter = true;
       s.visible_frames = 0;
     } else if (event.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
-      DestroySession();
+      EndSession();
     }
     event = {XR_TYPE_EVENT_DATA_BUFFER};
   }
@@ -1745,6 +1790,8 @@ void FrameLoop() {
       std::lock_guard<std::mutex> lock(s.mutex);
       if (s.session == XR_NULL_HANDLE) return;
       PollEvents();
+      DestroyEndedSession();
+      if (s.session == XR_NULL_HANDLE) return;
     }
     if (!s.running.load(std::memory_order_acquire)) {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -2639,6 +2686,7 @@ void GuestFrameSubmitted() {
   s.release_hold.Add(
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
   s.pair_released.notify_all();
+  DestroyEndedSession();
 }
 
 void Recenter() { S().recenter = true; }
