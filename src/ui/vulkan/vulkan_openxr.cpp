@@ -383,6 +383,7 @@ REXCVAR_DEFINE_BOOL(xr_frame_calls_hold_queue, false, "Display",
 
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -390,6 +391,7 @@ REXCVAR_DEFINE_BOOL(xr_frame_calls_hold_queue, false, "Display",
 #include <string>
 #include <condition_variable>
 #include <thread>
+#include <vector>
 
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
@@ -428,7 +430,7 @@ struct Target {
   float display_aspect = 0.0f;
 };
 
-enum TargetIndex { kLeft, kRight, kScreen, kTargetCount };
+enum TargetIndex { kLeft, kRight, kScreen, kHud, kTargetCount };
 
 // What BeginGuestFrame's copy releases once it is on the queue.
 enum class Pending { kNone, kPair, kScreen };
@@ -533,6 +535,12 @@ struct State {
     VkImage eye[2] = {};
     VkDeviceMemory memory[2] = {};
     uint32_t width = 0, height = 0;
+    // xr_hud_panel: the pair's HUD (8-bit UNORM, premultiplied alpha), left
+    // as a transfer source by the game's copy.
+    VkImage hud = VK_NULL_HANDLE;
+    VkDeviceMemory hud_memory = VK_NULL_HANDLE;
+    uint32_t hud_width = 0, hud_height = 0;
+    bool has_hud = false;
     XrPosef pose[2] = {};
     XrFovf fov[2] = {};
     uint32_t left_tag = UINT32_MAX;
@@ -558,6 +566,8 @@ struct State {
   int xr_cmd_next = 0;
   // What the headset shows: the eyes' latest released pair, or the screen.
   bool show_stereo = false, show_screen = false;
+  // The shown pair came with its HUD (xr_hud_panel), on a panel over it.
+  bool show_hud = false;
   // Pairs released (GuestFrameSubmitted) and the latest shown, and when the
   // latest was released: the headset's frame takes the next pair, waiting
   // for it a little, and the guest's vblank is nudged so pairs arrive a
@@ -935,7 +945,7 @@ void DestroySession() {
   s.filling = s.shown_slot = -1;
   s.shown_serial = s.slot_serial;
   for (State::Slot& slot : s.slots) slot.complete = slot.has_left = false;
-  s.show_stereo = s.show_screen = false;
+  s.show_stereo = s.show_screen = s.show_hud = false;
   if (s.view != XR_NULL_HANDLE) xrDestroySpace(s.view);
   if (XrSpace seat = s.seat.exchange(XR_NULL_HANDLE); seat != XR_NULL_HANDLE) xrDestroySpace(seat);
   for (XrSpace seat : s.old_seats) xrDestroySpace(seat);
@@ -1186,6 +1196,36 @@ bool EnsureSlot(State::Slot& slot, uint32_t width, uint32_t height) {
   return true;
 }
 
+// Under the state mutex: the slot's HUD image at this size.
+bool EnsureSlotHud(State::Slot& slot, uint32_t width, uint32_t height) {
+  State& s = S();
+  if (slot.hud != VK_NULL_HANDLE && slot.hud_width == width && slot.hud_height == height) {
+    return true;
+  }
+  if (slot.hud != VK_NULL_HANDLE) s.retired.emplace_back(slot.hud, slot.hud_memory);
+  slot.hud = VK_NULL_HANDLE;
+  VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  image_info.imageType = VK_IMAGE_TYPE_2D;
+  image_info.format = s.staging_format;
+  image_info.extent = {width, height, 1};
+  image_info.mipLevels = 1;
+  image_info.arrayLayers = 1;
+  image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  image_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (!util::CreateDedicatedAllocationImage(s.device, image_info, util::MemoryPurpose::kDeviceLocal,
+                                            slot.hud, slot.hud_memory)) {
+    REXLOG_WARN("OpenXR: could not create a {}x{} HUD image", width, height);
+    slot.hud = VK_NULL_HANDLE;
+    return false;
+  }
+  slot.hud_width = width;
+  slot.hud_height = height;
+  return true;
+}
+
 // Under the state mutex: the newest whole pair not shown yet whose copy has
 // run, or -1.
 int ReadySlot() {
@@ -1223,6 +1263,91 @@ int FillSlot() {
     if (oldest < 0 || slot.serial < s.slots[oldest].serial) oldest = i;
   }
   return oldest;
+}
+
+// The HUD panel's parts: rectangles [x0, x1) x [y0, y1) of its image, and how
+// far each is raised. The bands of xr_hud_bands come first (the rows below
+// the last staying put), then each box of xr_hud_boxes is cut out of them and
+// raised on its own.
+constexpr size_t kMaxHudParts = 16;
+struct HudPart {
+  int32_t x0, y0, x1, y1;
+  // The rows of the plane it lies on: its band's, or the box's own. Pieces
+  // of one band share its tilt, so their edges meet.
+  int32_t plane_y0, plane_y1;
+  float raise;
+};
+// Entries of `list` split at `separator`.
+std::vector<std::string> SplitList(const std::string& list, char separator) {
+  std::vector<std::string> entries;
+  size_t start = 0;
+  while (start < list.size()) {
+    size_t end = list.find(separator, start);
+    if (end == std::string::npos) end = list.size();
+    entries.push_back(list.substr(start, end - start));
+    start = end + 1;
+  }
+  return entries;
+}
+std::vector<HudPart> HudParts(const std::string& bands, const std::string& boxes, uint32_t width,
+                              uint32_t height) {
+  auto rows = [&](double share) {
+    return int32_t(std::lround(std::clamp(share, 0.0, 1.0) * double(height)));
+  };
+  auto columns = [&](double share) {
+    return int32_t(std::lround(std::clamp(share, 0.0, 1.0) * double(width)));
+  };
+  std::vector<HudPart> parts;
+  int32_t first = 0;
+  for (const std::string& band : SplitList(bands, ',')) {
+    const size_t colon = band.find(':');
+    if (colon == std::string::npos) continue;
+    const int32_t end = rows(std::strtod(band.c_str(), nullptr));
+    if (end <= first) continue;
+    parts.push_back({0, first, int32_t(width), end, first, end,
+                     float(std::strtod(band.c_str() + colon + 1, nullptr))});
+    first = end;
+  }
+  if (first < int32_t(height)) {
+    parts.push_back({0, first, int32_t(width), int32_t(height), first, int32_t(height), 0.0f});
+  }
+  for (const std::string& box_text : SplitList(boxes, ';')) {
+    const size_t colon = box_text.find(':');
+    const std::vector<std::string> corners = SplitList(box_text.substr(0, colon), ',');
+    if (colon == std::string::npos || corners.size() != 4) continue;
+    HudPart box = {columns(std::strtod(corners[0].c_str(), nullptr)),
+                   rows(std::strtod(corners[1].c_str(), nullptr)),
+                   columns(std::strtod(corners[2].c_str(), nullptr)),
+                   rows(std::strtod(corners[3].c_str(), nullptr)),
+                   0,
+                   0,
+                   float(std::strtod(box_text.c_str() + colon + 1, nullptr))};
+    box.plane_y0 = box.y0;
+    box.plane_y1 = box.y1;
+    if (box.x1 <= box.x0 || box.y1 <= box.y0) continue;
+    // What the box overlaps of each part goes, leaving up to four pieces.
+    std::vector<HudPart> cut;
+    for (const HudPart& part : parts) {
+      const int32_t y0 = std::max(part.y0, box.y0), y1 = std::min(part.y1, box.y1);
+      if (std::max(part.x0, box.x0) >= std::min(part.x1, box.x1) || y0 >= y1) {
+        cut.push_back(part);
+        continue;
+      }
+      const int32_t p0 = part.plane_y0, p1 = part.plane_y1;
+      const HudPart pieces[] = {{part.x0, part.y0, part.x1, y0, p0, p1, part.raise},
+                                {part.x0, y1, part.x1, part.y1, p0, p1, part.raise},
+                                {part.x0, y0, std::max(part.x0, box.x0), y1, p0, p1, part.raise},
+                                {std::min(part.x1, box.x1), y0, part.x1, y1, p0, p1,
+                                 part.raise}};
+      for (const HudPart& piece : pieces) {
+        if (piece.x1 > piece.x0 && piece.y1 > piece.y0) cut.push_back(piece);
+      }
+    }
+    cut.push_back(box);
+    if (cut.size() > kMaxHudParts) break;
+    parts = std::move(cut);
+  }
+  return parts;
 }
 
 // Under the state mutex, on the headset thread inside its frame: copies the
@@ -1314,6 +1439,34 @@ bool CopySlot(State::Slot& slot) {
                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
                                VK_PIPELINE_STAGE_TRANSFER_BIT,
                            0, 0, nullptr, 0, nullptr, 4, after);
+  // The pair's HUD into the panel's swapchain; the eyes go on without it.
+  Target& hud = s.targets[kHud];
+  const bool hud_copied = slot.has_hud && slot.hud != VK_NULL_HANDLE &&
+                          REXCVAR_GET(xr_hud_panel) &&
+                          EnsureTarget(hud, slot.hud_width, slot.hud_height, "HUD panel") &&
+                          Acquire(hud, 20'000'000);
+  if (hud_copied) {
+    const VkImage hud_target = hud.images[hud.index].image;
+    const VkImageMemoryBarrier hud_before[] = {
+        barrier(slot.hud, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+        barrier(hud_target, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)};
+    dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 2, hud_before);
+    VkImageCopy hud_copy{};
+    hud_copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    hud_copy.dstSubresource = hud_copy.srcSubresource;
+    hud_copy.extent = {slot.hud_width, slot.hud_height, 1};
+    dfn.vkCmdCopyImage(cmd, slot.hud, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hud_target,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &hud_copy);
+    const VkImageMemoryBarrier hud_after =
+        barrier(hud_target, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0,
+                             nullptr, 1, &hud_after);
+  }
   dfn.vkEndCommandBuffer(cmd);
   {
     const auto queue = s.device->AcquireQueue(s.device->queue_family_graphics_compute(), 0);
@@ -1329,6 +1482,8 @@ bool CopySlot(State::Slot& slot) {
   const auto queue = HoldQueueForRuntime();
   Release(left);
   Release(right);
+  if (hud_copied) Release(hud);
+  s.show_hud = hud_copied;
   return true;
 }
 
@@ -1609,7 +1764,9 @@ void FrameLoop() {
     XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     XrCompositionLayerProjectionView views[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
                                                  {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
-    const XrCompositionLayerBaseHeader* layers[1];
+    XrCompositionLayerQuad hud_quads[kMaxHudParts];
+    for (XrCompositionLayerQuad& quad_part : hud_quads) quad_part = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+    const XrCompositionLayerBaseHeader* layers[1 + kMaxHudParts];
     uint32_t layer_count = 0;
     if (frame_state.shouldRender && s.show_stereo && s.targets[kLeft].released &&
         s.targets[kRight].released) {
@@ -1624,6 +1781,56 @@ void FrameLoop() {
       projection.viewCount = 2;
       projection.views = views;
       layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection);
+      const Target& hud = s.targets[kHud];
+      if (s.show_hud && hud.released && REXCVAR_GET(xr_hud_panel)) {
+        // Over the scene, blended by its premultiplied alpha, in front of
+        // the seat (its origin is the eyes when seated), or of the head. The
+        // bands of xr_hud_bands and boxes of xr_hud_boxes go higher, out of
+        // the view ahead or onto the windscreen's lower edge, and each part
+        // is tilted to face the eyes.
+        const bool follow = REXCVAR_GET(xr_hud_follow_head) && s.view != XR_NULL_HANDLE;
+        const float width_m = float(REXCVAR_GET(xr_hud_width));
+        const float height_m = width_m * float(hud.height) / float(hud.width);
+        const float distance = float(REXCVAR_GET(xr_hud_distance));
+        const float center_y = float(REXCVAR_GET(xr_hud_height));
+        const std::vector<HudPart> parts = HudParts(
+            REXCVAR_GET(xr_hud_bands), REXCVAR_GET(xr_hud_boxes), hud.width, hud.height);
+        for (size_t i = 0; i < parts.size() && i < kMaxHudParts; ++i) {
+          const HudPart& part = parts[i];
+          XrCompositionLayerQuad& quad_part = hud_quads[i];
+          // Its plane's centre where that lies in the whole panel, raised and
+          // tilted to face the eyes; the part sits on that plane, so pieces of
+          // one band meet at their edges (each tilted on its own, the map and
+          // speedometer showed a step where the speed trap's box cut them).
+          const auto panel_y = [&](float rows) {
+            return center_y + height_m * 0.5f - height_m * rows / float(hud.height);
+          };
+          const float plane_y =
+              panel_y(float(part.plane_y0 + part.plane_y1) * 0.5f) + part.raise;
+          const float tilt = std::atan2(plane_y, distance) * 0.5f;
+          // Up the plane from its centre to the part's (sin and cos of the
+          // whole tilt angle).
+          const float along = panel_y(float(part.y0 + part.y1) * 0.5f) -
+                              panel_y(float(part.plane_y0 + part.plane_y1) * 0.5f);
+          const float angle = 2.0f * tilt;
+          const float x = width_m * (float(part.x0 + part.x1) * 0.5f / float(hud.width) - 0.5f);
+          const float y = plane_y + along * std::cos(angle);
+          const float z = -distance + along * std::sin(angle);
+          quad_part.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+          quad_part.space = follow ? s.view : Seat();
+          quad_part.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+          quad_part.subImage.swapchain = hud.swapchain;
+          quad_part.subImage.imageRect = {{part.x0, part.y0},
+                                          {part.x1 - part.x0, part.y1 - part.y0}};
+          quad_part.pose.orientation = {std::sin(tilt), 0.0f, 0.0f, std::cos(tilt)};
+          quad_part.pose.position.x = x;
+          quad_part.pose.position.y = y;
+          quad_part.pose.position.z = z;
+          quad_part.size = {width_m * float(part.x1 - part.x0) / float(hud.width),
+                            height_m * float(part.y1 - part.y0) / float(hud.height)};
+          layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad_part);
+        }
+      }
     } else if (frame_state.shouldRender && s.show_screen && s.targets[kScreen].released) {
       const Target& screen = s.targets[kScreen];
       const float width_m = float(REXCVAR_GET(xr_screen_width));
@@ -1887,6 +2094,8 @@ bool StereoWanted() {
   return REXCVAR_GET(xr_stereo) && S().running.load(std::memory_order_relaxed);
 }
 
+bool HudPanelWanted() { return REXCVAR_GET(xr_hud_panel) && StereoWanted(); }
+
 bool NextEye(EyeRequest& out) {
   const uint64_t sequence = [] {
     std::lock_guard<std::mutex> lock(B().mutex);
@@ -2113,6 +2322,19 @@ bool BeginGuestFrame(uint32_t width, uint32_t height, float display_aspect, cons
     out.staging = s.staging;
     out.target = slot->eye[eye];
     out.eye = eye;
+    // The HUD panel's image: 1920 wide, at the frame's shape as shown.
+    slot->has_hud = false;
+    if (REXCVAR_GET(xr_hud_panel)) {
+      const float aspect = display_aspect > 0.0f ? display_aspect : float(width) / float(height);
+      const uint32_t hud_width = 1920;
+      const uint32_t hud_height = std::max(1u, uint32_t(std::lround(hud_width / aspect)));
+      if (EnsureSlotHud(*slot, hud_width, hud_height)) {
+        slot->has_hud = true;
+        out.hud = slot->hud;
+        out.hud_width = hud_width;
+        out.hud_height = hud_height;
+      }
+    }
     return true;
   }
   const TargetIndex index = kScreen;
@@ -2235,6 +2457,7 @@ bool CreateDevice(VkInstance, VkPhysicalDevice, const VkDeviceCreateInfo&, VkDev
 void OnDeviceCreated(const VulkanInstance*, const VulkanDevice*) {}
 void OnDeviceDestroying() {}
 bool StereoWanted() { return REXCVAR_GET(xr_simulate); }
+bool HudPanelWanted() { return false; }
 bool NextEye(EyeRequest& out) {
   if (!REXCVAR_GET(xr_simulate)) return false;
   const uint64_t sequence = [] {

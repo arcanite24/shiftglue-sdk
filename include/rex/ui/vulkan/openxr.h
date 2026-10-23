@@ -71,6 +71,10 @@ void OnDeviceDestroying();
 // Whether stereo frames are wanted: a running stereo session, or
 // xr_simulate. The GPU side then measures each frame's lens.
 bool StereoWanted();
+// Whether the game's HUD goes to a panel of its own in the headset
+// (xr_hud_panel) in stereo, instead of being hidden: the GPU side then draws
+// it into a layer apart from the scene (FrameCopy::hud).
+bool HudPanelWanted();
 
 // One frame's camera in the headset's start (LOCAL) space: x right, y up,
 // -z forward, in metres, and the orientation as a unit quaternion (x, y, z,
@@ -143,6 +147,9 @@ struct FrameCopy {
   VkBuffer capture = VK_NULL_HANDLE;
   // The eye the frame goes to, or -1 (the screen).
   int eye = -1;
+  float crop[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+  VkImage hud = VK_NULL_HANDLE;
+  uint32_t hud_width = 0, hud_height = 0;
 };
 bool BeginGuestFrame(uint32_t width, uint32_t height, float display_aspect, const Lens& lens,
                      FrameCopy& out);

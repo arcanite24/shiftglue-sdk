@@ -425,7 +425,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   // guest output scaled.
   void RecordXrFrameCopy(VkImage guest_output, VkImageView guest_output_view, uint32_t width,
                          uint32_t height, uint32_t output_width, uint32_t output_height,
-                         const ui::vulkan::openxr::FrameCopy& copy);
+                         const ui::vulkan::openxr::FrameCopy& copy,
+                         const Fh1NativeExecutor::HudLayer* hud_layer);
 
   // VR's DLSS (xr_upscaler): each eye's frames go through a history of the
   // presenter's DLSS provider of their own, in the headset's copy. An image's
@@ -1284,6 +1285,18 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipeline swap_hud_mask_pipeline_ = VK_NULL_HANDLE;
   VkDescriptorPool swap_hud_mask_descriptor_pool_ = VK_NULL_HANDLE;
   std::array<VkDescriptorSet, kMaxFramesInFlight> swap_hud_mask_descriptor_sets_{};
+  // VR's HUD panel: the HUD layer (Fh1NativeExecutor::TakeHudLayer) over the
+  // guest output (hud_layer_composite.cs.glsl), created on first use.
+  bool EnsureHudLayerComposite();
+  void CompositeHudLayer(VkImage guest_output, VkImageView guest_output_view, uint32_t width,
+                         uint32_t height, const Fh1NativeExecutor::HudLayer& hud_layer,
+                         uint32_t swap_frame_index);
+  bool hud_layer_composite_failed_ = false;
+  VkDescriptorSetLayout hud_layer_composite_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout hud_layer_composite_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline hud_layer_composite_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool hud_layer_composite_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> hud_layer_composite_descriptor_sets_{};
   // UP-1.2: the guest output without the HUD for a temporal upscaler (the
   // pre-HUD snapshot through the gamma ramp, the HUD mask in alpha), with
   // its own descriptor sets so it can run beside present_hdr's mask.
