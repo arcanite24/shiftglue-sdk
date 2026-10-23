@@ -241,10 +241,16 @@ void Fh1NativeExecutor::ReduceOcclusionDepth() {
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
   const auto& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
+  // The grid's tiles are square in host pixels: unequal axis scales would
+  // need a tile size per axis in the reduction shader.
+  if (scale_x_ != scale_y_) {
+    Count("occlusion_grid_unequal_scale");
+    return;
+  }
   // The scene is 16:9 (1280x720 at 1x); the surface can hold more rows.
-  const uint32_t width = surface->width * scale_;
-  const uint32_t height = std::min(width * 9 / 16, surface->image_height * scale_);
-  const uint32_t tile = uint32_t(REXCVAR_GET(fh1_occlusion_tile)) * scale_;
+  const uint32_t width = surface->width * scale_x_;
+  const uint32_t height = std::min(width * 9 / 16, surface->image_height * scale_y_);
+  const uint32_t tile = uint32_t(REXCVAR_GET(fh1_occlusion_tile)) * scale_x_;
   const uint32_t columns = (width + tile - 1) / tile;
   const uint32_t rows = (height + tile - 1) / tile;
   if (columns * rows > rex::system::Fh1OcclusionGrid::kMaxTiles) {

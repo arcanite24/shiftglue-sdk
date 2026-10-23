@@ -21,7 +21,7 @@
 FH1_PUSH_CONSTANTS cbuffer Fh1NativeTransferConstants FH1_CONSTANTS_REGISTER {
   uint fh1_dest_layout;    // Layout of the new owner, with its host sample mode.
   uint fh1_source_layout;  // Layout of the previous owner, with its host sample mode.
-  uint fh1_flags;          // FH1_FLAG_*, stencil bit index 8:10, scale - 1 12:13.
+  uint fh1_flags;          // FH1_FLAG_*, stencil bit index 8:10, scale - 1 x 12:13, y 14:15.
 };
 
 // Vulkan pipelines may be specialized for one kind of transfer: with fh1_spec
@@ -55,7 +55,7 @@ uint LoadWord(float4 position, uint host_sample, uint half) {
   uint guest_sample = GuestSample(host_sample, LayoutMsaa(FH1_DEST_LAYOUT),
                                   LayoutHostSampleMode(FH1_DEST_LAYOUT));
   uint2 pixel = uint2(position.xy);
-  SetScaledPixel(pixel, ((FH1_FLAGS >> FH1_FLAG_SCALE_SHIFT) & 3u) + 1u);
+  SetScaledPixel(pixel, FlagScale(FH1_FLAGS));
   return LoadSourceWord(FH1_DEST_LAYOUT, pixel, guest_sample, half, FH1_SOURCE_LAYOUT,
                         FH1_FLAGS);
 }
