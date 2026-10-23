@@ -68,6 +68,11 @@ REXCVAR_DEFINE_UINT32(vulkan_texture_max_size, 0, "GPU/Vulkan",
                       "larger ones drop their top levels (0: no limit, otherwise at "
                       "least 64)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(vulkan_bc_transcode, true, "GPU/Vulkan",
+                    "On a device without BC textures but with ASTC, transcode DXT1, DXT3 and DXT5 "
+                    "to ASTC 4x4 on the GPU (lossy, 1 to 2 times the BC size) instead of decoding "
+                    "to RGBA8 (4 times)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_force_bc_decode, false, "GPU/Vulkan",
                     "Decode BC (DXT, DXN) textures to uncompressed formats on the GPU as on a "
                     "device without them, to measure that path where BC is supported")
@@ -111,6 +116,7 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/texture_load_depth_unorm_scaled_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_dxn_rg8_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_dxt1_rgba8_cs.h"
+#include "../shaders/vulkan_spirv/texture_transcode_bc_astc_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_dxt3_rgba8_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_dxt3a_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_dxt3aas1111_argb4_cs.h"
@@ -515,6 +521,9 @@ VulkanTextureCache::~VulkanTextureCache() {
     if (null_images_memory != VK_NULL_HANDLE) {
       dfn.vkFreeMemory(device, null_images_memory, nullptr);
     }
+  }
+  if (transcode_pipeline_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyPipeline(device, transcode_pipeline_, nullptr);
   }
   for (VkPipeline load_pipeline : load_pipelines_scaled_) {
     if (load_pipeline != VK_NULL_HANDLE) {
@@ -1615,6 +1624,8 @@ VkFormat GetSrgbHostFormat(VkFormat format) {
       return VK_FORMAT_BC2_SRGB_BLOCK;
     case VK_FORMAT_BC3_UNORM_BLOCK:
       return VK_FORMAT_BC3_SRGB_BLOCK;
+    case VK_FORMAT_ASTC_4x4_UNORM_BLOCK:
+      return VK_FORMAT_ASTC_4x4_SRGB_BLOCK;
     default:
       return VK_FORMAT_UNDEFINED;
   }
@@ -2405,9 +2416,20 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
         level_host_layout.y_pitch_blocks * level_guest_z_extent_texels;
     host_buffer_size += level_host_layout.slice_size_bytes * array_size;
   }
+  // With BC to ASTC transcoding, the loaded BC blocks are followed by their
+  // ASTC blocks (block for block, 16 bytes each), which the copy reads.
+  const uint8_t transcode_mode = host_format.transcode_mode;
+  if (transcode_mode && transcode_pipeline_ == VK_NULL_HANDLE) {
+    return false;
+  }
+  const uint32_t copy_scale = transcode_mode ? 16 / load_shader_info.bytes_per_host_block : 1;
+  const VkDeviceSize copy_base =
+      transcode_mode ? rex::align(host_buffer_size, VkDeviceSize(16)) : 0;
+  const VkDeviceSize scratch_size =
+      transcode_mode ? copy_base + host_buffer_size * copy_scale : host_buffer_size;
   VulkanCommandProcessor::ScratchBufferAcquisition scratch_buffer_acquisition(
-      command_processor_.AcquireScratchGpuBuffer(
-          host_buffer_size, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT));
+      command_processor_.AcquireScratchGpuBuffer(scratch_size, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                                 VK_ACCESS_SHADER_WRITE_BIT));
   VkBuffer scratch_buffer = scratch_buffer_acquisition.buffer();
   if (scratch_buffer == VK_NULL_HANDLE) {
     return false;
@@ -2431,7 +2453,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
   {
     write_descriptor_set_dest_buffer_info.buffer = scratch_buffer;
     write_descriptor_set_dest_buffer_info.offset = 0;
-    write_descriptor_set_dest_buffer_info.range = host_buffer_size;
+    write_descriptor_set_dest_buffer_info.range = scratch_size;
     VkWriteDescriptorSet& write_descriptor_set_dest =
         write_descriptor_sets[write_descriptor_set_count++];
     write_descriptor_set_dest.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -2676,6 +2698,33 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
     }
   }
 
+  if (transcode_mode) {
+    command_processor_.PushBufferMemoryBarrier(
+        scratch_buffer, 0, VK_WHOLE_SIZE,
+        scratch_buffer_acquisition.SetStageMask(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT),
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        scratch_buffer_acquisition.SetAccessMask(VK_ACCESS_SHADER_READ_BIT |
+                                                 VK_ACCESS_SHADER_WRITE_BIT),
+        VK_ACCESS_SHADER_READ_BIT);
+    command_processor_.SubmitBarriers(true);
+    command_processor_.BindExternalComputePipeline(transcode_pipeline_);
+    command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, load_pipeline_layout_,
+                                           kLoadDescriptorSetIndexDestination, 1,
+                                           &descriptor_set_dest, 0, nullptr);
+    command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, load_pipeline_layout_,
+                                           kLoadDescriptorSetIndexSource, 1, &descriptor_set_dest,
+                                           0, nullptr);
+    const uint32_t block_count = uint32_t(host_buffer_size / load_shader_info.bytes_per_host_block);
+    // 64 blocks per group; the groups wrap into Y past the 65535 group limit.
+    const uint32_t group_count = (block_count + 63) / 64;
+    const uint32_t transcode_constants[4] = {0, uint32_t(copy_base), block_count,
+                                             uint32_t(transcode_mode - 1)};
+    command_buffer.CmdVkPushConstants(load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                      sizeof(transcode_constants), transcode_constants);
+    command_buffer.CmdVkDispatch(std::min(group_count, UINT32_C(65535)),
+                                 (group_count + 65534) / 65535, 1);
+  }
+
   if (pipeline_float_convert != VK_NULL_HANDLE) {
     assert_not_null(load_shader_info_float_convert);
     static std::array<uint8_t, 64> float_fallback_log_mask = {};
@@ -2879,7 +2928,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
     VkBufferImageCopy& copy_region = copy_regions[(level - level_first) * layer_run_count];
     const HostLayout& level_host_layout =
         level != 0 ? host_layout_mips[std::min(level, level_packed)] : host_layout_base;
-    copy_region.bufferOffset = level_host_layout.offset_bytes;
+    copy_region.bufferOffset = copy_base + level_host_layout.offset_bytes * copy_scale;
     if (level >= level_packed) {
       uint32_t level_offset_blocks_x, level_offset_blocks_y, level_offset_z;
       texture_util::GetPackedMipOffset(width, height, depth, guest_format, level,
@@ -2892,7 +2941,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
         level_offset_host_blocks_y *= block_height;
       }
       copy_region.bufferOffset +=
-          load_shader_info.bytes_per_host_block *
+          load_shader_info.bytes_per_host_block * copy_scale *
           (level_offset_host_blocks_x +
            level_host_layout.x_pitch_blocks *
                (level_offset_host_blocks_y +
@@ -2927,7 +2976,8 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
     for (uint32_t run = layer_run_count; run-- > 0;) {
       VkBufferImageCopy& run_region = copy_regions[(level - level_first) * layer_run_count + run];
       run_region = copy_region;
-      run_region.bufferOffset += level_host_layout.slice_size_bytes * layer_runs[run].first;
+      run_region.bufferOffset +=
+          level_host_layout.slice_size_bytes * copy_scale * layer_runs[run].first;
       run_region.imageSubresource.baseArrayLayer = layer_runs[run].first;
       run_region.imageSubresource.layerCount = layer_runs[run].second;
     }
@@ -3730,16 +3780,35 @@ bool VulkanTextureCache::Initialize() {
   // As a device without BC formats would: to measure the decode fallback's
   // memory and check its output where BC is available (AP-2.4).
   const bool force_bc_decode = REXCVAR_GET(vulkan_force_bc_decode);
+  // ASTC 4x4 shares the BC block footprint, so a device without BC but with ASTC
+  // (Mali) can keep the compressed footprint: vulkan_bc_transcode.
+  ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_ASTC_4x4_UNORM_BLOCK,
+                                          &format_properties);
+  const bool astc_available =
+      REXCVAR_GET(vulkan_bc_transcode) && vulkan_device->properties().textureCompressionASTC_LDR &&
+      (format_properties.optimalTilingFeatures & kLinearFilterFeatures) == kLinearFilterFeatures;
+  REXGPU_INFO("Texture cache: BC texture path = {}", force_bc_decode ? "forced RGBA8 decode"
+                                                     : astc_available
+                                                         ? "ASTC transcode when BC is absent"
+                                                         : "RGBA8 decode when BC is absent");
   HostFormatPair& host_format_dxt1 = host_formats_[uint32_t(xenos::TextureFormat::k_DXT1)];
   assert_true(host_format_dxt1.format_unsigned.format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK);
   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
                                           &format_properties);
   if (force_bc_decode ||
       (format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
-    host_format_dxt1.format_unsigned.load_shader = kLoadShaderIndexDXT1ToRGBA8;
-    host_format_dxt1.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
-    host_format_dxt1.format_unsigned.block_compressed = false;
-    host_formats_[uint32_t(xenos::TextureFormat::k_DXT1_AS_16_16_16_16)] = host_format_dxt1;
+    const bool transcode_to_astc = astc_available;
+    if (transcode_to_astc) {
+      // The BC load shader still untiles; a following pass transcodes.
+      host_format_dxt1.format_unsigned.format = VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+      host_format_dxt1.format_unsigned.transcode_mode = 1;
+      host_formats_[uint32_t(xenos::TextureFormat::k_DXT1_AS_16_16_16_16)] = host_format_dxt1;
+    } else {
+      host_format_dxt1.format_unsigned.load_shader = kLoadShaderIndexDXT1ToRGBA8;
+      host_format_dxt1.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
+      host_format_dxt1.format_unsigned.block_compressed = false;
+      host_formats_[uint32_t(xenos::TextureFormat::k_DXT1_AS_16_16_16_16)] = host_format_dxt1;
+    }
   }
   HostFormatPair& host_format_dxt2_3 = host_formats_[uint32_t(xenos::TextureFormat::k_DXT2_3)];
   assert_true(host_format_dxt2_3.format_unsigned.format == VK_FORMAT_BC2_UNORM_BLOCK);
@@ -3747,10 +3816,18 @@ bool VulkanTextureCache::Initialize() {
                                           &format_properties);
   if (force_bc_decode ||
       (format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
-    host_format_dxt2_3.format_unsigned.load_shader = kLoadShaderIndexDXT3ToRGBA8;
-    host_format_dxt2_3.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
-    host_format_dxt2_3.format_unsigned.block_compressed = false;
-    host_formats_[uint32_t(xenos::TextureFormat::k_DXT2_3_AS_16_16_16_16)] = host_format_dxt2_3;
+    const bool transcode_to_astc = astc_available;
+    if (transcode_to_astc) {
+      // The BC load shader still untiles; a following pass transcodes.
+      host_format_dxt2_3.format_unsigned.format = VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+      host_format_dxt2_3.format_unsigned.transcode_mode = 2;
+      host_formats_[uint32_t(xenos::TextureFormat::k_DXT2_3_AS_16_16_16_16)] = host_format_dxt2_3;
+    } else {
+      host_format_dxt2_3.format_unsigned.load_shader = kLoadShaderIndexDXT3ToRGBA8;
+      host_format_dxt2_3.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
+      host_format_dxt2_3.format_unsigned.block_compressed = false;
+      host_formats_[uint32_t(xenos::TextureFormat::k_DXT2_3_AS_16_16_16_16)] = host_format_dxt2_3;
+    }
   }
   HostFormatPair& host_format_dxt4_5 = host_formats_[uint32_t(xenos::TextureFormat::k_DXT4_5)];
   assert_true(host_format_dxt4_5.format_unsigned.format == VK_FORMAT_BC3_UNORM_BLOCK);
@@ -3758,10 +3835,18 @@ bool VulkanTextureCache::Initialize() {
                                           &format_properties);
   if (force_bc_decode ||
       (format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
-    host_format_dxt4_5.format_unsigned.load_shader = kLoadShaderIndexDXT5ToRGBA8;
-    host_format_dxt4_5.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
-    host_format_dxt4_5.format_unsigned.block_compressed = false;
-    host_formats_[uint32_t(xenos::TextureFormat::k_DXT4_5_AS_16_16_16_16)] = host_format_dxt4_5;
+    const bool transcode_to_astc = astc_available;
+    if (transcode_to_astc) {
+      // The BC load shader still untiles; a following pass transcodes.
+      host_format_dxt4_5.format_unsigned.format = VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+      host_format_dxt4_5.format_unsigned.transcode_mode = 3;
+      host_formats_[uint32_t(xenos::TextureFormat::k_DXT4_5_AS_16_16_16_16)] = host_format_dxt4_5;
+    } else {
+      host_format_dxt4_5.format_unsigned.load_shader = kLoadShaderIndexDXT5ToRGBA8;
+      host_format_dxt4_5.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
+      host_format_dxt4_5.format_unsigned.block_compressed = false;
+      host_formats_[uint32_t(xenos::TextureFormat::k_DXT4_5_AS_16_16_16_16)] = host_format_dxt4_5;
+    }
   }
   HostFormatPair& host_format_dxn = host_formats_[uint32_t(xenos::TextureFormat::k_DXN)];
   assert_true(host_format_dxn.format_unsigned.format == VK_FORMAT_BC5_UNORM_BLOCK);
@@ -4224,6 +4309,18 @@ bool VulkanTextureCache::Initialize() {
               i);
           return false;
         }
+      }
+    }
+  }
+
+  for (const HostFormatPair& pair : host_formats_) {
+    if (pair.format_unsigned.transcode_mode && transcode_pipeline_ == VK_NULL_HANDLE) {
+      transcode_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+          vulkan_device, load_pipeline_layout_, shaders::texture_transcode_bc_astc_cs,
+          sizeof(shaders::texture_transcode_bc_astc_cs));
+      if (transcode_pipeline_ == VK_NULL_HANDLE) {
+        REXGPU_ERROR("VulkanTextureCache: Failed to create the BC to ASTC transcoding pipeline");
+        return false;
       }
     }
   }

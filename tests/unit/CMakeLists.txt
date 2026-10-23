@@ -37,6 +37,7 @@ add_executable(unit_tests
     graphics/native_guest_output_test.cpp
     graphics/vulkan_shader_overrides_test.cpp
     graphics/cube_lut_test.cpp
+    graphics/texture_transcode_astc_test.cpp
     graphics/texture_cache_test.cpp
     graphics/fh1_edram_resolve_test.cpp
     ui/presentation_pacer_test.cpp
@@ -47,6 +48,7 @@ target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/progress.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/vulkan/shader_overrides.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/cube_lut.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/texture_transcode_astc.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/register_file.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/registers.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/fh1_edram_resolve.cpp
