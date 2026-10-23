@@ -1609,6 +1609,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     double hud_squeeze = 0.0;
     double hud_scale = 0.0;
     bool object_motion = false;
+    bool glow_depth_test = false;
   };
   // Key: the buffer (address << 32 | dwords) mixed with the state hash and
   // shaders at its start, so each pass that runs the list has its own.
