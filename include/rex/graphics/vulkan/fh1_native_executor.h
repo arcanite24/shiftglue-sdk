@@ -532,7 +532,11 @@ class Fh1NativeExecutor {
     Surface* surface = nullptr;
   };
   SurfaceFront surface_front_[16];
-  uint32_t scale_ = 1;
+  // The draw resolution scale along each axis (each 1 to 4): a guest pixel is
+  // scale_x_ x scale_y_ host pixels.
+  uint32_t scale_x_ = 1;
+  uint32_t scale_y_ = 1;
+  bool Scaled() const { return scale_x_ > 1 || scale_y_ > 1; }
   // fh1_untile_predicated_tiling: the screen height the images hold, and the
   // last later-tile band resolved from each surface since the tiling began.
   uint32_t untile_height_ = 0;

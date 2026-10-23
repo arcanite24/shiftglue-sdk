@@ -281,7 +281,7 @@ uint32_t Fh1NativeExecutor::CurrentDepthKey() const {
 int32_t Fh1NativeExecutor::ObjectRowOffset() const {
   if (untile_height_) return 0;
   return std::max(0, -int32_t(register_file_.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset)) *
-         int32_t(scale_);
+         int32_t(scale_y_);
 }
 
 uint64_t Fh1NativeExecutor::CurrentColorKey() const {
@@ -545,9 +545,9 @@ void Fh1NativeExecutor::SnapshotCameraDepth(uint32_t band_row) {
   // A band holds the surface's rows. The copy is resized only before a
   // frame's first band, to the bottom of the lowest band seen, so frames
   // with a taller band than it has are dropped until the next.
-  const uint32_t width = surface->width * scale_;
-  const uint32_t height = std::min(surface->height, surface->image_height) * scale_;
-  const uint32_t dest_row = band_row * scale_;
+  const uint32_t width = surface->width * scale_x_;
+  const uint32_t height = std::min(surface->height, surface->image_height) * scale_y_;
+  const uint32_t dest_row = band_row * scale_y_;
   camera_depth_wanted_height_ = std::max(camera_depth_wanted_height_, dest_row + height);
   if (camera_depth_rows_ &&
       (camera_depth_.width != width || camera_depth_.height < dest_row + height)) {
