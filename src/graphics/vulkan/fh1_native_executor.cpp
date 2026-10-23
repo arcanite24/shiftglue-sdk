@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <unordered_set>
 #include <mutex>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -158,6 +160,14 @@ REXCVAR_DEFINE_BOOL(fh1_debug_skip_clears, false, "GPU",
 REXCVAR_DEFINE_STRING(fh1_debug_skip_resolves, "", "GPU",
                       "Diagnostics: skip the resolve dispatches whose source and size, written "
                       "<surface>@<width>x<height>, are in this list, to see what they feed")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(fh1_debug_skip_hud_draws, "", "GPU",
+                      "Diagnostics: skip the frame's HUD draws (IsHudDraw) numbered first-last "
+                      "from 0 in each frame, to see which draws make what")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(fh1_debug_log_hud_draws, 0, "GPU",
+                     "Diagnostics: log the state of this many HUD draws (IsHudDraw), from the "
+                     "first one seen")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_debug_skip_resolve_dispatches, false, "GPU",
                     "Diagnostics: keep every resolve's barriers but not its compute dispatch "
@@ -620,6 +630,7 @@ void Fh1NativeExecutor::Shutdown() {
   for (auto& [packed, surface] : surfaces_) DestroySurface(surface);
   surfaces_.clear();
   DestroyHudSnapshot();
+  DestroyHudLayer();
   DestroyCamera();
   for (auto& [key, pipeline] : transfer_pipelines_) dfn.vkDestroyPipeline(device, pipeline, nullptr);
   transfer_pipelines_.clear();
@@ -2376,7 +2387,7 @@ bool Fh1NativeExecutor::BindTargets(VulkanRenderTargetCache::RenderPassKey& key_
   }
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
     if (!(used_bits & (1u << i))) continue;
-    Surface* surface = FindSurface(keys[i].Pack());
+    Surface* surface = BoundSurface(i);
     if (!surface) {
       Skip("draw_surface_create");
       return false;
@@ -2402,6 +2413,7 @@ bool Fh1NativeExecutor::BindTargets(VulkanRenderTargetCache::RenderPassKey& key_
     bound_bits_ |= 1u << i;
   }
   key_out.depth_and_color_used = bound_bits_;
+  key_out.fh1_hud_layer = hud_layer_bound_ && (bound_bits_ & 0b10);
   // Every used surface was bound, so this is the bound surfaces' scope.
   bound_rendering_id_ = rendering_id;
   if (!used_bits) Count("draw_writes_nothing");
@@ -2464,6 +2476,8 @@ uint64_t Fh1NativeExecutor::DrawRenderingId(uint32_t used_bits) const {
     if (!(used_bits & (1u << i))) continue;
     id = (id ^ (uint64_t(pending_keys_[i].Pack()) + i)) * 0x100000001B3ull;
   }
+  // The HUD layer is another image than the front buffer it stands for.
+  if (hud_layer_bound_ && (used_bits & 0b10)) id = (id ^ 0x4855444Cull) * 0x100000001B3ull;
   id &= ~(uint64_t(1) << 63);
   return id | 1;
 }
@@ -2528,7 +2542,7 @@ void Fh1NativeExecutor::BeginDrawRendering() {
   if (pending_clear_surfaces_) {
     for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
       if (!(bound_bits_ & (1u << i))) continue;
-      bound[i] = FindSurface(pending_keys_[i].Pack());
+      bound[i] = BoundSurface(i);
       if (!bound[i]) continue;
       clears |= !bound[i]->pending_clears.empty();
       clear_width = std::min(clear_width, bound[i]->width * scale_x_);
@@ -2564,7 +2578,7 @@ void Fh1NativeExecutor::BeginDrawRendering() {
   uint32_t width = UINT32_MAX, height = UINT32_MAX;
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
     if (!(bound_bits_ & (1u << i))) continue;
-    Surface* surface = FindSurface(pending_keys_[i].Pack());
+    Surface* surface = BoundSurface(i);
     if (!surface) continue;
     VkRenderingAttachmentInfo& attachment = i ? colors[i - 1] : depth;
     attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -2601,7 +2615,7 @@ void Fh1NativeExecutor::BeginDrawRendering() {
       Count("draw_attachment_barrier_late");
       for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
         if (!(bound_bits_ & (1u << i))) continue;
-        if (Surface* surface = FindSurface(pending_keys_[i].Pack())) {
+        if (Surface* surface = BoundSurface(i)) {
           TransitionForAttachment(*surface);
         }
       }
@@ -3554,6 +3568,9 @@ void Fh1NativeExecutor::OnSwap(uint64_t frame) {
   BeginInspection();
   hud_snapshot_ready_ = hud_snapshot_taken_;
   hud_snapshot_taken_ = false;
+  hud_layer_ready_ = hud_layer_drawn_;
+  hud_layer_drawn_ = false;
+  hud_draw_index_ = UINT32_MAX;
   hud_scene_base_ = UINT32_MAX;
   camera_depth_rows_ready_ = camera_depth_rows_;
   camera_depth_rows_ = 0;
@@ -3595,6 +3612,8 @@ bool Fh1NativeExecutor::IsHudTarget() const {
 void Fh1NativeExecutor::MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw) {
   NoteCameraDraw(draw);
   hud_draw_ = false;
+  hud_layer_bound_ = false;
+  hud_world_draw_ = false;
   if (!initialized_ || draw.memexport || !draw.rasterization_done ||
       !(draw.normalized_color_mask & 0xF)) {
     return;
@@ -3611,10 +3630,42 @@ void Fh1NativeExecutor::MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw) {
     return;
   }
   hud_draw_ = true;
+  ++hud_draw_index_;
+  // Only VR's HUD panel sets name tags apart: in flat play they take the
+  // HUD scale and safe zone as they always have.
+  hud_world_draw_ = hud_layer_enabled_ && IsWorldAnchoredHudDraw(draw);
+  if (static int32_t logged = 0; logged < REXCVAR_GET(fh1_debug_log_hud_draws)) {
+    ++logged;
+    const uint32_t* r = register_file_.values;
+    const float* c = reinterpret_cast<const float*>(&r[XE_GPU_REG_SHADER_CONSTANT_000_X]);
+    std::string used;
+    if (draw.vertex_shader) {
+      const auto& map = draw.vertex_shader->constant_register_map();
+      for (uint32_t i = 0; i < 256; ++i) {
+        if ((map.float_bitmap[i / 64] >> (i % 64)) & 1) used += fmt::format("{},", i);
+      }
+    }
+    REXGPU_INFO(
+        "HUD draw {}: vs {:016X} ps {:016X} initiator {:08X} blend {:08X} depth {:08X} "
+        "viewport {} {} {} {} scissor {:08X}-{:08X} vfetch0 {:08X} vs consts [{}] "
+        "c0-3 [{:.3f} {:.3f} {:.3f} {:.3f} | {:.3f} {:.3f} {:.3f} {:.3f} | {:.3f} {:.3f} {:.3f} {:.3f} "
+        "| {:.3f} {:.3f} {:.3f} {:.3f}]",
+        hud_draw_index_, draw.vertex_shader ? draw.vertex_shader->ucode_data_hash() : 0,
+        draw.pixel_shader ? draw.pixel_shader->ucode_data_hash() : 0,
+        r[XE_GPU_REG_VGT_DRAW_INITIATOR], r[XE_GPU_REG_RB_BLENDCONTROL0],
+        draw.normalized_depth_control.value,
+        *reinterpret_cast<const float*>(&r[XE_GPU_REG_PA_CL_VPORT_XSCALE]),
+        *reinterpret_cast<const float*>(&r[XE_GPU_REG_PA_CL_VPORT_XOFFSET]),
+        *reinterpret_cast<const float*>(&r[XE_GPU_REG_PA_CL_VPORT_XSCALE + 2]),
+        *reinterpret_cast<const float*>(&r[XE_GPU_REG_PA_CL_VPORT_XSCALE + 3]),
+        r[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL], r[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR],
+        r[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], used, c[0], c[1], c[2], c[3], c[4], c[5], c[6],
+        c[7], c[8], c[9], c[10], c[11], c[12], c[13], c[14], c[15]);
+  }
   // Untiled, the scene depth is whole by the HUD.
   if (untile_height_) SnapshotCameraDepth(0);
-  if (!hud_snapshot_enabled_ || hud_snapshot_taken_) return;
-  hud_snapshot_taken_ = true;
+  const bool snapshot = hud_snapshot_enabled_ && !hud_snapshot_taken_;
+  if (!snapshot && !hud_layer_enabled_) return;
   const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
   const uint32_t msaa = uint32_t(surface_info.msaa_samples);
   // The HUD's view shares the scene's surface.
@@ -3623,10 +3674,12 @@ void Fh1NativeExecutor::MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw) {
                                                                        msaa),
                                                          msaa, color_info.color_format))
                                      .Pack());
-  if (!surface || surface->samples != 1) {
-    hud_snapshot_taken_ = false;
-    return;
+  if (!surface || surface->samples != 1) return;
+  if (hud_layer_enabled_ && !hud_world_draw_) {
+    hud_layer_bound_ = BeginHudLayerDraw(*surface);
   }
+  if (!snapshot) return;
+  hud_snapshot_taken_ = true;
   const uint32_t width = surface->width * scale_x_;
   // The rows the image holds: on demand they may stop short of the period.
   const uint32_t height = surface->image_height * scale_y_;
@@ -3711,6 +3764,126 @@ void Fh1NativeExecutor::DestroyHudSnapshot() {
   if (hud_snapshot_.memory) dfn.vkFreeMemory(device, hud_snapshot_.memory, nullptr);
   hud_snapshot_ = Surface();
   hud_snapshot_ready_ = false;
+}
+
+bool Fh1NativeExecutor::BeginHudLayerDraw(const Surface& scene) {
+  if (hud_layer_drawn_) return hud_layer_.image != VK_NULL_HANDLE;
+  const uint32_t width = scene.width * scale_x_;
+  const uint32_t height = scene.image_height * scale_y_;
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  command_processor_.EndRenderPass();
+  if (hud_layer_.image != VK_NULL_HANDLE &&
+      (hud_layer_.width < width || hud_layer_.height < height)) {
+    // Earlier frames may still read it; only when the scene grows.
+    command_processor_.Fh1AwaitAllQueueOperations();
+    DestroyHudLayer();
+  }
+  if (hud_layer_.image == VK_NULL_HANDLE) {
+    constexpr VkFormat kFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    VkImageCreateInfo image_info = {};
+    image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.format = kFormat;
+    image_info.extent = {width, height, 1};
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            vulkan_device, image_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+            hud_layer_.image, hud_layer_.memory)) {
+      Skip("hud_layer_create");
+      hud_layer_drawn_ = true;
+      return false;
+    }
+    VkImageViewCreateInfo view_info = {};
+    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_info.image = hud_layer_.image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = kFormat;
+    view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (dfn.vkCreateImageView(device, &view_info, nullptr, &hud_layer_.view) != VK_SUCCESS) {
+      DestroyHudLayer();
+      Skip("hud_layer_create");
+      hud_layer_drawn_ = true;
+      return false;
+    }
+    hud_layer_.format = kFormat;
+    hud_layer_.width = width;
+    hud_layer_.height = height;
+    hud_layer_.image_height = height;
+    REXGPU_INFO("FH1 native executor: VR HUD layer {}x{}", width, height);
+  }
+  Transition(hud_layer_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+             VK_ACCESS_TRANSFER_WRITE_BIT);
+  command_processor_.SubmitBarriers(true);
+  const VkClearColorValue transparent = {};
+  const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  command_processor_.deferred_command_buffer().CmdVkClearColorImage(
+      hud_layer_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &transparent, 1, &range);
+  hud_layer_drawn_ = true;
+  Count("hud_layer");
+  return true;
+}
+
+bool Fh1NativeExecutor::TakeHudLayer(HudLayer& out) {
+  const bool ready = hud_layer_ready_;
+  hud_layer_ready_ = false;
+  if (!ready || hud_layer_.view == VK_NULL_HANDLE) return false;
+  Transition(hud_layer_, VK_IMAGE_LAYOUT_GENERAL,
+             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+  out.image = hud_layer_.image;
+  out.view = hud_layer_.view;
+  out.width = hud_layer_.width;
+  out.height = hud_layer_.height;
+  return true;
+}
+
+void Fh1NativeExecutor::DestroyHudLayer() {
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (hud_layer_.view) dfn.vkDestroyImageView(device, hud_layer_.view, nullptr);
+  if (hud_layer_.image) dfn.vkDestroyImage(device, hud_layer_.image, nullptr);
+  if (hud_layer_.memory) dfn.vkFreeMemory(device, hud_layer_.memory, nullptr);
+  hud_layer_ = Surface();
+  hud_layer_ready_ = false;
+}
+
+bool Fh1NativeExecutor::IsWorldAnchoredHudDraw(const Fh1DrawInfo& draw) const {
+  // Other racers' name tags are drawn with the HUD, but placed at their car's
+  // projected position: c3 holds it in clip space, with w the car's depth
+  // (1021 for a car ahead). The HUD's own draws put a screen position there,
+  // w = 1, or do not read c3 (a frame dump with a name tag: its 5 draws and
+  // none of the other 62; a festival frame: none of 89).
+  if (!draw.vertex_shader) return false;
+  const auto& map = draw.vertex_shader->constant_register_map();
+  if (!((map.float_bitmap[0] >> 3) & 1)) return false;
+  const float w = *reinterpret_cast<const float*>(
+      &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X + 3 * 4 + 3]);
+  return std::abs(w - 1.0f) > 0.01f;
+}
+
+bool Fh1NativeExecutor::SkipsHudDraw() const {
+  static const std::string range = REXCVAR_GET(fh1_debug_skip_hud_draws);
+  if (!hud_draw_ || range.empty()) return false;
+  const uint32_t first = uint32_t(std::strtoul(range.c_str(), nullptr, 10));
+  const size_t dash = range.find('-');
+  const uint32_t last =
+      dash == std::string::npos ? first : uint32_t(std::strtoul(range.c_str() + dash + 1, nullptr, 10));
+  return hud_draw_index_ >= first && hud_draw_index_ <= last;
+}
+
+Fh1NativeExecutor::Surface* Fh1NativeExecutor::BoundSurface(uint32_t index) {
+  if (index == 1 && hud_layer_bound_) return &hud_layer_;
+  return FindSurface(pending_keys_[index].Pack());
 }
 
 void Fh1NativeExecutor::LogStats(uint64_t frame) {

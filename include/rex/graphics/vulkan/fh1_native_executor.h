@@ -147,6 +147,11 @@ class Fh1NativeExecutor {
   // the front buffer's 2_10_10_10_AS_10_10_10_10 view after the scene was
   // composited there this frame (menus over a game world included).
   bool IsHudDraw() const { return hud_draw_; }
+  // Of those, while the HUD layer is enabled (VR's HUD panel), one placed at
+  // a point in the world (IsWorldAnchoredHudDraw); always false otherwise.
+  bool IsWorldAnchoredHud() const { return hud_world_draw_; }
+  // fh1_debug_skip_hud_draws: whether that HUD draw is one to leave out.
+  bool SkipsHudDraw() const;
   // Whether render target 0 is that HUD view now, before
   // MaybeSnapshotBeforeHud sees the draw (for its samplers).
   bool IsHudTarget() const;
@@ -154,6 +159,20 @@ class Fh1NativeExecutor {
   // After OnSwap: the swapped frame's snapshot, made readable from compute
   // shaders, if it covers width x height; null otherwise.
   VkImageView TakeHudSnapshot(uint32_t width, uint32_t height);
+  // VR's HUD panel (xr_hud_panel): while enabled, the HUD's draws (IsHudDraw)
+  // go into an image of their own instead of the front buffer: RGBA16F,
+  // cleared to transparent black at the frame's first HUD draw, the color
+  // premultiplied and the alpha the HUD's coverage (pipeline_cache.cpp). The
+  // swap shows it in the headset, and puts it over the guest output.
+  void SetHudLayerEnabled(bool enabled) { hud_layer_enabled_ = enabled; }
+  struct HudLayer {
+    VkImage image = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    uint32_t width = 0, height = 0;
+  };
+  // After OnSwap: whether the swapped frame drew its HUD into the layer; it
+  // is then in the general layout, readable by compute shaders and transfers.
+  bool TakeHudLayer(HudLayer& out);
 
   // UP-1.3: the camera and depth a temporal upscaler needs (fh1_camera.cpp).
   // While enabled, every scene draw's world-view-projection (vertex float
@@ -577,6 +596,25 @@ class Fh1NativeExecutor {
   bool hud_snapshot_ready_ = false;
   Surface hud_snapshot_;
   void DestroyHudSnapshot();
+  // The frame's HUD draws so far, less one (UINT32_MAX before the first).
+  uint32_t hud_draw_index_ = UINT32_MAX;
+  bool hud_world_draw_ = false;
+  bool hud_layer_enabled_ = false;
+  // This frame's HUD went into hud_layer_ (cleared at its first draw).
+  bool hud_layer_drawn_ = false;
+  bool hud_layer_ready_ = false;
+  // The draw MaybeSnapshotBeforeHud last saw renders into hud_layer_.
+  bool hud_layer_bound_ = false;
+  Surface hud_layer_;
+  // At a HUD draw: hud_layer_ for the scene surface `scene`, cleared at the
+  // frame's first; false (the draw goes to the front buffer) when it cannot.
+  bool BeginHudLayerDraw(const Surface& scene);
+  // A HUD draw placed at a point in the world (a racer's name tag): it stays
+  // in the scene, drawn for each eye, rather than going to the HUD layer.
+  bool IsWorldAnchoredHudDraw(const Fh1DrawInfo& draw) const;
+  void DestroyHudLayer();
+  // The surface a bound slot renders into: hud_layer_ for the HUD's color.
+  Surface* BoundSurface(uint32_t index);
 
   // UP-1.3 camera tracking (fh1_camera.cpp).
   struct CameraDraw {
