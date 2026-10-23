@@ -269,6 +269,7 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
 
   bool Prepare(uint32_t max_render_width, uint32_t max_render_height, uint32_t max_output_width,
                uint32_t max_output_height, bool hdr) override {
+    const std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!info_.available) {
       return false;
     }
@@ -292,6 +293,7 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
   }
 
   bool Dispatch(VkCommandBuffer command_buffer, const VulkanUpscalerInputs& inputs) override {
+    const std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!info_.available || !inputs.color.image || !inputs.output.image ||
         !inputs.depth.image || !inputs.motion_vectors.image) {
       return false;
@@ -351,6 +353,7 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
   }
 
   void Release() override {
+    const std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (h().feature) {
       NVSDK_NGX_VULKAN_ReleaseFeature(h().feature);
       h().feature = nullptr;
@@ -358,7 +361,13 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
   }
 
   uint32_t history_count() const override { return kHistoryCount; }
-  void SelectHistory(uint32_t index) override { history_ = index < kHistoryCount ? index : 0; }
+  void SelectHistory(uint32_t index) override {
+    const std::lock_guard<std::recursive_mutex> lock(mutex_);
+    history_ = index < kHistoryCount ? index : 0;
+  }
+  std::unique_lock<std::recursive_mutex> LockHistory() override {
+    return std::unique_lock<std::recursive_mutex>(mutex_);
+  }
 
  private:
   bool CreateFeature(VkCommandBuffer command_buffer, const UpscalerFrame& frame) {
@@ -429,6 +438,9 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
     NVSDK_NGX_DLSS_Hint_Render_Preset preset = NVSDK_NGX_DLSS_Hint_Render_Preset_Default;
   };
   static constexpr uint32_t kHistoryCount = 3;
+  // The presenter's thread and VR's (the submission worker, DispatchXrUpscale)
+  // share the histories' selection and the NGX parameters.
+  std::recursive_mutex mutex_;
   History histories_[kHistoryCount];
   uint32_t history_ = 0;
   History& h() { return histories_[history_]; }

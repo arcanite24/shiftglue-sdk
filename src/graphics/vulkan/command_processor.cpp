@@ -4048,7 +4048,10 @@ void VulkanCommandProcessor::DispatchXrUpscale(const void* data, VkCommandBuffer
   std::memcpy(&dispatch, data, sizeof(dispatch));
   const ui::UpscalerFrame& frame = dispatch.inputs.frame;
   // Prepare keeps the eye's feature while the sizes stay (they are fixed for
-  // a session: xr_upscale_ratio needs a restart).
+  // a session: xr_upscale_ratio needs a restart). This runs on the submission
+  // worker while the presenter paints on its own thread: the history stays
+  // selected for this eye only inside the lock.
+  const auto history_lock = dispatch.upscaler->LockHistory();
   dispatch.upscaler->SelectHistory(dispatch.history);
   const bool upscaled =
       dispatch.upscaler->Prepare(frame.render_width, frame.render_height, frame.output_width,
