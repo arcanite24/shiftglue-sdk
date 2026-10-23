@@ -550,6 +550,9 @@ struct State {
   // The runtime ended the session (EXITING, LOSS_PENDING): it is destroyed
   // once no copy into its swapchains is outstanding (DestroyEndedSession).
   bool session_ended = false;
+  // The headset thread's xrEndFrame shows the screen's swapchain: the game
+  // does not replace that swapchain meanwhile.
+  bool screen_in_end = false;
   XrSpace local = XR_NULL_HANDLE;
   XrSpace view = XR_NULL_HANDLE;
   // The seat: LOCAL moved to where the head was, facing level, at the start
@@ -2025,10 +2028,13 @@ void FrameLoop() {
     end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     end_info.layerCount = layer_count;
     end_info.layers = layers;
-    // The screen's swapchain is the game thread's: the layer is ended under
-    // the mutex then, the eyes' without it.
-    const bool screen_layer = layer_count && layers[0] == reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
-    if (!screen_layer) lock.unlock();
+    // Not under the state mutex, which every game frame takes (BeginGuestFrame):
+    // the runtime's 100-200 ms stalls would hold the game. The screen's
+    // swapchain is the game thread's; it acquires and releases images there
+    // meanwhile, but does not replace the swapchain (screen_in_end).
+    s.screen_in_end =
+        layer_count && layers[0] == reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
+    lock.unlock();
     XrResult ended;
     double end_ms;
     {
@@ -2045,7 +2051,8 @@ void FrameLoop() {
         xrEndFrame(s.session, &end_info);
       }
     }
-    if (!lock.owns_lock()) lock.lock();
+    lock.lock();
+    s.screen_in_end = false;
     if (!failed(ended, "xrEndFrame") && layer_count) ++s.frames;
     s.begin_end.Add(
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - locked).count());
@@ -2605,6 +2612,11 @@ bool BeginGuestFrame(uint32_t width, uint32_t height, float display_aspect, cons
   const TargetIndex index = kScreen;
   static const char* const kNames[] = {"left eye", "right eye", "screen"};
   Target& target = s.targets[index];
+  // A new size replaces the swapchain: not while a frame end shows it.
+  if (s.screen_in_end && target.swapchain != XR_NULL_HANDLE &&
+      (target.width != width || target.height != height)) {
+    return false;
+  }
   if (!EnsureTarget(target, width, height, kNames[index]) || !Acquire(target)) return false;
   if (target.display_aspect != display_aspect) {
     REXLOG_INFO("OpenXR: screen {}x{} shown at {:.3f}:1", width, height,
