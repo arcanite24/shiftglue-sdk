@@ -33,7 +33,7 @@ FH1_PUSH_CONSTANTS cbuffer Fh1NativeResolveMemoryConstants FH1_CONSTANTS_REGISTE
   // swap red/blue 6, float24 rounding 7,
   // exp bias 8:15 (signed), bytes per texel log2 16:17, gamma targets hold
   // linear values 18, 16_16[_16_16] hosts keep the full range as snorm / 32 19,
-  // resolution scale - 1 20:21 (the rectangle is then in host pixels and the
+  // resolution scale - 1 x 20:21, y 23:24 (the rectangle is then in host pixels and the
   // destination is the texture cache's scaled resolve range), unscaled
   // destination 22 (at scale: the rectangle in guest pixels, each written to
   // the guest layout from its first host pixel).
@@ -119,14 +119,14 @@ int TiledOffset2D(int x, int y, uint pitch, uint bpb_log2) {
 }
 
 // The texture cache's scaled resolve layout: each 16 bytes of the guest
-// texture become scale x scale groups of 16 bytes, each holding one host row
-// of the guest group's texels at scale, stored column-major by group.
-uint ScaledOffset(uint2 pixel, uint2 subpixel, uint pitch, uint bpb_log2, uint scale) {
+// texture become scale.x x scale.y groups of 16 bytes, each holding one host
+// row of the guest group's texels at scale, stored column-major by group.
+uint ScaledOffset(uint2 pixel, uint2 subpixel, uint pitch, uint bpb_log2, uint2 scale) {
   uint guest = uint(TiledOffset2D(int(pixel.x), int(pixel.y), pitch, bpb_log2));
   uint texels_per_group = 16u >> bpb_log2;
-  uint host_x = ((guest & 15u) >> bpb_log2) * scale + subpixel.x;
+  uint host_x = ((guest & 15u) >> bpb_log2) * scale.x + subpixel.x;
   uint group_x = host_x / texels_per_group;
-  return (guest & ~15u) * scale * scale + ((group_x * scale + subpixel.y) << 4u) +
+  return (guest & ~15u) * scale.x * scale.y + ((group_x * scale.y + subpixel.y) << 4u) +
          ((host_x % texels_per_group) << bpb_log2);
 }
 
@@ -213,7 +213,7 @@ void main(uint3 thread : SV_DispatchThreadID) {
   uint2 pixel = uint2(fh1_rect_origin & 0xFFFFu, fh1_rect_origin >> 16u) + thread.xy;
   uint2 host_pixel = pixel;
   fh1_fixed16_scale = ((FH1_DEST_INFO >> 19u) & 1u) != 0u ? 32.0f : 1.0f;
-  uint scale = ((FH1_DEST_INFO >> 20u) & 3u) + 1u;
+  uint2 scale = uint2((FH1_DEST_INFO >> 20u) & 3u, (FH1_DEST_INFO >> 23u) & 3u) + 1u;
   bool unscaled_dest = ((FH1_DEST_INFO >> 22u) & 1u) != 0u;
   if (unscaled_dest) {
     fh1_scale = scale;
@@ -225,8 +225,8 @@ void main(uint3 thread : SV_DispatchThreadID) {
   uint endian = (FH1_DEST_INFO >> 3u) & 7u;
   uint bpb_log2 = (FH1_DEST_INFO >> 16u) & 3u;
   uint address;
-  [branch] if (scale > 1u && !unscaled_dest) {
-    address = fh1_dest_base * scale * scale +
+  [branch] if (any(scale > 1u) && !unscaled_dest) {
+    address = fh1_dest_base * scale.x * scale.y +
               ScaledOffset(pixel, fh1_subpixel, fh1_dest_pitch, bpb_log2, scale);
   } else {
     address = fh1_dest_base +

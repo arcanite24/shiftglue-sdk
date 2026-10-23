@@ -471,22 +471,25 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   config_ = config;
   if (!config_.memory || !config_.textures || !config_.render_targets) return false;
   async_specialize_ = REXCVAR_GET(fh1_async_specialized_passes);
-  scale_ = config_.textures->draw_resolution_scale_x();
+  scale_x_ = config_.textures->draw_resolution_scale_x();
+  scale_y_ = config_.textures->draw_resolution_scale_y();
   share_msaa_aliases_ = REXCVAR_GET(fh1_share_msaa_aliases);
   untile_height_ = config_.untile_height;
   UpdateCoarseShading();
-  single_sample_msaa_ = (scale_ >= 2 && REXCVAR_GET(fh1_scaled_msaa_single_sample)) ||
+  single_sample_msaa_ = (Scaled() && REXCVAR_GET(fh1_scaled_msaa_single_sample)) ||
                         REXCVAR_GET(fh1_msaa_single_sample);
   stencil_export_ = REXCVAR_GET(fh1_native_stencil_export) &&
                     command_processor_.GetVulkanDevice()->extensions().ext_EXT_shader_stencil_export;
   two_sample_msaa_ =
       !single_sample_msaa_ && REXCVAR_GET(fh1_msaa_2x) && config_.msaa_2x_supported;
   if (single_sample_msaa_) {
-    REXGPU_INFO("FH1 native executor (Vulkan): MSAA surfaces single-sampled at {}x", scale_);
+    REXGPU_INFO("FH1 native executor (Vulkan): MSAA surfaces single-sampled at {}x{}", scale_x_,
+                scale_y_);
   } else if (two_sample_msaa_) {
     REXGPU_INFO("FH1 native executor (Vulkan): 4x MSAA surfaces with 2 host samples");
   }
-  if (config_.textures->draw_resolution_scale_y() != scale_ || scale_ > 4) {
+  // Each axis's scale - 1 has two bits in the shaders' constants.
+  if (scale_x_ > 4 || scale_y_ > 4) {
     REXGPU_WARN("FH1 native executor (Vulkan): resolution scale {}x{} is not supported",
                 config_.textures->draw_resolution_scale_x(),
                 config_.textures->draw_resolution_scale_y());
@@ -716,17 +719,18 @@ Fh1NativeExecutor::SurfaceKey Fh1NativeExecutor::MakeDepthKey(
 uint32_t Fh1NativeExecutor::SurfaceHeight(uint32_t pitch_tiles, uint32_t msaa) const {
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
   return Fh1SurfaceHeight(pitch_tiles, msaa,
-                          vulkan_device->properties().maxImageDimension2D, scale_);
+                          vulkan_device->properties().maxImageDimension2D, scale_y_);
 }
 
 Fh1NativeExecutor::Rect Fh1NativeExecutor::HostRect(const Rect& rect) const {
-  return {rect.left * int32_t(scale_), rect.top * int32_t(scale_), rect.right * int32_t(scale_),
-          rect.bottom * int32_t(scale_)};
+  return {rect.left * int32_t(scale_x_), rect.top * int32_t(scale_y_),
+          rect.right * int32_t(scale_x_), rect.bottom * int32_t(scale_y_)};
 }
 
 uint32_t Fh1NativeExecutor::TransferFlags() const {
   return (config_.depth_float24_round ? 1u : 0u) | (config_.gamma_as_unorm16 ? 2u : 0u) |
-         (config_.fixed16_truncated ? 0u : 4u) | ((scale_ - 1) << 12);
+         (config_.fixed16_truncated ? 0u : 4u) | ((scale_x_ - 1) << 12) |
+         ((scale_y_ - 1) << 14);
 }
 
 Fh1NativeExecutor::Surface* Fh1NativeExecutor::FindSurface(uint32_t packed_key) {
@@ -807,7 +811,7 @@ void Fh1NativeExecutor::BeginSurfaceRendering(Surface& surface, bool uint_view) 
   attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   VkRenderingInfo info = {};
   info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-  info.renderArea.extent = {surface.width * scale_, surface.image_height * scale_};
+  info.renderArea.extent = {surface.width * scale_x_, surface.image_height * scale_y_};
   info.layerCount = 1;
   if (surface.key.is_depth) {
     info.pDepthAttachment = &attachment;
@@ -837,9 +841,10 @@ void Fh1NativeExecutor::EndUntiledTiling() {
     VkImageCopy region = {};
     region.srcSubresource = {AspectMask(*surface), 0, 0, 1};
     region.dstSubresource = region.srcSubresource;
-    region.srcOffset = {0, int32_t(band * scale_), 0};
+    region.srcOffset = {0, int32_t(band * scale_y_), 0};
     // Rows past the band would overlap their own destination.
-    region.extent = {surface->width * scale_, std::min(untile_height_ - band, band) * scale_, 1};
+    region.extent = {surface->width * scale_x_, std::min(untile_height_ - band, band) * scale_y_,
+                     1};
     command_processor_.deferred_command_buffer().CmdVkCopyImage(
         surface->image, VK_IMAGE_LAYOUT_GENERAL, surface->image, VK_IMAGE_LAYOUT_GENERAL, region);
     Count("untile_copy_down");
@@ -892,7 +897,7 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
   VkClearAttachment clear = {};
   clear.aspectMask = AspectMask(stored);
   VkClearRect clear_rect = {};
-  clear_rect.rect.extent = {stored.width * scale_, stored.image_height * scale_};
+  clear_rect.rect.extent = {stored.width * scale_x_, stored.image_height * scale_y_};
   clear_rect.layerCount = 1;
   command_processor_.deferred_command_buffer().CmdVkClearAttachments(1, &clear, 1, &clear_rect);
   Count("surface_created");
@@ -911,7 +916,7 @@ bool Fh1NativeExecutor::CreateSurfaceImage(Surface& surface) {
                          : 0;
   image_info.imageType = VK_IMAGE_TYPE_2D;
   image_info.format = surface.format;
-  image_info.extent = {surface.width * scale_, surface.image_height * scale_, 1};
+  image_info.extent = {surface.width * scale_x_, surface.image_height * scale_y_, 1};
   image_info.mipLevels = 1;
   image_info.arrayLayers = 1;
   image_info.samples = VkSampleCountFlagBits(surface.samples);
@@ -947,7 +952,7 @@ bool Fh1NativeExecutor::CreateSurfaceImage(Surface& surface) {
           "FH1 native executor: could not allocate a {}x{} surface image (format {}, {} samples, "
           "{}) with {} surfaces ({} MB) alive; draws using it lose that target "
           "(failure {})",
-          surface.width * scale_, surface.image_height * scale_, uint32_t(surface.format),
+          surface.width * scale_x_, surface.image_height * scale_y_, uint32_t(surface.format),
           surface.samples, key.is_depth ? "depth" : "color", surfaces_.size(), surface_bytes_ >> 20,
           create_failures + 1);
     }
@@ -1046,7 +1051,7 @@ void Fh1NativeExecutor::EnsureSurfaceRows(Surface& surface, uint32_t rows) {
   VkImageCopy region = {};
   region.srcSubresource = {aspect, 0, 0, 1};
   region.dstSubresource = region.srcSubresource;
-  region.extent = {surface.width * scale_, old_rows * scale_, 1};
+  region.extent = {surface.width * scale_x_, old_rows * scale_y_, 1};
   commands.CmdVkCopyImage(surface.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, grown.image,
                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
   // The old image lives until the GPU has finished this submission.
@@ -1080,8 +1085,8 @@ void Fh1NativeExecutor::EnsureSurfaceRows(Surface& surface, uint32_t rows) {
   VkClearAttachment clear = {};
   clear.aspectMask = aspect;
   VkClearRect clear_rect = {};
-  clear_rect.rect.offset = {0, int32_t(old_rows * scale_)};
-  clear_rect.rect.extent = {surface.width * scale_, (new_rows - old_rows) * scale_};
+  clear_rect.rect.offset = {0, int32_t(old_rows * scale_y_)};
+  clear_rect.rect.extent = {surface.width * scale_x_, (new_rows - old_rows) * scale_y_};
   clear_rect.layerCount = 1;
   commands.CmdVkClearAttachments(1, &clear, 1, &clear_rect);
   Count("surface_grown");
@@ -1864,7 +1869,7 @@ void Fh1NativeExecutor::FlushDepthTransfersExported(Surface& dest, size_t first,
 }
 
 bool Fh1NativeExecutor::EnsureTransferWords(const Surface& dest) {
-  const VkDeviceSize size = VkDeviceSize(dest.width) * dest.height * scale_ * scale_ *
+  const VkDeviceSize size = VkDeviceSize(dest.width) * dest.height * scale_x_ * scale_y_ *
                             dest.samples * sizeof(uint32_t);
   if (transfer_words_ && transfer_words_size_ >= size) return true;
   if (transfer_words_) {
@@ -1963,7 +1968,7 @@ void Fh1NativeExecutor::FlushDepthTransfers(Surface& dest, size_t first, size_t 
       const uint32_t constants[kComputeConstantCount] = {
           uint32_t(rect.left) | (uint32_t(rect.top) << 16),
           uint32_t(rect.right - rect.left) | (uint32_t(rect.bottom - rect.top) << 16),
-          LayoutConstant(dest), LayoutConstant(*source), flags, dest.width * scale_,
+          LayoutConstant(dest), LayoutConstant(*source), flags, dest.width * scale_x_,
           dest.samples, 0};
       command_buffer.CmdVkPushConstants(compute_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                         sizeof(constants), constants);
@@ -2020,7 +2025,7 @@ void Fh1NativeExecutor::FlushDepthTransfers(Surface& dest, size_t first, size_t 
       set_bound = true;
     }
     const uint32_t constants[kTransferConstantCount] = {
-        LayoutConstant(dest), (dest.width * scale_) | (dest.samples << 16),
+        LayoutConstant(dest), (dest.width * scale_x_) | (dest.samples << 16),
         flags | (pass ? (pass - 1) << 8 : 0)};
     command_buffer.CmdVkPushConstants(words_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                       sizeof(constants), constants);
@@ -2603,7 +2608,7 @@ void Fh1NativeExecutor::DiscoverShaderDraw(const VulkanShader::VulkanTranslation
         "{}{{\"slot\":{},\"key\":\"{:08X}\",\"depth\":{},\"base_tiles\":{},"
         "\"pitch_tiles\":{},\"format\":{},\"width\":{},\"height\":{},\"samples\":{}}}",
         first ? "" : ",", i, key.Pack(), key.is_depth, key.base_tiles, key.pitch_tiles,
-        key.format, surface->width * scale_, surface->image_height * scale_, surface->samples);
+        key.format, surface->width * scale_x_, surface->image_height * scale_y_, surface->samples);
     first = false;
   }
   shader_discovery_draws_ << "]}\n";
@@ -2620,8 +2625,8 @@ void Fh1NativeExecutor::BeginDrawRendering() {
       bound[i] = FindSurface(pending_keys_[i].Pack());
       if (!bound[i]) continue;
       clears |= !bound[i]->pending_clears.empty();
-      clear_width = std::min(clear_width, bound[i]->width * scale_);
-      clear_height = std::min(clear_height, bound[i]->image_height * scale_);
+      clear_width = std::min(clear_width, bound[i]->width * scale_x_);
+      clear_height = std::min(clear_height, bound[i]->image_height * scale_y_);
     }
     if (clears) {
       FoldPendingClears(bound, clear_width, clear_height, nullptr, nullptr, true);
@@ -2663,8 +2668,8 @@ void Fh1NativeExecutor::BeginDrawRendering() {
     attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     if (i) color_count = i;
-    width = std::min(width, surface->width * scale_);
-    height = std::min(height, surface->image_height * scale_);
+    width = std::min(width, surface->width * scale_x_);
+    height = std::min(height, surface->image_height * scale_y_);
   }
   if (width == UINT32_MAX) {
     // No attachments: the surface pitch bounds the draw.
@@ -2677,8 +2682,8 @@ void Fh1NativeExecutor::BeginDrawRendering() {
                               ? uint32_t(xenos::MsaaSamples::k1X)
                               : guest_msaa;
     const uint32_t msaa_x_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k4X));
-    width = pitch_tiles * (xenos::kEdramTileWidthSamples >> msaa_x_log2) * scale_;
-    height = SurfaceHeight(pitch_tiles, msaa) * scale_;
+    width = pitch_tiles * (xenos::kEdramTileWidthSamples >> msaa_x_log2) * scale_x_;
+    height = SurfaceHeight(pitch_tiles, msaa) * scale_y_;
   }
   const uint64_t id = bound_id;
   if (attachment_barriers_skipped_) {
@@ -3011,10 +3016,11 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
     }
   }
   constants[4] = sample_select;
-  constants[5] = dest_info | ((scale_ - 1) << 20) | (unscaled_dest ? 1u << 22 : 0u);
+  constants[5] = dest_info | ((scale_x_ - 1) << 20) | (unscaled_dest ? 1u << 22 : 0u) |
+                 ((scale_y_ - 1) << 23);
   constants[6] = dest_base;
   constants[7] = dest_pitch;
-  constants[8] = image_row * scale_;
+  constants[8] = image_row * scale_y_;
   constants[9] = image_endian;
   constants[10] = image2_view != VK_NULL_HANDLE ? image2_endian | (1u << 5) : 0u;
   if (const VkPipeline specialized = GetSpecializedResolvePipeline(
@@ -3065,7 +3071,7 @@ bool Fh1NativeExecutor::NativeResolve(uint32_t& written_address, uint32_t& writt
   if (!initialized_) return false;
   if (!Resolve(&written_address, &written_length)) return false;
   // At scale the resolve reads one-off captures back itself.
-  if (scale_ == 1 && written_length && IsOneOffResolve(written_address, written_length)) {
+  if (!Scaled() && written_length && IsOneOffResolve(written_address, written_length)) {
     QueueResolveReadback(written_address, written_length);
   }
   if (written_length && !REXCVAR_GET(fh1_resolve_dump_dir).empty() &&
@@ -3359,7 +3365,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     VkBuffer target = config_.memory->buffer();
     VkDeviceSize target_offset = offset, target_range = range;
     uint32_t dest_base = uint32_t(plan.dest_base - offset);
-    if (scale_ > 1) {
+    if (Scaled()) {
       const uint32_t base = resolve_info.copy_dest_base;
       const uint32_t range_unscaled = extent_start - base + extent_length;
       uint64_t scaled_base, scaled_length, use_start, use_length;
@@ -3403,7 +3409,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
         config_.textures->FindDirectResolveTargets(
             plan.dest_base, extent_start, extent_length,
             i < 2 ? formats[i] : xenos::TextureFormat::k_8_8_8_8, plan.dest_pitch,
-            uint32_t(plan.x1), uint32_t(plan.y1), scale_ > 1, direct_resolve_candidates_,
+            uint32_t(plan.x1), uint32_t(plan.y1), Scaled(), direct_resolve_candidates_,
             plan.x0 == 0 && plan.y0 == 0);
         for (const TextureCache::DirectResolveTarget& candidate : direct_resolve_candidates_) {
           if (direct_resolve_targets_.size() >= (two_targets ? 2u : 1u)) break;
@@ -3496,9 +3502,9 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     // daytime limit, overexposing the screen until about noon (#444).
     constexpr uint32_t kUnscaledCopyMaxLength = 4096;
     const bool one_off =
-        scale_ > 1 && written_address && IsOneOffResolve(extent_start, extent_length);
-    bool unscaled_copy_complete = scale_ == 1 && complete;
-    if (scale_ > 1 && written_address &&
+        Scaled() && written_address && IsOneOffResolve(extent_start, extent_length);
+    bool unscaled_copy_complete = !Scaled() && complete;
+    if (Scaled() && written_address &&
         (one_off || extent_length <= kUnscaledCopyMaxLength)) {
       config_.memory->RequestRange(extent_start, extent_length);
       config_.memory->Use(VulkanSharedMemory::Usage::kComputeWrite,
@@ -3728,9 +3734,9 @@ void Fh1NativeExecutor::MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw) {
     hud_snapshot_taken_ = false;
     return;
   }
-  const uint32_t width = surface->width * scale_;
+  const uint32_t width = surface->width * scale_x_;
   // The rows the image holds: on demand they may stop short of the period.
-  const uint32_t height = surface->image_height * scale_;
+  const uint32_t height = surface->image_height * scale_y_;
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
   const auto& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
