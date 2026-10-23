@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include <rex/ui/upscaler.h>
@@ -60,6 +61,11 @@ class VulkanUpscaler {
   // to the selected one; 0 is the presenter's.
   virtual uint32_t history_count() const { return 1; }
   virtual void SelectHistory(uint32_t index) {}
+  // Held across a sequence on another history (SelectHistory, Prepare,
+  // Dispatch, SelectHistory(0)) by a caller on another thread than the
+  // presenter's: the presenter's own calls then wait, and always find
+  // history 0 selected.
+  virtual std::unique_lock<std::recursive_mutex> LockHistory() { return {}; }
 };
 
 // The temporal providers built into this build, available or not.
