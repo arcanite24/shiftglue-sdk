@@ -50,6 +50,8 @@
 #include <rex/hash.h>
 #include <rex/system/kernel_state.h>
 #include <rex/ui/vulkan/linked_type_descriptor_set_allocator.h>
+#include <rex/ui/vulkan/openxr.h>
+#include <rex/ui/vulkan/upscaler.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/provider.h>
 #include <rex/ui/vulkan/upload_buffer_pool.h>
@@ -287,6 +289,16 @@ class VulkanCommandProcessor : public CommandProcessor {
     return in_render_pass_ && id && current_fh1_rendering_id_ == id;
   }
   bool in_render_pass() const { return in_render_pass_; }
+  // vulkan_hoist_split_uploads: the stream position just before the open FH1
+  // rendering began, where uploads can go instead of ending it, and the
+  // shared memory invalidation count when it began.
+  bool Fh1UploadHoistSlot(size_t& slot, uint32_t& epoch) const {
+    if (!fh1_hoist_slot_valid_ || !in_render_pass_) return false;
+    slot = fh1_hoist_slot_;
+    epoch = fh1_hoist_epoch_;
+    return true;
+  }
+  void Fh1AdvanceUploadHoistSlot(size_t words) { fh1_hoist_slot_ += words; }
   system::GraphicsShaderTranslationObserver GetShaderTranslationObserver() const;
   // Submits the open submission, waits for every queue operation and reopens
   // the submission if one was open (FH1 resolve read-backs).
@@ -406,6 +418,83 @@ class VulkanCommandProcessor : public CommandProcessor {
                  uint32_t frontbuffer_height) override;
   void IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                      uint32_t frontbuffer_height);
+  // The guest output's copy for the VR headset (openxr::BeginGuestFrame), in
+  // the swap's submission; the guest output is in the presenter's internal
+  // layout before and after. The headset's images are output_width x
+  // output_height: with xr_upscaler, DLSS's output for an eye, otherwise the
+  // guest output scaled.
+  void RecordXrFrameCopy(VkImage guest_output, VkImageView guest_output_view, uint32_t width,
+                         uint32_t height, uint32_t output_width, uint32_t output_height,
+                         const ui::vulkan::openxr::FrameCopy& copy,
+                         const Fh1NativeExecutor::HudLayer* hud_layer);
+
+  // VR's DLSS (xr_upscaler): each eye's frames go through a history of the
+  // presenter's DLSS provider of their own, in the headset's copy. An image's
+  // depth and motion come from the swap before it: the title presents the
+  // frame before the one whose draws just ended, so a swap's camera pass
+  // (with the executor's per-eye camera, SetStereoCamera) is the next
+  // swap's image's, the other eye's.
+  struct XrUpscaleCamera {
+    VkImage depth = VK_NULL_HANDLE;
+    VkImage motion = VK_NULL_HANDLE;
+    VkImageView depth_view = VK_NULL_HANDLE;
+    VkImageView motion_view = VK_NULL_HANDLE;
+    VkDeviceMemory depth_memory = VK_NULL_HANDLE;
+    VkDeviceMemory motion_memory = VK_NULL_HANDLE;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    // Written by the camera pass of the swap it was last used in.
+    bool valid = false;
+    int eye = -1;
+    ui::UpscalerCamera camera;
+  };
+  // What a recorded DLSS dispatch needs when the commands run (a tape
+  // callback's data).
+  struct XrUpscaleDispatch {
+    const ui::vulkan::VulkanDevice* device;
+    ui::vulkan::VulkanUpscaler* upscaler;
+    uint32_t history;
+    ui::vulkan::VulkanUpscalerInputs inputs;
+  };
+  static void DispatchXrUpscale(const void* data, VkCommandBuffer command_buffer);
+  bool EnsureXrUpscaleImages(uint32_t render_width, uint32_t render_height,
+                             uint32_t output_width, uint32_t output_height);
+  void DestroyXrUpscaleImages();
+  // The headset's image size for this render size (xr_upscale_ratio).
+  static void XrUpscaleOutputSize(uint32_t width, uint32_t height, uint32_t& output_width,
+                                  uint32_t& output_height);
+  // After a tape callback that records its own pipelines and bindings.
+  void InvalidateBindingsAfterCallback();
+  // This swap's provider while VR's DLSS is on, else null.
+  ui::vulkan::VulkanUpscaler* xr_upscaler_ = nullptr;
+  XrUpscaleCamera xr_upscale_cameras_[2];
+  // The pair this swap's camera pass writes and its DLSS reads; the next
+  // swap's takes the other.
+  uint32_t xr_upscale_camera_next_ = 0;
+  VkImage xr_upscale_output_ = VK_NULL_HANDLE;
+  VkImageView xr_upscale_output_view_ = VK_NULL_HANDLE;
+  VkDeviceMemory xr_upscale_output_memory_ = VK_NULL_HANDLE;
+  uint32_t xr_upscale_output_width_ = 0;
+  uint32_t xr_upscale_output_height_ = 0;
+  // Whether each eye's history continues, and when it last moved.
+  bool xr_upscale_history_[2] = {};
+  uint64_t xr_upscale_last_us_[2] = {};
+  uint64_t xr_upscale_dispatches_ = 0;
+  uint64_t xr_upscale_misses_ = 0;
+  // xr_upscale_inputs_dir: a captured frame's DLSS inputs (the image, depth
+  // and motion), read back for SaveXrUpscaleInputs once its copy has run.
+  VkBuffer xr_inputs_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory xr_inputs_memory_ = VK_NULL_HANDLE;
+  VkDeviceSize xr_inputs_size_ = 0;
+  struct XrInputsPending {
+    bool pending = false;
+    int eye = -1;
+    uint32_t width = 0, height = 0;
+    float jitter_x = 0, jitter_y = 0;
+    bool reset = false;
+  } xr_inputs_pending_;
+  uint32_t xr_inputs_saved_ = 0;
+  void SaveXrUpscaleInputs();
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -425,6 +514,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   // decode time; with the recorder their draws intermittently sampled other
   // textures (frame-to-frame noise on FH1's foliage, flags and signs).
   bool SupportsRecordThread() const override { return push_pixel_texture_descriptors_; }
+  // A frame dump starts recording packets at the swap before its frame.
+  bool RecordSyncAfterSwap(uint64_t frame) const override {
+    return frame + 1 == Fh1FrameDump::RequestedFrame();
+  }
 
  private:
   struct CommandBuffer {
@@ -869,6 +962,9 @@ class VulkanCommandProcessor : public CommandProcessor {
                                          VkWriteDescriptorSet* descriptor_set_writes_out);
 
   bool device_lost_ = false;
+  // IssueDraw failures logged since device_lost_ last changed (rate limit).
+  uint64_t draw_failures_ = 0;
+  bool draw_failures_device_lost_ = false;
 
   bool cache_clear_requested_ = false;
 
@@ -1189,6 +1285,18 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipeline swap_hud_mask_pipeline_ = VK_NULL_HANDLE;
   VkDescriptorPool swap_hud_mask_descriptor_pool_ = VK_NULL_HANDLE;
   std::array<VkDescriptorSet, kMaxFramesInFlight> swap_hud_mask_descriptor_sets_{};
+  // VR's HUD panel: the HUD layer (Fh1NativeExecutor::TakeHudLayer) over the
+  // guest output (hud_layer_composite.cs.glsl), created on first use.
+  bool EnsureHudLayerComposite();
+  void CompositeHudLayer(VkImage guest_output, VkImageView guest_output_view, uint32_t width,
+                         uint32_t height, const Fh1NativeExecutor::HudLayer& hud_layer,
+                         uint32_t swap_frame_index);
+  bool hud_layer_composite_failed_ = false;
+  VkDescriptorSetLayout hud_layer_composite_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout hud_layer_composite_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline hud_layer_composite_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool hud_layer_composite_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> hud_layer_composite_descriptor_sets_{};
   // UP-1.2: the guest output without the HUD for a temporal upscaler (the
   // pre-HUD snapshot through the gamma ramp, the HUD mask in alpha), with
   // its own descriptor sets so it can run beside present_hdr's mask.
@@ -1517,12 +1625,19 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t depth_control = 0;
     // UP-1.7: whether the pixel shader writes the object slot.
     bool object_slot = false;
+    // LS-4.5: whether the draw renders a shared 4x alias at twice the scale.
+    bool doubled_scale = false;
     SpirvShaderTranslator::Modification vertex_modification;
     SpirvShaderTranslator::Modification pixel_modification;
     VulkanShader::VulkanTranslation* vertex_translation = nullptr;
     VulkanShader::VulkanTranslation* pixel_translation = nullptr;
   };
   std::unique_ptr<TranslationMemo[]> translation_memos_{new TranslationMemo[kStateMemoCount]};
+  // LS-4.5 (Fh1NativeExecutor::DrawAsDoubledScale): the current draw renders
+  // a 4x MSAA surface into its single-sampled storage at twice the draw
+  // resolution scale; its viewport, scissor, depth bias and system constants
+  // use the doubled scale.
+  bool draw_doubled_scale_ = false;
   // Host viewport information by memo state.
   struct ViewportMemo {
     uint64_t state_epoch = 0;
@@ -1742,6 +1857,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkRenderPass current_render_pass_;
   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
   bool in_render_pass_ = false;
+  size_t fh1_hoist_slot_ = 0;
+  uint32_t fh1_hoist_epoch_ = 0;
+  bool fh1_hoist_slot_valid_ = false;
 #if defined(REXGPU_FH1_ORDERED_CENSUS)
   uint64_t ordered_census_pass_ = 0;
 #endif

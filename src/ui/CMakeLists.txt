@@ -12,6 +12,7 @@ set(REXUI_CORE_SOURCES
     menu_item.cpp
     presenter.cpp
     upscaler.cpp
+    xr.cpp
     renderdoc_api.cpp
     sdl_virtual_key.cpp
     window.cpp
@@ -46,6 +47,7 @@ set(REXUI_VULKAN_SOURCES
     vulkan/vulkan_instance.cpp
     $<$<BOOL:${ANDROID}>:vulkan/android_gpu_driver.cpp>
     vulkan/vulkan_mem_alloc.cpp
+    vulkan/vulkan_openxr.cpp
     vulkan/vulkan_presenter.cpp
     vulkan/vulkan_provider.cpp
     vulkan/vulkan_submission_tracker.cpp
@@ -160,6 +162,13 @@ if(REXGLUE_USE_VULKAN AND REXGLUE_DLSS_INCLUDE_DIR AND REXGLUE_DLSS_LIBRARY)
     target_include_directories(rexui PRIVATE "${REXGLUE_DLSS_INCLUDE_DIR}")
     target_compile_definitions(rexui PRIVATE REX_HAS_DLSS=1)
     target_link_libraries(rexui PRIVATE "${REXGLUE_DLSS_LIBRARY}")
+endif()
+
+# The OpenXR output, when the build opted in (cmake/rexglue_openxr.cmake).
+if(REXGLUE_USE_VULKAN AND REXGLUE_OPENXR_TARGET)
+    target_include_directories(rexui PRIVATE "${REXGLUE_OPENXR_INCLUDE_DIR}")
+    target_compile_definitions(rexui PRIVATE REX_HAS_OPENXR=1)
+    target_link_libraries(rexui PRIVATE ${REXGLUE_OPENXR_TARGET})
 endif()
 
 if(REXGLUE_USE_VULKAN)

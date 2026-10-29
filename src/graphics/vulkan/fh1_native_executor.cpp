@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <unordered_set>
 #include <mutex>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -60,6 +62,20 @@ REXCVAR_DEFINE_BOOL(fh1_async_specialized_passes, true, "GPU",
                     "worker and use the generic one until it is ready, instead of stopping the "
                     "GPU commands thread for it (tens of milliseconds a pipeline on a cold "
                     "driver cache)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_color_overwrite_claims, true, "GPU",
+                    "A depth-overwriting rectangle draw that also writes every channel of a "
+                    "color target without blending claims that target's tiles without a "
+                    "transfer too, as its depth does (FH1 clears color, depth and stencil "
+                    "with one such draw; Vulkan FH1 native executor)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(fh1_share_msaa_aliases, false, "GPU",
+                    "Store FH1's half-size 4x MSAA views of its 1x surfaces at pitches 16 and 13 "
+                    "in the 1x surfaces, rendering their draws single-sampled at twice the "
+                    "scale, instead of transferring the EDRAM contents at every switch between "
+                    "the views (Vulkan FH1 native executor, LS-4.5). Off by default: with "
+                    "fh1_msaa_single_sample those passes do about 4x the pixel work, measured "
+                    "only on an RTX 3090")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_msaa_single_sample, true, "GPU",
                     "Keep the guest's 2x and 4x MSAA surfaces as single-sampled images at any "
@@ -119,6 +135,10 @@ REXCVAR_DEFINE_BOOL(fh1_debug_skip_stencil_transfers, false, "GPU",
                     "Diagnostics: transfer depth without its stencil bit passes on devices "
                     "without stencil export (wrong stencil), to bound what they cost")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(fh1_debug_trace_transfers, "", "GPU",
+                      "Diagnostics: log the state of the draw that causes each transfer between "
+                      "these surfaces (<source>=<destination> descriptions)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(fh1_debug_skip_transfers, "", "GPU",
                       "Diagnostics: skip transfers between these surfaces, as "
                       "<source>=<destination> descriptions (wrong image if they are needed)")
@@ -140,6 +160,18 @@ REXCVAR_DEFINE_STRING(fh1_coarse_shading, "", "GPU",
 REXCVAR_DEFINE_BOOL(fh1_debug_skip_clears, false, "GPU",
                     "Diagnostics: skip every EDRAM clear (wrong image), to bound what clears "
                     "cost")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(fh1_debug_skip_resolves, "", "GPU",
+                      "Diagnostics: skip the resolve dispatches whose source and size, written "
+                      "<surface>@<width>x<height>, are in this list, to see what they feed")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(fh1_debug_skip_hud_draws, "", "GPU",
+                      "Diagnostics: skip the frame's HUD draws (IsHudDraw) numbered first-last "
+                      "from 0 in each frame, to see which draws make what")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(fh1_debug_log_hud_draws, 0, "GPU",
+                     "Diagnostics: log the state of this many HUD draws (IsHudDraw), from the "
+                     "first one seen")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_debug_skip_resolve_dispatches, false, "GPU",
                     "Diagnostics: keep every resolve's barriers but not its compute dispatch "
@@ -449,21 +481,25 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   config_ = config;
   if (!config_.memory || !config_.textures || !config_.render_targets) return false;
   async_specialize_ = REXCVAR_GET(fh1_async_specialized_passes);
-  scale_ = config_.textures->draw_resolution_scale_x();
+  scale_x_ = config_.textures->draw_resolution_scale_x();
+  scale_y_ = config_.textures->draw_resolution_scale_y();
+  share_msaa_aliases_ = REXCVAR_GET(fh1_share_msaa_aliases);
   untile_height_ = config_.untile_height;
   UpdateCoarseShading();
-  single_sample_msaa_ = (scale_ >= 2 && REXCVAR_GET(fh1_scaled_msaa_single_sample)) ||
+  single_sample_msaa_ = (Scaled() && REXCVAR_GET(fh1_scaled_msaa_single_sample)) ||
                         REXCVAR_GET(fh1_msaa_single_sample);
   stencil_export_ = REXCVAR_GET(fh1_native_stencil_export) &&
                     command_processor_.GetVulkanDevice()->extensions().ext_EXT_shader_stencil_export;
   two_sample_msaa_ =
       !single_sample_msaa_ && REXCVAR_GET(fh1_msaa_2x) && config_.msaa_2x_supported;
   if (single_sample_msaa_) {
-    REXGPU_INFO("FH1 native executor (Vulkan): MSAA surfaces single-sampled at {}x", scale_);
+    REXGPU_INFO("FH1 native executor (Vulkan): MSAA surfaces single-sampled at {}x{}", scale_x_,
+                scale_y_);
   } else if (two_sample_msaa_) {
     REXGPU_INFO("FH1 native executor (Vulkan): 4x MSAA surfaces with 2 host samples");
   }
-  if (config_.textures->draw_resolution_scale_y() != scale_ || scale_ > 4) {
+  // Each axis's scale - 1 has two bits in the shaders' constants.
+  if (scale_x_ > 4 || scale_y_ > 4) {
     REXGPU_WARN("FH1 native executor (Vulkan): resolution scale {}x{} is not supported",
                 config_.textures->draw_resolution_scale_x(),
                 config_.textures->draw_resolution_scale_y());
@@ -598,6 +634,7 @@ void Fh1NativeExecutor::Shutdown() {
   for (auto& [packed, surface] : surfaces_) DestroySurface(surface);
   surfaces_.clear();
   DestroyHudSnapshot();
+  DestroyHudLayer();
   DestroyCamera();
   for (auto& [key, pipeline] : transfer_pipelines_) dfn.vkDestroyPipeline(device, pipeline, nullptr);
   transfer_pipelines_.clear();
@@ -693,17 +730,18 @@ Fh1NativeExecutor::SurfaceKey Fh1NativeExecutor::MakeDepthKey(
 uint32_t Fh1NativeExecutor::SurfaceHeight(uint32_t pitch_tiles, uint32_t msaa) const {
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
   return Fh1SurfaceHeight(pitch_tiles, msaa,
-                          vulkan_device->properties().maxImageDimension2D, scale_);
+                          vulkan_device->properties().maxImageDimension2D, scale_y_);
 }
 
 Fh1NativeExecutor::Rect Fh1NativeExecutor::HostRect(const Rect& rect) const {
-  return {rect.left * int32_t(scale_), rect.top * int32_t(scale_), rect.right * int32_t(scale_),
-          rect.bottom * int32_t(scale_)};
+  return {rect.left * int32_t(scale_x_), rect.top * int32_t(scale_y_),
+          rect.right * int32_t(scale_x_), rect.bottom * int32_t(scale_y_)};
 }
 
 uint32_t Fh1NativeExecutor::TransferFlags() const {
   return (config_.depth_float24_round ? 1u : 0u) | (config_.gamma_as_unorm16 ? 2u : 0u) |
-         (config_.fixed16_truncated ? 0u : 4u) | ((scale_ - 1) << 12);
+         (config_.fixed16_truncated ? 0u : 4u) | ((scale_x_ - 1) << 12) |
+         ((scale_y_ - 1) << 14);
 }
 
 Fh1NativeExecutor::Surface* Fh1NativeExecutor::FindSurface(uint32_t packed_key) {
@@ -784,7 +822,7 @@ void Fh1NativeExecutor::BeginSurfaceRendering(Surface& surface, bool uint_view) 
   attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   VkRenderingInfo info = {};
   info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-  info.renderArea.extent = {surface.width * scale_, surface.image_height * scale_};
+  info.renderArea.extent = {surface.width * scale_x_, surface.image_height * scale_y_};
   info.layerCount = 1;
   if (surface.key.is_depth) {
     info.pDepthAttachment = &attachment;
@@ -814,9 +852,10 @@ void Fh1NativeExecutor::EndUntiledTiling() {
     VkImageCopy region = {};
     region.srcSubresource = {AspectMask(*surface), 0, 0, 1};
     region.dstSubresource = region.srcSubresource;
-    region.srcOffset = {0, int32_t(band * scale_), 0};
+    region.srcOffset = {0, int32_t(band * scale_y_), 0};
     // Rows past the band would overlap their own destination.
-    region.extent = {surface->width * scale_, std::min(untile_height_ - band, band) * scale_, 1};
+    region.extent = {surface->width * scale_x_, std::min(untile_height_ - band, band) * scale_y_,
+                     1};
     command_processor_.deferred_command_buffer().CmdVkCopyImage(
         surface->image, VK_IMAGE_LAYOUT_GENERAL, surface->image, VK_IMAGE_LAYOUT_GENERAL, region);
     Count("untile_copy_down");
@@ -869,7 +908,7 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
   VkClearAttachment clear = {};
   clear.aspectMask = AspectMask(stored);
   VkClearRect clear_rect = {};
-  clear_rect.rect.extent = {stored.width * scale_, stored.image_height * scale_};
+  clear_rect.rect.extent = {stored.width * scale_x_, stored.image_height * scale_y_};
   clear_rect.layerCount = 1;
   command_processor_.deferred_command_buffer().CmdVkClearAttachments(1, &clear, 1, &clear_rect);
   Count("surface_created");
@@ -888,7 +927,7 @@ bool Fh1NativeExecutor::CreateSurfaceImage(Surface& surface) {
                          : 0;
   image_info.imageType = VK_IMAGE_TYPE_2D;
   image_info.format = surface.format;
-  image_info.extent = {surface.width * scale_, surface.image_height * scale_, 1};
+  image_info.extent = {surface.width * scale_x_, surface.image_height * scale_y_, 1};
   image_info.mipLevels = 1;
   image_info.arrayLayers = 1;
   image_info.samples = VkSampleCountFlagBits(surface.samples);
@@ -924,7 +963,7 @@ bool Fh1NativeExecutor::CreateSurfaceImage(Surface& surface) {
           "FH1 native executor: could not allocate a {}x{} surface image (format {}, {} samples, "
           "{}) with {} surfaces ({} MB) alive; draws using it lose that target "
           "(failure {})",
-          surface.width * scale_, surface.image_height * scale_, uint32_t(surface.format),
+          surface.width * scale_x_, surface.image_height * scale_y_, uint32_t(surface.format),
           surface.samples, key.is_depth ? "depth" : "color", surfaces_.size(), surface_bytes_ >> 20,
           create_failures + 1);
     }
@@ -1023,7 +1062,7 @@ void Fh1NativeExecutor::EnsureSurfaceRows(Surface& surface, uint32_t rows) {
   VkImageCopy region = {};
   region.srcSubresource = {aspect, 0, 0, 1};
   region.dstSubresource = region.srcSubresource;
-  region.extent = {surface.width * scale_, old_rows * scale_, 1};
+  region.extent = {surface.width * scale_x_, old_rows * scale_y_, 1};
   commands.CmdVkCopyImage(surface.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, grown.image,
                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
   // The old image lives until the GPU has finished this submission.
@@ -1057,8 +1096,8 @@ void Fh1NativeExecutor::EnsureSurfaceRows(Surface& surface, uint32_t rows) {
   VkClearAttachment clear = {};
   clear.aspectMask = aspect;
   VkClearRect clear_rect = {};
-  clear_rect.rect.offset = {0, int32_t(old_rows * scale_)};
-  clear_rect.rect.extent = {surface.width * scale_, (new_rows - old_rows) * scale_};
+  clear_rect.rect.offset = {0, int32_t(old_rows * scale_y_)};
+  clear_rect.rect.extent = {surface.width * scale_x_, (new_rows - old_rows) * scale_y_};
   clear_rect.layerCount = 1;
   commands.CmdVkClearAttachments(1, &clear, 1, &clear_rect);
   Count("surface_grown");
@@ -1595,6 +1634,28 @@ void Fh1NativeExecutor::TransferRects(Surface& dest, uint32_t previous_owner, co
       return;
     }
   }
+  {
+    static const std::string trace_pairs = REXCVAR_GET(fh1_debug_trace_transfers);
+    static uint32_t trace_logs = 0;
+    const std::string pair = source->key.Describe() + "=" + dest.key.Describe();
+    if (!trace_pairs.empty() && trace_pairs.find(pair) != std::string::npos && trace_logs < 60) {
+      ++trace_logs;
+      const RegisterFile& regs = register_file_;
+      std::string rect_text;
+      for (uint32_t i = 0; i < rect_count; ++i) {
+        rect_text += fmt::format(" [{},{} {}x{}]", rects[i].left, rects[i].top,
+                                 rects[i].right - rects[i].left, rects[i].bottom - rects[i].top);
+      }
+      REXGPU_INFO("FH1 transfer trace {} draw {}: rects{} of {}x{}; depthcontrol {:08X} "
+                  "colorcontrol {:08X} blend0 {:08X} colormask {:08X} initiator {:08X} "
+                  "indices {} copy {:08X}",
+                  pair, draws_, rect_text, dest.width, dest.height,
+                  regs[XE_GPU_REG_RB_DEPTHCONTROL], regs[XE_GPU_REG_RB_COLORCONTROL],
+                  regs[XE_GPU_REG_RB_BLENDCONTROL0], regs[XE_GPU_REG_RB_COLOR_MASK],
+                  regs[XE_GPU_REG_VGT_DRAW_INITIATOR], regs[XE_GPU_REG_VGT_DMA_SIZE],
+                  regs[XE_GPU_REG_RB_COPY_CONTROL]);
+    }
+  }
   Count("transfer");
   ++transfer_count_;
   const bool source_stencil =
@@ -1819,7 +1880,7 @@ void Fh1NativeExecutor::FlushDepthTransfersExported(Surface& dest, size_t first,
 }
 
 bool Fh1NativeExecutor::EnsureTransferWords(const Surface& dest) {
-  const VkDeviceSize size = VkDeviceSize(dest.width) * dest.height * scale_ * scale_ *
+  const VkDeviceSize size = VkDeviceSize(dest.width) * dest.height * scale_x_ * scale_y_ *
                             dest.samples * sizeof(uint32_t);
   if (transfer_words_ && transfer_words_size_ >= size) return true;
   if (transfer_words_) {
@@ -1918,7 +1979,7 @@ void Fh1NativeExecutor::FlushDepthTransfers(Surface& dest, size_t first, size_t 
       const uint32_t constants[kComputeConstantCount] = {
           uint32_t(rect.left) | (uint32_t(rect.top) << 16),
           uint32_t(rect.right - rect.left) | (uint32_t(rect.bottom - rect.top) << 16),
-          LayoutConstant(dest), LayoutConstant(*source), flags, dest.width * scale_,
+          LayoutConstant(dest), LayoutConstant(*source), flags, dest.width * scale_x_,
           dest.samples, 0};
       command_buffer.CmdVkPushConstants(compute_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                         sizeof(constants), constants);
@@ -1975,7 +2036,7 @@ void Fh1NativeExecutor::FlushDepthTransfers(Surface& dest, size_t first, size_t 
       set_bound = true;
     }
     const uint32_t constants[kTransferConstantCount] = {
-        LayoutConstant(dest), (dest.width * scale_) | (dest.samples << 16),
+        LayoutConstant(dest), (dest.width * scale_x_) | (dest.samples << 16),
         flags | (pass ? (pass - 1) << 8 : 0)};
     command_buffer.CmdVkPushConstants(words_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                       sizeof(constants), constants);
@@ -2048,29 +2109,28 @@ bool Fh1NativeExecutor::DrawMayWriteNonzeroStencil(reg::RB_DEPTHCONTROL depth_co
 }
 
 bool Fh1NativeExecutor::ClaimDepthOverwriteTiles(const SurfaceKey& key, uint32_t length,
-                                                 bool stencil_overwritten, bool stencil_written) {
+                                                 bool stencil_overwritten, bool stencil_written,
+                                                 uint32_t rect_shift) {
   const uint32_t msaa_x_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
   const uint32_t msaa_y_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
   const uint32_t tile_width = xenos::kEdramTileWidthSamples >> msaa_x_log2;
   const uint32_t tile_height = xenos::kEdramTileHeightSamples >> msaa_y_log2;
-  const auto image_rect = [this](Fh1DepthOverwrite::Rect rect) {
-    // The interpreter's rectangles are in guest pixels, before alias scaling.
-    if (shared_depth_alias_draw_) {
-      for (auto& coordinate : rect.inner) coordinate *= 2;
-      for (auto& coordinate : rect.outer) coordinate *= 2;
-    }
-    return rect;
-  };
-  for (const auto& guest_rect : depth_overwrite_.rects()) {
-    const auto rect = image_rect(guest_rect);
+  // In the storage surface's pixels: twice the guest's for a shared 4x
+  // alias (rect_shift) or a shared depth alias draw (fh1_shared_depth_alias).
+  const uint32_t shift = shared_depth_alias_draw_ ? 1 : rect_shift;
+  auto rects = depth_overwrite_.rects();
+  for (auto& rect : rects) {
+    for (int32_t& value : rect.outer) value <<= shift;
+    for (int32_t& value : rect.inner) value <<= shift;
+  }
+  for (const auto& rect : rects) {
     const uint32_t column_end = (uint32_t(rect.outer[2]) + tile_width - 1) / tile_width;
     const uint32_t row_end = (uint32_t(rect.outer[3]) + tile_height - 1) / tile_height;
     if (column_end > key.pitch_tiles || (row_end - 1) * key.pitch_tiles + column_end > length) {
       return false;
     }
   }
-  for (const auto& guest_rect : depth_overwrite_.rects()) {
-    const auto rect = image_rect(guest_rect);
+  for (const auto& rect : rects) {
     ClaimOverwrittenDepthTiles(key, rect.inner, stencil_overwritten);
     const uint32_t column_first = uint32_t(rect.outer[0]) / tile_width;
     const uint32_t column_end = (uint32_t(rect.outer[2]) + tile_width - 1) / tile_width;
@@ -2161,7 +2221,9 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1DrawInfo& draw) {
   const auto window = register_file_.Get<reg::PA_SC_WINDOW_OFFSET>();
   const bool untile_shifted = untile_height_ &&
       (window.window_x_offset || window.window_y_offset);
-  if (enabled && !single_sample_msaa_ && !two_sample_msaa_ && !untile_shifted &&
+  // fh1_share_msaa_aliases stores these views as 1x already, for every draw.
+  if (enabled && !share_msaa_aliases_ && !single_sample_msaa_ && !two_sample_msaa_ &&
+      !untile_shifted &&
       !draw.memexport && !draw.occlusion_query_active && !reads_depth &&
       (register_file_[XE_GPU_REG_PA_SC_AA_MASK] & 0xFFFF) == 0xFFFF &&
       (!draw.pixel_shader || !draw.pixel_shader->writes_depth()) && draw.rasterization_done &&
@@ -2205,7 +2267,9 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1DrawInfo& draw) {
   }
   PrepareTargetsImpl(draw);
   const bool may_overwrite_depth =
-      pending_used_bits_ == 1 && draw.normalized_depth_control.z_enable &&
+      (pending_used_bits_ == 1 ||
+       ((pending_used_bits_ & 1) && REXCVAR_GET(fh1_color_overwrite_claims))) &&
+      draw.normalized_depth_control.z_enable &&
       draw.normalized_depth_control.z_write_enable &&
       draw.normalized_depth_control.zfunc == xenos::CompareFunction::kAlways;
   if (memo_allowed && !may_overwrite_depth) {
@@ -2235,14 +2299,16 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
   if (draw.rasterization_done && pitch_tiles) {
     if (draw.normalized_depth_control.z_enable || draw.normalized_depth_control.stencil_enable) {
       const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
-      keys[0] = MakeDepthKey(depth_info.depth_base, pitch_tiles, msaa, depth_info.depth_format);
+      keys[0] = StorageKey(
+          MakeDepthKey(depth_info.depth_base, pitch_tiles, msaa, depth_info.depth_format));
       used_bits |= 1;
     }
     for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
       if (!(draw.normalized_color_mask & (0xFu << (4 * i)))) continue;
       const auto color_info =
           regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
-      keys[1 + i] = MakeColorKey(color_info.color_base, pitch_tiles, msaa, color_info.color_format);
+      keys[1 + i] = StorageKey(
+          MakeColorKey(color_info.color_base, pitch_tiles, msaa, color_info.color_format));
       used_bits |= 1u << (1 + i);
     }
     for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
@@ -2268,6 +2334,9 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
   }
 
   const uint32_t msaa_y_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k2X));
+  // A shared 4x alias's storage has two rows a guest row (the EDRAM tiles
+  // are the same).
+  const uint32_t storage_shift = IsSharedMsaaAlias(msaa, pitch_tiles) ? 1 : 0;
   auto length_for_height = [&](uint32_t height) {
     return ((height << msaa_y_log2) + xenos::kEdramTileHeightSamples - 1) /
            xenos::kEdramTileHeightSamples * pitch_tiles;
@@ -2310,7 +2379,7 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
 
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
     if ((used_bits & (1u << i)) &&
-        !GetOrCreateSurface(keys[i], height_used * draw_coordinate_scale())) {
+        !GetOrCreateSurface(keys[i], height_used * (storage_shift ? 2u : draw_coordinate_scale()))) {
       used_bits &= ~(1u << i);
     }
   }
@@ -2324,9 +2393,29 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
   }
   std::sort(bases.begin(), bases.end());
   bool stencil_overwritten = false;
+  const bool color_claims = REXCVAR_GET(fh1_color_overwrite_claims);
   const bool depth_overwritten =
-      used_bits == 1 &&
+      (used_bits == 1 || ((used_bits & 1) && color_claims)) &&
       depth_overwrite_.Derive(draw, REXCVAR_GET(half_pixel_offset), stencil_overwritten);
+  // A color target the overwriting draw replaces in its rectangles: every
+  // channel written (the normalized mask counts channels the format lacks),
+  // no blending, written by the pixel shader. Derive has ruled out kills,
+  // alpha test, alpha to coverage and sample masks.
+  auto color_overwritten = [&](uint32_t target) {
+    if (!color_claims || !target || !draw.pixel_shader ||
+        !draw.pixel_shader->writes_color_target(int(target - 1)) ||
+        ((draw.normalized_color_mask >> (4 * (target - 1))) & 0xF) != 0xF) {
+      return false;
+    }
+    const auto blend = regs.Get<reg::RB_BLENDCONTROL>(
+        reg::RB_BLENDCONTROL::rt_register_indices[target - 1]);
+    return blend.color_srcblend == xenos::BlendFactor::kOne &&
+           blend.color_destblend == xenos::BlendFactor::kZero &&
+           blend.color_comb_fcn == xenos::BlendOp::kAdd &&
+           blend.alpha_srcblend == xenos::BlendFactor::kOne &&
+           blend.alpha_destblend == xenos::BlendFactor::kZero &&
+           blend.alpha_comb_fcn == xenos::BlendOp::kAdd;
+  };
   for (size_t i = 0; i < bases.size(); ++i) {
     const SurfaceKey& key = keys[bases[i].second];
     const uint32_t next_base = i + 1 < bases.size()
@@ -2334,8 +2423,19 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
                                    : xenos::kEdramTileCount + bases[0].first;
     const uint32_t length =
         std::min(length_tiles_32bpp << uint32_t(key.Is64bpp()), next_base - key.base_tiles);
-    if (depth_overwritten &&
-        ClaimDepthOverwriteTiles(key, length, stencil_overwritten, depth_stencil_written)) {
+    if (depth_overwritten && key.is_depth &&
+        ClaimDepthOverwriteTiles(key, length, stencil_overwritten, depth_stencil_written,
+                                 storage_shift)) {
+      continue;
+    }
+    // A color target has no stencil to keep, and its tiles are marked as
+    // possibly holding stencil, as any color claim marks them. The tile
+    // helpers count 32bpp tiles (80 samples wide), so 64bpp targets keep
+    // their transfers.
+    if (depth_overwritten && !key.is_depth && !key.Is64bpp() &&
+        color_overwritten(bases[i].second) &&
+        ClaimDepthOverwriteTiles(key, length, true, true, storage_shift)) {
+      Count("color_overwrite_claim");
       continue;
     }
     ClaimTiles(key.base_tiles, length, key.Pack());
@@ -2373,7 +2473,7 @@ bool Fh1NativeExecutor::BindTargets(VulkanRenderTargetCache::RenderPassKey& key_
   const uint32_t used_bits = pending_used_bits_;
   const SurfaceKey* keys = pending_keys_;
   const uint64_t rendering_id = DrawRenderingId(used_bits);
-  key_out.msaa_samples = single_sample_msaa_ || shared_depth_alias_draw_
+  key_out.msaa_samples = single_sample_msaa_ || shared_depth_alias_draw_ || DrawAsDoubledScale()
                              ? xenos::MsaaSamples::k1X
                              : register_file_.Get<reg::RB_SURFACE_INFO>().msaa_samples;
   if (two_sample_msaa_ && key_out.msaa_samples == xenos::MsaaSamples::k4X) {
@@ -2381,7 +2481,7 @@ bool Fh1NativeExecutor::BindTargets(VulkanRenderTargetCache::RenderPassKey& key_
   }
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
     if (!(used_bits & (1u << i))) continue;
-    Surface* surface = FindSurface(keys[i].Pack());
+    Surface* surface = BoundSurface(i);
     if (!surface) {
       Skip("draw_surface_create");
       return false;
@@ -2407,6 +2507,7 @@ bool Fh1NativeExecutor::BindTargets(VulkanRenderTargetCache::RenderPassKey& key_
     bound_bits_ |= 1u << i;
   }
   key_out.depth_and_color_used = bound_bits_;
+  key_out.fh1_hud_layer = hud_layer_bound_ && (bound_bits_ & 0b10);
   // Every used surface was bound, so this is the bound surfaces' scope.
   bound_rendering_id_ = rendering_id;
   if (!used_bits) Count("draw_writes_nothing");
@@ -2455,6 +2556,13 @@ void Fh1NativeExecutor::UpdateCoarseShading() {
   }
 }
 
+bool Fh1NativeExecutor::DrawAsDoubledScale() const {
+  if (!share_msaa_aliases_ || !initialized_) return false;
+  const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
+  const uint32_t msaa = uint32_t(surface_info.msaa_samples);
+  return IsSharedMsaaAlias(msaa, Fh1PitchTiles(surface_info.surface_pitch, msaa));
+}
+
 uint64_t Fh1NativeExecutor::DrawRenderingId(uint32_t used_bits) const {
   // The scope is identified by the bound surfaces.
   uint64_t id = 0x9E3779B97F4A7C15ull;
@@ -2462,6 +2570,8 @@ uint64_t Fh1NativeExecutor::DrawRenderingId(uint32_t used_bits) const {
     if (!(used_bits & (1u << i))) continue;
     id = (id ^ (uint64_t(pending_keys_[i].Pack()) + i)) * 0x100000001B3ull;
   }
+  // The HUD layer is another image than the front buffer it stands for.
+  if (hud_layer_bound_ && (used_bits & 0b10)) id = (id ^ 0x4855444Cull) * 0x100000001B3ull;
   id &= ~(uint64_t(1) << 63);
   return id | 1;
 }
@@ -2512,7 +2622,7 @@ void Fh1NativeExecutor::DiscoverShaderDraw(const VulkanShader::VulkanTranslation
         "{}{{\"slot\":{},\"key\":\"{:08X}\",\"depth\":{},\"base_tiles\":{},"
         "\"pitch_tiles\":{},\"format\":{},\"width\":{},\"height\":{},\"samples\":{}}}",
         first ? "" : ",", i, key.Pack(), key.is_depth, key.base_tiles, key.pitch_tiles,
-        key.format, surface->width * scale_, surface->image_height * scale_, surface->samples);
+        key.format, surface->width * scale_x_, surface->image_height * scale_y_, surface->samples);
     first = false;
   }
   shader_discovery_draws_ << "]}\n";
@@ -2526,11 +2636,11 @@ void Fh1NativeExecutor::BeginDrawRendering() {
   if (pending_clear_surfaces_) {
     for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
       if (!(bound_bits_ & (1u << i))) continue;
-      bound[i] = FindSurface(pending_keys_[i].Pack());
+      bound[i] = BoundSurface(i);
       if (!bound[i]) continue;
       clears |= !bound[i]->pending_clears.empty();
-      clear_width = std::min(clear_width, bound[i]->width * scale_);
-      clear_height = std::min(clear_height, bound[i]->image_height * scale_);
+      clear_width = std::min(clear_width, bound[i]->width * scale_x_);
+      clear_height = std::min(clear_height, bound[i]->image_height * scale_y_);
     }
     if (clears) {
       FoldPendingClears(bound, clear_width, clear_height, nullptr, nullptr, true);
@@ -2562,7 +2672,7 @@ void Fh1NativeExecutor::BeginDrawRendering() {
   uint32_t width = UINT32_MAX, height = UINT32_MAX;
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
     if (!(bound_bits_ & (1u << i))) continue;
-    Surface* surface = FindSurface(pending_keys_[i].Pack());
+    Surface* surface = BoundSurface(i);
     if (!surface) continue;
     VkRenderingAttachmentInfo& attachment = i ? colors[i - 1] : depth;
     attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -2572,17 +2682,22 @@ void Fh1NativeExecutor::BeginDrawRendering() {
     attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     if (i) color_count = i;
-    width = std::min(width, surface->width * scale_);
-    height = std::min(height, surface->image_height * scale_);
+    width = std::min(width, surface->width * scale_x_);
+    height = std::min(height, surface->image_height * scale_y_);
   }
   if (width == UINT32_MAX) {
     // No attachments: the surface pitch bounds the draw.
     const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
-    const uint32_t msaa = uint32_t(surface_info.msaa_samples);
-    const uint32_t pitch_tiles = std::max(Fh1PitchTiles(surface_info.surface_pitch, msaa), 1u);
+    const uint32_t guest_msaa = uint32_t(surface_info.msaa_samples);
+    const uint32_t pitch_tiles =
+        std::max(Fh1PitchTiles(surface_info.surface_pitch, guest_msaa), 1u);
+    // A shared 4x alias renders in its 1x storage's pixels.
+    const uint32_t msaa = IsSharedMsaaAlias(guest_msaa, pitch_tiles)
+                              ? uint32_t(xenos::MsaaSamples::k1X)
+                              : guest_msaa;
     const uint32_t msaa_x_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k4X));
-    width = pitch_tiles * (xenos::kEdramTileWidthSamples >> msaa_x_log2) * scale_;
-    height = SurfaceHeight(pitch_tiles, msaa) * scale_;
+    width = pitch_tiles * (xenos::kEdramTileWidthSamples >> msaa_x_log2) * scale_x_;
+    height = SurfaceHeight(pitch_tiles, msaa) * scale_y_;
   }
   const uint64_t id = bound_id;
   if (attachment_barriers_skipped_) {
@@ -2594,7 +2709,7 @@ void Fh1NativeExecutor::BeginDrawRendering() {
       Count("draw_attachment_barrier_late");
       for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
         if (!(bound_bits_ & (1u << i))) continue;
-        if (Surface* surface = FindSurface(pending_keys_[i].Pack())) {
+        if (Surface* surface = BoundSurface(i)) {
           TransitionForAttachment(*surface);
         }
       }
@@ -2915,10 +3030,11 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
     }
   }
   constants[4] = sample_select;
-  constants[5] = dest_info | ((scale_ - 1) << 20) | (unscaled_dest ? 1u << 22 : 0u);
+  constants[5] = dest_info | ((scale_x_ - 1) << 20) | (unscaled_dest ? 1u << 22 : 0u) |
+                 ((scale_y_ - 1) << 23);
   constants[6] = dest_base;
   constants[7] = dest_pitch;
-  constants[8] = image_row * scale_;
+  constants[8] = image_row * scale_y_;
   constants[9] = image_endian;
   constants[10] = image2_view != VK_NULL_HANDLE ? image2_endian | (1u << 5) : 0u;
   if (const VkPipeline specialized = GetSpecializedResolvePipeline(
@@ -2937,7 +3053,14 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   command_processor_.BeginDebugLabel(image_view != VK_NULL_HANDLE ? "fh1 resolve and texture"
                                                                   : "fh1 resolve");
   // 16x16 groups, as fh1_native_resolve_memory.cs.hlsl's Vulkan variants.
-  if (!REXCVAR_GET(fh1_debug_skip_resolve_dispatches)) {
+  static const std::string skip_resolves = REXCVAR_GET(fh1_debug_skip_resolves);
+  const bool skip_this =
+      !skip_resolves.empty() &&
+      skip_resolves.find(fmt::format("{}@{}x{}", surface.key.Describe(),
+                                     source.rect.right - source.rect.left,
+                                     source.rect.bottom - source.rect.top)) != std::string::npos;
+  if (skip_this) Count("debug_resolve_skipped");
+  if (!REXCVAR_GET(fh1_debug_skip_resolve_dispatches) && !skip_this) {
     command_buffer.CmdVkDispatch((uint32_t(rect.right - rect.left) + 15) / 16,
                                  (uint32_t(rect.bottom - rect.top) + 15) / 16, 1);
   }
@@ -2962,7 +3085,7 @@ bool Fh1NativeExecutor::NativeResolve(uint32_t& written_address, uint32_t& writt
   if (!initialized_) return false;
   if (!Resolve(&written_address, &written_length)) return false;
   // At scale the resolve reads one-off captures back itself.
-  if (scale_ == 1 && written_length && IsOneOffResolve(written_address, written_length)) {
+  if (!Scaled() && written_length && IsOneOffResolve(written_address, written_length)) {
     QueueResolveReadback(written_address, written_length);
   }
   if (written_length && !REXCVAR_GET(fh1_resolve_dump_dir).empty() &&
@@ -3210,9 +3333,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
     const auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
     const uint32_t msaa = uint32_t(surface_info.msaa_samples);
-    if (MakeDepthKey(depth_info.depth_base, Fh1PitchTiles(surface_info.surface_pitch, msaa),
-                     msaa, depth_info.depth_format)
-            .Pack() == camera_scene_depth_) {
+    if (CurrentDepthKey() == camera_scene_depth_) {
       SnapshotCameraDepth(uint32_t(
           std::max(0, -int32_t(regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset))));
     }
@@ -3258,7 +3379,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     VkBuffer target = config_.memory->buffer();
     VkDeviceSize target_offset = offset, target_range = range;
     uint32_t dest_base = uint32_t(plan.dest_base - offset);
-    if (scale_ > 1) {
+    if (Scaled()) {
       const uint32_t base = resolve_info.copy_dest_base;
       const uint32_t range_unscaled = extent_start - base + extent_length;
       uint64_t scaled_base, scaled_length, use_start, use_length;
@@ -3302,7 +3423,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
         config_.textures->FindDirectResolveTargets(
             plan.dest_base, extent_start, extent_length,
             i < 2 ? formats[i] : xenos::TextureFormat::k_8_8_8_8, plan.dest_pitch,
-            uint32_t(plan.x1), uint32_t(plan.y1), scale_ > 1, direct_resolve_candidates_,
+            uint32_t(plan.x1), uint32_t(plan.y1), Scaled(), direct_resolve_candidates_,
             plan.x0 == 0 && plan.y0 == 0);
         for (const TextureCache::DirectResolveTarget& candidate : direct_resolve_candidates_) {
           if (direct_resolve_targets_.size() >= (two_targets ? 2u : 1u)) break;
@@ -3395,9 +3516,9 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     // daytime limit, overexposing the screen until about noon (#444).
     constexpr uint32_t kUnscaledCopyMaxLength = 4096;
     const bool one_off =
-        scale_ > 1 && written_address && IsOneOffResolve(extent_start, extent_length);
-    bool unscaled_copy_complete = scale_ == 1 && complete;
-    if (scale_ > 1 && written_address &&
+        Scaled() && written_address && IsOneOffResolve(extent_start, extent_length);
+    bool unscaled_copy_complete = !Scaled() && complete;
+    if (Scaled() && written_address &&
         (one_off || extent_length <= kUnscaledCopyMaxLength)) {
       config_.memory->RequestRange(extent_start, extent_length);
       config_.memory->Use(VulkanSharedMemory::Usage::kComputeWrite,
@@ -3467,32 +3588,41 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
 
   // Clears target the surface configured at the original base and take
   // ownership of the cleared tiles.
-  const uint32_t msaa_x_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k4X));
-  const uint32_t msaa_y_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k2X));
-  auto clear = [&](SurfaceKey key, uint32_t value, uint32_t value_lo) {
+  auto clear = [&](const SurfaceKey& guest_key, uint32_t value, uint32_t value_lo) {
+    // A shared 4x alias is cleared in its 1x storage, two pixels a guest
+    // pixel along each axis; so is the base-0 half-pitch depth while
+    // fh1_shared_depth_alias shares it (only without fh1_share_msaa_aliases,
+    // which stores it so already).
+    SurfaceKey key = StorageKey(guest_key);
     const auto window = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
-    const bool shared = REXCVAR_GET(fh1_shared_depth_alias) &&
+    if (key.msaa == guest_key.msaa && REXCVAR_GET(fh1_shared_depth_alias) &&
         !single_sample_msaa_ && !two_sample_msaa_ &&
-        (!untile_height_ || (!window.window_x_offset && !window.window_y_offset)) && key.is_depth &&
-        key.base_tiles == 0 && key.pitch_tiles == 16 &&
+        (!untile_height_ || (!window.window_x_offset && !window.window_y_offset)) &&
+        key.is_depth && key.base_tiles == 0 && key.pitch_tiles == 16 &&
         key.msaa == uint32_t(xenos::MsaaSamples::k4X) &&
-        key.format == uint32_t(xenos::DepthRenderTargetFormat::kD24FS8);
-    if (shared) key.msaa = uint32_t(xenos::MsaaSamples::k1X);
-    Surface* surface = GetOrCreateSurface(key, std::max(uint32_t(y1), 1u) * (shared ? 2u : 1u));
+        key.format == uint32_t(xenos::DepthRenderTargetFormat::kD24FS8)) {
+      key.msaa = uint32_t(xenos::MsaaSamples::k1X);
+    }
+    const uint32_t shift = key.msaa != guest_key.msaa ? 1 : 0;
+    const int32_t left = rect.left << shift, top = rect.top << shift;
+    const int32_t right = rect.right << shift, bottom = rect.bottom << shift;
+    const uint32_t msaa_x_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
+    const uint32_t msaa_y_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
+    Surface* surface = GetOrCreateSurface(key, std::max(uint32_t(bottom), 1u));
     if (!surface) return Skip("resolve_clear_surface");
     const uint32_t is_64bpp = key.Is64bpp() ? 1 : 0;
     const uint32_t tile_width = (xenos::kEdramTileWidthSamples >> msaa_x_log2) >> is_64bpp;
     const uint32_t tile_height = xenos::kEdramTileHeightSamples >> msaa_y_log2;
     const uint32_t pitch = key.pitch_tiles << is_64bpp;
-    const uint32_t column_first = uint32_t(x0) / tile_width;
-    const uint32_t column_end = (uint32_t(x1) + tile_width - 1) / tile_width;
-    const uint32_t inner_first = (uint32_t(x0) + tile_width - 1) / tile_width;
-    const uint32_t inner_end = std::max(inner_first, uint32_t(x1) / tile_width);
-    for (uint32_t row = uint32_t(y0) / tile_height;
-         row < (uint32_t(y1) + tile_height - 1) / tile_height; ++row) {
+    const uint32_t column_first = uint32_t(left) / tile_width;
+    const uint32_t column_end = (uint32_t(right) + tile_width - 1) / tile_width;
+    const uint32_t inner_first = (uint32_t(left) + tile_width - 1) / tile_width;
+    const uint32_t inner_end = std::max(inner_first, uint32_t(right) / tile_width);
+    for (uint32_t row = uint32_t(top) / tile_height;
+         row < (uint32_t(bottom) + tile_height - 1) / tile_height; ++row) {
       const uint32_t row_base = key.base_tiles + row * pitch;
       const bool row_covered =
-          row * tile_height >= uint32_t(y0) && (row + 1) * tile_height <= uint32_t(y1);
+          row * tile_height >= uint32_t(top) && (row + 1) * tile_height <= uint32_t(bottom);
       if (!row_covered || inner_first >= inner_end) {
         ClaimTiles(row_base + column_first, column_end - column_first, key.Pack());
         continue;
@@ -3505,11 +3635,11 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
         ClaimTiles(row_base + inner_end, column_end - inner_end, key.Pack());
       }
     }
-    for (uint32_t row = uint32_t(y0) / tile_height;
-         row < (uint32_t(y1) + tile_height - 1) / tile_height; ++row) {
+    for (uint32_t row = uint32_t(top) / tile_height;
+         row < (uint32_t(bottom) + tile_height - 1) / tile_height; ++row) {
       const uint32_t row_base = key.base_tiles + row * pitch;
       const bool row_covered =
-          row * tile_height >= uint32_t(y0) && (row + 1) * tile_height <= uint32_t(y1);
+          row * tile_height >= uint32_t(top) && (row + 1) * tile_height <= uint32_t(bottom);
       if (!key.is_depth || (value & 0xFF)) {
         MarkTileStencil(row_base + column_first, column_end - column_first, true);
       } else if (row_covered && inner_first < inner_end) {
@@ -3517,15 +3647,12 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
       }
     }
     FlushTransfers();
-    Rect clear_rect = rect;
-    if (shared) {
-      clear_rect = {rect.left * 2, rect.top * 2, rect.right * 2, rect.bottom * 2};
-    }
+    Rect clear_rect = {left, top, right, bottom};
     if (untile_band) {
-      clear_rect.top += int32_t(untile_band);
-      clear_rect.bottom += int32_t(untile_band);
+      clear_rect.top += int32_t(untile_band << shift);
+      clear_rect.bottom += int32_t(untile_band << shift);
       uint32_t& band = untile_bands_[key.Pack()];
-      band = std::max(band, untile_band);
+      band = std::max(band, untile_band << shift);
     }
     ClearSurfaceRect(*surface, clear_rect, value, value_lo);
     Count(key.is_depth ? "clear_depth" : "clear_color");
@@ -3546,6 +3673,9 @@ void Fh1NativeExecutor::OnSwap(uint64_t frame) {
   BeginInspection();
   hud_snapshot_ready_ = hud_snapshot_taken_;
   hud_snapshot_taken_ = false;
+  hud_layer_ready_ = hud_layer_drawn_;
+  hud_layer_drawn_ = false;
+  hud_draw_index_ = UINT32_MAX;
   hud_scene_base_ = UINT32_MAX;
   camera_depth_rows_ready_ = camera_depth_rows_;
   camera_depth_rows_ = 0;
@@ -3589,6 +3719,8 @@ bool Fh1NativeExecutor::IsHudTarget() const {
 void Fh1NativeExecutor::MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw) {
   NoteCameraDraw(draw);
   hud_draw_ = false;
+  hud_layer_bound_ = false;
+  hud_world_draw_ = false;
   if (!initialized_ || draw.memexport || !draw.rasterization_done ||
       !(draw.normalized_color_mask & 0xF)) {
     return;
@@ -3605,24 +3737,59 @@ void Fh1NativeExecutor::MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw) {
     return;
   }
   hud_draw_ = true;
+  ++hud_draw_index_;
+  // Only VR's HUD panel sets name tags apart: in flat play they take the
+  // HUD scale and safe zone as they always have.
+  hud_world_draw_ = hud_layer_enabled_ && IsWorldAnchoredHudDraw(draw);
+  if (static int32_t logged = 0; logged < REXCVAR_GET(fh1_debug_log_hud_draws)) {
+    ++logged;
+    const uint32_t* r = register_file_.values;
+    const float* c = reinterpret_cast<const float*>(&r[XE_GPU_REG_SHADER_CONSTANT_000_X]);
+    std::string used;
+    if (draw.vertex_shader) {
+      const auto& map = draw.vertex_shader->constant_register_map();
+      for (uint32_t i = 0; i < 256; ++i) {
+        if ((map.float_bitmap[i / 64] >> (i % 64)) & 1) used += fmt::format("{},", i);
+      }
+    }
+    REXGPU_INFO(
+        "HUD draw {}: vs {:016X} ps {:016X} initiator {:08X} blend {:08X} depth {:08X} "
+        "viewport {} {} {} {} scissor {:08X}-{:08X} vfetch0 {:08X} vs consts [{}] "
+        "c0-3 [{:.3f} {:.3f} {:.3f} {:.3f} | {:.3f} {:.3f} {:.3f} {:.3f} | {:.3f} {:.3f} {:.3f} {:.3f} "
+        "| {:.3f} {:.3f} {:.3f} {:.3f}]",
+        hud_draw_index_, draw.vertex_shader ? draw.vertex_shader->ucode_data_hash() : 0,
+        draw.pixel_shader ? draw.pixel_shader->ucode_data_hash() : 0,
+        r[XE_GPU_REG_VGT_DRAW_INITIATOR], r[XE_GPU_REG_RB_BLENDCONTROL0],
+        draw.normalized_depth_control.value,
+        *reinterpret_cast<const float*>(&r[XE_GPU_REG_PA_CL_VPORT_XSCALE]),
+        *reinterpret_cast<const float*>(&r[XE_GPU_REG_PA_CL_VPORT_XOFFSET]),
+        *reinterpret_cast<const float*>(&r[XE_GPU_REG_PA_CL_VPORT_XSCALE + 2]),
+        *reinterpret_cast<const float*>(&r[XE_GPU_REG_PA_CL_VPORT_XSCALE + 3]),
+        r[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL], r[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR],
+        r[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], used, c[0], c[1], c[2], c[3], c[4], c[5], c[6],
+        c[7], c[8], c[9], c[10], c[11], c[12], c[13], c[14], c[15]);
+  }
   // Untiled, the scene depth is whole by the HUD.
   if (untile_height_) SnapshotCameraDepth(0);
-  if (!hud_snapshot_enabled_ || hud_snapshot_taken_) return;
-  hud_snapshot_taken_ = true;
+  const bool snapshot = hud_snapshot_enabled_ && !hud_snapshot_taken_;
+  if (!snapshot && !hud_layer_enabled_) return;
   const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
   const uint32_t msaa = uint32_t(surface_info.msaa_samples);
   // The HUD's view shares the scene's surface.
-  Surface* surface = FindSurface(MakeColorKey(color_info.color_base,
-                                              Fh1PitchTiles(surface_info.surface_pitch, msaa),
-                                              msaa, color_info.color_format)
+  Surface* surface = FindSurface(StorageKey(MakeColorKey(color_info.color_base,
+                                                         Fh1PitchTiles(surface_info.surface_pitch,
+                                                                       msaa),
+                                                         msaa, color_info.color_format))
                                      .Pack());
-  if (!surface || surface->samples != 1) {
-    hud_snapshot_taken_ = false;
-    return;
+  if (!surface || surface->samples != 1) return;
+  if (hud_layer_enabled_ && !hud_world_draw_) {
+    hud_layer_bound_ = BeginHudLayerDraw(*surface);
   }
-  const uint32_t width = surface->width * scale_;
+  if (!snapshot) return;
+  hud_snapshot_taken_ = true;
+  const uint32_t width = surface->width * scale_x_;
   // The rows the image holds: on demand they may stop short of the period.
-  const uint32_t height = surface->image_height * scale_;
+  const uint32_t height = surface->image_height * scale_y_;
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
   const auto& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -3704,6 +3871,126 @@ void Fh1NativeExecutor::DestroyHudSnapshot() {
   if (hud_snapshot_.memory) dfn.vkFreeMemory(device, hud_snapshot_.memory, nullptr);
   hud_snapshot_ = Surface();
   hud_snapshot_ready_ = false;
+}
+
+bool Fh1NativeExecutor::BeginHudLayerDraw(const Surface& scene) {
+  if (hud_layer_drawn_) return hud_layer_.image != VK_NULL_HANDLE;
+  const uint32_t width = scene.width * scale_x_;
+  const uint32_t height = scene.image_height * scale_y_;
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  command_processor_.EndRenderPass();
+  if (hud_layer_.image != VK_NULL_HANDLE &&
+      (hud_layer_.width < width || hud_layer_.height < height)) {
+    // Earlier frames may still read it; only when the scene grows.
+    command_processor_.Fh1AwaitAllQueueOperations();
+    DestroyHudLayer();
+  }
+  if (hud_layer_.image == VK_NULL_HANDLE) {
+    constexpr VkFormat kFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    VkImageCreateInfo image_info = {};
+    image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.format = kFormat;
+    image_info.extent = {width, height, 1};
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            vulkan_device, image_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+            hud_layer_.image, hud_layer_.memory)) {
+      Skip("hud_layer_create");
+      hud_layer_drawn_ = true;
+      return false;
+    }
+    VkImageViewCreateInfo view_info = {};
+    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_info.image = hud_layer_.image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = kFormat;
+    view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (dfn.vkCreateImageView(device, &view_info, nullptr, &hud_layer_.view) != VK_SUCCESS) {
+      DestroyHudLayer();
+      Skip("hud_layer_create");
+      hud_layer_drawn_ = true;
+      return false;
+    }
+    hud_layer_.format = kFormat;
+    hud_layer_.width = width;
+    hud_layer_.height = height;
+    hud_layer_.image_height = height;
+    REXGPU_INFO("FH1 native executor: VR HUD layer {}x{}", width, height);
+  }
+  Transition(hud_layer_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+             VK_ACCESS_TRANSFER_WRITE_BIT);
+  command_processor_.SubmitBarriers(true);
+  const VkClearColorValue transparent = {};
+  const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  command_processor_.deferred_command_buffer().CmdVkClearColorImage(
+      hud_layer_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &transparent, 1, &range);
+  hud_layer_drawn_ = true;
+  Count("hud_layer");
+  return true;
+}
+
+bool Fh1NativeExecutor::TakeHudLayer(HudLayer& out) {
+  const bool ready = hud_layer_ready_;
+  hud_layer_ready_ = false;
+  if (!ready || hud_layer_.view == VK_NULL_HANDLE) return false;
+  Transition(hud_layer_, VK_IMAGE_LAYOUT_GENERAL,
+             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+  out.image = hud_layer_.image;
+  out.view = hud_layer_.view;
+  out.width = hud_layer_.width;
+  out.height = hud_layer_.height;
+  return true;
+}
+
+void Fh1NativeExecutor::DestroyHudLayer() {
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (hud_layer_.view) dfn.vkDestroyImageView(device, hud_layer_.view, nullptr);
+  if (hud_layer_.image) dfn.vkDestroyImage(device, hud_layer_.image, nullptr);
+  if (hud_layer_.memory) dfn.vkFreeMemory(device, hud_layer_.memory, nullptr);
+  hud_layer_ = Surface();
+  hud_layer_ready_ = false;
+}
+
+bool Fh1NativeExecutor::IsWorldAnchoredHudDraw(const Fh1DrawInfo& draw) const {
+  // Other racers' name tags are drawn with the HUD, but placed at their car's
+  // projected position: c3 holds it in clip space, with w the car's depth
+  // (1021 for a car ahead). The HUD's own draws put a screen position there,
+  // w = 1, or do not read c3 (a frame dump with a name tag: its 5 draws and
+  // none of the other 62; a festival frame: none of 89).
+  if (!draw.vertex_shader) return false;
+  const auto& map = draw.vertex_shader->constant_register_map();
+  if (!((map.float_bitmap[0] >> 3) & 1)) return false;
+  const float w = *reinterpret_cast<const float*>(
+      &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X + 3 * 4 + 3]);
+  return std::abs(w - 1.0f) > 0.01f;
+}
+
+bool Fh1NativeExecutor::SkipsHudDraw() const {
+  static const std::string range = REXCVAR_GET(fh1_debug_skip_hud_draws);
+  if (!hud_draw_ || range.empty()) return false;
+  const uint32_t first = uint32_t(std::strtoul(range.c_str(), nullptr, 10));
+  const size_t dash = range.find('-');
+  const uint32_t last =
+      dash == std::string::npos ? first : uint32_t(std::strtoul(range.c_str() + dash + 1, nullptr, 10));
+  return hud_draw_index_ >= first && hud_draw_index_ <= last;
+}
+
+Fh1NativeExecutor::Surface* Fh1NativeExecutor::BoundSurface(uint32_t index) {
+  if (index == 1 && hud_layer_bound_) return &hud_layer_;
+  return FindSurface(pending_keys_[index].Pack());
 }
 
 void Fh1NativeExecutor::LogStats(uint64_t frame) {

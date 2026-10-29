@@ -36,7 +36,7 @@ void main(uint3 thread : SV_DispatchThreadID) {
     uint guest_sample = GuestSample(host_sample, LayoutMsaa(fh1_dest_layout),
                                     LayoutHostSampleMode(fh1_dest_layout));
     uint2 guest_pixel = pixel;
-    SetScaledPixel(guest_pixel, ((fh1_flags >> FH1_FLAG_SCALE_SHIFT) & 3u) + 1u);
+    SetScaledPixel(guest_pixel, FlagScale(fh1_flags));
     fh1_words.Store((base + host_sample) * 4u,
                     LoadSourceWord(fh1_dest_layout, guest_pixel, guest_sample, 0u,
                                    fh1_source_layout, fh1_flags));

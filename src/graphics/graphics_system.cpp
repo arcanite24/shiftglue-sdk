@@ -38,6 +38,7 @@
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/window.h>
+#include <rex/ui/xr.h>
 #include <rex/ui/windowed_app_context.h>
 
 REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
@@ -249,8 +250,10 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             rex::thread::Sleep(std::chrono::milliseconds(20));
             continue;
           }
+          // In VR the headset's refresh rate, when the output asks (rex/ui/xr.h).
+          const uint32_t headset_hz = ui::xr::HeadsetRefreshHz();
           const uint32_t current_render_fps_limit =
-              REXCVAR_GET(pinyon_shift_fh1_render_fps_limit);
+              headset_hz ? headset_hz : REXCVAR_GET(pinyon_shift_fh1_render_fps_limit);
           if (current_render_fps_limit != render_fps_limit) {
             render_fps_limit = current_render_fps_limit;
             const double refresh_rate_hz = Fh1GuestVblankHzForRenderLimit(
@@ -259,6 +262,12 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
                 std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
           }
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+          // In VR stereo the headset's frame loop keeps these vblanks in
+          // phase with its frames (rex/ui/xr.h).
+          if (const int64_t nudge_ns = ui::xr::TakeVblankPhaseNudge(); nudge_ns != 0) {
+            last_frame_time = uint64_t(int64_t(last_frame_time) +
+                                       int64_t(double(nudge_ns) * double(guest_tick_frequency) / 1e9));
+          }
           while (current_time - last_frame_time >= interval_ticks) {
             if (perf::CriticalPathTraceEnabled()) {
               const uint64_t late_ticks = current_time - last_frame_time - interval_ticks;

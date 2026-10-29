@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <iterator>
 #include <mutex>
 #include <string>
@@ -57,6 +58,7 @@
 #include <rex/types.h>
 #include <rex/memory/utils.h>
 #include <rex/ui/flags.h>
+#include <rex/ui/vulkan/openxr.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -134,6 +136,25 @@ REXCVAR_DEFINE_INT32(gpu_d3d_program_probe, 0, "GPU",
                      "draws only their first triangle and 2 skips their draw commands (wrong "
                      "image), to bound the GPU time those lists cost (NA-3.2, Vulkan)")
     .range(0, 2);
+REXCVAR_DEFINE_STRING(fh1_debug_draw_constants_path, "", "GPU",
+                      "Diagnostics: write every draw's shader hashes and the float constants "
+                      "its shaders read to this file (for frame replays: comparing two frames' "
+                      "draws, such as a stereo pair's)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(fh1_debug_draw_state_path, "", "GPU",
+                      "Diagnostics: write a CSV line per draw (its index in the frame, shader "
+                      "hashes, alpha test, alpha to coverage, pixel kill, MSAA, primitive, index "
+                      "count) to this file, for finding which draws use which coverage technique")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_UINT64(fh1_debug_skip_pixel_shader, 0, "GPU",
+                      "Diagnostics: skip the draws with this pixel shader (its ucode hash, as "
+                      "the per-shader GPU profile names it), to bound what it costs")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(fh1_debug_skip_coverage, "", "GPU",
+                      "Diagnostics: skip the draws that use alpha to coverage (a2c; a2cdither: "
+                      "only those with per-pixel dither offsets), the alpha test (alphatest) or "
+                      "a pixel kill (kill), to see what they draw")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_native_gpu_profile_draws, false, "GPU",
                     "Diagnostics: with fh1_native_gpu_profile, also time every draw by its "
                     "pixel shader (Vulkan)")
@@ -274,6 +295,22 @@ REXCVAR_DEFINE_INT32(vulkan_memory_budget_log_seconds, 30, "GPU/Vulkan",
                      "Log each memory heap's usage against its budget, the texture cache and "
                      "the resident size, with their peaks, this often (0: never)")
     .range(0, 3600)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(xr_upscaler, "off", "Display",
+                      "In VR, upscale each eye's frames with DLSS (dlss: a build with DLSS and "
+                      "an NVIDIA RTX GPU; each eye keeps a history of its own) into headset "
+                      "images xr_upscale_ratio times the render size, or off. MSAA should be off "
+                      "with it (fh1_msaa_single_sample)")
+    .allowed({"off", "dlss"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_DOUBLE(xr_upscale_ratio, 1.5, "Display",
+                      "With xr_upscaler, the headset's images are this many times the render "
+                      "size along each axis (DLSS's Quality mode is 1.5)")
+    .range(1.0, 3.0)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(xr_upscale_inputs_dir, "", "Display",
+                      "Testing: with xr_upscaler, save each frame xr_capture_request captures "
+                      "as DLSS gets it (the image, depth and motion, raw) in this directory")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
@@ -793,6 +830,8 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/resolve_downscale_cs.h"
 // glslangValidator -V, from ../shaders/hdr_hud_mask.cs.glsl.
 #include "../shaders/vulkan_spirv/hdr_hud_mask_cs.h"
+// glslangValidator -V -S comp, from ../shaders/hud_layer_composite.cs.glsl.
+#include "../shaders/vulkan_spirv/hud_layer_composite_cs.h"
 }  // namespace shaders
 
 const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeUniformBuffer = {
@@ -2876,6 +2915,7 @@ void VulkanCommandProcessor::ResetCachedDrawState() {
 void VulkanCommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
   StopSubmissionWorker();
+  DestroyXrUpscaleImages();
 #if defined(REXGLUE_ENABLE_CS_PROBES)
   StopCompletionWorker();
 #endif
@@ -2984,6 +3024,14 @@ void VulkanCommandProcessor::ShutdownContext() {
                                          swap_camera_set_layout_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
                                          swap_hud_mask_set_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                         hud_layer_composite_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         hud_layer_composite_pipeline_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                                         hud_layer_composite_descriptor_pool_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+                                         hud_layer_composite_set_layout_);
   // Into the destroy queues, emptied below.
   DestroySceneLut();
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_scene_post_pipeline_);
@@ -3511,6 +3559,129 @@ bool VulkanCommandProcessor::EnsureSwapHudMask() {
   return true;
 }
 
+bool VulkanCommandProcessor::EnsureHudLayerComposite() {
+  if (hud_layer_composite_pipeline_ != VK_NULL_HANDLE) return true;
+  if (hud_layer_composite_failed_) return false;
+  hud_layer_composite_failed_ = true;
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  VkDescriptorSetLayoutBinding bindings[2] = {};
+  for (uint32_t i = 0; i < 2; ++i) {
+    bindings[i].binding = i;
+    bindings[i].descriptorType =
+        i == 1 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    bindings[i].descriptorCount = 1;
+    bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  }
+  VkDescriptorSetLayoutCreateInfo set_layout_info = {};
+  set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  set_layout_info.bindingCount = 2;
+  set_layout_info.pBindings = bindings;
+  if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
+                                      &hud_layer_composite_set_layout_) != VK_SUCCESS) {
+    REXGPU_WARN("Failed to create the VR HUD layer descriptor set layout");
+    return false;
+  }
+  VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                             sizeof(uint32_t) * 2};
+  VkPipelineLayoutCreateInfo pipeline_layout_info = {};
+  pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  pipeline_layout_info.setLayoutCount = 1;
+  pipeline_layout_info.pSetLayouts = &hud_layer_composite_set_layout_;
+  pipeline_layout_info.pushConstantRangeCount = 1;
+  pipeline_layout_info.pPushConstantRanges = &push_constant_range;
+  if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr,
+                                 &hud_layer_composite_pipeline_layout_) != VK_SUCCESS) {
+    REXGPU_WARN("Failed to create the VR HUD layer pipeline layout");
+    return false;
+  }
+  VkDescriptorPoolSize pool_sizes[2] = {
+      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kMaxFramesInFlight},
+  };
+  VkDescriptorPoolCreateInfo pool_info = {};
+  pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  pool_info.maxSets = kMaxFramesInFlight;
+  pool_info.poolSizeCount = 2;
+  pool_info.pPoolSizes = pool_sizes;
+  if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr,
+                                 &hud_layer_composite_descriptor_pool_) != VK_SUCCESS) {
+    REXGPU_WARN("Failed to create the VR HUD layer descriptor pool");
+    return false;
+  }
+  std::array<VkDescriptorSetLayout, kMaxFramesInFlight> set_layouts;
+  set_layouts.fill(hud_layer_composite_set_layout_);
+  VkDescriptorSetAllocateInfo set_info = {};
+  set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  set_info.descriptorPool = hud_layer_composite_descriptor_pool_;
+  set_info.descriptorSetCount = kMaxFramesInFlight;
+  set_info.pSetLayouts = set_layouts.data();
+  if (dfn.vkAllocateDescriptorSets(device, &set_info,
+                                   hud_layer_composite_descriptor_sets_.data()) != VK_SUCCESS) {
+    REXGPU_WARN("Failed to allocate the VR HUD layer descriptor sets");
+    return false;
+  }
+  hud_layer_composite_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+      vulkan_device, hud_layer_composite_pipeline_layout_, shaders::hud_layer_composite_cs,
+      sizeof(shaders::hud_layer_composite_cs));
+  if (hud_layer_composite_pipeline_ == VK_NULL_HANDLE) {
+    REXGPU_WARN("Failed to create the VR HUD layer pipeline");
+    return false;
+  }
+  hud_layer_composite_failed_ = false;
+  return true;
+}
+
+void VulkanCommandProcessor::CompositeHudLayer(VkImage guest_output,
+                                               VkImageView guest_output_view, uint32_t width,
+                                               uint32_t height,
+                                               const Fh1NativeExecutor::HudLayer& hud_layer,
+                                               uint32_t swap_frame_index) {
+  if (!EnsureHudLayerComposite()) return;
+  using Presenter = ui::vulkan::VulkanPresenter;
+  width = std::min(width, hud_layer.width);
+  height = std::min(height, hud_layer.height);
+  const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  PushImageMemoryBarrier(guest_output, range, Presenter::kGuestOutputInternalStageMask,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         Presenter::kGuestOutputInternalAccessMask,
+                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                         Presenter::kGuestOutputInternalLayout, VK_IMAGE_LAYOUT_GENERAL);
+  SubmitBarriers(true);
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const VkDescriptorSet set = hud_layer_composite_descriptor_sets_[swap_frame_index];
+  VkDescriptorImageInfo image_infos[2] = {
+      {VK_NULL_HANDLE, hud_layer.view, VK_IMAGE_LAYOUT_GENERAL},
+      {VK_NULL_HANDLE, guest_output_view, VK_IMAGE_LAYOUT_GENERAL},
+  };
+  VkWriteDescriptorSet writes[2] = {};
+  for (uint32_t i = 0; i < 2; ++i) {
+    writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[i].dstSet = set;
+    writes[i].dstBinding = i;
+    writes[i].descriptorCount = 1;
+    writes[i].descriptorType =
+        i == 1 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[i].pImageInfo = &image_infos[i];
+  }
+  vulkan_device->functions().vkUpdateDescriptorSets(vulkan_device->device(), 2, writes, 0,
+                                                    nullptr);
+  deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                   hud_layer_composite_pipeline_layout_, 0, 1,
+                                                   &set, 0, nullptr);
+  const uint32_t size[2] = {width, height};
+  deferred_command_buffer_.CmdVkPushConstants(hud_layer_composite_pipeline_layout_,
+                                              VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(size), size);
+  BindExternalComputePipeline(hud_layer_composite_pipeline_);
+  deferred_command_buffer_.CmdVkDispatch((width + 15) / 16, (height + 7) / 8, 1);
+  PushImageMemoryBarrier(guest_output, range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         Presenter::kGuestOutputInternalStageMask, VK_ACCESS_SHADER_WRITE_BIT,
+                         Presenter::kGuestOutputInternalAccessMask, VK_IMAGE_LAYOUT_GENERAL,
+                         Presenter::kGuestOutputInternalLayout);
+  SubmitBarriers(true);
+}
+
 bool VulkanCommandProcessor::EnsureSwapHudless() {
   if (swap_hudless_descriptor_pool_ != VK_NULL_HANDLE) return true;
   if (swap_hudless_failed_ || !EnsureSwapHudMask()) return false;
@@ -3756,6 +3927,475 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   RecreateSamplersIfMipLodBiasChanged();
 }
 
+void VulkanCommandProcessor::XrUpscaleOutputSize(uint32_t width, uint32_t height,
+                                                 uint32_t& output_width,
+                                                 uint32_t& output_height) {
+  const double ratio = REXCVAR_GET(xr_upscale_ratio);
+  output_width = std::max(width, uint32_t(std::lround(width * ratio)) & ~1u);
+  output_height = std::max(height, uint32_t(std::lround(height * ratio)) & ~1u);
+}
+
+void VulkanCommandProcessor::InvalidateBindingsAfterCallback() {
+  current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
+  current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+  current_external_compute_pipeline_ = VK_NULL_HANDLE;
+  current_guest_graphics_pipeline_layout_ = nullptr;
+  current_graphics_descriptor_sets_bound_up_to_date_ = 0;
+  last_pushed_pixel_textures_ = {};
+}
+
+bool VulkanCommandProcessor::EnsureXrUpscaleImages(uint32_t render_width, uint32_t render_height,
+                                                   uint32_t output_width,
+                                                   uint32_t output_height) {
+  if (xr_upscale_output_ != VK_NULL_HANDLE && xr_upscale_output_width_ == output_width &&
+      xr_upscale_output_height_ == output_height &&
+      xr_upscale_cameras_[0].width == render_width &&
+      xr_upscale_cameras_[0].height == render_height) {
+    return true;
+  }
+  // Images earlier swaps' copies used go once the GPU is done with them.
+  if (xr_upscale_output_ != VK_NULL_HANDLE) {
+    AwaitAllQueueOperationsCompletion();
+    DestroyXrUpscaleImages();
+  }
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  auto create = [&](VkFormat format, uint32_t width, uint32_t height, VkImageUsageFlags usage,
+                    VkImage& image, VkDeviceMemory& memory, VkImageView& view) {
+    VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.format = format;
+    image_info.extent = {width, height, 1};
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.usage = usage;
+    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            vulkan_device, image_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, image,
+            memory)) {
+      return false;
+    }
+    VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view_info.image = image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = format;
+    view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    return dfn.vkCreateImageView(device, &view_info, nullptr, &view) == VK_SUCCESS;
+  };
+  constexpr VkImageUsageFlags kCameraUsage =
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+  bool created = true;
+  for (XrUpscaleCamera& camera : xr_upscale_cameras_) {
+    created = created &&
+              create(ui::vulkan::VulkanPresenter::kGuestOutputDepthFormat, render_width,
+                     render_height, kCameraUsage, camera.depth, camera.depth_memory,
+                     camera.depth_view) &&
+              create(ui::vulkan::VulkanPresenter::kGuestOutputMotionFormat, render_width,
+                     render_height, kCameraUsage, camera.motion, camera.motion_memory,
+                     camera.motion_view);
+    camera.width = render_width;
+    camera.height = render_height;
+    camera.valid = false;
+  }
+  created = created && create(ui::vulkan::VulkanPresenter::kGuestOutputFormat, output_width,
+                              output_height,
+                              VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                              xr_upscale_output_, xr_upscale_output_memory_,
+                              xr_upscale_output_view_);
+  xr_upscale_output_width_ = output_width;
+  xr_upscale_output_height_ = output_height;
+  xr_upscale_history_[0] = xr_upscale_history_[1] = false;
+  if (!created) {
+    REXGPU_WARN("VR upscale: could not create its {}x{} and {}x{} images", render_width,
+                render_height, output_width, output_height);
+    DestroyXrUpscaleImages();
+    return false;
+  }
+  REXGPU_INFO("VR upscale: DLSS per eye from {}x{} to {}x{}", render_width, render_height,
+              output_width, output_height);
+  return true;
+}
+
+void VulkanCommandProcessor::DestroyXrUpscaleImages() {
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, xr_inputs_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, xr_inputs_memory_);
+  xr_inputs_size_ = 0;
+  for (XrUpscaleCamera& camera : xr_upscale_cameras_) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, camera.depth_view);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, camera.depth);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, camera.depth_memory);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, camera.motion_view);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, camera.motion);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, camera.motion_memory);
+    camera = XrUpscaleCamera();
+  }
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, xr_upscale_output_view_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, xr_upscale_output_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, xr_upscale_output_memory_);
+  xr_upscale_output_width_ = xr_upscale_output_height_ = 0;
+}
+
+void VulkanCommandProcessor::DispatchXrUpscale(const void* data, VkCommandBuffer command_buffer) {
+  XrUpscaleDispatch dispatch;
+  std::memcpy(&dispatch, data, sizeof(dispatch));
+  const ui::UpscalerFrame& frame = dispatch.inputs.frame;
+  // Prepare keeps the eye's feature while the sizes stay (they are fixed for
+  // a session: xr_upscale_ratio needs a restart). This runs on the submission
+  // worker while the presenter paints on its own thread: the history stays
+  // selected for this eye only inside the lock.
+  const auto history_lock = dispatch.upscaler->LockHistory();
+  dispatch.upscaler->SelectHistory(dispatch.history);
+  const bool upscaled =
+      dispatch.upscaler->Prepare(frame.render_width, frame.render_height, frame.output_width,
+                                 frame.output_height, false) &&
+      dispatch.upscaler->Dispatch(command_buffer, dispatch.inputs);
+  dispatch.upscaler->SelectHistory(0);
+  if (!upscaled) {
+    // Black rather than whatever the image held.
+    const VkClearColorValue black = {};
+    const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    dispatch.device->functions().vkCmdClearColorImage(command_buffer,
+                                                      dispatch.inputs.output.image,
+                                                      VK_IMAGE_LAYOUT_GENERAL, &black, 1, &range);
+  }
+}
+
+void VulkanCommandProcessor::SaveXrUpscaleInputs() {
+  // After GuestFrameSubmitted, which waits for a captured frame's copy.
+  if (!xr_inputs_pending_.pending) return;
+  xr_inputs_pending_.pending = false;
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  void* mapped = nullptr;
+  if (dfn.vkMapMemory(vulkan_device->device(), xr_inputs_memory_, 0, VK_WHOLE_SIZE, 0,
+                      &mapped) != VK_SUCCESS) {
+    return;
+  }
+  VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+  range.memory = xr_inputs_memory_;
+  range.size = VK_WHOLE_SIZE;
+  dfn.vkInvalidateMappedMemoryRanges(vulkan_device->device(), 1, &range);
+  const XrInputsPending& p = xr_inputs_pending_;
+  const std::string directory = REXCVAR_GET(xr_upscale_inputs_dir);
+  std::filesystem::create_directories(directory);
+  const std::string base = directory + "/" + std::to_string(xr_inputs_saved_++) +
+                           (p.eye ? "-right" : "-left");
+  const size_t plane = size_t(p.width) * p.height * 4;
+  const char* names[] = {"-color.a2b10g10r10", "-depth.r32f", "-motion.rg16f"};
+  for (int i = 0; i < 3; ++i) {
+    std::ofstream file(base + names[i], std::ios::binary);
+    file.write(static_cast<const char*>(mapped) + plane * i, std::streamsize(plane));
+  }
+  dfn.vkUnmapMemory(vulkan_device->device(), xr_inputs_memory_);
+  std::ofstream log(directory + "/inputs.jsonl", std::ios::app);
+  log << fmt::format(
+      "{{\"base\":\"{}\",\"eye\":{},\"width\":{},\"height\":{},\"jitter\":[{:.4f},{:.4f}],"
+      "\"reset\":{}}}\n",
+      base.substr(directory.size() + 1), p.eye, p.width, p.height, p.jitter_x, p.jitter_y,
+      p.reset ? "true" : "false");
+}
+
+void VulkanCommandProcessor::RecordXrFrameCopy(VkImage guest_output,
+                                               VkImageView guest_output_view, uint32_t width,
+                                               uint32_t height, uint32_t output_width,
+                                               uint32_t output_height,
+                                               const ui::vulkan::openxr::FrameCopy& copy,
+                                               const Fh1NativeExecutor::HudLayer* hud_layer) {
+  using Presenter = ui::vulkan::VulkanPresenter;
+  SubmitBarriers(true);
+  const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  auto barrier = [&](VkImage image, VkAccessFlags from_access, VkAccessFlags to_access,
+                     VkImageLayout from, VkImageLayout to) {
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask = from_access;
+    b.dstAccessMask = to_access;
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = range;
+    return b;
+  };
+
+  // VR's DLSS: an eye's image with the depth and motion of this swap's
+  // camera pass (XrUpscaleCamera), from the same frame's draws, into the
+  // output image, which is then copied as the guest output is otherwise.
+  const XrUpscaleCamera* upscale_camera = nullptr;
+  if (xr_upscaler_ && copy.eye >= 0 && xr_upscale_output_ != VK_NULL_HANDLE &&
+      xr_upscale_output_width_ == output_width && xr_upscale_output_height_ == output_height) {
+    const XrUpscaleCamera& camera = xr_upscale_cameras_[xr_upscale_camera_next_];
+    if (camera.valid && camera.eye == copy.eye && camera.width == width &&
+        camera.height == height) {
+      upscale_camera = &camera;
+    } else {
+      ++xr_upscale_misses_;
+    }
+  }
+  if (copy.eye >= 0 && !upscale_camera) {
+    xr_upscale_history_[copy.eye & 1] = false;
+  }
+  VkImage source = guest_output;
+  uint32_t source_width = width, source_height = height;
+  if (upscale_camera && copy.capture != VK_NULL_HANDLE &&
+      !REXCVAR_GET(xr_upscale_inputs_dir).empty()) {
+    // xr_upscale_inputs_dir: this frame's DLSS inputs, read back.
+    const VkDeviceSize plane = VkDeviceSize(width) * height * 4;
+    if (xr_inputs_size_ < plane * 3) {
+      const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+      if (xr_inputs_buffer_ != VK_NULL_HANDLE) {
+        vulkan_device->functions().vkDestroyBuffer(vulkan_device->device(), xr_inputs_buffer_,
+                                                   nullptr);
+        vulkan_device->functions().vkFreeMemory(vulkan_device->device(), xr_inputs_memory_,
+                                                nullptr);
+        xr_inputs_buffer_ = VK_NULL_HANDLE;
+        xr_inputs_memory_ = VK_NULL_HANDLE;
+      }
+      xr_inputs_size_ = ui::vulkan::util::CreateDedicatedAllocationBuffer(
+                            vulkan_device, plane * 3, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                            ui::vulkan::util::MemoryPurpose::kReadback, xr_inputs_buffer_,
+                            xr_inputs_memory_)
+                            ? plane * 3
+                            : 0;
+    }
+    if (xr_inputs_size_ >= plane * 3) {
+      const VkImage images[] = {guest_output, upscale_camera->depth, upscale_camera->motion};
+      VkImageMemoryBarrier to_copy[3], from_copy[3];
+      for (int i = 0; i < 3; ++i) {
+        to_copy[i] = barrier(images[i], Presenter::kGuestOutputInternalAccessMask,
+                             VK_ACCESS_TRANSFER_READ_BIT, Presenter::kGuestOutputInternalLayout,
+                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        from_copy[i] = barrier(images[i], VK_ACCESS_TRANSFER_READ_BIT,
+                               Presenter::kGuestOutputInternalAccessMask,
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               Presenter::kGuestOutputInternalLayout);
+      }
+      deferred_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                                                    nullptr, 0, nullptr, 3, to_copy);
+      for (int i = 0; i < 3; ++i) {
+        VkBufferImageCopy region{};
+        region.bufferOffset = plane * i;
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {width, height, 1};
+        deferred_command_buffer_.CmdVkCopyImageToBuffer(
+            images[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, xr_inputs_buffer_, region);
+      }
+      VkBufferMemoryBarrier to_host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+      to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+      to_host.srcQueueFamilyIndex = to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      to_host.buffer = xr_inputs_buffer_;
+      to_host.size = VK_WHOLE_SIZE;
+      deferred_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT |
+                                                        VK_PIPELINE_STAGE_HOST_BIT,
+                                                    0, 0, nullptr, 1, &to_host, 3, from_copy);
+      xr_inputs_pending_.pending = true;
+      xr_inputs_pending_.eye = copy.eye;
+      xr_inputs_pending_.width = width;
+      xr_inputs_pending_.height = height;
+      xr_inputs_pending_.jitter_x = upscale_camera->camera.jitter_x;
+      xr_inputs_pending_.jitter_y = upscale_camera->camera.jitter_y;
+      xr_inputs_pending_.reset = !xr_upscale_history_[copy.eye & 1] || upscale_camera->camera.cut;
+    }
+  }
+  if (upscale_camera) {
+    const int eye = copy.eye & 1;
+    const VkImageMemoryBarrier to_upscale[] = {
+        barrier(guest_output, Presenter::kGuestOutputInternalAccessMask,
+                VK_ACCESS_SHADER_READ_BIT, Presenter::kGuestOutputInternalLayout,
+                Presenter::kGuestOutputInternalLayout),
+        barrier(xr_upscale_output_, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL)};
+    deferred_command_buffer_.CmdVkPipelineBarrier(
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
+        0, nullptr, uint32_t(std::size(to_upscale)), to_upscale);
+    const uint64_t now_us =
+        uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now().time_since_epoch())
+                     .count());
+    XrUpscaleDispatch dispatch = {};
+    dispatch.device = GetVulkanDevice();
+    dispatch.upscaler = xr_upscaler_;
+    dispatch.history = 1 + uint32_t(eye);
+    constexpr VkImageUsageFlags kCameraUsage =
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    ui::vulkan::VulkanUpscalerInputs& inputs = dispatch.inputs;
+    inputs.color = {guest_output, guest_output_view, Presenter::kGuestOutputFormat, width,
+                    height,
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT};
+    inputs.depth = {upscale_camera->depth, upscale_camera->depth_view,
+                    Presenter::kGuestOutputDepthFormat, width, height, kCameraUsage};
+    inputs.motion_vectors = {upscale_camera->motion, upscale_camera->motion_view,
+                             Presenter::kGuestOutputMotionFormat, width, height, kCameraUsage};
+    inputs.output = {xr_upscale_output_, xr_upscale_output_view_, Presenter::kGuestOutputFormat,
+                     output_width, output_height,
+                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
+    ui::UpscalerFrame& frame = inputs.frame;
+    frame.render_width = width;
+    frame.render_height = height;
+    frame.output_width = output_width;
+    frame.output_height = output_height;
+    frame.jitter_x = upscale_camera->camera.jitter_x;
+    frame.jitter_y = upscale_camera->camera.jitter_y;
+    // The motion is in UV units, as for the presenter's upscale.
+    frame.motion_vector_scale_x = float(width);
+    frame.motion_vector_scale_y = float(height);
+    // The time since this eye's previous frame (about two game frames).
+    frame.frame_delta_ms =
+        xr_upscale_history_[eye] && xr_upscale_last_us_[eye]
+            ? std::clamp(float(now_us - xr_upscale_last_us_[eye]) / 1000.0f, 1.0f, 100.0f)
+            : 16.667f;
+    frame.reset = !xr_upscale_history_[eye] || upscale_camera->camera.cut;
+    frame.camera_near = upscale_camera->camera.near_plane;
+    frame.camera_far = upscale_camera->camera.far_plane;
+    frame.camera_fov_y = upscale_camera->camera.fov_y;
+    deferred_command_buffer_.CmdCallback(&DispatchXrUpscale, &dispatch, sizeof(dispatch));
+    InvalidateBindingsAfterCallback();
+    xr_upscale_history_[eye] = true;
+    xr_upscale_last_us_[eye] = now_us;
+    if ((++xr_upscale_dispatches_ % 3000) == 0) {
+      REXGPU_INFO("VR upscale: {} DLSS frames, {} eye frames without their camera",
+                  xr_upscale_dispatches_, xr_upscale_misses_);
+    }
+    const VkImageMemoryBarrier from_upscale =
+        barrier(xr_upscale_output_, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    deferred_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                                                  0, nullptr, 1, &from_upscale);
+    source = xr_upscale_output_;
+    source_width = output_width;
+    source_height = output_height;
+  }
+
+  // The staging image was last read by the previous frame's copy, and the
+  // headset's image by the runtime.
+  VkImageMemoryBarrier before[3];
+  uint32_t before_count = 0;
+  if (source == guest_output) {
+    before[before_count++] =
+        barrier(guest_output, Presenter::kGuestOutputInternalAccessMask,
+                VK_ACCESS_TRANSFER_READ_BIT, Presenter::kGuestOutputInternalLayout,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  }
+  before[before_count++] =
+      barrier(copy.staging, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+              VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  before[before_count++] =
+      barrier(copy.target, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  deferred_command_buffer_.CmdVkPipelineBarrier(
+      Presenter::kGuestOutputInternalStageMask | VK_PIPELINE_STAGE_TRANSFER_BIT |
+          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, before_count, before);
+  // Scaled (linear) when the headset's images are larger than the frame and
+  // DLSS did not make it.
+  // Only the part the eye's field of view sees (FrameCopy::crop).
+  VkImageBlit blit{};
+  blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  blit.srcOffsets[0] = {int32_t(std::lround(copy.crop[0] * float(source_width))),
+                        int32_t(std::lround(copy.crop[1] * float(source_height))), 0};
+  blit.srcOffsets[1] = {int32_t(std::lround(copy.crop[2] * float(source_width))),
+                        int32_t(std::lround(copy.crop[3] * float(source_height))), 1};
+  blit.dstSubresource = blit.srcSubresource;
+  blit.dstOffsets[1] = {int32_t(output_width), int32_t(output_height), 1};
+  const bool same_size = blit.srcOffsets[1].x - blit.srcOffsets[0].x == int32_t(output_width) &&
+                         blit.srcOffsets[1].y - blit.srcOffsets[0].y == int32_t(output_height);
+  deferred_command_buffer_.CmdVkBlitImage(source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                          copy.staging, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                          blit, same_size ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+  VkImageMemoryBarrier middle[2];
+  uint32_t middle_count = 0;
+  middle[middle_count++] =
+      barrier(copy.staging, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  if (source == guest_output) {
+    middle[middle_count++] =
+        barrier(guest_output, VK_ACCESS_TRANSFER_READ_BIT,
+                Presenter::kGuestOutputInternalAccessMask, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                Presenter::kGuestOutputInternalLayout);
+  }
+  deferred_command_buffer_.CmdVkPipelineBarrier(
+      VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT | Presenter::kGuestOutputInternalStageMask, 0, 0, nullptr, 0,
+      nullptr, middle_count, middle);
+  VkImageCopy image_copy{};
+  image_copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  image_copy.dstSubresource = image_copy.srcSubresource;
+  image_copy.extent = {output_width, output_height, 1};
+  deferred_command_buffer_.CmdVkCopyImage(copy.staging, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                          copy.target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                          image_copy);
+  if (copy.capture != VK_NULL_HANDLE) {
+    VkBufferImageCopy readback{};
+    readback.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    readback.imageExtent = {output_width, output_height, 1};
+    deferred_command_buffer_.CmdVkCopyImageToBuffer(
+        copy.staging, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, copy.capture, readback);
+    VkBufferMemoryBarrier to_host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    to_host.srcQueueFamilyIndex = to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_host.buffer = copy.capture;
+    to_host.size = VK_WHOLE_SIZE;
+    deferred_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                  VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
+                                                  &to_host, 0, nullptr);
+  }
+  // The runtime takes the image back as a color attachment.
+  const VkImageMemoryBarrier after =
+      barrier(copy.target, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
+              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+  deferred_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+                                                0, nullptr, 0, nullptr, 1, &after);
+
+  // VR's HUD panel: the frame's HUD layer (its guest output's part, in the
+  // general layout from TakeHudLayer) scaled into the panel's image, or the
+  // image cleared when the frame drew no HUD.
+  if (copy.hud == VK_NULL_HANDLE) return;
+  const VkImageMemoryBarrier hud_before =
+      barrier(copy.hud, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+              VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  deferred_command_buffer_.CmdVkPipelineBarrier(
+      VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &hud_before);
+  if (hud_layer) {
+    VkImageBlit hud_blit{};
+    hud_blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    hud_blit.srcOffsets[1] = {int32_t(std::min(width, hud_layer->width)),
+                              int32_t(std::min(height, hud_layer->height)), 1};
+    hud_blit.dstSubresource = hud_blit.srcSubresource;
+    hud_blit.dstOffsets[1] = {int32_t(copy.hud_width), int32_t(copy.hud_height), 1};
+    deferred_command_buffer_.CmdVkBlitImage(hud_layer->image, VK_IMAGE_LAYOUT_GENERAL, copy.hud,
+                                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, hud_blit,
+                                            VK_FILTER_LINEAR);
+  } else {
+    const VkClearColorValue transparent = {};
+    deferred_command_buffer_.CmdVkClearColorImage(copy.hud, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                                  &transparent, 1, &range);
+  }
+  // The headset's thread copies it on as a transfer source.
+  const VkImageMemoryBarrier hud_after =
+      barrier(copy.hud, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  deferred_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                                                nullptr, 1, &hud_after);
+}
+
 void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                            uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
@@ -3968,11 +4608,28 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
   // HUD's coverage. Without one (menus), the guest output stays opaque, all
   // of it HUD, and the scene-only post does not run.
   VkImageView hud_snapshot_view = VK_NULL_HANDLE;
+  Fh1NativeExecutor::HudLayer hud_layer;
+  bool hud_layer_ready = false;
   bool hdr_active = false;
   // UP-1.2: a temporal upscaler reads the guest output without the HUD.
   const bool hudless_wanted = presenter->WantsHudlessGuestOutput();
+  // VR's DLSS (xr_upscaler): each eye through a history of its own of the
+  // presenter's provider, in the headset's copy.
+  xr_upscaler_ = nullptr;
+  if (fh1_native_executor_ && REXCVAR_GET(xr_upscaler) == "dlss" &&
+      ui::vulkan::openxr::StereoWanted()) {
+    ui::vulkan::VulkanUpscaler* upscaler =
+        static_cast<ui::vulkan::VulkanPresenter*>(presenter)->FindAvailableUpscaler("dlss");
+    if (upscaler && upscaler->history_count() >= 3) xr_upscaler_ = upscaler;
+  }
+  const bool xr_upscale = xr_upscaler_ != nullptr;
+  uint32_t xr_output_width = guest_output_width, xr_output_height = guest_output_height;
+  if (xr_upscale) {
+    XrUpscaleOutputSize(guest_output_width, guest_output_height, xr_output_width,
+                        xr_output_height);
+  }
   // UP-1.3: and the depth and camera motion.
-  const bool camera_wanted = presenter->WantsGuestOutputCamera();
+  const bool camera_wanted = presenter->WantsGuestOutputCamera() || xr_upscale;
   VkImageView camera_depth_view = VK_NULL_HANDLE;
   Fh1NativeExecutor::Camera camera = {};
   const bool scene_fxaa =
@@ -3985,7 +4642,12 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                                                 hudless_wanted);
     hud_snapshot_view =
         fh1_native_executor_->TakeHudSnapshot(guest_output_width, guest_output_height);
-    fh1_native_executor_->SetCameraTrackingEnabled(camera_wanted);
+    // VR's HUD panel: the next frame's HUD into its layer, and this one's.
+    fh1_native_executor_->SetHudLayerEnabled(ui::vulkan::openxr::HudPanelWanted());
+    hud_layer_ready = fh1_native_executor_->TakeHudLayer(hud_layer);
+    // And the OpenXR output's stereo, which reads each frame's lens.
+    fh1_native_executor_->SetCameraTrackingEnabled(camera_wanted ||
+                                                   ui::vulkan::openxr::StereoWanted());
     // UP-1.7: once the object slot image is the guest output's size (made
     // between frames, IssueSwap) and initialised by a camera pass.
     const bool object_motion_wanted =
@@ -3996,20 +4658,52 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
         object_motion_wanted && object_slot_image_initialized_ &&
         object_slot_image_width_ == guest_output_width &&
         object_slot_image_height_ == guest_output_height);
-    fh1_native_executor_->SetJitterPhases(camera_wanted ? presenter->GuestOutputJitterPhases()
-                                                        : 0u);
+    // DLSS's recommendation: 8 phases per output pixel.
+    const double xr_ratio = REXCVAR_GET(xr_upscale_ratio);
+    fh1_native_executor_->SetJitterPhases(
+        xr_upscale ? std::max(1u, uint32_t(std::ceil(8.0 * xr_ratio * xr_ratio)))
+        : camera_wanted ? presenter->GuestOutputJitterPhases()
+                        : 0u);
+    fh1_native_executor_->SetStereoCamera(xr_upscale ? &ui::vulkan::openxr::LensEye : nullptr);
     if (camera_wanted) {
       camera_depth_view =
           fh1_native_executor_->TakeCameraFrame(guest_output_width, guest_output_height, camera);
     }
   }
-
+  // The lens of the frame this swap shows: the frame whose draws just ended
+  // (with its jitter, measured on simulated still frames: the image's shift
+  // follows that frame's jitter, correlation 0.97, not the frame before's).
+  // Its field of view carries the tag of the camera update after the one
+  // its eye was drawn for, so it goes to the eye and pose of the tag before:
+  // with eyes a metre apart (xr_simulate), each image showed the other eye
+  // than its own tag's, and after a dropped camera update the previous
+  // frame's tag gave the other eye too.
+  ui::vulkan::openxr::Lens xr_lens;
+  if (fh1_native_executor_) {
+    xr_lens.valid = fh1_native_executor_->TakeLens(xr_lens.fov_x, xr_lens.fov_y);
+    xr_lens.has_position =
+        fh1_native_executor_->TakeLensPosition(xr_lens.position, xr_lens.right);
+    const uint32_t tag = ui::vulkan::openxr::FovTag(xr_lens.fov_y);
+    if (xr_lens.valid && tag < ui::vulkan::openxr::kTagCount) {
+      xr_lens.fov_y = float(ui::vulkan::openxr::TagFov(
+          xr_lens.fov_y, (tag + ui::vulkan::openxr::kTagCount - 1) %
+                             ui::vulkan::openxr::kTagCount));
+    }
+  }
+  // The headset's screen shows the guest frame's shape, whatever the draw
+  // resolution scale.
+  const float xr_display_aspect =
+      frontbuffer_width_unscaled && frontbuffer_height_unscaled
+          ? float(frontbuffer_width_unscaled) / float(frontbuffer_height_unscaled)
+          : 0.0f;
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
-      [this, guest_output_width, guest_output_height, display_width, display_height,
-       frontbuffer_format, swap_texture_view, swap_post_effect, swap_source_needs_rb_swap,
-       hud_snapshot_view, hdr_active, scene_fxaa, scene_lut, hudless_wanted, camera_depth_view,
-       camera](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+      [this, xr_lens, xr_display_aspect, xr_upscale, xr_output_width, xr_output_height,
+       guest_output_width, guest_output_height, display_width,
+       display_height, frontbuffer_format, swap_texture_view, swap_post_effect,
+       swap_source_needs_rb_swap, hud_snapshot_view, hdr_active, scene_fxaa, scene_lut,
+       hudless_wanted, camera_depth_view, camera, hud_layer,
+       hud_layer_ready](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         // In case the swap command is the only one in the frame.
         if (!BeginSubmission(true)) {
           return false;
@@ -4552,15 +5246,29 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             vulkan_context.SetHudlessWritten();
           }
 
-          // UP-1.3 and UP-1.4: the depth and camera motion beside it.
+          // UP-1.3 and UP-1.4: the depth and camera motion beside it, or with
+          // VR's DLSS in its own pair of images, for this swap's image.
+          XrUpscaleCamera* xr_camera =
+              xr_upscale ? &xr_upscale_cameras_[xr_upscale_camera_next_] : nullptr;
+          if (xr_camera) xr_camera->valid = false;
           if (camera_depth_view != VK_NULL_HANDLE && EnsureSwapCamera() &&
-              vulkan_context.EnsureCameraImages()) {
-            const bool camera_written_before = vulkan_context.camera_ever_written_previously();
-            for (VkImage image : {vulkan_context.depth_image(), vulkan_context.motion_image()}) {
+              (xr_camera ? EnsureXrUpscaleImages(guest_output_width, guest_output_height,
+                                                 xr_output_width, xr_output_height)
+                         : vulkan_context.EnsureCameraImages())) {
+            const VkImage camera_depth_image =
+                xr_camera ? xr_camera->depth : vulkan_context.depth_image();
+            const VkImage camera_motion_image =
+                xr_camera ? xr_camera->motion : vulkan_context.motion_image();
+            const bool camera_written_before =
+                !xr_camera && vulkan_context.camera_ever_written_previously();
+            for (VkImage image : {camera_depth_image, camera_motion_image}) {
+              // VR's: after the DLSS of the swap before last read them.
               PushImageMemoryBarrier(
                   image, guest_output_subresource_range,
-                  camera_written_before ? ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask
-                                        : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                  xr_camera ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                  : camera_written_before
+                      ? ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask
+                      : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                   camera_written_before ? ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask
                                         : 0,
@@ -4605,8 +5313,12 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             }
             VkDescriptorImageInfo camera_infos[4] = {
                 {VK_NULL_HANDLE, camera_depth_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                {VK_NULL_HANDLE, vulkan_context.depth_image_view(), VK_IMAGE_LAYOUT_GENERAL},
-                {VK_NULL_HANDLE, vulkan_context.motion_image_view(), VK_IMAGE_LAYOUT_GENERAL},
+                {VK_NULL_HANDLE,
+                 xr_camera ? xr_camera->depth_view : vulkan_context.depth_image_view(),
+                 VK_IMAGE_LAYOUT_GENERAL},
+                {VK_NULL_HANDLE,
+                 xr_camera ? xr_camera->motion_view : vulkan_context.motion_image_view(),
+                 VK_IMAGE_LAYOUT_GENERAL},
                 {VK_NULL_HANDLE, object_slot_image_view_, VK_IMAGE_LAYOUT_GENERAL},
             };
             const VkDescriptorBufferInfo object_table_info = {
@@ -4679,10 +5391,13 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
                                    VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
             object_slot_image_initialized_ = true;
-            for (VkImage image : {vulkan_context.depth_image(), vulkan_context.motion_image()}) {
+            for (VkImage image : {camera_depth_image, camera_motion_image}) {
+              // VR's are read by this swap's DLSS, in a compute pass.
               PushImageMemoryBarrier(image, guest_output_subresource_range,
                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                     ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask,
+                                     xr_camera
+                                         ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                                         : ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask,
                                      VK_ACCESS_SHADER_WRITE_BIT,
                                      ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask,
                                      VK_IMAGE_LAYOUT_GENERAL,
@@ -4695,7 +5410,13 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             upscaler_camera.cut = camera.cut;
             upscaler_camera.jitter_x = camera.jitter_x;
             upscaler_camera.jitter_y = camera.jitter_y;
-            vulkan_context.SetCameraWritten(upscaler_camera);
+            if (xr_camera) {
+              xr_camera->valid = true;
+              xr_camera->eye = camera.eye;
+              xr_camera->camera = upscaler_camera;
+            } else {
+              vulkan_context.SetCameraWritten(upscaler_camera);
+            }
           }
 
           // Insert the release barrier.
@@ -4863,6 +5584,32 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                                  ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
         }
 
+        // The headset's copy of every frame (rex/ui/vulkan/openxr.h).
+        ui::vulkan::openxr::FrameCopy xr_copy;
+        const bool xr_frame = ui::vulkan::openxr::BeginGuestFrame(
+            xr_output_width, xr_output_height, xr_display_aspect, xr_lens, xr_copy);
+        // VR's HUD panel: an eye's frame goes without the HUD, which goes to
+        // the panel; the window and the headset's screen get it put back.
+        const bool hud_on_panel = xr_frame && xr_copy.eye >= 0;
+        if (hud_layer_ready && !hud_on_panel) {
+          CompositeHudLayer(vulkan_context.image(), vulkan_context.image_view(),
+                            guest_output_width, guest_output_height, hud_layer,
+                            swap_frame_index);
+        }
+        if (xr_frame) {
+          RecordXrFrameCopy(vulkan_context.image(), vulkan_context.image_view(),
+                            guest_output_width, guest_output_height, xr_output_width,
+                            xr_output_height, xr_copy, hud_layer_ready ? &hud_layer : nullptr);
+        }
+        if (hud_layer_ready && hud_on_panel) {
+          CompositeHudLayer(vulkan_context.image(), vulkan_context.image_view(),
+                            guest_output_width, guest_output_height, hud_layer,
+                            swap_frame_index);
+        }
+        // The next swap's camera pass writes the other pair, which this
+        // swap's DLSS is not reading.
+        if (xr_upscale) xr_upscale_camera_next_ ^= 1;
+
         // Need to submit all the commands before giving the image back to the
         // presenter so it can submit its own commands for displaying it to the
         // queue, and also need to submit the release barrier.
@@ -4893,6 +5640,20 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             pending_present_notify_ = [renderer, native_context]() { renderer(native_context); };
           } else {
             renderer(native_context);
+          }
+        }
+        if (xr_frame) {
+          // The headset may show the frame once its copy is on the queue.
+          if (present_deferred_presenter_) {
+            pending_present_notify_ = [this, notify = std::move(pending_present_notify_)]() {
+              ui::vulkan::openxr::GuestFrameSubmitted();
+              SaveXrUpscaleInputs();
+              if (notify) notify();
+            };
+          } else {
+            if (async_submission_) AwaitSubmissionWorker();
+            ui::vulkan::openxr::GuestFrameSubmitted();
+            SaveXrUpscaleInputs();
           }
         }
         ++presented_output_frames_;
@@ -5280,6 +6041,9 @@ void VulkanCommandProcessor::SubmitBarriersAndBeginFh1Rendering(
     return;
   }
   EndRenderPass();
+  fh1_hoist_slot_ = deferred_command_buffer_.GetSize();
+  fh1_hoist_epoch_ = shared_memory_ ? shared_memory_->invalidation_epoch() : 0;
+  fh1_hoist_slot_valid_ = true;
   deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
   PERF_counter_inc(kGpuRenderings);
   const char* const next_rendering_label = next_rendering_label_;
@@ -5448,6 +6212,7 @@ void VulkanCommandProcessor::FlushCpuVisibleResults() {
 void VulkanCommandProcessor::EndRenderPass(std::source_location caller) {
   assert_true(submission_open_);
   current_fh1_rendering_id_ = 0;
+  fh1_hoist_slot_valid_ = false;
   if (!in_render_pass_) {
     return;
   }
@@ -5893,12 +6658,22 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     draw_cost_.last = DrawCostNow();
   }
   auto draw_fail = [&](const char* stage) {
+    // After a lost device every draw fails: 15 rotated logs of this in 3 s
+    // (2026-10-22) took the lines before the loss with them. The first 100,
+    // then one in 10000, counted again from a loss or a recovery so earlier
+    // harmless failures never hide the ones after it.
+    if (draw_failures_device_lost_ != device_lost_) {
+      draw_failures_device_lost_ = device_lost_;
+      draw_failures_ = 0;
+    }
+    const uint64_t failure = draw_failures_++;
+    if (failure >= 100 && failure % 10000) return false;
     auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
     REXGPU_ERROR(
-        "Vulkan IssueDraw failed at {} "
+        "Vulkan IssueDraw failed at {} (failure {}) "
         "(prim_type={}, index_count={}, source_select={}, major_mode={}, explicit_major={}, "
         "path_select={}, tess_mode={}, edram_mode={})",
-        stage, uint32_t(prim_type), index_count, uint32_t(vgt_draw_initiator.source_select),
+        stage, failure + 1, uint32_t(prim_type), index_count, uint32_t(vgt_draw_initiator.source_select),
         uint32_t(vgt_draw_initiator.major_mode), uint32_t(major_mode_explicit),
         uint32_t(regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select),
         uint32_t(regs.Get<reg::VGT_HOS_CNTL>().tess_mode),
@@ -5906,9 +6681,11 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     return false;
   };
   // The HUD scale and safe zone shrink or grow the HUD around the centre,
-  // only for HUD draws over this frame's scene (fh1_native_executor).
+  // only for HUD draws over this frame's scene (fh1_native_executor), and
+  // with VR's HUD panel not for name tags placed at cars.
   auto hud_scale_now = [&]() {
     return fh1_native_executor_ && fh1_native_executor_->IsHudDraw() &&
+                   !fh1_native_executor_->IsWorldAnchoredHud() &&
                    !REXCVAR_GET(fh1_hud_scale_suspended)
                ? REXCVAR_GET(fh1_hud_scale) * (1.0 - 2.0 * REXCVAR_GET(fh1_hud_safe_zone))
                : 1.0;
@@ -6209,6 +6986,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   VulkanShader::VulkanTranslation* vertex_shader_translation;
   VulkanShader::VulkanTranslation* pixel_shader_translation;
   bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
+  // Memory export may write pages an upload would be moved ahead of.
+  if (memexport_writes_possible) fh1_hoist_slot_valid_ = false;
 
   DrawCostMark(kCostAnalysis);
   // Two iterations because a submission (even the current one - in which case
@@ -6275,6 +7054,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
                                          : pixel_shader && fh1_native_executor_ &&
                                                fh1_native_executor_->IsSceneObjectDraw(*vertex_shader);
     object_slot_draws_ += uint32_t(object_slot && !i);
+    const bool doubled_scale = fh1_native_executor_ && fh1_native_executor_->DrawAsDoubledScale();
+    draw_doubled_scale_ = doubled_scale;
     if (program_hit) {
       // NA-2.4: the recorded modifications and translations (ready when
       // recorded, and translations are never dropped).
@@ -6296,7 +7077,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
           translation_memo.interpolator_mask == interpolator_mask &&
           translation_memo.ps_param_gen_pos == ps_param_gen_pos &&
           translation_memo.depth_control == normalized_depth_control.value &&
-          translation_memo.object_slot == object_slot) {
+          translation_memo.object_slot == object_slot &&
+          translation_memo.doubled_scale == doubled_scale) {
         vertex_shader_modification = translation_memo.vertex_modification;
         pixel_shader_modification = translation_memo.pixel_modification;
         vertex_shader_translation = translation_memo.vertex_translation;
@@ -6310,8 +7092,13 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
                                *pixel_shader, interpolator_mask, ps_param_gen_pos,
                                normalized_depth_control)
                          : SpirvShaderTranslator::Modification(0);
-        if (object_slot) {
+        // The object slot image has the guest output's pixels, which a doubled
+        // draw's do not match (FH1's cars draw to the scene, never doubled).
+        if (object_slot && !doubled_scale) {
           pixel_shader_modification.pixel.object_slot_output = 1;
+        }
+        if (pixel_shader && doubled_scale) {
+          pixel_shader_modification.pixel.msaa_as_doubled_scale = 1;
         }
 
         // Translate the shaders now to obtain the sampler bindings.
@@ -6350,6 +7137,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         }
         translation_memo.state_epoch = memo_translation ? memo_state : 0;
         translation_memo.object_slot = object_slot;
+        translation_memo.doubled_scale = doubled_scale;
         translation_memo.vertex_shader = vertex_shader;
         translation_memo.pixel_shader = pixel_shader;
         translation_memo.host_vertex_shader_type =
@@ -6605,6 +7393,85 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   texture_inputs_generation_ += texture_cache_->unchanged_request_hits() == texture_hits_before;
   texture_section_skip_allowed_ = unchanged_inputs;
   texture_section_verify_ = unchanged_verify;
+  // fh1_debug_draw_constants_path: per draw, "DRAW", its index, the vertex
+  // and pixel shader hashes, then each float constant the shaders read (its
+  // register 0-511 and four floats).
+  {
+    static const std::string constants_path = REXCVAR_GET(fh1_debug_draw_constants_path);
+    if (!constants_path.empty()) {
+      static FILE* constants_file = std::fopen(constants_path.c_str(), "wb");
+      static uint32_t constants_draw = 0;
+      if (constants_file) {
+        std::vector<uint32_t> used;
+        for (uint32_t stage = 0; stage < 2; ++stage) {
+          const Shader* shader = stage ? static_cast<const Shader*>(pixel_shader)
+                                       : static_cast<const Shader*>(vertex_shader);
+          if (!shader) continue;
+          const auto& map = shader->constant_register_map();
+          for (uint32_t i = 0; i < 256; ++i) {
+            if (map.float_dynamic_addressing || (map.float_bitmap[i >> 6] >> (i & 63)) & 1) {
+              used.push_back(stage * 256 + i);
+            }
+          }
+        }
+        const uint32_t header[2] = {0x57415244u, constants_draw++};
+        const uint64_t hashes[2] = {vertex_shader->ucode_data_hash(),
+                                    pixel_shader ? pixel_shader->ucode_data_hash() : 0};
+        const uint32_t count = uint32_t(used.size());
+        std::fwrite(header, sizeof(header), 1, constants_file);
+        std::fwrite(hashes, sizeof(hashes), 1, constants_file);
+        std::fwrite(&count, sizeof(count), 1, constants_file);
+        for (uint32_t index : used) {
+          std::fwrite(&index, sizeof(index), 1, constants_file);
+          std::fwrite(&regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X + index * 4], 16, 1,
+                      constants_file);
+        }
+        std::fflush(constants_file);
+      }
+    }
+  }
+  {
+    static const std::string state_path = REXCVAR_GET(fh1_debug_draw_state_path);
+    if (!state_path.empty()) {
+      static FILE* state_file = [] {
+        FILE* file = std::fopen(state_path.c_str(), "w");
+        if (file) {
+          std::fputs("draw,vs,ps,alpha_test,alpha_func,alpha_to_coverage,a2c_offsets,kills,msaa,prim,indices\n",
+                     file);
+        }
+        return file;
+      }();
+      static uint32_t state_draw = 0;
+      if (state_file) {
+        const auto colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+        std::fprintf(state_file, "%u,%016llX,%016llX,%u,%u,%u,%02X,%u,%u,%u,%u\n", state_draw++,
+                     (unsigned long long)vertex_shader->ucode_data_hash(),
+                     (unsigned long long)(pixel_shader ? pixel_shader->ucode_data_hash() : 0),
+                     uint32_t(colorcontrol.alpha_test_enable), uint32_t(colorcontrol.alpha_func),
+                     uint32_t(colorcontrol.alpha_to_mask_enable), colorcontrol.value >> 24,
+                     uint32_t(pixel_shader && pixel_shader->kills_pixels()),
+                     uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples),
+                     uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type), index_count);
+        std::fflush(state_file);
+      }
+    }
+    if (const uint64_t skip_pixel_shader = REXCVAR_GET(fh1_debug_skip_pixel_shader);
+        skip_pixel_shader && pixel_shader &&
+        pixel_shader->ucode_data_hash() == skip_pixel_shader) {
+      return true;
+    }
+    static const std::string skip_coverage = REXCVAR_GET(fh1_debug_skip_coverage);
+    if (!skip_coverage.empty()) {
+      const auto colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+      if ((skip_coverage == "a2c" && colorcontrol.alpha_to_mask_enable) ||
+          (skip_coverage == "a2cdither" && colorcontrol.alpha_to_mask_enable &&
+           (colorcontrol.value >> 24) != 0xAA) ||
+          (skip_coverage == "alphatest" && colorcontrol.alpha_test_enable) ||
+          (skip_coverage == "kill" && pixel_shader && pixel_shader->kills_pixels())) {
+        return true;
+      }
+    }
+  }
   if (frame_dump_ && frame_dump_->recording()) {
     // Frame dumps: the guest ranges the draw reads.
     const bool guest_dma_indices = primitive_processing_result.index_buffer_type ==
@@ -6659,6 +7526,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     fh1_draw.state_epoch = unchanged_inputs ? memo_state : state_epoch_;
     fh1_draw.state_is_hash = unchanged_inputs;
     fh1_native_executor_->MaybeSnapshotBeforeHud(fh1_draw);
+    if (fh1_native_executor_->SkipsHudDraw()) return true;
     fh1_native_executor_->PrepareTargets(fh1_draw);
     if (!fh1_native_executor_->BindTargets(fh1_render_pass_key)) {
       return draw_fail("fh1_bind_targets");
@@ -8332,6 +9200,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // the end of the submission (when async pipeline object creation requests
     // are fulfilled).
     deferred_command_buffer_.Reset();
+    fh1_hoist_slot_valid_ = false;
 
     // Reset cached state of the command buffer.
     dynamic_viewport_update_needed_ = true;
@@ -8601,6 +9470,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
         tape = std::make_unique<DeferredCommandBuffer>(*this);
       }
       tape->Swap(deferred_command_buffer_);
+      fh1_hoist_slot_valid_ = false;
       {
         std::lock_guard<std::mutex> lock(submission_worker_mutex_);
         SubmissionJob job{std::move(tape), command_buffer, current_submission_wait_semaphores_,
@@ -9877,9 +10747,12 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   // MSAA sample count: the host's, where the FH1 executor stores the guest's
   // surfaces with fewer samples (alpha to coverage and per-sample shading
   // address host samples).
+  // A shared 4x alias keeps the guest's 4x: its pixels are the guest samples,
+  // and alpha to coverage takes each one's bit (msaa_as_doubled_scale).
   const xenos::MsaaSamples host_msaa_samples =
-      fh1_native_executor_ ? fh1_native_executor_->HostMsaaSamples(rb_surface_info.msaa_samples)
-                           : rb_surface_info.msaa_samples;
+      fh1_native_executor_ && !draw_doubled_scale_
+          ? fh1_native_executor_->HostMsaaSamples(rb_surface_info.msaa_samples)
+          : rb_surface_info.msaa_samples;
   flags |= uint32_t(host_msaa_samples) << SpirvShaderTranslator::kSysFlag_MsaaSamples_Shift;
   // Depth format.
   if (rb_depth_info.depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {

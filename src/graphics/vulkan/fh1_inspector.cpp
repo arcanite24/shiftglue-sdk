@@ -124,8 +124,8 @@ void main() {
       return image;
     }
   }
-  const uint32_t width = uint32_t(rect.right - rect.left) * scale_;
-  const uint32_t height = uint32_t(rect.bottom - rect.top) * scale_;
+  const uint32_t width = uint32_t(rect.right - rect.left) * scale_x_;
+  const uint32_t height = uint32_t(rect.bottom - rect.top) * scale_y_;
   const uint32_t longest = std::max(width, height);
   image.width = std::max(1u, width * std::min(longest, 256u) / longest);
   image.height = std::max(1u, height * std::min(longest, 256u) / longest);
@@ -164,8 +164,8 @@ void main() {
   writes[1].pBufferInfo = &buffer;
   fn.vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
   const uint32_t constants[] = {
-      uint32_t(rect.left) * scale_,
-      uint32_t(rect.top) * scale_,
+      uint32_t(rect.left) * scale_x_,
+      uint32_t(rect.top) * scale_y_,
       width,
       height,
       image.width,
@@ -228,8 +228,8 @@ void Fh1NativeExecutor::FinishInspection(uint64_t frame) {
         item.depth
             ? xenos::GetDepthRenderTargetFormatName(xenos::DepthRenderTargetFormat(item.format))
             : xenos::GetColorRenderTargetFormatName(xenos::ColorRenderTargetFormat(item.format));
-    item.width = surface.width * scale_;
-    item.height = surface.image_height * scale_;
+    item.width = surface.width * scale_x_;
+    item.height = surface.image_height * scale_y_;
     item.samples = surface.samples;
     item.draws = inspection_draws_[key];
     item.image = QueueInspectionImage(

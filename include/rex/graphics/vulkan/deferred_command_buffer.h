@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -33,6 +34,14 @@ class DeferredCommandBuffer {
   // Exchanges the recorded commands (the submission worker takes a finished
   // stream and leaves an empty one to record into).
   void Swap(DeferredCommandBuffer& other) { command_stream_.swap(other.command_stream_); }
+  // The recorded stream's length, a command boundary to move commands to.
+  size_t GetSize() const { return command_stream_.size(); }
+  // Moves the commands recorded from `tail` on to `slot`, an earlier command
+  // boundary, ahead of the commands between them.
+  void MoveTail(size_t slot, size_t tail) {
+    std::rotate(command_stream_.begin() + slot, command_stream_.begin() + tail,
+                command_stream_.end());
+  }
 
   // render_pass_begin->pNext of all barriers must be null.
   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
@@ -154,6 +163,20 @@ class DeferredCommandBuffer {
     std::memcpy(rects_arg, rects, sizeof(VkClearRect) * rect_count);
   }
 
+  // Calls `callback` with a copy of `size` bytes of `data` (trivially
+  // copyable) and the command buffer when the commands are executed, for
+  // work that records itself (DLSS through NGX). The command processor's
+  // cached bindings do not survive it (InvalidateBindingsAfterCallback).
+  using Callback = void (*)(const void* data, VkCommandBuffer command_buffer);
+  void CmdCallback(Callback callback, const void* data, size_t size) {
+    const size_t header_size = rex::align(sizeof(ArgsCallback), alignof(uintmax_t));
+    uint8_t* args_ptr =
+        reinterpret_cast<uint8_t*>(WriteCommand(Command::kCallback, header_size + size));
+    auto& args = *reinterpret_cast<ArgsCallback*>(args_ptr);
+    args.callback = callback;
+    std::memcpy(args_ptr + header_size, data, size);
+  }
+
   VkImageSubresourceRange* CmdClearColorImageEmplace(VkImage image, VkImageLayout image_layout,
                                                      const VkClearColorValue* color,
                                                      uint32_t range_count) {
@@ -219,6 +242,18 @@ class DeferredCommandBuffer {
                               const VkBufferImageCopy* regions) {
     std::memcpy(CmdCopyBufferToImageEmplace(src_buffer, dst_image, dst_image_layout, region_count),
                 regions, sizeof(VkBufferImageCopy) * region_count);
+  }
+
+  void CmdVkBlitImage(VkImage src_image, VkImageLayout src_image_layout, VkImage dst_image,
+                      VkImageLayout dst_image_layout, const VkImageBlit& region, VkFilter filter) {
+    auto& args = *reinterpret_cast<ArgsVkBlitImage*>(
+        WriteCommand(Command::kVkBlitImage, sizeof(ArgsVkBlitImage)));
+    args.src_image = src_image;
+    args.src_image_layout = src_image_layout;
+    args.dst_image = dst_image;
+    args.dst_image_layout = dst_image_layout;
+    args.region = region;
+    args.filter = filter;
   }
 
   void CmdVkCopyImage(VkImage src_image, VkImageLayout src_image_layout, VkImage dst_image,
@@ -436,6 +471,7 @@ class DeferredCommandBuffer {
 
  private:
   enum class Command {
+    kCallback,
     kVkBeginRenderPass,
     kVkBeginQuery,
     kVkBindDescriptorSets,
@@ -447,6 +483,7 @@ class DeferredCommandBuffer {
     kVkClearColorImage,
     kVkCopyBuffer,
     kVkCopyBufferToImage,
+    kVkBlitImage,
     kVkCopyImage,
     kVkCopyImageToBuffer,
     kVkCopyQueryPoolResults,
@@ -481,6 +518,11 @@ class DeferredCommandBuffer {
   };
   static constexpr size_t kCommandHeaderSizeElements =
       (sizeof(CommandHeader) + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
+
+  struct ArgsCallback {
+    Callback callback;
+    // Followed by the data, aligned.
+  };
 
   struct ArgsVkBeginRenderPass {
     VkRenderPass render_pass;
@@ -578,6 +620,15 @@ class DeferredCommandBuffer {
     uint32_t region_count;
     // Followed by aligned VkBufferImageCopy[].
     static_assert(alignof(VkBufferImageCopy) <= alignof(uintmax_t));
+  };
+
+  struct ArgsVkBlitImage {
+    VkImage src_image;
+    VkImageLayout src_image_layout;
+    VkImage dst_image;
+    VkImageLayout dst_image_layout;
+    VkImageBlit region;
+    VkFilter filter;
   };
 
   struct ArgsVkCopyImage {
