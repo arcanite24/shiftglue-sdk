@@ -134,6 +134,25 @@ REXCVAR_DEFINE_INT32(gpu_d3d_program_probe, 0, "GPU",
                      "draws only their first triangle and 2 skips their draw commands (wrong "
                      "image), to bound the GPU time those lists cost (NA-3.2, Vulkan)")
     .range(0, 2);
+REXCVAR_DEFINE_STRING(fh1_debug_draw_constants_path, "", "GPU",
+                      "Diagnostics: write every draw's shader hashes and the float constants "
+                      "its shaders read to this file (for frame replays: comparing two frames' "
+                      "draws, such as a stereo pair's)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(fh1_debug_draw_state_path, "", "GPU",
+                      "Diagnostics: write a CSV line per draw (its index in the frame, shader "
+                      "hashes, alpha test, alpha to coverage, pixel kill, MSAA, primitive, index "
+                      "count) to this file, for finding which draws use which coverage technique")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_UINT64(fh1_debug_skip_pixel_shader, 0, "GPU",
+                      "Diagnostics: skip the draws with this pixel shader (its ucode hash, as "
+                      "the per-shader GPU profile names it), to bound what it costs")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(fh1_debug_skip_coverage, "", "GPU",
+                      "Diagnostics: skip the draws that use alpha to coverage (a2c; a2cdither: "
+                      "only those with per-pixel dither offsets), the alpha test (alphatest) or "
+                      "a pixel kill (kill), to see what they draw")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_native_gpu_profile_draws, false, "GPU",
                     "Diagnostics: with fh1_native_gpu_profile, also time every draw by its "
                     "pixel shader (Vulkan)")
@@ -5280,6 +5299,9 @@ void VulkanCommandProcessor::SubmitBarriersAndBeginFh1Rendering(
     return;
   }
   EndRenderPass();
+  fh1_hoist_slot_ = deferred_command_buffer_.GetSize();
+  fh1_hoist_epoch_ = shared_memory_ ? shared_memory_->invalidation_epoch() : 0;
+  fh1_hoist_slot_valid_ = true;
   deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
   PERF_counter_inc(kGpuRenderings);
   const char* const next_rendering_label = next_rendering_label_;
@@ -5448,6 +5470,7 @@ void VulkanCommandProcessor::FlushCpuVisibleResults() {
 void VulkanCommandProcessor::EndRenderPass(std::source_location caller) {
   assert_true(submission_open_);
   current_fh1_rendering_id_ = 0;
+  fh1_hoist_slot_valid_ = false;
   if (!in_render_pass_) {
     return;
   }
@@ -5893,12 +5916,22 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     draw_cost_.last = DrawCostNow();
   }
   auto draw_fail = [&](const char* stage) {
+    // After a lost device every draw fails: 15 rotated logs of this in 3 s
+    // (2026-10-22) took the lines before the loss with them. The first 100,
+    // then one in 10000, counted again from a loss or a recovery so earlier
+    // harmless failures never hide the ones after it.
+    if (draw_failures_device_lost_ != device_lost_) {
+      draw_failures_device_lost_ = device_lost_;
+      draw_failures_ = 0;
+    }
+    const uint64_t failure = draw_failures_++;
+    if (failure >= 100 && failure % 10000) return false;
     auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
     REXGPU_ERROR(
-        "Vulkan IssueDraw failed at {} "
+        "Vulkan IssueDraw failed at {} (failure {}) "
         "(prim_type={}, index_count={}, source_select={}, major_mode={}, explicit_major={}, "
         "path_select={}, tess_mode={}, edram_mode={})",
-        stage, uint32_t(prim_type), index_count, uint32_t(vgt_draw_initiator.source_select),
+        stage, failure + 1, uint32_t(prim_type), index_count, uint32_t(vgt_draw_initiator.source_select),
         uint32_t(vgt_draw_initiator.major_mode), uint32_t(major_mode_explicit),
         uint32_t(regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select),
         uint32_t(regs.Get<reg::VGT_HOS_CNTL>().tess_mode),
@@ -6209,6 +6242,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   VulkanShader::VulkanTranslation* vertex_shader_translation;
   VulkanShader::VulkanTranslation* pixel_shader_translation;
   bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
+  // Memory export may write pages an upload would be moved ahead of.
+  if (memexport_writes_possible) fh1_hoist_slot_valid_ = false;
 
   DrawCostMark(kCostAnalysis);
   // Two iterations because a submission (even the current one - in which case
@@ -6275,6 +6310,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
                                          : pixel_shader && fh1_native_executor_ &&
                                                fh1_native_executor_->IsSceneObjectDraw(*vertex_shader);
     object_slot_draws_ += uint32_t(object_slot && !i);
+    const bool doubled_scale = fh1_native_executor_ && fh1_native_executor_->DrawAsDoubledScale();
+    draw_doubled_scale_ = doubled_scale;
     if (program_hit) {
       // NA-2.4: the recorded modifications and translations (ready when
       // recorded, and translations are never dropped).
@@ -6296,7 +6333,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
           translation_memo.interpolator_mask == interpolator_mask &&
           translation_memo.ps_param_gen_pos == ps_param_gen_pos &&
           translation_memo.depth_control == normalized_depth_control.value &&
-          translation_memo.object_slot == object_slot) {
+          translation_memo.object_slot == object_slot &&
+          translation_memo.doubled_scale == doubled_scale) {
         vertex_shader_modification = translation_memo.vertex_modification;
         pixel_shader_modification = translation_memo.pixel_modification;
         vertex_shader_translation = translation_memo.vertex_translation;
@@ -6310,8 +6348,13 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
                                *pixel_shader, interpolator_mask, ps_param_gen_pos,
                                normalized_depth_control)
                          : SpirvShaderTranslator::Modification(0);
-        if (object_slot) {
+        // The object slot image has the guest output's pixels, which a doubled
+        // draw's do not match (FH1's cars draw to the scene, never doubled).
+        if (object_slot && !doubled_scale) {
           pixel_shader_modification.pixel.object_slot_output = 1;
+        }
+        if (pixel_shader && doubled_scale) {
+          pixel_shader_modification.pixel.msaa_as_doubled_scale = 1;
         }
 
         // Translate the shaders now to obtain the sampler bindings.
@@ -6350,6 +6393,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         }
         translation_memo.state_epoch = memo_translation ? memo_state : 0;
         translation_memo.object_slot = object_slot;
+        translation_memo.doubled_scale = doubled_scale;
         translation_memo.vertex_shader = vertex_shader;
         translation_memo.pixel_shader = pixel_shader;
         translation_memo.host_vertex_shader_type =
@@ -6605,6 +6649,85 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   texture_inputs_generation_ += texture_cache_->unchanged_request_hits() == texture_hits_before;
   texture_section_skip_allowed_ = unchanged_inputs;
   texture_section_verify_ = unchanged_verify;
+  // fh1_debug_draw_constants_path: per draw, "DRAW", its index, the vertex
+  // and pixel shader hashes, then each float constant the shaders read (its
+  // register 0-511 and four floats).
+  {
+    static const std::string constants_path = REXCVAR_GET(fh1_debug_draw_constants_path);
+    if (!constants_path.empty()) {
+      static FILE* constants_file = std::fopen(constants_path.c_str(), "wb");
+      static uint32_t constants_draw = 0;
+      if (constants_file) {
+        std::vector<uint32_t> used;
+        for (uint32_t stage = 0; stage < 2; ++stage) {
+          const Shader* shader = stage ? static_cast<const Shader*>(pixel_shader)
+                                       : static_cast<const Shader*>(vertex_shader);
+          if (!shader) continue;
+          const auto& map = shader->constant_register_map();
+          for (uint32_t i = 0; i < 256; ++i) {
+            if (map.float_dynamic_addressing || (map.float_bitmap[i >> 6] >> (i & 63)) & 1) {
+              used.push_back(stage * 256 + i);
+            }
+          }
+        }
+        const uint32_t header[2] = {0x57415244u, constants_draw++};
+        const uint64_t hashes[2] = {vertex_shader->ucode_data_hash(),
+                                    pixel_shader ? pixel_shader->ucode_data_hash() : 0};
+        const uint32_t count = uint32_t(used.size());
+        std::fwrite(header, sizeof(header), 1, constants_file);
+        std::fwrite(hashes, sizeof(hashes), 1, constants_file);
+        std::fwrite(&count, sizeof(count), 1, constants_file);
+        for (uint32_t index : used) {
+          std::fwrite(&index, sizeof(index), 1, constants_file);
+          std::fwrite(&regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X + index * 4], 16, 1,
+                      constants_file);
+        }
+        std::fflush(constants_file);
+      }
+    }
+  }
+  {
+    static const std::string state_path = REXCVAR_GET(fh1_debug_draw_state_path);
+    if (!state_path.empty()) {
+      static FILE* state_file = [] {
+        FILE* file = std::fopen(state_path.c_str(), "w");
+        if (file) {
+          std::fputs("draw,vs,ps,alpha_test,alpha_func,alpha_to_coverage,a2c_offsets,kills,msaa,prim,indices\n",
+                     file);
+        }
+        return file;
+      }();
+      static uint32_t state_draw = 0;
+      if (state_file) {
+        const auto colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+        std::fprintf(state_file, "%u,%016llX,%016llX,%u,%u,%u,%02X,%u,%u,%u,%u\n", state_draw++,
+                     (unsigned long long)vertex_shader->ucode_data_hash(),
+                     (unsigned long long)(pixel_shader ? pixel_shader->ucode_data_hash() : 0),
+                     uint32_t(colorcontrol.alpha_test_enable), uint32_t(colorcontrol.alpha_func),
+                     uint32_t(colorcontrol.alpha_to_mask_enable), colorcontrol.value >> 24,
+                     uint32_t(pixel_shader && pixel_shader->kills_pixels()),
+                     uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples),
+                     uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type), index_count);
+        std::fflush(state_file);
+      }
+    }
+    if (const uint64_t skip_pixel_shader = REXCVAR_GET(fh1_debug_skip_pixel_shader);
+        skip_pixel_shader && pixel_shader &&
+        pixel_shader->ucode_data_hash() == skip_pixel_shader) {
+      return true;
+    }
+    static const std::string skip_coverage = REXCVAR_GET(fh1_debug_skip_coverage);
+    if (!skip_coverage.empty()) {
+      const auto colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+      if ((skip_coverage == "a2c" && colorcontrol.alpha_to_mask_enable) ||
+          (skip_coverage == "a2cdither" && colorcontrol.alpha_to_mask_enable &&
+           (colorcontrol.value >> 24) != 0xAA) ||
+          (skip_coverage == "alphatest" && colorcontrol.alpha_test_enable) ||
+          (skip_coverage == "kill" && pixel_shader && pixel_shader->kills_pixels())) {
+        return true;
+      }
+    }
+  }
   if (frame_dump_ && frame_dump_->recording()) {
     // Frame dumps: the guest ranges the draw reads.
     const bool guest_dma_indices = primitive_processing_result.index_buffer_type ==
@@ -8332,6 +8455,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // the end of the submission (when async pipeline object creation requests
     // are fulfilled).
     deferred_command_buffer_.Reset();
+    fh1_hoist_slot_valid_ = false;
 
     // Reset cached state of the command buffer.
     dynamic_viewport_update_needed_ = true;
@@ -8601,6 +8725,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
         tape = std::make_unique<DeferredCommandBuffer>(*this);
       }
       tape->Swap(deferred_command_buffer_);
+      fh1_hoist_slot_valid_ = false;
       {
         std::lock_guard<std::mutex> lock(submission_worker_mutex_);
         SubmissionJob job{std::move(tape), command_buffer, current_submission_wait_semaphores_,
@@ -9877,9 +10002,12 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   // MSAA sample count: the host's, where the FH1 executor stores the guest's
   // surfaces with fewer samples (alpha to coverage and per-sample shading
   // address host samples).
+  // A shared 4x alias keeps the guest's 4x: its pixels are the guest samples,
+  // and alpha to coverage takes each one's bit (msaa_as_doubled_scale).
   const xenos::MsaaSamples host_msaa_samples =
-      fh1_native_executor_ ? fh1_native_executor_->HostMsaaSamples(rb_surface_info.msaa_samples)
-                           : rb_surface_info.msaa_samples;
+      fh1_native_executor_ && !draw_doubled_scale_
+          ? fh1_native_executor_->HostMsaaSamples(rb_surface_info.msaa_samples)
+          : rb_surface_info.msaa_samples;
   flags |= uint32_t(host_msaa_samples) << SpirvShaderTranslator::kSysFlag_MsaaSamples_Shift;
   // Depth format.
   if (rb_depth_info.depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {

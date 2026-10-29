@@ -287,6 +287,16 @@ class VulkanCommandProcessor : public CommandProcessor {
     return in_render_pass_ && id && current_fh1_rendering_id_ == id;
   }
   bool in_render_pass() const { return in_render_pass_; }
+  // vulkan_hoist_split_uploads: the stream position just before the open FH1
+  // rendering began, where uploads can go instead of ending it, and the
+  // shared memory invalidation count when it began.
+  bool Fh1UploadHoistSlot(size_t& slot, uint32_t& epoch) const {
+    if (!fh1_hoist_slot_valid_ || !in_render_pass_) return false;
+    slot = fh1_hoist_slot_;
+    epoch = fh1_hoist_epoch_;
+    return true;
+  }
+  void Fh1AdvanceUploadHoistSlot(size_t words) { fh1_hoist_slot_ += words; }
   system::GraphicsShaderTranslationObserver GetShaderTranslationObserver() const;
   // Submits the open submission, waits for every queue operation and reopens
   // the submission if one was open (FH1 resolve read-backs).
@@ -425,6 +435,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   // decode time; with the recorder their draws intermittently sampled other
   // textures (frame-to-frame noise on FH1's foliage, flags and signs).
   bool SupportsRecordThread() const override { return push_pixel_texture_descriptors_; }
+  // A frame dump starts recording packets at the swap before its frame.
+  bool RecordSyncAfterSwap(uint64_t frame) const override {
+    return frame + 1 == Fh1FrameDump::RequestedFrame();
+  }
 
  private:
   struct CommandBuffer {
@@ -869,6 +883,9 @@ class VulkanCommandProcessor : public CommandProcessor {
                                          VkWriteDescriptorSet* descriptor_set_writes_out);
 
   bool device_lost_ = false;
+  // IssueDraw failures logged since device_lost_ last changed (rate limit).
+  uint64_t draw_failures_ = 0;
+  bool draw_failures_device_lost_ = false;
 
   bool cache_clear_requested_ = false;
 
@@ -1517,12 +1534,19 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t depth_control = 0;
     // UP-1.7: whether the pixel shader writes the object slot.
     bool object_slot = false;
+    // LS-4.5: whether the draw renders a shared 4x alias at twice the scale.
+    bool doubled_scale = false;
     SpirvShaderTranslator::Modification vertex_modification;
     SpirvShaderTranslator::Modification pixel_modification;
     VulkanShader::VulkanTranslation* vertex_translation = nullptr;
     VulkanShader::VulkanTranslation* pixel_translation = nullptr;
   };
   std::unique_ptr<TranslationMemo[]> translation_memos_{new TranslationMemo[kStateMemoCount]};
+  // LS-4.5 (Fh1NativeExecutor::DrawAsDoubledScale): the current draw renders
+  // a 4x MSAA surface into its single-sampled storage at twice the draw
+  // resolution scale; its viewport, scissor, depth bias and system constants
+  // use the doubled scale.
+  bool draw_doubled_scale_ = false;
   // Host viewport information by memo state.
   struct ViewportMemo {
     uint64_t state_epoch = 0;
@@ -1742,6 +1766,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkRenderPass current_render_pass_;
   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
   bool in_render_pass_ = false;
+  size_t fh1_hoist_slot_ = 0;
+  uint32_t fh1_hoist_epoch_ = 0;
+  bool fh1_hoist_slot_valid_ = false;
 #if defined(REXGPU_FH1_ORDERED_CENSUS)
   uint64_t ordered_census_pass_ = 0;
 #endif

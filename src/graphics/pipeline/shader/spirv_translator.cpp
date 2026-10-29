@@ -3156,7 +3156,7 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   // and there's no early depth / stencil), depth writing in the fragment shader
   // (per-sample if supported).
   bool memexport_resolution_scaled = current_shader().memexport_eM_written() &&
-                                     (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1);
+                                     (PixelScaleX() > 1 || PixelScaleY() > 1);
   const bool object_slot_output =
       !edram_fragment_shader_interlock_ && GetSpirvShaderModification().pixel.object_slot_output;
   if (edram_fragment_shader_interlock_ || param_gen_needed || memexport_resolution_scaled ||
@@ -3357,8 +3357,9 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
 
   if (current_shader().memexport_eM_written()) {
     // Make sure memexport is done only once for a guest pixel.
+    const uint32_t pixel_scale_x = PixelScaleX(), pixel_scale_y = PixelScaleY();
     uint32_t resolution_scaled_axes =
-        uint32_t(draw_resolution_scale_x_ > 1) | (uint32_t(draw_resolution_scale_y_ > 1) << 1);
+        uint32_t(pixel_scale_x > 1) | (uint32_t(pixel_scale_y > 1) << 1);
     if (resolution_scaled_axes) {
       assert_true(input_fragment_coordinates_ != spv::NoResult);
       spv::Id memexport_allowed = spv::NoResult;
@@ -3375,11 +3376,11 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
         spv::Id position_mod = builder_->createBinOp(
             spv::OpUMod, type_uint_,
             builder_->createUnaryOp(spv::OpConvertFToU, type_uint_, position),
-            builder_->makeUintConstant(i ? draw_resolution_scale_y_ : draw_resolution_scale_x_));
+            builder_->makeUintConstant(i ? pixel_scale_y : pixel_scale_x));
         spv::Id position_is_center =
             builder_->createBinOp(spv::OpIEqual, type_bool_, position_mod,
-                                  builder_->makeUintConstant(i ? (draw_resolution_scale_y_ >> 1)
-                                                               : (draw_resolution_scale_x_ >> 1)));
+                                  builder_->makeUintConstant(i ? (pixel_scale_y >> 1)
+                                                               : (pixel_scale_x >> 1)));
         memexport_allowed = memexport_allowed != spv::NoResult
                                 ? builder_->createBinOp(spv::OpLogicalAnd, type_bool_,
                                                         memexport_allowed, position_is_center)
@@ -3470,10 +3471,10 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
             builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
                                         id_vector_temp_),
             spv::NoPrecision));
-    if (draw_resolution_scale_x_ > 1) {
+    if (PixelScaleX() > 1) {
       param_gen_x = builder_->createNoContractionBinOp(
           spv::OpFMul, type_float_, param_gen_x,
-          builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_x_)));
+          builder_->makeFloatConstant(1.0f / float(PixelScaleX())));
     }
     param_gen_x = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
                                                    GLSLstd450FAbs, param_gen_x);
@@ -3506,10 +3507,10 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
             builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
                                         id_vector_temp_),
             spv::NoPrecision));
-    if (draw_resolution_scale_y_ > 1) {
+    if (PixelScaleY() > 1) {
       param_gen_y = builder_->createNoContractionBinOp(
           spv::OpFMul, type_float_, param_gen_y,
-          builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_y_)));
+          builder_->makeFloatConstant(1.0f / float(PixelScaleY())));
     }
     param_gen_y = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
                                                    GLSLstd450FAbs, param_gen_y);

@@ -85,6 +85,21 @@ class Fh1NativeExecutor {
   // tiles resolved are copied down to the EDRAM rows of their surfaces, where
   // the last tile leaves them on the console.
   void EndUntiledTiling();
+  // LS-4.5 (fh1_share_msaa_aliases): FH1 reads 1x surfaces as 4x MSAA ones
+  // of half the width and height at the same EDRAM base: its 1280x720 ones
+  // at pitch 16 (the scene and sun shadow depth) as 640x360, and its
+  // 1040-wide D24S8 at pitch 13 as 520 wide. Guest 4x pixel (x, y) sample s
+  // is 1x pixel (2x + (s & 1), 2y + (s >> 1)), so such a 4x surface is
+  // stored as its 1x surface, and its draws render into it single-sampled
+  // at twice the draw resolution scale: switching between the views
+  // transfers nothing.
+  bool IsSharedMsaaAlias(uint32_t msaa, uint32_t pitch_tiles) const {
+    return share_msaa_aliases_ && msaa == uint32_t(xenos::MsaaSamples::k4X) &&
+           (pitch_tiles == 16 || pitch_tiles == 13);
+  }
+  // The current draw's targets are a shared 4x alias (rendered at twice the
+  // scale with one sample).
+  bool DrawAsDoubledScale() const;
   // The host sample count of surfaces the guest renders with this many
   // samples (fh1_msaa_single_sample, fh1_msaa_2x).
   xenos::MsaaSamples HostMsaaSamples(xenos::MsaaSamples guest) const {
@@ -93,7 +108,12 @@ class Fh1NativeExecutor {
     return two_sample_msaa_ && guest == xenos::MsaaSamples::k4X ? xenos::MsaaSamples::k2X
                                                                  : guest;
   }
-  uint32_t draw_coordinate_scale() const { return shared_depth_alias_draw_ ? 2u : 1u; }
+  // Host pixels per guest pixel beyond the draw resolution scale: 2 for a
+  // shared depth alias draw (fh1_shared_depth_alias) or a shared 4x alias's
+  // (fh1_share_msaa_aliases, DrawAsDoubledScale).
+  uint32_t draw_coordinate_scale() const {
+    return shared_depth_alias_draw_ || DrawAsDoubledScale() ? 2u : 1u;
+  }
 
   // Before the targets are bound for a draw: derives the surfaces the draw
   // writes and takes their EDRAM tiles, transferring the previous owners'
@@ -367,6 +387,12 @@ class Fh1NativeExecutor {
   static SurfaceKey MakeDepthKey(uint32_t base, uint32_t pitch_tiles, uint32_t msaa,
                                  xenos::DepthRenderTargetFormat format);
   uint32_t SurfaceHeight(uint32_t pitch_tiles, uint32_t msaa) const;
+  // The surface a key's contents are stored in: a shared 4x alias's 1x
+  // surface (IsSharedMsaaAlias), otherwise the key's own.
+  SurfaceKey StorageKey(SurfaceKey key) const {
+    if (IsSharedMsaaAlias(key.msaa, key.pitch_tiles)) key.msaa = uint32_t(xenos::MsaaSamples::k1X);
+    return key;
+  }
   // rows: the guest rows the caller is about to claim (0: the whole period).
   Surface* GetOrCreateSurface(const SurfaceKey& key, uint32_t rows = 0);
   // Creates the image, its memory and views at surface.image_height.
@@ -399,8 +425,10 @@ class Fh1NativeExecutor {
   void ClaimTiles(uint32_t base, uint32_t length, uint32_t packed_key, bool transfer = true);
   void MarkTileStencil(uint32_t base, uint32_t length, bool nonzero);
   bool DrawMayWriteNonzeroStencil(reg::RB_DEPTHCONTROL depth_control) const;
+  // rect_shift: the overwrite rectangles are in pixels of a shared 4x alias
+  // (1) whose storage key is key, or of key itself (0).
   bool ClaimDepthOverwriteTiles(const SurfaceKey& key, uint32_t length, bool stencil_overwritten,
-                                bool stencil_written);
+                                bool stencil_written, uint32_t rect_shift);
   void ClaimOverwrittenDepthTiles(const SurfaceKey& key, const std::array<int32_t, 4>& rect,
                                   bool stencil_overwritten);
   void ClaimTileRect(const SurfaceKey& key, uint32_t column_first, uint32_t row_first,
@@ -511,7 +539,11 @@ class Fh1NativeExecutor {
     Surface* surface = nullptr;
   };
   SurfaceFront surface_front_[16];
-  uint32_t scale_ = 1;
+  // The draw resolution scale along each axis (each 1 to 4): a guest pixel is
+  // scale_x_ x scale_y_ host pixels.
+  uint32_t scale_x_ = 1;
+  uint32_t scale_y_ = 1;
+  bool Scaled() const { return scale_x_ > 1 || scale_y_ > 1; }
   // fh1_untile_predicated_tiling: the screen height the images hold, and the
   // last later-tile band resolved from each surface since the tiling began.
   uint32_t untile_height_ = 0;
@@ -737,6 +769,9 @@ class Fh1NativeExecutor {
   bool shared_depth_alias_draw_ = false;
   // fh1_scaled_msaa_single_sample at a scale above 1x.
   bool single_sample_msaa_ = false;
+  // fh1_share_msaa_aliases: 4x surfaces at the aliased pitches are stored as
+  // their 1x surfaces (IsSharedMsaaAlias).
+  bool share_msaa_aliases_ = false;
   bool two_sample_msaa_ = false;
   // The device exports stencil from shaders: depth transfers take one pass.
   bool stencil_export_ = false;

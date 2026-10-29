@@ -271,6 +271,7 @@ constexpr const char* kCounterNames[] = {
     "gpu_upload_splits_vertex",
     "gpu_upload_splits_index",
     "gpu_upload_splits_texture",
+    "gpu_uploads_hoisted",
     "gpu_upload_bytes",
     "d3d_census_visible_draws",
     "d3d_census_fallback_draws",
@@ -425,6 +426,7 @@ constexpr bool kIsGauge[] = {
     false,  // kGpuUploadSplitsVertex
     false,  // kGpuUploadSplitsIndex
     false,  // kGpuUploadSplitsTexture
+    false,  // kGpuUploadsHoisted
     false,  // kGpuUploadBytes
     false,  // kD3dCensusVisibleDraws
     false,  // kD3dCensusFallbackDraws

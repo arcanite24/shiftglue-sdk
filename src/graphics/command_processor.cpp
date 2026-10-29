@@ -2260,6 +2260,10 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
     d3d_census_decoder::Packet(packet_offset, packet);
   }
   if (packet_recorder_) {
+    // The recorder adds the guest ranges its draws read to the same recording:
+    // let it finish the packets before this one, so the two never overlap and
+    // the ranges are taken in the order they are without the split.
+    RecordSync();
     uint32_t dword_count = 1;
     switch (packet_type) {
       case 0x00:
@@ -2751,6 +2755,12 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
     }
   });
   PublishRecordBatch();
+  // The recorder sets and clears a packet recorder at a swap: the decoder may
+  // not decode further until it has.
+  if (record_split_ && (packet_recorder_ || RecordSyncAfterSwap(decode_frame_sequence_))) {
+    RecordSync();
+  }
+  ++decode_frame_sequence_;
 
   ++counter_;
   return true;
