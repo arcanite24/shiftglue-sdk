@@ -4475,8 +4475,13 @@ bool VulkanTextureCache::Initialize() {
   // VkDevice (true in a regular emulation scenario), so taking over all the
   // allocation slots exclusively.
   // Also leaving a few slots for use by things like overlay applications.
+  // The PowerVR driver reports UINT32_MAX, which sized the bindless sampler
+  // binding at ~4.29 billion descriptors and crashed the driver making the
+  // set resident (arcanite24/pinyon-shift#936): clamp to Vulkan's 4000
+  // minimum, which NVIDIA reports too.
   sampler_max_count_ =
-      device_properties.maxSamplerAllocationCount - ui::vulkan::UISamplers::kSamplerCount - 16;
+      std::min(device_properties.maxSamplerAllocationCount, UINT32_C(4000)) -
+      ui::vulkan::UISamplers::kSamplerCount - 16;
 
   if (device_properties.samplerAnisotropy) {
     max_anisotropy_ = xenos::AnisoFilter(
