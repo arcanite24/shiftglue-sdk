@@ -43,7 +43,74 @@
 #include <rex/ui/surface_gnulinux.h>
 #endif
 
+// A full-screen window on a 5K or 6K display, or on a 4K one in a scaled
+// HiDPI mode, has 15 to 20 million backing pixels: presenting into them cost
+// an M4 Pro 3 ms of GPU a frame and halved its 120 fps at 1x (6016x3384 on a
+// 4K TV "looks like 3008x1692"). The game draws 1280x720 to 3840x2160, so the
+// automatic cap keeps a drawable no larger than 4K and the system scales it.
+// macOS only.
+REXCVAR_DEFINE_DOUBLE(window_max_pixel_density, 0.0, "UI/Window",
+                      "Most drawable pixels per window point on a high-density (Retina) "
+                      "display; the system scales the picture up to the window. 0 uses the "
+                      "display's density up to 3840x2160 pixels; 4 always uses all of it (macOS)")
+    .range(0.0, 4.0)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::ui {
+
+namespace {
+
+// Drawable pixels per window point, at most the display's own density.
+float RenderDensity(SDL_Window* window, int points_width, int points_height) {
+  float density = window ? SDL_GetWindowPixelDensity(window) : 1.0f;
+  if (density <= 1.0f) {
+    return 1.0f;
+  }
+#if REX_PLATFORM_MAC
+  constexpr double kAutoMaxRenderPixels = 3840.0 * 2160.0;
+  double cap = REXCVAR_GET(window_max_pixel_density);
+  if (cap < 1.0 && points_width > 0 && points_height > 0) {
+    cap = std::max(
+        1.0, std::sqrt(kAutoMaxRenderPixels / (double(points_width) * double(points_height))));
+  }
+  return cap >= 1.0 ? std::min(density, float(cap)) : density;
+#else
+  // Only the Metal surface sizes its drawable from the capped size.
+  (void)points_width;
+  (void)points_height;
+  return density;
+#endif
+}
+
+}  // namespace
+
+float GetSdlWindowRenderDensity(SDL_Window* window) {
+  int points_width = 0;
+  int points_height = 0;
+  if (window) {
+    SDL_GetWindowSize(window, &points_width, &points_height);
+  }
+  return RenderDensity(window, points_width, points_height);
+}
+
+bool GetSdlWindowSizeInRenderPixels(SDL_Window* window, int* width, int* height) {
+  if (!SDL_GetWindowSizeInPixels(window, width, height)) {
+    return false;
+  }
+  int points_width = 0;
+  int points_height = 0;
+  if (!SDL_GetWindowSize(window, &points_width, &points_height) || points_width <= 0 ||
+      points_height <= 0) {
+    return true;
+  }
+  const float density = RenderDensity(window, points_width, points_height);
+  if (density >= SDL_GetWindowPixelDensity(window)) {
+    return true;
+  }
+  *width = std::max(1, int(std::lround(points_width * density)));
+  *height = std::max(1, int(std::lround(points_height * density)));
+  return true;
+}
 
 namespace {
 
@@ -183,7 +250,7 @@ bool WindowSDL::OpenImpl() {
   // by Window::Open after OpenImpl returns; these only record initial state.
   int pixel_width = 0;
   int pixel_height = 0;
-  SDL_GetWindowSizeInPixels(sdl_window_, &pixel_width, &pixel_height);
+  GetSdlWindowSizeInRenderPixels(sdl_window_, &pixel_width, &pixel_height);
   WindowDestructionReceiver destruction_receiver(this);
   OnActualSizeUpdate(uint32_t(pixel_width), uint32_t(pixel_height), destruction_receiver);
   if (destruction_receiver.IsWindowDestroyed()) {
@@ -228,8 +295,8 @@ Window::SafeAreaInsets WindowSDL::GetSafeAreaInsets() const {
   int width = 0, height = 0, pixel_width = 0, pixel_height = 0;
   if (!sdl_window_ || !SDL_GetWindowSafeArea(sdl_window_, &safe) ||
       !SDL_GetWindowSize(sdl_window_, &width, &height) ||
-      !SDL_GetWindowSizeInPixels(sdl_window_, &pixel_width, &pixel_height) || width <= 0 ||
-      height <= 0) {
+      !GetSdlWindowSizeInRenderPixels(sdl_window_, &pixel_width, &pixel_height) ||
+      width <= 0 || height <= 0) {
     return insets;
   }
   // The safe area is in window coordinates; the insets are pixels.
@@ -293,8 +360,7 @@ bool WindowSDL::WarpMouseToCenter(int32_t& x_out, int32_t& y_out) {
 }
 
 float WindowSDL::GetPixelDensity() const {
-  float density = sdl_window_ ? SDL_GetWindowPixelDensity(sdl_window_) : 1.0f;
-  return density > 0.0f ? density : 1.0f;
+  return GetSdlWindowRenderDensity(sdl_window_);
 }
 
 uint32_t WindowSDL::GetLatestDpiImpl() const {
@@ -518,10 +584,13 @@ void WindowSDL::HandlePaintEvent() {
 void WindowSDL::HandleWindowEvent(SDL_Event& event) {
   WindowDestructionReceiver destruction_receiver(this);
   switch (event.type) {
-    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
-      OnActualSizeUpdate(uint32_t(event.window.data1), uint32_t(event.window.data2),
-                         destruction_receiver);
+    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: {
+      int pixel_width = event.window.data1;
+      int pixel_height = event.window.data2;
+      GetSdlWindowSizeInRenderPixels(sdl_window_, &pixel_width, &pixel_height);
+      OnActualSizeUpdate(uint32_t(pixel_width), uint32_t(pixel_height), destruction_receiver);
       break;
+    }
     case SDL_EVENT_WINDOW_RESIZED: {
       // Track the user-driven size as the desired size for the normal state
       // only (mirrors the Win32 WM_SIZE handling).
@@ -626,7 +695,8 @@ void WindowSDL::HandleTextInputEvent(SDL_Event& event) {
 
 void WindowSDL::HandleFingerEvent(SDL_Event& event) {
   int width = 0, height = 0;
-  if (!SDL_GetWindowSizeInPixels(sdl_window_, &width, &height) || width <= 0 || height <= 0) {
+  if (!GetSdlWindowSizeInRenderPixels(sdl_window_, &width, &height) || width <= 0 ||
+      height <= 0) {
     return;
   }
   TouchEvent::Action action;

@@ -25,6 +25,13 @@
 
 namespace rex::ui {
 
+// The window's size in the pixels the renderer draws, and how many of them
+// span one SDL window coordinate. On a high-density (Retina) display these
+// are the backing pixels, unless window_max_pixel_density caps them: the
+// drawable is then smaller and the system scales it up to the window.
+bool GetSdlWindowSizeInRenderPixels(SDL_Window* window, int* width, int* height);
+float GetSdlWindowRenderDensity(SDL_Window* window);
+
 class WindowSDL final : public Window {
  public:
   // The default size is the app's own, used where the cvars ask for none.

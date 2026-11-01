@@ -14,6 +14,8 @@
 #include <SDL3/SDL_metal.h>
 #include <SDL3/SDL_video.h>
 
+#include <rex/ui/window_sdl.h>
+
 namespace rex {
 namespace ui {
 
@@ -27,7 +29,7 @@ CAMetalLayerSurface::~CAMetalLayerSurface() {
 bool CAMetalLayerSurface::GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const {
   int pixel_width = 0;
   int pixel_height = 0;
-  if (!SDL_GetWindowSizeInPixels(window_, &pixel_width, &pixel_height)) {
+  if (!GetSdlWindowSizeInRenderPixels(window_, &pixel_width, &pixel_height)) {
     return false;
   }
   width_out = uint32_t(pixel_width);
