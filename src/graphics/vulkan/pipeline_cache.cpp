@@ -109,6 +109,12 @@ REXCVAR_DEFINE_BOOL(vulkan_aot_pipelines, true, "GPU/Vulkan",
                     "with the stored ones")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_INT32(vulkan_aot_prewarm_threads, REX_PLATFORM_ANDROID ? 2 : -1, "GPU/Vulkan",
+                     "Threads building the ahead-of-time pipelines behind the title where the "
+                     "stored ones are built before it (-1: three quarters of the cores). A "
+                     "phone keeps cores for the game")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(vulkan_async_pipeline_no_placeholder, REX_PLATFORM_ANDROID, "GPU/Vulkan",
                     "With async_shader_compilation, never build a pipeline on the GPU commands "
                     "thread nor wait for one: a draw whose pipeline is not ready is skipped (the "
@@ -735,9 +741,11 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
            shader_storage_file_);
   }
 
+  // Kept apart: the storage file is truncated to the stored descriptions.
+  std::vector<PipelineStoredDescription> aot_descriptions;
   if (!edram_fragment_shader_interlock && REXCVAR_GET(vulkan_aot_pipelines)) {
     LoadAotPipelines(shader_storage_shareable_root / fmt::format("{:08X}.fbo.aot.xpso", title_id),
-                     pipeline_stored_descriptions, shader_translations_needed);
+                     aot_descriptions, shader_translations_needed);
   }
 
   // Translate shader modifications needed for stored pipelines.
@@ -768,22 +776,23 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
   LoadVkPipelineCache();
 
   // Create the pipelines.
-  std::vector<PipelineCreationArguments> pipeline_creations;
+  std::vector<PipelineCreationArguments> pipeline_creations, aot_creations;
   pipeline_creations.reserve(pipeline_stored_descriptions.size());
-  for (const PipelineStoredDescription& pipeline_stored_description :
-       pipeline_stored_descriptions) {
+  aot_creations.reserve(aot_descriptions.size());
+  auto add_creation = [&](const PipelineStoredDescription& pipeline_stored_description,
+                          std::vector<PipelineCreationArguments>& creations) {
     const PipelineDescription& pipeline_description = pipeline_stored_description.description;
 
     auto find_it = pipelines_.find(pipeline_description);
     if (find_it != pipelines_.end()) {
-      continue;
+      return;
     }
     auto& pipeline = *pipelines_.emplace(pipeline_description, Pipeline()).first;
     PipelineCreationArguments creation_arguments;
     if (!TryGetPipelineCreationArgumentsForDescription(pipeline_description, &pipeline,
                                                        creation_arguments)) {
       pipelines_.erase(pipeline_description);
-      continue;
+      return;
     }
     uint32_t bound_rts = 0;
     for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
@@ -800,7 +809,13 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
                                    : pipeline_description.depth_write_enable != 0;
     creation_arguments.priority = pipeline_util::CalculatePipelinePriority(
         bound_rts, shader_writes_color_targets, shader_writes_depth);
-    pipeline_creations.push_back(creation_arguments);
+    creations.push_back(creation_arguments);
+  };
+  for (const PipelineStoredDescription& stored : pipeline_stored_descriptions) {
+    add_creation(stored, pipeline_creations);
+  }
+  for (const PipelineStoredDescription& stored : aot_descriptions) {
+    add_creation(stored, aot_creations);
   }
   for (const SpecializedStoredDescription& stored : specialized_stored_descriptions) {
     SpecializedKey key{stored.description, {}};
@@ -823,8 +838,15 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     pipeline_creations.push_back(creation_arguments);
   }
 
-  if (!pipeline_creations.empty() && REXCVAR_GET(vulkan_pipeline_prewarm_background)) {
-    StartBackgroundPrewarm(std::move(pipeline_creations));
+  // Stored pipelines first; a pipeline seen before is likelier needed soon.
+  if (REXCVAR_GET(vulkan_pipeline_prewarm_background)) {
+    pipeline_creations.insert(pipeline_creations.end(), aot_creations.begin(),
+                              aot_creations.end());
+    aot_creations.clear();
+    if (!pipeline_creations.empty()) {
+      StartBackgroundPrewarm(std::move(pipeline_creations),
+                             REXCVAR_GET(vulkan_pipeline_creation_threads));
+    }
     pipeline_creations.clear();
   }
   if (!pipeline_creations.empty()) {
@@ -892,6 +914,11 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
       startup_loading_ = false;
     }
   }
+  // The ahead-of-time list is several thousand pipelines, too many to build
+  // before the title starts on a phone.
+  if (!aot_creations.empty()) {
+    StartBackgroundPrewarm(std::move(aot_creations), REXCVAR_GET(vulkan_aot_prewarm_threads));
+  }
 
   // If any pipeline descriptions were corrupted (or the whole file has excess
   // bytes in the end), truncate to the last valid pipeline description.
@@ -919,7 +946,7 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
 }
 
 void VulkanPipelineCache::StartBackgroundPrewarm(
-    std::vector<PipelineCreationArguments> creations) {
+    std::vector<PipelineCreationArguments> creations, int32_t threads) {
   auto prewarm = std::make_unique<BackgroundPrewarm>();
   prewarm->creations = std::move(creations);
   const size_t count = prewarm->creations.size();
@@ -935,11 +962,10 @@ void VulkanPipelineCache::StartBackgroundPrewarm(
     logical_processor_count = 6;
   }
   size_t thread_count;
-  if (REXCVAR_GET(vulkan_pipeline_creation_threads) < 0) {
+  if (threads < 0) {
     thread_count = std::max(logical_processor_count * 3 / 4, uint32_t(1));
   } else {
-    thread_count = std::clamp(uint32_t(REXCVAR_GET(vulkan_pipeline_creation_threads)),
-                              uint32_t(1), logical_processor_count);
+    thread_count = std::clamp(uint32_t(threads), uint32_t(1), logical_processor_count);
   }
   thread_count = std::min(thread_count, count);
   background_prewarm_ = std::move(prewarm);

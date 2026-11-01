@@ -431,7 +431,8 @@ class VulkanPipelineCache {
   bool EnsurePipelineCreated(const PipelineCreationArguments& creation_arguments,
                              VkShaderModule fragment_shader_override = VK_NULL_HANDLE);
   void CreationThread(size_t thread_index);
-  void StartBackgroundPrewarm(std::vector<PipelineCreationArguments> creations);
+  void StartBackgroundPrewarm(std::vector<PipelineCreationArguments> creations,
+                              int32_t threads);
   // Creates the stored pipeline at the index, or waits for the thread that
   // already is.
   void RunBackgroundPrewarmEntry(size_t index);
