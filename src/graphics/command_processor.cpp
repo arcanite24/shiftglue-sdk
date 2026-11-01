@@ -20,8 +20,10 @@
 #include <iterator>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <xxhash.h>
 
 #include <rex/cvar.h>
@@ -67,6 +69,12 @@ REXCVAR_DEFINE_INT32(gpu_trace_bins_vblank, -1, "GPU",
                      "resolves (-1: off)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+REXCVAR_DEFINE_BOOL(gpu_log_shader_sources, false, "GPU",
+                    "Diagnostics: log each guest shader the first time a session loads it, "
+                    "with its hash, guest address and the memory around it, to find where "
+                    "the title keeps or builds its shaders")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 #if defined(REXGLUE_ENABLE_CS_PROBES)
 REXCVAR_DECLARE(bool, gpu_async_fence_probe);
 REXCVAR_DEFINE_BOOL(gpu_async_fence_completion, false, "GPU",
@@ -3774,6 +3782,20 @@ void CommandProcessor::LoadGuestShader(xenos::ShaderType shader_type, uint32_t a
                                        uint32_t size_dwords) {
   const uint32_t* ucode = memory_->TranslatePhysical<uint32_t*>(addr);
   d3d_skipped_load_[shader_type == xenos::ShaderType::kPixel].valid = false;
+  if (REXCVAR_GET(gpu_log_shader_sources)) {
+    // Decoder thread only.
+    static std::unordered_set<uint64_t> logged;
+    const uint64_t hash = XXH3_64bits(ucode, size_t(size_dwords) * sizeof(uint32_t));
+    if (logged.insert(hash).second) {
+      constexpr uint32_t kBefore = 1024, kAfter = 256;
+      const uint32_t start = addr >= kBefore ? addr - kBefore : 0;
+      const auto* context = memory_->TranslatePhysical<const uint8_t*>(start);
+      const size_t length = (addr - start) + size_t(size_dwords) * 4 + kAfter;
+      REXGPU_INFO("Shader source: {} {:016X} at {:08X}, {} dwords, from {:08X} {:02X}",
+                  shader_type == xenos::ShaderType::kPixel ? "pixel" : "vertex", hash, addr,
+                  size_dwords, start, fmt::join(context, context + length, ""));
+    }
+  }
   if (d3d_list_verify_depth_ == trace_ib_depth_) {
     D3dListVerifyLoad(uint32_t(shader_type), addr, size_dwords);
   }
