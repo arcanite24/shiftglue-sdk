@@ -93,6 +93,22 @@ REXCVAR_DEFINE_BOOL(vulkan_pipeline_prewarm_background, REX_PLATFORM_MAC, "GPU/V
                     "commands thread, or waits for the thread building it")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// AOT-3: the specialized variants depend on the textures a draw binds, so a
+// list built ahead of play holds the pipelines without them. Their shaders
+// read the same signs from the system constants instead, so drawing with
+// one is correct, a few instructions slower per texture fetch.
+REXCVAR_DEFINE_BOOL(vulkan_signs_generic_fallback, true, "GPU/Vulkan",
+                    "With spirv_specialize_texture_signs, a draw whose texture-sign variant is "
+                    "not built yet uses the stored pipeline without the specialization when that "
+                    "one is built, instead of waiting for the variant")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(vulkan_aot_pipelines, true, "GPU/Vulkan",
+                    "Also build the pipelines listed in <title>.fbo.aot.xpso, which the "
+                    "launcher writes ahead of play from the player's disc, behind the title "
+                    "with the stored ones")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(vulkan_async_pipeline_no_placeholder, REX_PLATFORM_ANDROID, "GPU/Vulkan",
                     "With async_shader_compilation, never build a pipeline on the GPU commands "
                     "thread nor wait for one: a draw whose pipeline is not ready is skipped (the "
@@ -719,6 +735,11 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
            shader_storage_file_);
   }
 
+  if (!edram_fragment_shader_interlock && REXCVAR_GET(vulkan_aot_pipelines)) {
+    LoadAotPipelines(shader_storage_shareable_root / fmt::format("{:08X}.fbo.aot.xpso", title_id),
+                     pipeline_stored_descriptions, shader_translations_needed);
+  }
+
   // Translate shader modifications needed for stored pipelines.
   StopTranslationThread();
   for (const std::pair<uint64_t, uint64_t>& translation_needed : shader_translations_needed) {
@@ -790,6 +811,7 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     }
     entry->second = std::make_unique<std::pair<const PipelineDescription, Pipeline>>(
         stored.description, Pipeline());
+    entry->second->second.generic = FindSignsGenericFallback(stored.description);
     PipelineCreationArguments creation_arguments;
     if (!TryGetPipelineCreationArgumentsForDescription(stored.description, entry->second.get(),
                                                        creation_arguments)) {
@@ -1640,13 +1662,19 @@ bool VulkanPipelineCache::ConfigurePipeline(
                                        no_placeholder_ &&
                                        pipeline_handle_out;
     auto [entry, inserted] = specialized_pipelines_.try_emplace(key);
-    if (!inserted && entry->second->second.pipeline.load(std::memory_order_acquire) ==
-                         VK_NULL_HANDLE) {
+    if (!inserted &&
+        entry->second->second.pipeline.load(std::memory_order_acquire) == VK_NULL_HANDLE &&
+        !IsBuilt(entry->second->second.generic)) {
       AwaitBackgroundPrewarm(entry->second->second);
     }
     if (inserted) {
       entry->second = std::make_unique<std::pair<const PipelineDescription, Pipeline>>(
           description, Pipeline());
+      entry->second->second.generic = FindSignsGenericFallback(description);
+      REXGPU_INFO("First draw with pipeline VS {:016X} PS {:016X} (texture-sign variant, {})",
+                  description.vertex_shader_hash, description.pixel_shader_hash,
+                  IsBuilt(entry->second->second.generic) ? "drawn unspecialized while it builds"
+                                                         : "nothing built to draw with");
       PipelineCreationArguments creation_arguments;
       if (!TryGetPipelineCreationArgumentsForDescription(description, entry->second.get(),
                                                          creation_arguments)) {
@@ -1699,6 +1727,12 @@ bool VulkanPipelineCache::ConfigurePipeline(
     pipeline_layout_out = specialized.pipeline_layout.load(std::memory_order_acquire);
     if (pipeline_handle_out) {
       *pipeline_handle_out = &specialized;
+    }
+    if (pipeline_out == VK_NULL_HANDLE && IsBuilt(specialized.generic)) {
+      // The handle resolves to the variant once a worker has built it.
+      pipeline_out = specialized.generic->pipeline.load(std::memory_order_acquire);
+      pipeline_layout_out = specialized.generic->pipeline_layout.load(std::memory_order_acquire);
+      return true;
     }
     if (pipeline_out == VK_NULL_HANDLE && use_async_specialized &&
         specialized.is_placeholder.load(std::memory_order_acquire)) {
@@ -1779,6 +1813,8 @@ bool VulkanPipelineCache::ConfigurePipeline(
   }
 
   // Create the pipeline if not already existing.
+  REXGPU_INFO("First draw with pipeline VS {:016X} PS {:016X}", description.vertex_shader_hash,
+              description.pixel_shader_hash);
   auto& pipeline = *pipelines_.emplace(description, Pipeline()).first;
   PipelineCreationArguments creation_arguments_real;
   if (!TryGetPipelineCreationArgumentsForDescription(description, &pipeline,
@@ -1890,10 +1926,103 @@ void VulkanPipelineCache::GetPipelineAndLayoutByHandle(
   }
   const auto* pipeline = reinterpret_cast<const Pipeline*>(handle);
   pipeline_out = pipeline->pipeline.load(std::memory_order_acquire);
+  if (pipeline_out == VK_NULL_HANDLE && IsBuilt(pipeline->generic)) {
+    pipeline = pipeline->generic;
+    pipeline_out = pipeline->pipeline.load(std::memory_order_acquire);
+  }
   pipeline_layout_out = pipeline->pipeline_layout.load(std::memory_order_acquire);
   if (is_placeholder_out) {
     *is_placeholder_out = pipeline->is_placeholder.load(std::memory_order_acquire);
   }
+}
+
+// AOT-4: written ahead of play (tools/fh1_aot_pipelines.py): a header
+// ('XEAO', the description version, shader and pipeline counts), the
+// shaders as .xsh records, then the descriptions in the portable 58-byte
+// layout: the bitfields packed without padding, as clang lays them out.
+void VulkanPipelineCache::LoadAotPipelines(
+    const std::filesystem::path& path, std::vector<PipelineStoredDescription>& descriptions,
+    std::set<std::pair<uint64_t, uint64_t>>& translations_needed) {
+  static_assert(sizeof(PipelineDescription) == 58 || sizeof(PipelineDescription) == 60);
+  FILE* file = rex::filesystem::OpenFile(path, "rb");
+  if (!file) {
+    return;
+  }
+  struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t shader_count;
+    uint32_t pipeline_count;
+  } header;
+  size_t shader_count = 0, kept = 0, missing = 0;
+  if (fread(&header, sizeof(header), 1, file) && header.magic == 0x4F414558 &&
+      header.version == PipelineDescription::kVersion) {
+    ShaderStoredHeader shader_header;
+    std::vector<uint32_t> ucode;
+    for (uint32_t i = 0; i < header.shader_count; ++i) {
+      if (!fread(&shader_header, sizeof(shader_header), 1, file)) {
+        break;
+      }
+      ucode.resize(shader_header.ucode_dword_count);
+      if (!fread(ucode.data(), ucode.size() * sizeof(uint32_t), 1, file)) {
+        break;
+      }
+      const uint64_t hash = XXH3_64bits(ucode.data(), ucode.size() * sizeof(uint32_t));
+      if (hash != shader_header.ucode_data_hash) {
+        continue;
+      }
+      LoadShader(shader_header.type, ucode.data(), uint32_t(ucode.size()), hash);
+      ++shader_count;
+    }
+    uint8_t record[58];
+    for (uint32_t i = 0; i < header.pipeline_count && fread(record, sizeof(record), 1, file);
+         ++i) {
+      PipelineStoredDescription stored;
+      auto* bytes = reinterpret_cast<uint8_t*>(&stored.description);
+      // Hashes, modifications, render pass key and the first 32 bits; MSVC
+      // starts the remaining 15 in a new 32-bit unit.
+      std::memcpy(bytes, record, 42);
+      std::memcpy(bytes + sizeof(PipelineDescription) - 16, record + 42, 16);
+      const PipelineDescription& description = stored.description;
+      if (shaders_.find(description.vertex_shader_hash) == shaders_.end() ||
+          (description.pixel_shader_hash &&
+           shaders_.find(description.pixel_shader_hash) == shaders_.end())) {
+        ++missing;
+        continue;
+      }
+      if (!ArePipelineRequirementsMet(description)) {
+        continue;
+      }
+      stored.description_hash = description.GetHash();
+      descriptions.push_back(stored);
+      translations_needed.emplace(description.vertex_shader_hash,
+                                  description.vertex_shader_modification);
+      if (description.pixel_shader_hash) {
+        translations_needed.emplace(description.pixel_shader_hash,
+                                    description.pixel_shader_modification);
+      }
+      ++kept;
+    }
+  }
+  fclose(file);
+  REXGPU_INFO("VulkanPipelineCache: {} ahead-of-time pipelines from {} ({} shaders, {} pipelines "
+              "without their shaders)",
+              kept, rex::path_to_utf8(path), shader_count, missing);
+}
+
+bool VulkanPipelineCache::IsBuilt(const Pipeline* pipeline) {
+  return pipeline && pipeline->pipeline.load(std::memory_order_acquire) != VK_NULL_HANDLE &&
+         pipeline->pipeline_layout.load(std::memory_order_acquire) != nullptr;
+}
+
+const VulkanPipelineCache::Pipeline* VulkanPipelineCache::FindSignsGenericFallback(
+    const PipelineDescription& description) const {
+  if (!REXCVAR_GET(vulkan_signs_generic_fallback)) {
+    return nullptr;
+  }
+  // The map's nodes stay put while it grows.
+  auto it = pipelines_.find(description);
+  return it != pipelines_.end() ? &it->second : nullptr;
 }
 
 VkPipeline VulkanPipelineCache::AwaitPipeline(void* handle, int32_t wait_ms,

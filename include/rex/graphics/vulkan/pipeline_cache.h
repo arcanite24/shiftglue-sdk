@@ -272,13 +272,17 @@ class VulkanPipelineCache {
     // destroyed by it while the pipeline cache is active.
     std::atomic<const PipelineLayoutProvider*> pipeline_layout{nullptr};
     std::atomic<bool> is_placeholder{false};
+    // A texture-sign variant's pipeline without the specialization, drawn
+    // with while the variant is built (vulkan_signs_generic_fallback).
+    const Pipeline* generic = nullptr;
     Pipeline() = default;
     Pipeline(const PipelineLayoutProvider* pipeline_layout_provider)
         : pipeline_layout(pipeline_layout_provider) {}
     Pipeline(const Pipeline& other)
         : pipeline(other.pipeline.load(std::memory_order_acquire)),
           pipeline_layout(other.pipeline_layout.load(std::memory_order_acquire)),
-          is_placeholder(other.is_placeholder.load(std::memory_order_acquire)) {}
+          is_placeholder(other.is_placeholder.load(std::memory_order_acquire)),
+          generic(other.generic) {}
     Pipeline& operator=(const Pipeline& other) {
       if (this == &other) {
         return *this;
@@ -288,9 +292,16 @@ class VulkanPipelineCache {
                             std::memory_order_release);
       is_placeholder.store(other.is_placeholder.load(std::memory_order_acquire),
                            std::memory_order_release);
+      generic = other.generic;
       return *this;
     }
   };
+
+  static bool IsBuilt(const Pipeline* pipeline);
+  void LoadAotPipelines(const std::filesystem::path& path,
+                        std::vector<PipelineStoredDescription>& descriptions,
+                        std::set<std::pair<uint64_t, uint64_t>>& translations_needed);
+  const Pipeline* FindSignsGenericFallback(const PipelineDescription& description) const;
 
   // Description that can be passed from the command processor thread to the
   // creation threads, with everything needed from caches pre-looked-up.
