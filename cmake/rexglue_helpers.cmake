@@ -55,6 +55,14 @@ function(_rexglue_stage_fidelityfx_runtime target_name)
         endif()
         return()
     endif()
+    # An installed SDK may carry the library prebuilt (REXGLUE_FFX_RUNTIME_LIBRARY
+    # and its REXGLUE_FFX_LICENSE), as the game's prebuilt kit does.
+    if(REXGLUE_FIDELITYFX_RUNTIME AND REXGLUE_USE_VULKAN AND NOT ANDROID
+       AND REXGLUE_FFX_RUNTIME_LIBRARY AND REXGLUE_FFX_LICENSE)
+        _rexglue_stage_upscaler_files(${target_name} "fidelityfx/1.1.4"
+            "${REXGLUE_FFX_RUNTIME_LIBRARY}" "${REXGLUE_FFX_LICENSE}")
+        return()
+    endif()
     if(NOT REXGLUE_FIDELITYFX_RUNTIME OR ANDROID OR NOT REXGLUE_USE_VULKAN
        OR NOT REXGLUE_FFX_API_INCLUDE_DIR OR NOT EXISTS "${_source}/CMakeLists.txt"
        OR TARGET rexglue_fidelityfx_runtime)
