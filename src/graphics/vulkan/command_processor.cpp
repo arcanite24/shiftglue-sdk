@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -9413,6 +9414,16 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
     viewport.x -= float(pa_sc_window_offset.window_x_offset * int32_t(draw_resolution_scale_x));
     viewport.y += float(untile_rows * int32_t(draw_resolution_scale_y));
   }
+  // fh1_debug_raster_percent: the draw rasterizes a top-left share of its
+  // target (RS-0.3 probe; the image is wrong).
+  const float raster_fraction =
+      fh1_native_executor_ ? fh1_native_executor_->draw_raster_fraction() : 1.0f;
+  if (raster_fraction < 1.0f) {
+    viewport.x *= raster_fraction;
+    viewport.y *= raster_fraction;
+    viewport.width *= raster_fraction;
+    viewport.height *= raster_fraction;
+  }
   SetViewport(viewport);
 
   // Scissor.
@@ -9440,6 +9451,18 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
   scissor_rect.offset.y = int32_t(scissor.offset[1]);
   scissor_rect.extent.width = scissor.extent[0];
   scissor_rect.extent.height = scissor.extent[1];
+  if (raster_fraction < 1.0f) {
+    const int32_t left = int32_t(std::floor(float(scissor_rect.offset.x) * raster_fraction));
+    const int32_t top = int32_t(std::floor(float(scissor_rect.offset.y) * raster_fraction));
+    const int32_t right = int32_t(std::ceil(
+        float(scissor_rect.offset.x + int32_t(scissor_rect.extent.width)) * raster_fraction));
+    const int32_t bottom = int32_t(std::ceil(
+        float(scissor_rect.offset.y + int32_t(scissor_rect.extent.height)) * raster_fraction));
+    scissor_rect.offset.x = left;
+    scissor_rect.offset.y = top;
+    scissor_rect.extent.width = uint32_t(std::max(right - left, 0));
+    scissor_rect.extent.height = uint32_t(std::max(bottom - top, 0));
+  }
   SetScissor(scissor_rect);
 
   if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {

@@ -137,6 +137,16 @@ REXCVAR_DEFINE_STRING(fh1_coarse_shading, "", "GPU",
                       "VK_KHR_fragment_shading_rate (vulkan_fragment_shading_rate), as "
                       "comma-separated rendering=WxH entries, the rendering named as in the GPU "
                       "profile (such as 0/16/1x/d1+720/16/1x/c0=2x2)");
+REXCVAR_DEFINE_INT32(fh1_debug_raster_percent, 100, "GPU",
+                     "Diagnostics (RS-0.3): draws into surfaces whose pitch is listed in "
+                     "fh1_debug_raster_pitches rasterize only this percentage of their "
+                     "viewport and scissor, in the top-left corner (wrong image), to measure "
+                     "what rendering below 1x would save")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(fh1_debug_raster_pitches, "16", "GPU",
+                      "Diagnostics: comma-separated surface pitches in 32bpp tiles, as in the GPU "
+                      "profile's rendering names, that fh1_debug_raster_percent shrinks")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_debug_skip_clears, false, "GPU",
                     "Diagnostics: skip every EDRAM clear (wrong image), to bound what clears "
                     "cost")
@@ -2410,6 +2420,19 @@ bool Fh1NativeExecutor::BindTargets(VulkanRenderTargetCache::RenderPassKey& key_
   // Every used surface was bound, so this is the bound surfaces' scope.
   bound_rendering_id_ = rendering_id;
   if (!used_bits) Count("draw_writes_nothing");
+  draw_raster_fraction_ = 1.0f;
+  const int32_t raster_percent = REXCVAR_GET(fh1_debug_raster_percent);
+  if (raster_percent > 0 && raster_percent < 100 && !shared_depth_alias_draw_) {
+    const std::string pitches = "," + REXCVAR_GET(fh1_debug_raster_pitches) + ",";
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if ((bound_bits_ & (1u << i)) &&
+          pitches.find("," + std::to_string(keys[i].pitch_tiles) + ",") != std::string::npos) {
+        draw_raster_fraction_ = float(raster_percent) * 0.01f;
+        Count("draw_raster_fraction");
+        break;
+      }
+    }
+  }
   draw_shading_rate_ = {1, 1};
   if (!coarse_shading_.empty()) {
     const uint64_t id = rendering_id;

@@ -108,6 +108,9 @@ class Fh1NativeExecutor {
   // After BindTargets: the draw's fragment shading rate, coarser than 1x1 in
   // the renderings fh1_coarse_shading names.
   VkExtent2D draw_shading_rate() const { return draw_shading_rate_; }
+  // After BindTargets: the share of the viewport the draw rasterizes
+  // (fh1_debug_raster_percent; 1 otherwise).
+  float draw_raster_fraction() const { return draw_raster_fraction_; }
   // Enters dynamic rendering with the bound surfaces (after all barriers).
   void BeginDrawRendering();
   // Local one-frame shader identities and the actual bound render surfaces.
@@ -693,6 +696,7 @@ class Fh1NativeExecutor {
   std::vector<std::pair<std::string, VkExtent2D>> coarse_shading_;
   std::unordered_map<uint64_t, VkExtent2D> shading_rate_by_rendering_;
   VkExtent2D draw_shading_rate_ = {1, 1};
+  float draw_raster_fraction_ = 1.0f;
   // Identifies the attachments of the current dynamic rendering scope for the
   // command processor (0: none).
   uint64_t rendering_id_ = 0;
