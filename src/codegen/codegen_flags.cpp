@@ -17,7 +17,10 @@
 // Codegen/Output
 //=============================================================================
 
-REXCVAR_DEFINE_UINT32(max_file_size_bytes, 1048576, "Codegen",
+// 4 MiB: each file includes the same large header, so fewer files compile
+// faster (FH1, 1 to 4 MiB: 172 to 146 s on 4 jobs, 80 to 74 s on 16) while
+// 16 jobs still have work to the end.
+REXCVAR_DEFINE_UINT32(max_file_size_bytes, 4194304, "Codegen",
                       "Target source file size in bytes; sets how many recomp files a project "
                       "is split into, chosen once and then persisted")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly)
