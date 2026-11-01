@@ -137,6 +137,12 @@ REXCVAR_DEFINE_STRING(fh1_coarse_shading, "", "GPU",
                       "VK_KHR_fragment_shading_rate (vulkan_fragment_shading_rate), as "
                       "comma-separated rendering=WxH entries, the rendering named as in the GPU "
                       "profile (such as 0/16/1x/d1+720/16/1x/c0=2x2)");
+REXCVAR_DEFINE_INT32(fh1_debug_attachment_ops, 0, "GPU",
+                     "Diagnostics: draw renderings drop attachment loads (1), stores of "
+                     "MSAA attachments (2) or depth stores (4); wrong image, bounds what "
+                     "load and store ops could save on a tiled GPU")
+    .range(0, 7)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(fh1_debug_raster_percent, 100, "GPU",
                      "Diagnostics (RS-0.3): draws into surfaces whose pitch is listed in "
                      "fh1_debug_raster_pitches rasterize only this percentage of their "
@@ -2594,6 +2600,13 @@ void Fh1NativeExecutor::BeginDrawRendering() {
     attachment.resolveMode = VK_RESOLVE_MODE_NONE;
     attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    {
+      static const int32_t debug_ops = REXCVAR_GET(fh1_debug_attachment_ops);
+      if (debug_ops & 1) attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+      if (((debug_ops & 2) && surface->samples > 1) || ((debug_ops & 4) && !i)) {
+        attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+      }
+    }
     if (i) color_count = i;
     width = std::min(width, surface->width * scale_);
     height = std::min(height, surface->image_height * scale_);
