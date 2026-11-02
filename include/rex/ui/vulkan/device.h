@@ -206,6 +206,9 @@ class VulkanDevice {
     uint32_t maxPerStageDescriptorUpdateAfterBindSampledImages = 0;
     uint32_t maxPerStageDescriptorUpdateAfterBindSamplers = 0;
     uint32_t maxUpdateAfterBindDescriptorsInAllPools = 0;
+    // Vulkan 1.1 (maintenance3): descriptors one set layout may hold in all;
+    // 0 when not reported (1.0 devices).
+    uint32_t maxPerSetDescriptors = 0;
   };
 
   // Properties of the core API and enabled extensions, and enabled features.

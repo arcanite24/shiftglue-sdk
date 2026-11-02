@@ -950,6 +950,19 @@ bool VulkanTextureCache::InitializeBindless() {
   bindless_.capacity[SpirvShaderTranslator::kBindlessBindingSamplers] =
       std::min({properties.maxPerStageDescriptorUpdateAfterBindSamplers,
                 properties.maxDescriptorSetUpdateAfterBindSamplers, sampler_max_count_ + 1});
+  // The whole set must also fit maxPerSetDescriptors. Mali (G720) reports
+  // 500,000 update-after-bind samplers and the same per-set total, so the
+  // views plus that many samplers went over; the layout was still created and
+  // the driver crashed recording draws. The samplers give way.
+  if (properties.maxPerSetDescriptors) {
+    const uint32_t views = bindless_.capacity[SpirvShaderTranslator::kBindlessBindingImages3D] +
+                           bindless_.capacity[SpirvShaderTranslator::kBindlessBindingImagesCube] +
+                           bindless_.capacity[SpirvShaderTranslator::kBindlessBindingImages2DArray];
+    uint32_t& samplers = bindless_.capacity[SpirvShaderTranslator::kBindlessBindingSamplers];
+    samplers = std::min(samplers, properties.maxPerSetDescriptors > views
+                                      ? properties.maxPerSetDescriptors - views
+                                      : 0);
+  }
   if (bindless_.capacity[SpirvShaderTranslator::kBindlessBindingImages2DArray] < 4096 ||
       bindless_.capacity[SpirvShaderTranslator::kBindlessBindingSamplers] < 256) {
     REXGPU_WARN("VulkanTextureCache: Device limits too small for bindless textures");
