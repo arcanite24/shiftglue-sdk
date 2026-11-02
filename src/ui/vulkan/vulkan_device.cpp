@@ -38,6 +38,10 @@ REXCVAR_DEFINE_BOOL(vulkan_pipeline_statistics, false, "UI/Vulkan",
                     "spills) for every graphics pipeline, where the driver reports them "
                     "through VK_KHR_pipeline_executable_properties")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(vulkan_image_compression_report, false, "UI/Vulkan",
+                    "Diagnostics: log once per kind of texture and render target whether the "
+                    "driver compresses it (VK_EXT_image_compression_control, Arm AFBC)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_fragment_shading_rate, REX_PLATFORM_LINUX, "UI/Vulkan",
                     "Enable VK_KHR_fragment_shading_rate where the device has it, so chosen "
                     "passes may be shaded once per 2x2 pixels (fh1_coarse_shading)")
@@ -493,6 +497,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       // #270.
       XE_UI_VULKAN_STRUCT_EXTENSION(KHR_pipeline_executable_properties)
     }
+    if (get_physical_device_properties2_supported &&
+        REXCVAR_GET(vulkan_image_compression_report)) {
+      // #339.
+      XE_UI_VULKAN_STRUCT_EXTENSION(EXT_image_compression_control)
+    }
     if (REXCVAR_GET(vulkan_diagnostic_checkpoints)) {
       // #207.
       XE_UI_VULKAN_STRUCT_EXTENSION(NV_device_diagnostic_checkpoints)
@@ -629,6 +638,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceFragmentShadingRateFeaturesKHR,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR>
       features_KHR_fragment_shading_rate;
+  VulkanFeatures<VkPhysicalDeviceImageCompressionControlFeaturesEXT,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_COMPRESSION_CONTROL_FEATURES_EXT>
+      features_EXT_image_compression_control;
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -694,6 +706,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (device->extensions_.ext_KHR_fragment_shading_rate) {
       features_KHR_fragment_shading_rate.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_EXT_image_compression_control) {
+      features_EXT_image_compression_control.Link(supported_features_2, device_create_info);
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
@@ -1090,6 +1105,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (device->extensions_.ext_KHR_fragment_shading_rate) {
     XE_UI_VULKAN_FEATURE_2(features_KHR_fragment_shading_rate, pipelineFragmentShadingRate)
   }
+  if (device->extensions_.ext_EXT_image_compression_control) {
+    XE_UI_VULKAN_FEATURE_2(features_EXT_image_compression_control, imageCompressionControl)
+  }
 
 #undef XE_UI_VULKAN_LIMIT
 #undef XE_UI_VULKAN_ENUM_LIMIT
@@ -1224,6 +1242,51 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
 
   return device;
+}
+
+void VulkanDevice::ReportImageCompression(VkImage image, const VkImageCreateInfo& info,
+                                          const char* what) const {
+  if (!extensions_.ext_EXT_image_compression_control || image == VK_NULL_HANDLE) {
+    return;
+  }
+  uint64_t key = uint64_t(info.format) | (uint64_t(info.usage & 0xFFFF) << 32) |
+                 (uint64_t(info.flags & 0xFF) << 48) | (uint64_t(info.mipLevels > 1) << 56);
+  for (const char* c = what; *c; ++c) key = key * 31 + uint8_t(*c);
+  {
+    std::lock_guard<std::mutex> lock(image_compression_reported_mutex_);
+    for (uint64_t reported : image_compression_reported_) {
+      if (reported == key) return;
+    }
+    image_compression_reported_.push_back(key);
+  }
+  static const auto get_layout = PFN_vkGetImageSubresourceLayout2EXT(
+      vulkan_instance_->functions().vkGetDeviceProcAddr(device_, "vkGetImageSubresourceLayout2EXT"));
+  if (!get_layout) {
+    return;
+  }
+  VkImageSubresource2EXT subresource = {VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2_EXT};
+  const bool is_depth = info.format == VK_FORMAT_D24_UNORM_S8_UINT ||
+                        info.format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+                        info.format == VK_FORMAT_D32_SFLOAT || info.format == VK_FORMAT_D16_UNORM;
+  subresource.imageSubresource.aspectMask =
+      is_depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+  VkImageCompressionPropertiesEXT compression = {
+      VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_PROPERTIES_EXT};
+  VkSubresourceLayout2EXT layout = {VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2_EXT};
+  layout.pNext = &compression;
+  get_layout(device_, image, &subresource, &layout);
+  const char* state =
+      compression.imageCompressionFlags & VK_IMAGE_COMPRESSION_DISABLED_EXT ? "uncompressed"
+      : compression.imageCompressionFlags & VK_IMAGE_COMPRESSION_FIXED_RATE_EXPLICIT_EXT
+          ? "fixed-rate"
+          : compression.imageCompressionFlags & VK_IMAGE_COMPRESSION_FIXED_RATE_DEFAULT_EXT
+              ? "fixed-rate"
+              : "default (compressed where eligible)";
+  REXLOG_INFO("Image compression: {} format {} usage 0x{:X} flags 0x{:X} {}x{} levels {}: {} "
+              "(flags 0x{:X})",
+              what, uint32_t(info.format), uint32_t(info.usage), uint32_t(info.flags),
+              info.extent.width, info.extent.height, info.mipLevels, state,
+              uint32_t(compression.imageCompressionFlags));
 }
 
 VulkanDevice::~VulkanDevice() {

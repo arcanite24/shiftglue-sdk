@@ -956,6 +956,8 @@ bool Fh1NativeExecutor::CreateSurfaceImage(Surface& surface) {
     view_info.subresourceRange = {aspect, 0, 1, 0, 1};
     return dfn.vkCreateImageView(device, &view_info, nullptr, &view_out) == VK_SUCCESS;
   };
+  vulkan_device->ReportImageCompression(surface.image, image_info,
+                                        key.is_depth ? "depth surface" : "color surface");
   bool views_created;
   if (key.is_depth) {
     views_created =

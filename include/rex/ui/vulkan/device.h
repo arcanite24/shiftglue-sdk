@@ -192,6 +192,8 @@ class VulkanDevice {
     // rate, with vulkan_fragment_shading_rate.
 
     bool pipelineFragmentShadingRate = false;
+    // VK_EXT_image_compression_control (vulkan_image_compression_report).
+    bool imageCompressionControl = false;
 
     // Descriptor indexing (promoted to 1.2), for bindless textures
     // (RECORDER_PER_DRAW_BACKLOG PD-4). Enabled only on Vulkan 1.2+ devices.
@@ -252,6 +254,8 @@ class VulkanDevice {
     bool ext_KHR_pipeline_executable_properties = false;  // #270
     // Has optional features not implied by this being true.
     bool ext_KHR_fragment_shading_rate = false;  // #227
+    // Only with vulkan_image_compression_report.
+    bool ext_EXT_image_compression_control = false;  // #339
   };
 
   const Extensions& extensions() const { return extensions_; }
@@ -288,6 +292,13 @@ class VulkanDevice {
   };
 
   const Functions& functions() const { return functions_; }
+
+  // vulkan_image_compression_report: logs, once per kind of image (what,
+  // format, usage, flags, single or several levels), whether the driver
+  // compresses it (Arm AFBC and similar), through
+  // VK_EXT_image_compression_control. Does nothing otherwise.
+  void ReportImageCompression(VkImage image, const VkImageCreateInfo& info,
+                              const char* what) const;
 
   // vkWaitForFences until the fences signal or the device fails. Waits a
   // second at a time: an Adreno 830 driver (Snapdragon 8 Elite) returns
@@ -388,6 +399,9 @@ class VulkanDevice {
   uint32_t queue_family_sparse_binding_ = UINT32_MAX;
 
   MemoryTypes memory_types_;
+
+  mutable std::mutex image_compression_reported_mutex_;
+  mutable std::vector<uint64_t> image_compression_reported_;
 };
 
 }  // namespace vulkan

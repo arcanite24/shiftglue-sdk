@@ -575,6 +575,7 @@ VkResult VulkanTextureCache::CreateTextureImage(const VkImageCreateInfo& image_c
                                       &allocation, nullptr) == VK_SUCCESS) {
           if (vmaBindImageMemory(vma_allocator_, allocation, pool_image) == VK_SUCCESS) {
             image = pool_image;
+            vulkan_device->ReportImageCompression(image, image_create_info, "texture");
             return VK_SUCCESS;
           }
           vmaFreeMemory(vma_allocator_, allocation);
@@ -583,8 +584,13 @@ VkResult VulkanTextureCache::CreateTextureImage(const VkImageCreateInfo& image_c
       dfn.vkDestroyImage(device, pool_image, nullptr);
     }
   }
-  return vmaCreateImage(vma_allocator_, &image_create_info, &allocation_create_info, &image,
-                        &allocation, nullptr);
+  const VkResult result = vmaCreateImage(vma_allocator_, &image_create_info,
+                                         &allocation_create_info, &image, &allocation, nullptr);
+  if (result == VK_SUCCESS) {
+    command_processor_.GetVulkanDevice()->ReportImageCompression(image, image_create_info,
+                                                                 "texture");
+  }
+  return result;
 }
 
 void VulkanTextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_index) {
