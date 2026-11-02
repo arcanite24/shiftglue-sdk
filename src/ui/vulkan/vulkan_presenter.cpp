@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -63,6 +64,15 @@ void SyncMacMetalLayerDrawableSize(const void* metal_layer, const VkExtent2D& ex
 }  // namespace
 #endif
 
+#if REX_PLATFORM_ANDROID
+REXCVAR_DEFINE_INT32(android_present_divisor, 0, "UI/Presenter",
+                     "Android: the swapchain is the display's size divided by this, and the "
+                     "display hardware scales it up (fewer pixels for the GPU to write each "
+                     "frame). 0 picks the largest whole divisor that still holds the game's "
+                     "output at the render scale; 1 is the display's size")
+    .range(0, 8)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#endif
 REXCVAR_DEFINE_BOOL(present_upscaler_profile, false, "UI/Presenter",
                     "Time the temporal upscaler on the GPU and log the mean of every 300 "
                     "upscales");
@@ -1585,6 +1595,34 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   // requirements - the maximum 2D framebuffer size on the specific physical
   // device, and the minimum swap chain size on the whole instance - fail to
   // create until the surface becomes smaller).
+#if REX_PLATFORM_ANDROID
+  // Android's swapchain scales its images to the window, so a smaller one
+  // costs no composition: on a Mali-G720 at 2960x1848, half the size saved
+  // 0.4-2 ms of GPU time a frame (MALI_BACKLOG MT-1.9 in Pinyon Shift).
+  {
+    uint32_t divisor = uint32_t(std::max(REXCVAR_GET(android_present_divisor), int32_t(0)));
+    if (!divisor) {
+      auto scale = [](const char* name) {
+        const std::string value = rex::cvar::GetFlagByName(name);
+        const uint32_t parsed = uint32_t(std::strtoul(value.c_str(), nullptr, 10));
+        return std::max(parsed, uint32_t(1));
+      };
+      const uint32_t output_long = 1280 * scale("draw_resolution_scale_x");
+      const uint32_t output_short = 720 * scale("draw_resolution_scale_y");
+      const uint32_t surface_long = std::max(width, height);
+      const uint32_t surface_short = std::min(width, height);
+      divisor = 1;
+      while (surface_long / (divisor + 1) >= output_long &&
+             surface_short / (divisor + 1) >= output_short) {
+        ++divisor;
+      }
+    }
+    if (divisor > 1) {
+      width = std::max(width / divisor, uint32_t(1));
+      height = std::max(height / divisor, uint32_t(1));
+    }
+  }
+#endif
   VkExtent2D max_framebuffer_extent = util::GetMax2DFramebufferExtent(vulkan_device->properties());
   VkExtent2D image_extent;
   image_extent.width = std::min(std::max(std::min(width, max_framebuffer_extent.width),
