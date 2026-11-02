@@ -54,6 +54,8 @@ class VulkanSharedMemory : public SharedMemory {
                                         uint32_t length_allocations) override;
 
   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
+  // The copies of an upload into the buffer, recorded at the end of the stream.
+  bool RecordUploadCopies(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges);
 
  private:
   void GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,

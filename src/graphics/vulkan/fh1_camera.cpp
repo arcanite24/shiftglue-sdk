@@ -272,15 +272,16 @@ uint32_t Fh1NativeExecutor::CurrentDepthKey() const {
   const auto depth_info = register_file_.Get<reg::RB_DEPTH_INFO>();
   const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
   const uint32_t msaa = uint32_t(surface_info.msaa_samples);
-  return MakeDepthKey(depth_info.depth_base, Fh1PitchTiles(surface_info.surface_pitch, msaa), msaa,
-                      depth_info.depth_format)
+  return StorageKey(MakeDepthKey(depth_info.depth_base,
+                                 Fh1PitchTiles(surface_info.surface_pitch, msaa), msaa,
+                                 depth_info.depth_format))
       .Pack();
 }
 
 int32_t Fh1NativeExecutor::ObjectRowOffset() const {
   if (untile_height_) return 0;
   return std::max(0, -int32_t(register_file_.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset)) *
-         int32_t(scale_);
+         int32_t(scale_y_);
 }
 
 uint64_t Fh1NativeExecutor::CurrentColorKey() const {
@@ -299,9 +300,11 @@ void Fh1NativeExecutor::AdvanceJitter() {
   camera_ready_.jitter_x = -jitter_x_;
   camera_ready_.jitter_y = -jitter_y_;
   if (jitter_phases_) {
-    jitter_index_ = (jitter_index_ + 1) % jitter_phases_;
-    jitter_x_ = Halton(jitter_index_ + 1, 2) - 0.5f;
-    jitter_y_ = Halton(jitter_index_ + 1, 3) - 0.5f;
+    // With SetStereoCamera, the sequence of the eye the next frame is for.
+    uint32_t& index = next_eye_ >= 0 ? jitter_index_eye_[next_eye_] : jitter_index_;
+    index = (index + 1) % jitter_phases_;
+    jitter_x_ = Halton(index + 1, 2) - 0.5f;
+    jitter_y_ = Halton(index + 1, 3) - 0.5f;
   } else {
     jitter_x_ = 0.0f;
     jitter_y_ = 0.0f;
@@ -319,13 +322,7 @@ bool Fh1NativeExecutor::GetSceneJitter(float& x, float& y) const {
     return true;
   }
   if (!draw_uses_camera_matrix_) return false;
-  const auto depth_info = register_file_.Get<reg::RB_DEPTH_INFO>();
-  const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
-  const uint32_t msaa = uint32_t(surface_info.msaa_samples);
-  if (MakeDepthKey(depth_info.depth_base, Fh1PitchTiles(surface_info.surface_pitch, msaa), msaa,
-                   depth_info.depth_format)
-              .Pack() != camera_scene_depth_ ||
-      CurrentColorKey() != camera_scene_color_) {
+  if (CurrentDepthKey() != camera_scene_depth_ || CurrentColorKey() != camera_scene_color_) {
     return false;
   }
   x = jitter_x_;
@@ -335,18 +332,38 @@ bool Fh1NativeExecutor::GetSceneJitter(float& x, float& y) const {
 
 void Fh1NativeExecutor::FinishCameraFrame() {
   camera_ready_valid_ = false;
+  lens_valid_ = false;
   camera_depth_dirty_ = false;
   std::vector<std::array<float, 16>> object_reprojections = std::move(object_reprojections_);
   object_reprojections_.clear();
   object_slot_by_matrix_.clear();
   object_occurrences_.clear();
-  object_previous_wvp_ = std::move(object_current_wvp_);
+  // This frame's object matrices: the next frame's previous ones, or with
+  // SetStereoCamera those of this frame's eye, and the other eye's become
+  // the next frame's.
+  std::unordered_map<uint64_t, std::array<float, 16>> finished_wvp =
+      std::move(object_current_wvp_);
   object_current_wvp_.clear();
+  auto finish_objects = [&](int eye) {
+    if (lens_eye_ && eye >= 0) {
+      object_wvp_eye_[eye] = std::move(finished_wvp);
+      next_eye_ = eye ^ 1;
+      object_previous_wvp_ = std::move(object_wvp_eye_[next_eye_]);
+    } else {
+      object_previous_wvp_ = std::move(finished_wvp);
+      next_eye_ = -1;
+    }
+  };
+  auto lose_eyes = [&] {
+    for (auto& objects : camera_previous_objects_eye_) objects.clear();
+    finish_objects(-1);
+  };
   object_reprojections_ready_.clear();
   if (!camera_tracking_enabled_ || camera_draws_.empty()) {
     camera_scene_depth_valid_ = false;
     camera_draws_.clear();
     camera_previous_objects_.clear();
+    lose_eyes();
     return;
   }
   // The scene's depth: the one most of the matrix draws test against.
@@ -386,6 +403,7 @@ void Fh1NativeExecutor::FinishCameraFrame() {
                        [](const auto& a, const auto& b) { return a.second < b.second; });
   if (world == groups.end() || world->second < kCameraMinWorldDraws) {
     camera_previous_objects_.clear();
+    lose_eyes();
     return;
   }
   const std::array<float, 16>& current = world->first;
@@ -397,9 +415,43 @@ void Fh1NativeExecutor::FinishCameraFrame() {
   const double w_length = RowLength(current, 3);
   if (y_scale <= 0.0 || w_length <= 0.0) {
     camera_previous_objects_ = std::move(objects);
+    lose_eyes();
     return;
   }
   camera.fov_y = float(2.0 * std::atan(1.0 / y_scale));
+  const int eye = lens_eye_ ? lens_eye_(camera.fov_y) : -1;
+  camera.eye = eye;
+  std::unordered_map<uint64_t, std::array<float, 16>>& previous_objects =
+      eye >= 0 ? camera_previous_objects_eye_[eye] : camera_previous_objects_;
+  // The OpenXR output reads the tag its host put in the field of view.
+  const double x_scale = RowLength(current, 0);
+  if (x_scale > 0.0) {
+    lens_fov_x_ = float(2.0 * std::atan(1.0 / x_scale));
+    lens_fov_y_ = camera.fov_y;
+    lens_valid_ = true;
+    // The camera: the point the x, y and w rows send to 0.
+    const double a[3][3] = {{current[0], current[1], current[2]},
+                            {current[4], current[5], current[6]},
+                            {current[12], current[13], current[14]}};
+    const double b[3] = {-current[3], -current[7], -current[15]};
+    auto det3 = [](const double m[3][3]) {
+      return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+             m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+             m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    };
+    const double d = det3(a);
+    lens_has_position_ = std::abs(d) > 1e-12;
+    for (int c = 0; c < 3 && lens_has_position_; ++c) {
+      double m[3][3];
+      for (int r = 0; r < 3; ++r) {
+        for (int k = 0; k < 3; ++k) m[r][k] = k == c ? b[r] : a[r][k];
+      }
+      lens_position_[c] = float(det3(m) / d);
+      // The scene is drawn turned 180 degrees (clip x is the screen's
+      // negated), so the x row points to the viewer's left.
+      lens_right_[c] = float(-current[c] / x_scale);
+    }
+  }
   const double k = z_length / w_length;
   const double near_plane = (k * current[15] / w_length - current[11] / w_length) / k;
   camera.near_plane = float(near_plane);
@@ -410,8 +462,8 @@ void Fh1NativeExecutor::FinishCameraFrame() {
   size_t matched = 0;
   for (const auto& [object, wvp] : objects) {
     if (wvp != current) continue;
-    auto previous = camera_previous_objects_.find(object);
-    if (previous == camera_previous_objects_.end()) continue;
+    auto previous = previous_objects.find(object);
+    if (previous == previous_objects.end()) continue;
     ++previous_matches[previous->second];
     ++matched;
   }
@@ -426,18 +478,43 @@ void Fh1NativeExecutor::FinishCameraFrame() {
         Invert(ToMatrix(current), current_inverse)) {
       const Matrix candidate = Multiply(ToMatrix(previous->first), current_inverse);
       // A jump of the view between frames is a cut even when the world
-      // carries over.
-      double change = 0.0;
-      for (int r = 0; r < 2; ++r) {
-        for (int c = 0; c < 4; ++c) {
-          change = std::max(change, std::abs(candidate[r * 4 + c] - (r == c ? 1.0 : 0.0)));
+      // carries over: points 2, 10 and 100 m away moving a quarter of the
+      // screen or more, or to behind the camera. (The matrix's own entries
+      // are no measure: with a 0.1 m near plane, driving moves its depth
+      // column by more than any turn, and in VR an eye's previous frame is
+      // two frames back; at speed nearly every frame counted as a cut.)
+      bool jump = false;
+      for (const double distance : {2.0, 10.0, 100.0}) {
+        // The matrix's clip z is the usual D3D depth.
+        const double z = camera.far_plane > camera.near_plane
+                             ? camera.far_plane * (distance - camera.near_plane) /
+                                   (distance * (camera.far_plane - camera.near_plane))
+                             : 1.0 - camera.near_plane / distance;
+        for (const double x : {-0.6, 0.0, 0.6}) {
+          for (const double y : {-0.6, 0.6}) {
+            const double v[4] = {x, y, z, 1.0};
+            double out[4] = {};
+            for (int r = 0; r < 4; ++r) {
+              for (int c = 0; c < 4; ++c) out[r] += candidate[r * 4 + c] * v[c];
+            }
+            if (!(out[3] > 1.0e-6) || std::abs(out[0] / out[3] - x) >= 0.5 ||
+                std::abs(out[1] / out[3] - y) >= 0.5) {
+              jump = true;
+            }
+          }
         }
       }
-      if (change < 0.25) {
+      if (!jump) {
         reprojection = candidate;
         camera.cut = false;
+      } else {
+        Count("camera_cut_jump");
       }
+    } else {
+      Count("camera_cut_unmatched");
     }
+  } else {
+    Count("camera_cut_unmatched");
   }
   for (size_t i = 0; i < 16; ++i) camera.reprojection[i] = float(reprojection[i]);
   if (camera.cut) Count("camera_cut");
@@ -451,7 +528,8 @@ void Fh1NativeExecutor::FinishCameraFrame() {
   }
   camera_ready_ = camera;
   camera_ready_valid_ = true;
-  camera_previous_objects_ = std::move(objects);
+  previous_objects = std::move(objects);
+  finish_objects(eye);
   if (!camera.cut) {
     if (object_reprojections.size() > 1) Count("camera_object_frame");
     if ((frame_ % 600) == 0) {
@@ -550,9 +628,9 @@ void Fh1NativeExecutor::SnapshotCameraDepth(uint32_t band_row) {
   // A band holds the surface's rows. The copy is resized only before a
   // frame's first band, to the bottom of the lowest band seen, so frames
   // with a taller band than it has are dropped until the next.
-  const uint32_t width = surface->width * scale_;
-  const uint32_t height = std::min(surface->height, surface->image_height) * scale_;
-  const uint32_t dest_row = band_row * scale_;
+  const uint32_t width = surface->width * scale_x_;
+  const uint32_t height = std::min(surface->height, surface->image_height) * scale_y_;
+  const uint32_t dest_row = band_row * scale_y_;
   camera_depth_wanted_height_ = std::max(camera_depth_wanted_height_, dest_row + height);
   if (camera_depth_rows_ &&
       (camera_depth_.width != width || camera_depth_.height < dest_row + height)) {
