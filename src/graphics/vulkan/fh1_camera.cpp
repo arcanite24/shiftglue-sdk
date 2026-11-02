@@ -272,15 +272,16 @@ uint32_t Fh1NativeExecutor::CurrentDepthKey() const {
   const auto depth_info = register_file_.Get<reg::RB_DEPTH_INFO>();
   const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
   const uint32_t msaa = uint32_t(surface_info.msaa_samples);
-  return MakeDepthKey(depth_info.depth_base, Fh1PitchTiles(surface_info.surface_pitch, msaa), msaa,
-                      depth_info.depth_format)
+  return StorageKey(MakeDepthKey(depth_info.depth_base,
+                                 Fh1PitchTiles(surface_info.surface_pitch, msaa), msaa,
+                                 depth_info.depth_format))
       .Pack();
 }
 
 int32_t Fh1NativeExecutor::ObjectRowOffset() const {
   if (untile_height_) return 0;
   return std::max(0, -int32_t(register_file_.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset)) *
-         int32_t(scale_);
+         int32_t(scale_y_);
 }
 
 uint64_t Fh1NativeExecutor::CurrentColorKey() const {
@@ -319,13 +320,7 @@ bool Fh1NativeExecutor::GetSceneJitter(float& x, float& y) const {
     return true;
   }
   if (!draw_uses_camera_matrix_) return false;
-  const auto depth_info = register_file_.Get<reg::RB_DEPTH_INFO>();
-  const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
-  const uint32_t msaa = uint32_t(surface_info.msaa_samples);
-  if (MakeDepthKey(depth_info.depth_base, Fh1PitchTiles(surface_info.surface_pitch, msaa), msaa,
-                   depth_info.depth_format)
-              .Pack() != camera_scene_depth_ ||
-      CurrentColorKey() != camera_scene_color_) {
+  if (CurrentDepthKey() != camera_scene_depth_ || CurrentColorKey() != camera_scene_color_) {
     return false;
   }
   x = jitter_x_;
@@ -426,18 +421,43 @@ void Fh1NativeExecutor::FinishCameraFrame() {
         Invert(ToMatrix(current), current_inverse)) {
       const Matrix candidate = Multiply(ToMatrix(previous->first), current_inverse);
       // A jump of the view between frames is a cut even when the world
-      // carries over.
-      double change = 0.0;
-      for (int r = 0; r < 2; ++r) {
-        for (int c = 0; c < 4; ++c) {
-          change = std::max(change, std::abs(candidate[r * 4 + c] - (r == c ? 1.0 : 0.0)));
+      // carries over: points 2, 10 and 100 m away moving a quarter of the
+      // screen or more, or to behind the camera. (The matrix's own entries
+      // are no measure: with a 0.1 m near plane, driving moves its depth
+      // column by more than any turn, and in VR an eye's previous frame is
+      // two frames back; at speed nearly every frame counted as a cut.)
+      bool jump = false;
+      for (const double distance : {2.0, 10.0, 100.0}) {
+        // The matrix's clip z is the usual D3D depth.
+        const double z = camera.far_plane > camera.near_plane
+                             ? camera.far_plane * (distance - camera.near_plane) /
+                                   (distance * (camera.far_plane - camera.near_plane))
+                             : 1.0 - camera.near_plane / distance;
+        for (const double x : {-0.6, 0.0, 0.6}) {
+          for (const double y : {-0.6, 0.6}) {
+            const double v[4] = {x, y, z, 1.0};
+            double out[4] = {};
+            for (int r = 0; r < 4; ++r) {
+              for (int c = 0; c < 4; ++c) out[r] += candidate[r * 4 + c] * v[c];
+            }
+            if (!(out[3] > 1.0e-6) || std::abs(out[0] / out[3] - x) >= 0.5 ||
+                std::abs(out[1] / out[3] - y) >= 0.5) {
+              jump = true;
+            }
+          }
         }
       }
-      if (change < 0.25) {
+      if (!jump) {
         reprojection = candidate;
         camera.cut = false;
+      } else {
+        Count("camera_cut_jump");
       }
+    } else {
+      Count("camera_cut_unmatched");
     }
+  } else {
+    Count("camera_cut_unmatched");
   }
   for (size_t i = 0; i < 16; ++i) camera.reprojection[i] = float(reprojection[i]);
   if (camera.cut) Count("camera_cut");
@@ -550,9 +570,9 @@ void Fh1NativeExecutor::SnapshotCameraDepth(uint32_t band_row) {
   // A band holds the surface's rows. The copy is resized only before a
   // frame's first band, to the bottom of the lowest band seen, so frames
   // with a taller band than it has are dropped until the next.
-  const uint32_t width = surface->width * scale_;
-  const uint32_t height = std::min(surface->height, surface->image_height) * scale_;
-  const uint32_t dest_row = band_row * scale_;
+  const uint32_t width = surface->width * scale_x_;
+  const uint32_t height = std::min(surface->height, surface->image_height) * scale_y_;
+  const uint32_t dest_row = band_row * scale_y_;
   camera_depth_wanted_height_ = std::max(camera_depth_wanted_height_, dest_row + height);
   if (camera_depth_rows_ &&
       (camera_depth_.width != width || camera_depth_.height < dest_row + height)) {

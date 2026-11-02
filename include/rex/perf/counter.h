@@ -240,6 +240,7 @@ enum class CounterId : uint16_t {
   kGpuUploadSplitsVertex,
   kGpuUploadSplitsIndex,
   kGpuUploadSplitsTexture,
+  kGpuUploadsHoisted,
   kGpuUploadBytes,
   // D3D census (DL-0.1/DL-1.1, pinyon_shift_d3d_census): drawn draws the
   // census counts as visible to an API-level renderer and as fallback; with
