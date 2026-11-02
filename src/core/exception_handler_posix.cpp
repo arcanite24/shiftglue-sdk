@@ -30,6 +30,9 @@
 #include <rex/platform.h>
 
 #include <ucontext.h>
+#if REX_PLATFORM_ANDROID
+#include <android/log.h>
+#endif
 
 namespace rex::arch {
 
@@ -418,6 +421,28 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
     }
   }
 
+#if REX_PLATFORM_ANDROID && REX_ARCH_ARM64
+  // Not ours: the system writes no tombstone once the default action ends the
+  // process, so record where it faulted (a driver crash otherwise leaves only
+  // the backtrace).
+  {
+    const ucontext_t* uc = static_cast<const ucontext_t*>(signal_context);
+    const auto& mc = uc->uc_mcontext;
+    __android_log_print(ANDROID_LOG_FATAL, "rex-fault",
+                        "signal %d code %d fault address %p pc %llx lr %llx sp %llx",
+                        signal_number, signal_info->si_code, signal_info->si_addr,
+                        (unsigned long long)mc.pc, (unsigned long long)mc.regs[30],
+                        (unsigned long long)mc.sp);
+    for (int i = 0; i < 30; i += 4) {
+      __android_log_print(ANDROID_LOG_FATAL, "rex-fault",
+                          "x%-2d %016llx x%-2d %016llx x%-2d %016llx x%-2d %016llx", i,
+                          (unsigned long long)mc.regs[i], i + 1,
+                          (unsigned long long)mc.regs[i + 1], i + 2,
+                          (unsigned long long)(i + 2 < 31 ? mc.regs[i + 2] : 0), i + 3,
+                          (unsigned long long)(i + 3 < 31 ? mc.regs[i + 3] : 0));
+    }
+  }
+#endif
   // Not a fault any handler expects: give it to whatever was installed before
   // (a crash reporter), or let the default action end the process when the
   // instruction faults again. Returning alone would fault forever.
