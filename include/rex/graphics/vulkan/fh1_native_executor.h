@@ -81,6 +81,8 @@ class Fh1NativeExecutor {
   void Shutdown();
   // Counts an event in the rendering stats (such as occlusion query ends).
   void CountEvent(const char* stat) { Count(stat); }
+  // MR-0 knock-out: suppress only the selected rendering's draw commands.
+  bool DebugSkipRenderingDraw(const Fh1DrawInfo& draw);
   // fh1_untile_predicated_tiling: after the last tile, the bands the later
   // tiles resolved are copied down to the EDRAM rows of their surfaces, where
   // the last tile leaves them on the console.
@@ -245,6 +247,7 @@ class Fh1NativeExecutor {
   void VisEnd(uint32_t query);
 
  private:
+  bool debug_skip_rendering_ = false;
   using SurfaceKey = Fh1SurfaceKey;
   struct Rect {
     int32_t left, top, right, bottom;

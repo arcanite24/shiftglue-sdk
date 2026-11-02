@@ -157,6 +157,15 @@ REXCVAR_DEFINE_BOOL(fh1_debug_skip_clears, false, "GPU",
                     "Diagnostics: skip every EDRAM clear (wrong image), to bound what clears "
                     "cost")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(fh1_debug_skip_renderings, "", "GPU",
+                      "Diagnostics (MR-0): comma-separated exact draw-rendering labels from "
+                      "fh1_native_gpu_profile for fh1_debug_skip_rendering_draws; empty selects "
+                      "nothing. State, clears, resolves, queries and fences still run")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_debug_skip_rendering_draws, false, "GPU",
+                    "Diagnostics (renders wrong): suppress draw commands for the renderings "
+                    "selected by fh1_debug_skip_renderings, to measure their marginal GPU cost")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_debug_skip_resolve_dispatches, false, "GPU",
                     "Diagnostics: keep every resolve's barriers but not its compute dispatch "
                     "(wrong image), to bound what the resolve shaders cost (Vulkan)")
@@ -2650,17 +2659,30 @@ void Fh1NativeExecutor::BeginDrawRendering() {
   }
   if (clears) FoldPendingClears(bound, clear_width, clear_height, colors, &depth, true);
   rendering_id_ = id;
-  if (gpu_query_pool_ != VK_NULL_HANDLE) {
+  const auto& skip_renderings = REXCVAR_GET(fh1_debug_skip_renderings);
+  if (gpu_query_pool_ != VK_NULL_HANDLE || !skip_renderings.empty()) {
     std::string label;
     for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
       if (bound_bits_ & (1u << i)) label += (label.empty() ? "" : "+") + pending_keys_[i].Describe();
     }
     if (label.empty()) label = "none";
-    GpuMarkRendering(GpuLabel(label));
+    debug_skip_rendering_ = !skip_renderings.empty() &&
+        ("," + skip_renderings + ",").find("," + label + ",") != std::string::npos;
+    if (gpu_query_pool_ != VK_NULL_HANDLE) GpuMarkRendering(GpuLabel(label));
   }
   if (vis_frame_) VisMarkRendering();
   command_processor_.SubmitBarriersAndBeginFh1Rendering(info, id);
   if (clears) FoldPendingClears(bound, clear_width, clear_height, nullptr, nullptr, false);
+}
+
+bool Fh1NativeExecutor::DebugSkipRenderingDraw(const Fh1DrawInfo& draw) {
+  if (!debug_skip_rendering_ || !REXCVAR_GET(fh1_debug_skip_rendering_draws)) return false;
+  if (draw.memexport || draw.occlusion_query_active) {
+    Count("debug_rendering_draw_preserved");
+    return false;
+  }
+  Count("debug_rendering_draw_skipped");
+  return true;
 }
 
 void Fh1NativeExecutor::NativeDrawIssued(const Fh1DrawInfo& draw) {
