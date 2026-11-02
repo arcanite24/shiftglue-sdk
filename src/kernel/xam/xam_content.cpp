@@ -237,7 +237,12 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
     }
 
     if (license_mask_ptr && XSUCCEEDED(result)) {
+      // Match the configured Xenia-style override for Marketplace content.
+      // Zero preserves the imported package licence; save content is unaffected.
       *license_mask_ptr = content_license;
+      if (content_data.content_type == XContentType::kMarketplaceContent) {
+        *license_mask_ptr = content_license | REXCVAR_GET(license_mask);
+      }
     }
 
     if (disposition_ptr) {
