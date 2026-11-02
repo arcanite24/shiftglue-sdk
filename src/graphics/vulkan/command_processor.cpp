@@ -7994,10 +7994,14 @@ bool VulkanCommandProcessor::AcquireOcclusionQueryIndex(uint32_t& host_index_out
 
 void VulkanCommandProcessor::DisableHostOcclusionQueries() {
   if (active_occlusion_query_.valid && occlusion_query_pool_ != VK_NULL_HANDLE) {
+    // Cleared before EndSubmission, which otherwise ends the query a second
+    // time: ending a query that is not active crashed Arm's Mali r44p1 driver
+    // in vkCmdEndQuery (VUID-vkCmdEndQuery-None-01923).
+    const uint32_t host_index = active_occlusion_query_.host_index;
+    active_occlusion_query_ = {};
     if (BeginSubmission(true)) {
       EndRenderPass();
-      deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_,
-                                             active_occlusion_query_.host_index);
+      deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_, host_index);
       EndSubmission(false);
     }
   }
