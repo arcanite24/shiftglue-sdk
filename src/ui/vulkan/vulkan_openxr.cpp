@@ -134,6 +134,14 @@ REXCVAR_DEFINE_DOUBLE(xr_hud_box_snap, 0.03, "Display",
                       "between two parts; 0 keeps the edges where they are set")
     .range(0.0, 0.2)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(xr_hud_box_snap_sides, 0.15, "Display",
+                      "How far, in shares of the HUD's height, the left and right edges of "
+                      "xr_hud_boxes may move to a gap in the HUD wider than a gap between "
+                      "letters (1 % of its height), so a word across an edge (\"SAVING\" across "
+                      "the speed trap box's right edge) is not split; 0 keeps the edges where "
+                      "they are set")
+    .range(0.0, 0.5)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(xr_hud_follow_head, false, "Display",
                     "Keep the VR HUD panel in front of the head as it turns, instead of in "
                     "front of the seat")
@@ -668,18 +676,21 @@ struct State {
   VkCommandBuffer xr_cmd[2] = {};
   VkFence xr_cmd_fence[2] = {};
   int xr_cmd_next = 0;
-  // xr_hud_box_snap: each command buffer's copy also reads back the HUD's
-  // rows around the boxes' top and bottom edges (host-visible, mapped), and
-  // the newest of them read gives each box the edges it is cut at.
+  // xr_hud_box_snap: each command buffer's copy also reads back the HUD
+  // around the boxes' edges (host-visible, mapped): rows around the top and
+  // bottom, columns around the left and right. The newest of them read
+  // gives each box the edges it is cut at.
+  enum HudEdge { kTopEdge, kBottomEdge, kLeftEdge, kRightEdge };
   struct HudStrip {
     int32_t x0, y0, x1, y1;  // the box as set
-    bool bottom;
-    int32_t row0, rows;
+    HudEdge edge;
+    // The rectangle read back, its texels' rows one after another.
+    int32_t left, top, columns, rows;
     VkDeviceSize offset;
   };
   struct HudBoxRows {
-    int32_t x0, y0, x1, y1;  // the box as set
-    int32_t top, bottom;     // where it is cut
+    int32_t x0, y0, x1, y1;            // the box as set
+    int32_t top, bottom, left, right;  // where it is cut
   };
   VkBuffer hud_strip_buffer[2] = {};
   VkDeviceMemory hud_strip_memory[2] = {};
@@ -716,6 +727,9 @@ struct State {
   Lens capture_lens;
   uint64_t capture_requested_ns = 0, capture_recorded_ns = 0;
   uint32_t capture_width = 0, capture_height = 0;
+  // A capture also saves the next HUD copied to the panel, with its alpha,
+  // and the parts it is cut into.
+  bool capture_hud = false;
 
   // Log: headset frames, new pairs shown, right eyes dropped for lack of
   // their left, since the last line.
@@ -1515,20 +1529,22 @@ int32_t SnapHudEdge(int32_t edge, int32_t inward, int32_t reach, Empty empty) {
   return edge;
 }
 
-// Under the state mutex: moves each box's top and bottom edge to the rows
-// the newest readback of the HUD found for it (xr_hud_box_snap), its plane
-// staying where the box is set, so its tilt and place hold still.
+// Under the state mutex: moves each box's edges to the rows and columns the
+// newest readback of the HUD found for them (xr_hud_box_snap), its plane
+// staying where the box is set, so its tilt and height hold still.
 void SnapHudBoxes(std::vector<HudPart>& boxes) {
   const State& s = S();
   for (size_t i = 0; i < boxes.size() && i < s.hud_box_rows.size(); ++i) {
     HudPart& box = boxes[i];
     const State::HudBoxRows& found = s.hud_box_rows[i];
     if (found.x0 != box.x0 || found.y0 != box.y0 || found.x1 != box.x1 || found.y1 != box.y1 ||
-        found.top >= found.bottom) {
+        found.top >= found.bottom || found.left >= found.right) {
       continue;
     }
     box.y0 = found.top;
     box.y1 = found.bottom;
+    box.x0 = found.left;
+    box.x1 = found.right;
   }
 }
 
@@ -1577,6 +1593,19 @@ std::vector<HudPart> HudParts(const std::string& bands, const std::vector<HudPar
   return parts;
 }
 
+// How far a box's edges may move in a HUD `height` rows high: rows for its
+// top and bottom (xr_hud_box_snap), columns for its sides
+// (xr_hud_box_snap_sides), and half the empty columns a side's gap takes
+// (1 % of the height: "SAVING"'s letters are 2-5 columns apart at 1080).
+struct HudSnapReach {
+  int32_t rows, columns, half_gap;
+};
+HudSnapReach GetHudSnapReach(uint32_t height) {
+  return {int32_t(std::lround(REXCVAR_GET(xr_hud_box_snap) * double(height))),
+          int32_t(std::lround(REXCVAR_GET(xr_hud_box_snap_sides) * double(height))),
+          std::max(1, int32_t(std::lround(0.005 * double(height))))};
+}
+
 // Under the state mutex, once command buffer `index`'s copy has run: the
 // edges its readback of the HUD gives each box.
 void ReadHudStrips(int index) {
@@ -1587,62 +1616,103 @@ void ReadHudStrips(int index) {
   range.memory = s.hud_strip_memory[index];
   range.size = VK_WHOLE_SIZE;
   s.device->functions().vkInvalidateMappedMemoryRanges(s.device->device(), 1, &range);
-  const int32_t reach = int32_t(std::lround(REXCVAR_GET(xr_hud_box_snap) *
-                                            double(s.hud_strip_height[index])));
+  const HudSnapReach reach = GetHudSnapReach(s.hud_strip_height[index]);
   std::vector<State::HudBoxRows> found;
   for (const State::HudStrip& strip : s.hud_strips[index]) {
-    if (!strip.bottom) found.push_back({strip.x0, strip.y0, strip.x1, strip.y1, strip.y0, strip.y1});
+    if (strip.edge == State::kTopEdge) {
+      found.push_back({strip.x0, strip.y0, strip.x1, strip.y1, strip.y0, strip.y1, strip.x0,
+                       strip.x1});
+    }
     const uint8_t* texels = s.hud_strip_mapped[index] + strip.offset;
-    const int32_t columns = strip.x1 - strip.x0;
     // Empty: no texel's alpha (the fourth byte in either channel order)
-    // above 1/255 in the box's columns; rows out of the strip are not.
-    const auto empty = [&](int32_t row) {
-      if (row < strip.row0 || row >= strip.row0 + strip.rows) return false;
-      const uint8_t* line = texels + size_t(row - strip.row0) * size_t(columns) * 4;
-      for (int32_t x = 0; x < columns; ++x) {
-        if (line[x * 4 + 3] > 1) return false;
+    // above 1/255 along the box's side of the strip; rows or columns out of
+    // the strip are not.
+    const bool side = strip.edge == State::kLeftEdge || strip.edge == State::kRightEdge;
+    const int32_t first = side ? strip.left : strip.top;
+    const int32_t count = side ? strip.columns : strip.rows;
+    const int32_t length = side ? strip.rows : strip.columns;
+    const size_t row_bytes = size_t(strip.columns) * 4;
+    const size_t start = side ? 4 : row_bytes;  // from one row or column to the next
+    const size_t next = side ? row_bytes : 4;   // along one
+    const auto empty = [&](int32_t at) {
+      if (at < first || at >= first + count) return false;
+      const uint8_t* texel = texels + size_t(at - first) * start + 3;
+      for (int32_t i = 0; i < length; ++i, texel += next) {
+        if (*texel > 1) return false;
+      }
+      return true;
+    };
+    // A side is cut only in a gap wider than one between letters: the gap
+    // between a word's letters is a few columns ("SAVING" kept its S in the
+    // box, cut in the gap after it).
+    const auto gap = [&](int32_t at) {
+      for (int32_t x = at - reach.half_gap; x < at + reach.half_gap; ++x) {
+        if (!empty(x)) return false;
       }
       return true;
     };
     State::HudBoxRows& box = found.back();
-    const int32_t edge = strip.bottom ? strip.y1 : strip.y0;
-    (strip.bottom ? box.bottom : box.top) =
-        SnapHudEdge(edge, strip.bottom ? -1 : 1, std::min(reach, strip.rows), empty);
+    switch (strip.edge) {
+      case State::kTopEdge:
+        box.top = SnapHudEdge(strip.y0, 1, std::min(reach.rows, count), empty);
+        break;
+      case State::kBottomEdge:
+        box.bottom = SnapHudEdge(strip.y1, -1, std::min(reach.rows, count), empty);
+        break;
+      case State::kLeftEdge:
+        box.left = SnapHudEdge(strip.x0, 1, std::min(reach.columns, count), gap);
+        break;
+      case State::kRightEdge:
+        box.right = SnapHudEdge(strip.x1, -1, std::min(reach.columns, count), gap);
+        break;
+    }
   }
   s.hud_box_rows = std::move(found);
 }
 
 // Under the state mutex: records into `cmd` (command buffer `index`) the
-// readback of the slot's HUD rows around each box's top and bottom edge,
-// the HUD a transfer source.
+// readback of the slot's HUD around each box's edges, rows around its top
+// and bottom and columns around its left and right (a "SAVING..." across
+// the speed trap box's side lost its first letter to the raised box), the
+// HUD a transfer source.
 void RecordHudStrips(VkCommandBuffer cmd, int index, const State::Slot& slot) {
   State& s = S();
   const VulkanDevice::Functions& dfn = s.device->functions();
   s.hud_strips[index].clear();
   s.hud_strip_serial[index] = 0;
-  const int32_t reach =
-      int32_t(std::lround(REXCVAR_GET(xr_hud_box_snap) * double(slot.hud_height)));
-  if (reach <= 0) {
+  const HudSnapReach reach = GetHudSnapReach(slot.hud_height);
+  if (reach.rows <= 0 && reach.columns <= 0) {
     s.hud_box_rows.clear();
     return;
   }
   std::vector<VkBufferImageCopy> regions;
   VkDeviceSize size = 0;
   for (const HudPart& box : HudBoxes(REXCVAR_GET(xr_hud_boxes), slot.hud_width, slot.hud_height)) {
-    for (const bool bottom : {false, true}) {
-      const int32_t edge = bottom ? box.y1 : box.y0;
-      const int32_t row0 = std::max(0, edge - reach);
-      // Never empty (reach is at least a row); a box's top strip comes
-      // before its bottom one, as ReadHudStrips takes them.
-      const int32_t rows = std::min(int32_t(slot.hud_height), edge + reach + 1) - row0;
-      s.hud_strips[index].push_back({box.x0, box.y0, box.x1, box.y1, bottom, row0, rows, size});
+    // A box's top strip comes first, as ReadHudStrips takes them. Never
+    // empty: each takes at least the row or column of its edge; the side
+    // strips span the box's rows as set, and the gap's half beyond reach.
+    for (const State::HudEdge edge :
+         {State::kTopEdge, State::kBottomEdge, State::kLeftEdge, State::kRightEdge}) {
+      State::HudStrip strip = {box.x0, box.y0, box.x1, box.y1, edge, box.x0, box.y0,
+                               box.x1 - box.x0, box.y1 - box.y0, size};
+      if (edge == State::kTopEdge || edge == State::kBottomEdge) {
+        const int32_t at = edge == State::kBottomEdge ? box.y1 : box.y0;
+        strip.top = std::max(0, at - reach.rows);
+        strip.rows = std::min(int32_t(slot.hud_height), at + reach.rows + 1) - strip.top;
+      } else {
+        const int32_t at = edge == State::kRightEdge ? box.x1 : box.x0;
+        const int32_t extent = reach.columns + reach.half_gap;
+        strip.left = std::max(0, at - extent);
+        strip.columns = std::min(int32_t(slot.hud_width), at + extent + 1) - strip.left;
+      }
+      s.hud_strips[index].push_back(strip);
       VkBufferImageCopy region{};
       region.bufferOffset = size;
       region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-      region.imageOffset = {box.x0, row0, 0};
-      region.imageExtent = {uint32_t(box.x1 - box.x0), uint32_t(rows), 1};
+      region.imageOffset = {strip.left, strip.top, 0};
+      region.imageExtent = {uint32_t(strip.columns), uint32_t(strip.rows), 1};
       regions.push_back(region);
-      size += VkDeviceSize(box.x1 - box.x0) * VkDeviceSize(rows) * 4;
+      size += VkDeviceSize(strip.columns) * VkDeviceSize(strip.rows) * 4;
     }
   }
   if (regions.empty()) return;
@@ -1687,6 +1757,64 @@ void RecordHudStrips(VkCommandBuffer cmd, int index, const State::Slot& slot) {
                            nullptr, 1, &to_host, 0, nullptr);
   s.hud_strip_height[index] = slot.hud_height;
   s.hud_strip_serial[index] = ++s.hud_strip_serial_next;
+}
+
+// Under the state mutex, once the copy into `memory` has run: the captured
+// HUD as xr-capture-hud.pam (RGBA, alpha the coverage), and in the capture's
+// log the boxes as set, where the snap last cut them and the parts shown.
+void SaveCaptureHud(VkDeviceMemory memory, uint32_t width, uint32_t height) {
+  State& s = S();
+  const VulkanDevice::Functions& dfn = s.device->functions();
+  void* mapped = nullptr;
+  if (dfn.vkMapMemory(s.device->device(), memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+    return;
+  }
+  VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+  range.memory = memory;
+  range.size = VK_WHOLE_SIZE;
+  dfn.vkInvalidateMappedMemoryRanges(s.device->device(), 1, &range);
+  {
+    std::ofstream image(s.capture_directory + "/xr-capture-hud.pam", std::ios::binary);
+    image << "P7\nWIDTH " << width << "\nHEIGHT " << height
+          << "\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n";
+    const auto* pixels = static_cast<const uint8_t*>(mapped);
+    const bool bgra = s.staging_format == VK_FORMAT_B8G8R8A8_UNORM;
+    std::vector<uint8_t> row(size_t(width) * 4);
+    for (uint32_t y = 0; y < height; ++y) {
+      const uint8_t* in = pixels + size_t(y) * width * 4;
+      for (uint32_t x = 0; x < width; ++x) {
+        row[x * 4 + 0] = in[x * 4 + (bgra ? 2 : 0)];
+        row[x * 4 + 1] = in[x * 4 + 1];
+        row[x * 4 + 2] = in[x * 4 + (bgra ? 0 : 2)];
+        row[x * 4 + 3] = in[x * 4 + 3];
+      }
+      image.write(reinterpret_cast<const char*>(row.data()), std::streamsize(row.size()));
+    }
+  }
+  dfn.vkUnmapMemory(s.device->device(), memory);
+  const auto rects = [](const std::vector<HudPart>& parts) {
+    std::string text;
+    for (const HudPart& p : parts) {
+      text += fmt::format("{}[{},{},{},{},{:.2f}]", text.empty() ? "" : ",", p.x0, p.y0, p.x1,
+                          p.y1, p.raise);
+    }
+    return text;
+  };
+  std::string found;
+  for (const State::HudBoxRows& b : s.hud_box_rows) {
+    found += fmt::format("{}[{},{},{},{}]", found.empty() ? "" : ",", b.left, b.top, b.right,
+                         b.bottom);
+  }
+  const std::vector<HudPart> set = HudBoxes(REXCVAR_GET(xr_hud_boxes), width, height);
+  std::vector<HudPart> snapped = set;
+  SnapHudBoxes(snapped);
+  std::ofstream log(s.capture_directory + "/xr-capture.jsonl", std::ios::app);
+  log << fmt::format(
+      "{{\"hud\":\"xr-capture-hud.pam\",\"width\":{},\"height\":{},\"boxes_set\":[{}],"
+      "\"boxes_found\":[{}],\"parts\":[{}]}}\n",
+      width, height, rects(set), found,
+      rects(HudParts(REXCVAR_GET(xr_hud_bands), snapped, width, height)));
+  REXLOG_INFO("OpenXR: HUD {}x{} saved in {}", width, height, s.capture_directory);
 }
 
 // Under the state mutex, on the headset thread inside its frame: copies the
@@ -1798,6 +1926,9 @@ bool CopySlot(State::Slot& slot) {
                                VK_PIPELINE_STAGE_TRANSFER_BIT,
                            0, 0, nullptr, 0, nullptr, 4, after);
   // The pair's HUD into the panel's swapchain; the eyes go on without it.
+  // Read back whole too while a capture wants it (xr_capture_request).
+  VkBuffer hud_capture_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory hud_capture_memory = VK_NULL_HANDLE;
   Target& hud = s.targets[kHud];
   const bool hud_copied = slot.has_hud && slot.hud != VK_NULL_HANDLE &&
                           REXCVAR_GET(xr_hud_panel) &&
@@ -1819,6 +1950,25 @@ bool CopySlot(State::Slot& slot) {
     dfn.vkCmdCopyImage(cmd, slot.hud, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hud_target,
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &hud_copy);
     RecordHudStrips(cmd, c, slot);
+    if (s.capture_hud &&
+        util::CreateDedicatedAllocationBuffer(
+            s.device, VkDeviceSize(slot.hud_width) * slot.hud_height * 4,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT, util::MemoryPurpose::kReadback,
+            hud_capture_buffer, hud_capture_memory)) {
+      VkBufferImageCopy region{};
+      region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      region.imageExtent = {slot.hud_width, slot.hud_height, 1};
+      dfn.vkCmdCopyImageToBuffer(cmd, slot.hud, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                 hud_capture_buffer, 1, &region);
+      VkBufferMemoryBarrier to_host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+      to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+      to_host.srcQueueFamilyIndex = to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      to_host.buffer = hud_capture_buffer;
+      to_host.size = VK_WHOLE_SIZE;
+      dfn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                               0, 0, nullptr, 1, &to_host, 0, nullptr);
+    }
     const VkImageMemoryBarrier hud_after =
         barrier(hud_target, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
@@ -1835,7 +1985,22 @@ bool CopySlot(State::Slot& slot) {
     if (dfn.vkQueueSubmit(queue.queue(), 1, &submit, s.xr_cmd_fence[c]) != VK_SUCCESS) {
       // Signalled for the next use.
       dfn.vkQueueSubmit(queue.queue(), 0, nullptr, s.xr_cmd_fence[c]);
+      if (hud_capture_buffer != VK_NULL_HANDLE) {
+        dfn.vkDestroyBuffer(device, hud_capture_buffer, nullptr);
+        dfn.vkFreeMemory(device, hud_capture_memory, nullptr);
+      }
       return false;
+    }
+  }
+  if (hud_capture_buffer != VK_NULL_HANDLE) {
+    // Once, for a capture: waiting here holds this frame up.
+    // Left alone (lost) if the GPU has not got to it, which may still write it.
+    if (dfn.vkWaitForFences(device, 1, &s.xr_cmd_fence[c], VK_TRUE, 1'000'000'000) ==
+        VK_SUCCESS) {
+      SaveCaptureHud(hud_capture_memory, slot.hud_width, slot.hud_height);
+      s.capture_hud = false;
+      dfn.vkDestroyBuffer(device, hud_capture_buffer, nullptr);
+      dfn.vkFreeMemory(device, hud_capture_memory, nullptr);
     }
   }
   const auto queue = HoldQueueForRuntime();
@@ -2914,6 +3079,7 @@ void RequestCapture(const std::string& directory, int frames) {
   State& s = S();
   s.capture_directory = directory;
   s.capture_left = frames;
+  s.capture_hud = true;
   REXLOG_INFO("OpenXR: capturing the next {} stereo frames into {}", frames, directory);
 }
 
