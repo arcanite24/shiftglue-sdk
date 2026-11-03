@@ -176,7 +176,7 @@ REXCVAR_DEFINE_UINT64(fh1_debug_skip_pixel_shader, 0, "GPU",
 REXCVAR_DEFINE_BOOL(fh1_debug_skip_resolve_dispatches, false, "GPU",
                     "Diagnostics: keep every resolve's barriers but not its compute dispatch "
                     "(wrong image), to bound what the resolve shaders cost (Vulkan)")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 #if REX_HAS_D3D12
 REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
 REXCVAR_DECLARE(int32_t, fh1_resolve_dump_frame);
@@ -3072,6 +3072,8 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   if (!REXCVAR_GET(fh1_debug_skip_resolve_dispatches)) {
     command_buffer.CmdVkDispatch((uint32_t(rect.right - rect.left) + 15) / 16,
                                  (uint32_t(rect.bottom - rect.top) + 15) / 16, 1);
+  } else {
+    Count("debug_resolve_dispatch_skipped");
   }
   command_processor_.EndDebugLabel();
   return true;
