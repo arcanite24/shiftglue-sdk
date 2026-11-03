@@ -139,6 +139,43 @@ TEST_CASE("texture binding memo follows resolve ownership with unchanged fetch w
   CHECK(unrelated->payload_generation() == 1);
 }
 
+TEST_CASE("texture diagnostics report guest padding and separate mip storage",
+          "[graphics][texture_cache]") {
+  RegisterFile regs;
+  TestSharedMemory memory;
+  TestTextureCache cache(regs, memory);
+  CHECK(cache.GetActiveTextureGuestRanges(0)[0].second == 0);
+  constexpr uint32_t kBase = 0x400000, kMips = 0x800000;
+  xenos::xe_gpu_texture_fetch_t fetch{};
+  fetch.type = xenos::FetchConstantType::kTexture;
+  fetch.dimension = xenos::DataDimension::k2DOrStacked;
+  fetch.tiled = 1;
+  fetch.base_address = kBase >> 12;
+  SECTION("32-bit guest scene with a 64-bit host view") {
+    fetch.format = xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16;
+    fetch.pitch = 40;
+    fetch.size_2d.width = 1279;
+    fetch.size_2d.height = 719;
+  }
+  SECTION("packed mips have their own allocation") {
+    fetch.format = xenos::TextureFormat::k_8_8_8_8;
+    fetch.pitch = 2;
+    fetch.size_2d.width = 63;
+    fetch.size_2d.height = 63;
+    fetch.packed_mips = 1;
+    fetch.mip_address = kMips >> 12;
+    fetch.mip_max_level = 3;
+  }
+  std::memcpy(&regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], &fetch, sizeof(fetch));
+  cache.RequestTextures(1);
+  REQUIRE(cache.bound());
+  const auto ranges = cache.GetActiveTextureGuestRanges(0);
+  CHECK(ranges[0].first == kBase);
+  CHECK(ranges[0].second == (fetch.mip_address ? 64u * 64u * 4u : 1280u * 736u * 4u));
+  CHECK(ranges[1].first == (fetch.mip_address ? kMips : 0));
+  CHECK(ranges[1].second == (fetch.mip_address ? 8192 : 0));
+}
+
 TEST_CASE("compressed textures do not select a partly owned scaled buffer",
           "[graphics][texture_cache]") {
   RegisterFile regs;

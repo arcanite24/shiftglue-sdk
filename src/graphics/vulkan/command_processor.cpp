@@ -7217,7 +7217,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
 
   DrawCostMark(kCostBeginRendering);
   if (fh1_native_executor_) {
-    fh1_native_executor_->DiscoverShaderDraw(vertex_shader_translation, pixel_shader_translation);
+    fh1_native_executor_->DiscoverShaderDraw(vertex_shader_translation, pixel_shader_translation,
+                                             used_texture_mask);
   }
   // Draws inside the lists gpu_d3d_program marks, for the NA-3.2 ceiling.
   const int32_t program_probe = draw_program_ ? REXCVAR_GET(gpu_d3d_program_probe) : 0;

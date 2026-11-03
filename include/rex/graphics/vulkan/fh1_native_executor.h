@@ -117,7 +117,7 @@ class Fh1NativeExecutor {
   void BeginDrawRendering();
   // Local one-frame shader identities and the actual bound render surfaces.
   void DiscoverShaderDraw(const VulkanShader::VulkanTranslation* vertex,
-                          const VulkanShader::VulkanTranslation* pixel);
+                          const VulkanShader::VulkanTranslation* pixel, uint32_t texture_mask);
   // After BindTargets: the draw has no depth, stencil or color target to use.
   bool BoundNothing() const { return bound_bits_ == 0; }
   void CountDrawSkippedWithoutEffect() { Count("draw_skipped_without_effect"); }
@@ -689,8 +689,13 @@ class Fh1NativeExecutor {
   SurfaceKey pending_keys_[1 + xenos::kMaxColorRenderTargets];
   uint32_t bound_bits_ = 0;
   std::ofstream shader_discovery_draws_;
+  std::ofstream shader_discovery_resolves_;
+  uint32_t shader_discovery_draw_index_ = 0;
   bool shader_discovery_started_ = false;
   std::set<std::string> shader_discovery_written_;
+  bool BeginShaderDiscovery();
+  void DiscoverShaderResolve(const CopyPlan& plan, uint32_t address, uint32_t length,
+                              uint32_t untile_band);
   // DrawRenderingId(bound_bits_), set by BindTargets for BeginDrawRendering.
   uint64_t bound_rendering_id_ = 0;
   // fh1_coarse_shading, parsed at swaps, and the rate of each draw rendering.
