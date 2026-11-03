@@ -117,7 +117,8 @@ class Fh1NativeExecutor {
   void BeginDrawRendering();
   // Local one-frame shader identities and the actual bound render surfaces.
   void DiscoverShaderDraw(const VulkanShader::VulkanTranslation* vertex,
-                          const VulkanShader::VulkanTranslation* pixel, uint32_t texture_mask);
+                          const VulkanShader::VulkanTranslation* pixel, uint32_t texture_mask,
+                          const Fh1DrawInfo& draw, bool suppressed);
   // After BindTargets: the draw has no depth, stencil or color target to use.
   bool BoundNothing() const { return bound_bits_ == 0; }
   void CountDrawSkippedWithoutEffect() { Count("draw_skipped_without_effect"); }

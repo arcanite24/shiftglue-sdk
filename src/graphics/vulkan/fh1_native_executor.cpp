@@ -2539,7 +2539,8 @@ bool Fh1NativeExecutor::BeginShaderDiscovery() {
 
 void Fh1NativeExecutor::DiscoverShaderDraw(const VulkanShader::VulkanTranslation* vertex,
                                           const VulkanShader::VulkanTranslation* pixel,
-                                          uint32_t texture_mask) {
+                                          uint32_t texture_mask, const Fh1DrawInfo& draw,
+                                          bool suppressed) {
   if (!BeginShaderDiscovery()) return;
   const auto root = rex::to_path(REXCVAR_GET(vulkan_shader_discovery_dir));
   auto capture = [&](const VulkanShader::VulkanTranslation* translation) {
@@ -2559,8 +2560,13 @@ void Fh1NativeExecutor::DiscoverShaderDraw(const VulkanShader::VulkanTranslation
   };
   const auto vs = capture(vertex), ps = capture(pixel);
   shader_discovery_draws_ << fmt::format(
-      "{{\"frame\":{},\"index\":{},\"vertex\":\"{}\",\"pixel\":\"{}\",\"hud\":{},\"surfaces\":[",
-      frame_, shader_discovery_draw_index_++, vs, ps, hud_draw_);
+      "{{\"frame\":{},\"index\":{},\"vertex\":\"{}\",\"pixel\":\"{}\",\"hud\":{},"
+      "\"probe_shader\":\"{:016X}\",\"probe_rendering\":{},\"probe_on\":{},"
+      "\"draw_pixel\":\"{:016X}\",\"suppressed\":{},\"surfaces\":[",
+      frame_, shader_discovery_draw_index_++, vs, ps, hud_draw_,
+      REXCVAR_GET(fh1_debug_skip_pixel_shader), debug_skip_rendering_,
+      REXCVAR_GET(fh1_debug_skip_rendering_draws),
+      draw.pixel_shader ? draw.pixel_shader->ucode_data_hash() : 0, suppressed);
   bool first = true;
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
     if (!(bound_bits_ & (1u << i))) continue;
