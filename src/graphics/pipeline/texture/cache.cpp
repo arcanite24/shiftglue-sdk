@@ -422,6 +422,12 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
     if (!limit_hard_exceeded && (texture->last_usage_time() + limit_soft_lifetime) > current_time) {
       break;
     }
+    if (retain_texture_callback_ && retain_texture_callback_(retain_texture_context_, texture)) {
+      // Still read by a deferred memory write, which cannot be recorded here:
+      // kept, with every newer texture, until the write is done (the executor
+      // writes deferred writes older than a few seconds itself).
+      break;
+    }
     if (!destroyed_any) {
       destroyed_any = true;
       // The texture being destroyed might have been bound in the previous
@@ -1137,6 +1143,7 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
 }
 
 void TextureCache::DestroyAllTextures(bool from_destructor) {
+  if (retain_texture_callback_) retain_texture_callback_(retain_texture_context_, nullptr);
   ResetTextureBindings(from_destructor);
   textures_by_base_.clear();
   textures_.clear();

@@ -648,6 +648,15 @@ class TextureCache {
   // After MarkRangeAsResolved invalidated the targets: their data was written
   // directly, so they are current again.
   void CompleteDirectResolve(const std::vector<DirectResolveTarget>& targets);
+  // Textures a deferred guest memory write still reads (fh1_resolve_defer_memory):
+  // the callback returns whether the texture is one, which keeps it from
+  // being destroyed to free memory; with nullptr, every texture is being
+  // destroyed.
+  using RetainTextureCallback = bool (*)(void* context, Texture* texture);
+  void SetRetainTextureCallback(RetainTextureCallback callback, void* context) {
+    retain_texture_callback_ = callback;
+    retain_texture_context_ = context;
+  }
 
  protected:
   // Diagnostics: the textures whose base is at this guest address.
@@ -768,6 +777,8 @@ class TextureCache {
   // The largest base level of any texture created, bounding the textures
   // FindDirectResolveTargets has to look at below a destination.
   uint32_t max_texture_base_size_ = 0;
+  RetainTextureCallback retain_texture_callback_ = nullptr;
+  void* retain_texture_context_ = nullptr;
 
   uint64_t textures_total_host_memory_usage_ = 0;
 

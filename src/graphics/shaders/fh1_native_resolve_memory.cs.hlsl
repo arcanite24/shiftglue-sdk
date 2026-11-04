@@ -46,6 +46,7 @@ FH1_PUSH_CONSTANTS cbuffer Fh1NativeResolveMemoryConstants FH1_CONSTANTS_REGISTE
   // 24-bit unorm depth to float, 2: 20e4 depth to float).
   uint fh1_image_endian;
   // The same for a second texture over the same memory and rows (bit 5: it
+  // exists; bit 6: write the textures only, not guest memory)
   // exists), such as an 8_8_8_8 texture reading a depth resolve's words.
   uint fh1_image2_endian;
 #endif
@@ -161,6 +162,11 @@ uint ImageTexel(uint word, uint endian_and_conversion) {
 
 // Stores a 32-bit destination word (already in the guest memory's byte order).
 void StoreWord(uint address, uint2 host_pixel, uint word) {
+#ifdef FH1_DEST_IMAGE
+  // Bit 6 of the second texture's word: the textures only, not guest memory
+  // (fh1_debug_resolve_textures_only, a cost probe).
+  if (!((FH1_IMAGE2_ENDIAN >> 6u) & 1u))
+#endif
   fh1_memory.Store(address, word);
 #ifdef FH1_DEST_IMAGE
   // A resolve's area may be larger than a small texture it writes (an 8x8
@@ -197,6 +203,33 @@ float4 LoadOwnerColor(uint2 pixel, uint sample, uint format) {
   return color;
 }
 
+#if defined(FH1_DEST_IMAGE) && defined(FH1_FROM_IMAGE)
+// A deferred resolve's guest memory copy (fh1_resolve_defer_memory), from the
+// texture it wrote, read through the source binding in its current layout: the resolve's own addresses and texture rows, each texel
+// swapped back by the texture's endianness (each swap is its own inverse).
+// Unscaled resolves of 32-bit words into textures without a load conversion
+// that hold the whole rectangle only; only the bytes in the window
+// [fh1_resolve_layout, fh1_owner_layout), still owed, are written.
+[numthreads(16, 16, 1)]
+void main(uint3 thread : SV_DispatchThreadID) {
+  uint2 rect_size = uint2(fh1_rect_size & 0xFFFFu, fh1_rect_size >> 16u);
+  if (any(thread.xy >= rect_size)) {
+    return;
+  }
+  uint2 pixel = uint2(fh1_rect_origin & 0xFFFFu, fh1_rect_origin >> 16u) + thread.xy;
+  uint bpb_log2 = (fh1_dest_info >> 16u) & 3u;
+  uint address =
+      fh1_dest_base + uint(TiledOffset2D(int(pixel.x), int(pixel.y), fh1_dest_pitch, bpb_log2));
+  // The window of bytes still owed, in place of the EDRAM layouts.
+  if (address < fh1_resolve_layout || address >= fh1_owner_layout) {
+    return;
+  }
+  // The texture's 32-bit words, sampled where it is (built with
+  // FH1_SOURCE_UINT: the source binding).
+  uint texel = fh1_source_color.Load(int3(pixel + uint2(0u, fh1_image_row), 0)).x;
+  fh1_memory.Store(address, EndianSwap32(texel, fh1_image_endian & 7u));
+}
+#else
 // Vulkan: 16x16. On the Adreno 740 (Turnip) the 8x8 groups' resolves took
 // 0.8 ms more of the frame-600 replay (15.0 against 14.2 ms); 32x32 gains
 // nothing more, and four pixels a thread lose 0.2 ms.
@@ -302,3 +335,4 @@ void main(uint3 thread : SV_DispatchThreadID) {
     fh1_memory.Store2(address, uint2(EndianSwap32(words.x, endian), EndianSwap32(words.y, endian)));
   }
 }
+#endif

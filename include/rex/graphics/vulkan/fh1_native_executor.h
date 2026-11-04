@@ -630,6 +630,41 @@ class Fh1NativeExecutor {
   std::vector<TextureCache::DirectResolveTarget> direct_resolve_targets_;
   std::vector<TextureCache::DirectResolveTarget> direct_resolve_candidates_;
   std::vector<uint32_t> direct_resolve_conversions_;
+  // fh1_debug_resolve_textures_only for the resolve being dispatched.
+  bool resolve_textures_only_ = false;
+  // fh1_resolve_defer_memory: resolves whose guest memory copy waits until the
+  // memory is requested (SharedMemory::DeferWrite), written then from the
+  // texture they wrote, one per dispatch, by id (oldest first).
+  // TextureCache::Texture, which is protected.
+  using TexturePointer = decltype(TextureCache::DirectResolveTarget::texture);
+  struct DeferredMemoryWrite {
+    uint32_t start = 0, length = 0;  // the resolve's extent
+    TexturePointer texture = nullptr;
+    VkDeviceSize memory_offset = 0, memory_range = 0;
+    std::array<uint32_t, 11> constants = {};  // the dispatch's
+    // The resolve's destination, to forget the write when one writes the same
+    // bytes again.
+    uint32_t dest_base = 0, dest_pitch = 0, dest_info = 0;
+    int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    uint64_t frame = 0;
+    // The 1 KB blocks of the extent still owed (later resolves write some).
+    std::vector<uint64_t> owed;
+    uint32_t owed_count = 0;
+  };
+  std::map<uint64_t, DeferredMemoryWrite> deferred_memory_writes_;
+  uint64_t next_deferred_memory_write_ = 1;
+  // For the resolve being dispatched.
+  bool defer_memory_ = false;
+  DeferredMemoryWrite deferred_plan_;
+  VkPipeline from_image_pipeline_ = VK_NULL_HANDLE;
+  void WriteDeferredMemory(uint64_t id);
+  void WriteDeferredBlocks(const DeferredMemoryWrite& write, uint32_t first_block,
+                           uint32_t end_block);
+  void ResolveOverDeferredMemory(const CopyPlan& plan, uint32_t extent_start,
+                                 uint32_t extent_length);
+  void WriteOldDeferredMemory();
+  static void WriteDeferredMemoryThunk(void* context, uint64_t id);
+  static bool RetainTextureThunk(void* context, TexturePointer texture);
   // A descriptor pool per frame in flight, reset when the frame reopens.
   static constexpr uint32_t kDescriptorPoolFrames = 3;
   std::array<std::vector<VkDescriptorPool>, kDescriptorPoolFrames> descriptor_pools_;

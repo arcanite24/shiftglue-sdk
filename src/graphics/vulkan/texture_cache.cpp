@@ -2125,6 +2125,29 @@ VkImageView VulkanTextureCache::PrepareDirectResolveWrite(Texture& texture) {
   return view;
 }
 
+VkImageView VulkanTextureCache::PrepareComputeWordRead(Texture& texture, VkImageLayout& layout) {
+  VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
+  if (vulkan_texture.copy_words() != 1) {
+    return VK_NULL_HANDLE;
+  }
+  const VkImageView view = vulkan_texture.GetCopyView2D();
+  VkPipelineStageFlags stage_mask;
+  VkAccessFlags access_mask;
+  GetTextureUsageMasks(vulkan_texture.usage(), stage_mask, access_mask, layout);
+  if (view == VK_NULL_HANDLE || layout == VK_IMAGE_LAYOUT_UNDEFINED ||
+      layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+    return VK_NULL_HANDLE;
+  }
+  vulkan_texture.MarkAsUsed();
+  // No layout change (which can resolve a compressed image): only the earlier
+  // writes (a resolve, by compute) made visible to compute reads.
+  command_processor_.PushImageMemoryBarrier(
+      vulkan_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+      stage_mask | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, layout, layout);
+  return view;
+}
+
 VkImageView VulkanTextureCache::VulkanTexture::GetCopyView() {
   if (copy_view_ != VK_NULL_HANDLE || !copy_words_) {
     return copy_view_;

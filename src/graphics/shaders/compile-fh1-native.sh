@@ -101,6 +101,9 @@ if [[ -n $GLSLANG ]]; then
   done
   rm -r "$spirv_temp"
 fi
+# A deferred resolve's guest memory copy from its texture (Vulkan only, as
+# fh1_resolve_defer_memory).
+compile_spirv cs_5_1 fh1_native_resolve_memory.cs.hlsl fh1_native_resolve_from_image_cs   FH1_DEST_IMAGE=1 FH1_FROM_IMAGE=1 FH1_SOURCE_UINT=1
 # Texture cache: the scaled 32-bpp resolve buffer and reflection cube imports.
 # Their DXBC headers were built with other fxc flags and are kept as they are.
 compile_spirv cs_5_1 fh1_scaled_32bpp_2x.cs.hlsl fh1_scaled_32bpp_2x_cs

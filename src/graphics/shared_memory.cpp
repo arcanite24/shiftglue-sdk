@@ -517,9 +517,44 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
   watch_range_first_free_ = range;
 }
 
+void SharedMemory::UpdateDeferredBounds() {
+  deferred_low_ = UINT32_MAX;
+  deferred_high_ = 0;
+  for (const DeferredWrite& write : deferred_writes_) {
+    deferred_low_ = std::min(deferred_low_, write.start);
+    deferred_high_ = std::max(deferred_high_, uint64_t(write.start) + write.length);
+  }
+}
+
+void SharedMemory::ForgetDeferredWrite(uint64_t id) {
+  std::erase_if(deferred_writes_, [id](const DeferredWrite& write) { return write.id == id; });
+  UpdateDeferredBounds();
+}
+
+void SharedMemory::CompleteDeferredWrites(uint32_t start, uint32_t length) {
+  if (deferred_writes_.empty() || !length || deferred_writes_suspended_) return;
+  const uint64_t end = uint64_t(start) + length;
+  if (start >= deferred_high_ || end <= deferred_low_) return;
+  std::vector<uint64_t>& ids = deferred_write_ids_scratch_;
+  ids.clear();
+  std::erase_if(deferred_writes_, [&](const DeferredWrite& write) {
+    if (write.start >= end || uint64_t(write.start) + write.length <= start) return false;
+    ids.push_back(write.id);
+    return true;
+  });
+  UpdateDeferredBounds();
+  // Oldest first, as the resolves wrote them.
+  for (size_t i = 0; i < ids.size(); ++i) {
+    if (deferred_write_callback_) deferred_write_callback_(deferred_write_context_, ids[i]);
+  }
+}
+
 bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count) {
   if (ranges == nullptr || !count) {
     return true;
+  }
+  if (!deferred_writes_.empty()) {
+    for (size_t i = 0; i < count; ++i) CompleteDeferredWrites(ranges[i].first, ranges[i].second);
   }
 
   // Some texture or buffer is empty, for example - safe to draw in this case.
@@ -700,6 +735,7 @@ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
       }
     }
     if (valid) {
+      if (!deferred_writes_.empty()) CompleteDeferredWrites(start, length);
       return true;
     }
   }
