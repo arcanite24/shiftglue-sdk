@@ -452,10 +452,6 @@ class VulkanTextureCache final : public TextureCache {
   // its contents kept, or VK_NULL_HANDLE.
  public:
   VkImageView PrepareDirectResolveWrite(Texture& texture);
-  // For compute shaders sampling a texture's 32-bit words where it is (a
-  // deferred resolve's guest memory copy): the view and its current layout,
-  // after a barrier for earlier writes, or VK_NULL_HANDLE.
-  VkImageView PrepareComputeWordRead(Texture& texture, VkImageLayout& layout);
 
  private:
   void GetTextureUsageMasks(VulkanTexture::Usage usage, VkPipelineStageFlags& stage_mask,

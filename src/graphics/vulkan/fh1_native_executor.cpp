@@ -136,13 +136,6 @@ REXCVAR_DEFINE_BOOL(fh1_debug_resolve_textures_only, false, "GPU",
                     "guest memory copy, for the cost of the memory writes (MR-6). Resolves "
                     "of 4 KB or less, which the CPU reads, keep writing memory")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(fh1_resolve_defer_memory, false, "GPU",
-                    "A resolve that writes a current texture over its destination leaves its "
-                    "guest memory copy until something requests that memory (a texture load, "
-                    "vertex fetch or another resolve), and writes it then from the texture "
-                    "(MR-6). Unscaled 32-bit resolves of more than 4 KB into textures that "
-                    "hold the whole rectangle only")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_resolve_two_textures, true, "GPU",
                     "Resolves write up to two textures over their destination directly (such as "
                     "a depth texture and an 8_8_8_8 one reading the same words), not one")
@@ -219,7 +212,6 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/fh1_native_resolve_image_depth_ms_cs.h"
 #include "../shaders/vulkan_spirv/fh1_native_resolve_image_uint_cs.h"
 #include "../shaders/vulkan_spirv/fh1_native_resolve_image_uint_ms_cs.h"
-#include "../shaders/vulkan_spirv/fh1_native_resolve_from_image_cs.h"
 #include "../shaders/vulkan_spirv/fh1_native_transfer_color_from_color_ps.h"
 #include "../shaders/vulkan_spirv/fh1_native_transfer_color_from_color_ms_ps.h"
 #include "../shaders/vulkan_spirv/fh1_native_transfer_color_from_depth_ps.h"
@@ -412,8 +404,6 @@ const SpirvShader kImageShaders[3][2] = {
     {FH1_SPIRV(fh1_native_resolve_image_uint_cs),
      FH1_SPIRV(fh1_native_resolve_image_uint_ms_cs)},
 };
-// A deferred resolve's guest memory copy, from the texture it wrote.
-const SpirvShader kFromImageShader = FH1_SPIRV(fh1_native_resolve_from_image_cs);
 #undef FH1_SPIRV
 
 // Formats whose guest EDRAM words are the host channel bits (16-bit or 32-bit
@@ -608,8 +598,6 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
     return false;
   }
   tiles_.Reset();
-  config_.memory->SetDeferredWriteCallback(&Fh1NativeExecutor::WriteDeferredMemoryThunk, this);
-  config_.textures->SetRetainTextureCallback(&Fh1NativeExecutor::RetainTextureThunk, this);
   initialized_ = true;
 #if !defined(__ANDROID__)
   const auto& properties = command_processor_.GetVulkanDevice()->properties();
@@ -632,20 +620,6 @@ void Fh1NativeExecutor::Shutdown() {
     vulkan_device->functions().vkDestroyQueryPool(vulkan_device->device(), vis_query_pool_,
                                                   nullptr);
     vis_query_pool_ = VK_NULL_HANDLE;
-  }
-  if (initialized_ && config_.memory && config_.textures) {
-    // Deferred guest memory writes still owed are written while they can be.
-    if (command_processor_.submission_open()) {
-      while (!deferred_memory_writes_.empty()) {
-        const uint64_t id = deferred_memory_writes_.begin()->first;
-        config_.memory->ForgetDeferredWrite(id);
-        WriteDeferredMemory(id);
-      }
-    }
-    deferred_memory_writes_.clear();
-    config_.memory->ForgetAllDeferredWrites();
-    config_.memory->SetDeferredWriteCallback(nullptr, nullptr);
-    config_.textures->SetRetainTextureCallback(nullptr, nullptr);
   }
   if (initialized_) LogStats(frame_);
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
@@ -699,8 +673,6 @@ void Fh1NativeExecutor::Shutdown() {
   readback_mapped_ = nullptr;
   readback_size_ = 0;
   readback_used_ = 0;
-  if (from_image_pipeline_) dfn.vkDestroyPipeline(device, from_image_pipeline_, nullptr);
-  from_image_pipeline_ = VK_NULL_HANDLE;
   for (auto& by_kind : image_pipelines_) {
     for (VkPipeline& pipeline : by_kind) {
       if (pipeline) dfn.vkDestroyPipeline(device, pipeline, nullptr);
@@ -3093,22 +3065,9 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   constants[8] = image_row * scale_;
   constants[9] = image_endian;
   constants[10] = image2_view != VK_NULL_HANDLE ? image2_endian | (1u << 5) : 0u;
-  if (image_view != VK_NULL_HANDLE && (resolve_textures_only_ || defer_memory_)) {
+  if (image_view != VK_NULL_HANDLE && resolve_textures_only_) {
     constants[10] |= 1u << 6;
-    if (defer_memory_) {
-      // Written from the texture when the memory is requested.
-      DeferredMemoryWrite write = deferred_plan_;
-      write.memory_offset = memory_offset;
-      write.memory_range = memory_range;
-      static_assert(std::tuple_size_v<decltype(write.constants)> == kComputeConstantCount + 3);
-      std::copy(std::begin(constants), std::end(constants), write.constants.begin());
-      const uint64_t id = next_deferred_memory_write_++;
-      deferred_memory_writes_.emplace(id, write);
-      config_.memory->DeferWrite(write.start, write.length, id);
-      Count("resolve_memory_deferred");
-    } else {
-      Count("debug_resolve_textures_only");
-    }
+    Count("debug_resolve_textures_only");
   }
   if (const VkPipeline specialized = GetSpecializedResolvePipeline(
           image_view != VK_NULL_HANDLE, kind, msaa, constants)) {
@@ -3134,218 +3093,6 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   }
   command_processor_.EndDebugLabel();
   return true;
-}
-
-void Fh1NativeExecutor::WriteDeferredMemoryThunk(void* context, uint64_t id) {
-  static_cast<Fh1NativeExecutor*>(context)->WriteDeferredMemory(id);
-}
-
-bool Fh1NativeExecutor::RetainTextureThunk(void* context, TexturePointer texture) {
-  auto& executor = *static_cast<Fh1NativeExecutor*>(context);
-  if (!texture) {
-    // Every texture is being destroyed (a replay's reset): their copies go.
-    if (!executor.deferred_memory_writes_.empty()) {
-      executor.Count("resolve_memory_deferred_lost");
-    }
-    executor.deferred_memory_writes_.clear();
-    executor.config_.memory->ForgetAllDeferredWrites();
-    return false;
-  }
-  for (const auto& [id, write] : executor.deferred_memory_writes_) {
-    if (write.texture == texture) return true;
-  }
-  return false;
-}
-
-namespace {
-// How a resolve's plan writes the 1 KB block at an address: 0 not at all, 1 all
-// of it (every texel of the 32x32-texel macro tile holding it, a contiguous
-// 1 KB << bpb, is inside the rectangle), 2 in part or not known.
-uint32_t ResolveBlockCoverage(const Fh1ResolvePlan& plan, uint32_t block, bool whole) {
-  const uint32_t bpb_log2 = (plan.dest_info >> 16) & 3u;
-  if (block < plan.dest_base || (plan.dest_base & 1023u)) return 2;
-  const uint32_t tile = (block - plan.dest_base) >> (10 + bpb_log2);
-  const uint32_t tiles_per_row = ((plan.dest_pitch + 31) & ~UINT32_C(31)) >> 5;
-  if (!tiles_per_row) return 2;
-  const int32_t x = int32_t(tile % tiles_per_row) * 32, y = int32_t(tile / tiles_per_row) * 32;
-  if (x >= plan.x1 || x + 32 <= plan.x0 || y >= plan.y1 || y + 32 <= plan.y0) return 0;
-  return whole && x >= plan.x0 && x + 32 <= plan.x1 && y >= plan.y0 && y + 32 <= plan.y1 ? 1
-                                                                                         : 2;
-}
-}  // namespace
-
-void Fh1NativeExecutor::ResolveOverDeferredMemory(const CopyPlan& plan, uint32_t extent_start,
-                                                  uint32_t extent_length) {
-  // Blocks written whole only when every source resolves.
-  bool whole = true;
-  for (const SourceRect& source : plan.sources) {
-    if (source.rect.left >= source.rect.right || source.rect.top >= source.rect.bottom) {
-      continue;
-    }
-    whole &= source.surface &&
-             (source.surface->key.is_depth ||
-              Fh1IsResolveColorFormatSupported(
-                  xenos::ColorRenderTargetFormat(source.surface->key.format)));
-  }
-  const uint64_t extent_end = uint64_t(extent_start) + extent_length;
-  uint64_t rewritten_blocks = 0, written_blocks = 0;
-  for (auto it = deferred_memory_writes_.begin(); it != deferred_memory_writes_.end();) {
-    DeferredMemoryWrite& write = it->second;
-    if (write.start >= extent_end || uint64_t(write.start) + write.length <= extent_start) {
-      ++it;
-      continue;
-    }
-    const uint32_t first = extent_start > write.start ? (extent_start - write.start) >> 10 : 0;
-    const uint32_t end = uint32_t(
-        std::min<uint64_t>(write.length >> 10, (extent_end - write.start + 1023) >> 10));
-    uint32_t run_start = UINT32_MAX;
-    for (uint32_t block = first; block <= end; ++block) {
-      bool partial = false;
-      if (block < end && (write.owed[block >> 6] >> (block & 63)) & 1) {
-        const uint32_t coverage = ResolveBlockCoverage(plan, write.start + (block << 10), whole);
-        if (coverage == 1) {
-          write.owed[block >> 6] &= ~(uint64_t(1) << (block & 63));
-          --write.owed_count;
-          ++rewritten_blocks;
-        } else if (coverage == 2) {
-          partial = true;
-        }
-      }
-      if (partial && run_start == UINT32_MAX) run_start = block;
-      if (!partial && run_start != UINT32_MAX) {
-        // Written now, before this resolve writes over part of them.
-        WriteDeferredBlocks(write, run_start, block);
-        for (uint32_t b = run_start; b < block; ++b) {
-          write.owed[b >> 6] &= ~(uint64_t(1) << (b & 63));
-        }
-        write.owed_count -= block - run_start;
-        written_blocks += block - run_start;
-        run_start = UINT32_MAX;
-      }
-    }
-    if (!write.owed_count) {
-      config_.memory->ForgetDeferredWrite(it->first);
-      it = deferred_memory_writes_.erase(it);
-      Count("resolve_memory_deferred_rewritten");
-    } else {
-      ++it;
-    }
-  }
-  if (rewritten_blocks) {
-    counters_.Count("resolve_memory_deferred_block_rewritten", rewritten_blocks);
-  }
-  if (written_blocks) {
-    counters_.Count("resolve_memory_deferred_block_written_first", written_blocks);
-  }
-}
-
-void Fh1NativeExecutor::WriteDeferredMemory(uint64_t id) {
-  const auto it = deferred_memory_writes_.find(id);
-  if (it == deferred_memory_writes_.end()) return;
-  const DeferredMemoryWrite write = std::move(it->second);
-  deferred_memory_writes_.erase(it);
-  const uint32_t blocks = write.length >> 10;
-  uint32_t run_start = UINT32_MAX;
-  for (uint32_t block = 0; block <= blocks; ++block) {
-    const bool owed = block < blocks && ((write.owed[block >> 6] >> (block & 63)) & 1);
-    if (owed && run_start == UINT32_MAX) run_start = block;
-    if (!owed && run_start != UINT32_MAX) {
-      WriteDeferredBlocks(write, run_start, block);
-      run_start = UINT32_MAX;
-    }
-  }
-  Count("resolve_memory_deferred_written");
-  counters_.Count("resolve_memory_deferred_block_written", write.owed_count);
-}
-
-void Fh1NativeExecutor::WriteDeferredBlocks(const DeferredMemoryWrite& write,
-                                            uint32_t first_block, uint32_t end_block) {
-  const uint32_t low = write.start + (first_block << 10), high = write.start + (end_block << 10);
-  // Only the texture rows (and in one tile row, columns) whose tiles hold
-  // the blocks.
-  const uint32_t rect_x = write.constants[0] & 0xFFFFu, rect_y = write.constants[0] >> 16;
-  uint32_t x0 = rect_x, y0 = rect_y;
-  uint32_t x1 = rect_x + (write.constants[1] & 0xFFFFu);
-  uint32_t y1 = rect_y + (write.constants[1] >> 16);
-  const uint32_t tiles_per_row = ((write.dest_pitch + 31) & ~UINT32_C(31)) >> 5;
-  if (low >= write.dest_base && tiles_per_row) {
-    const uint32_t tile_first = (low - write.dest_base) >> 12;
-    const uint32_t tile_last = (high - 1 - write.dest_base) >> 12;
-    const uint32_t row_first = tile_first / tiles_per_row, row_last = tile_last / tiles_per_row;
-    y0 = std::max(y0, row_first * 32);
-    y1 = std::min(y1, row_last * 32 + 32);
-    if (row_first == row_last) {
-      x0 = std::max(x0, tile_first % tiles_per_row * 32);
-      x1 = std::min(x1, tile_last % tiles_per_row * 32 + 32);
-    }
-  }
-  if (x0 >= x1 || y0 >= y1) return;
-  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
-  if (!from_image_pipeline_) {
-    from_image_pipeline_ = ui::vulkan::util::CreateComputePipeline(
-        vulkan_device, image_pipeline_layout_, kFromImageShader.code, kFromImageShader.size,
-        nullptr, "main", command_processor_.UsePersistentVkPipelineCache());
-  }
-  VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
-  const VkImageView view =
-      from_image_pipeline_ ? config_.textures->PrepareComputeWordRead(*write.texture, layout)
-                           : VK_NULL_HANDLE;
-  const VkDescriptorSet set = view ? AllocateDescriptorSet(image_set_layout_) : VK_NULL_HANDLE;
-  if (!set) {
-    Skip("resolve_memory_deferred_write");
-    return;
-  }
-  config_.memory->Use(VulkanSharedMemory::Usage::kComputeWrite,
-                      std::make_pair(low, high - low));
-  command_processor_.SubmitBarriers(true);
-  const VkDescriptorBufferInfo buffer_info = {config_.memory->buffer(), write.memory_offset,
-                                              write.memory_range};
-  // The texture through the source binding (the shader samples it, in its
-  // current layout); the storage images are not used.
-  const VkDescriptorImageInfo image_info = {VK_NULL_HANDLE, view, layout};
-  VkWriteDescriptorSet writes[2] = {};
-  for (VkWriteDescriptorSet& w : writes) {
-    w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    w.dstSet = set;
-    w.descriptorCount = 1;
-  }
-  writes[0].dstBinding = kBindingMemory;
-  writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  writes[0].pBufferInfo = &buffer_info;
-  writes[1].dstBinding = kBindingSource;
-  writes[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-  writes[1].pImageInfo = &image_info;
-  vulkan_device->functions().vkUpdateDescriptorSets(vulkan_device->device(), 2, writes, 0,
-                                                    nullptr);
-  // The resolve's constants over the rows found, with the window of bytes
-  // (from the bound range) in place of the EDRAM layouts the shader skips.
-  std::array<uint32_t, 11> constants = write.constants;
-  constants[0] = x0 | (y0 << 16);
-  constants[1] = (x1 - x0) | ((y1 - y0) << 16);
-  constants[2] = uint32_t(low - write.memory_offset);
-  constants[3] = uint32_t(high - write.memory_offset);
-  auto& command_buffer = command_processor_.deferred_command_buffer();
-  command_processor_.BindExternalComputePipeline(from_image_pipeline_);
-  command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, image_pipeline_layout_,
-                                         0, 1, &set, 0, nullptr);
-  command_buffer.CmdVkPushConstants(image_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                    uint32_t(sizeof(constants)), constants.data());
-  command_processor_.BeginDebugLabel("fh1 deferred resolve memory");
-  command_buffer.CmdVkDispatch((x1 - x0 + 15) / 16, (y1 - y0 + 15) / 16, 1);
-  command_processor_.EndDebugLabel();
-  Count("resolve_memory_deferred_dispatch");
-}
-
-void Fh1NativeExecutor::WriteOldDeferredMemory() {
-  // Written after about five seconds at 60 fps unread, so that the textures
-  // they keep can be freed (the texture cache keeps them while they are owed).
-  constexpr uint64_t kMaxAgeFrames = 300;
-  while (!deferred_memory_writes_.empty() &&
-         deferred_memory_writes_.begin()->second.frame + kMaxAgeFrames < frame_) {
-    const uint64_t id = deferred_memory_writes_.begin()->first;
-    config_.memory->ForgetDeferredWrite(id);
-    WriteDeferredMemory(id);
-  }
 }
 
 bool Fh1NativeExecutor::PlanCopy(CopyPlan& plan) {
@@ -3599,7 +3346,6 @@ void LogResolvedRangeAccess(void*, uint32_t physical_address, uint32_t length, b
 }  // namespace
 
 bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_length) {
-  if (!deferred_memory_writes_.empty()) WriteOldDeferredMemory();
   const RegisterFile& regs = register_file_;
   // Untiled tiling: a later tile's band is at its screen rows of the
   // surfaces, past the EDRAM rows its window offset maps it to.
@@ -3680,13 +3426,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
       target_range = scaled_length;
       dest_base = plan.dest_base - base;
     } else {
-      // Deferred writes under this resolve: blocks it writes whole are not owed
-      // any more, blocks it writes in part are written first, the rest wait.
-      if (!deferred_memory_writes_.empty()) ResolveOverDeferredMemory(plan, extent_start,
-                                                                      extent_length);
-      config_.memory->set_deferred_writes_suspended(true);
       config_.memory->RequestRange(extent_start, extent_length);
-      config_.memory->set_deferred_writes_suspended(false);
       config_.memory->Use(VulkanSharedMemory::Usage::kComputeWrite,
                           std::make_pair(extent_start, extent_length));
     }
@@ -3743,38 +3483,6 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
         direct_resolve_view2 =
             config_.textures->PrepareDirectResolveWrite(*direct_resolve_targets_[1].texture);
         if (direct_resolve_view2 == VK_NULL_HANDLE) direct_resolve_targets_.resize(1);
-      }
-    }
-    // Deferring the guest memory copy (fh1_resolve_defer_memory): the first
-    // texture's texels must give back every word, so 32-bit words without a
-    // load conversion, unscaled, with the whole rectangle inside the texture.
-    defer_memory_ = false;
-    if (REXCVAR_GET(fh1_resolve_defer_memory) && !resolve_textures_only_ && scale_ == 1 &&
-        !direct_resolve_targets_.empty() && extent_length > 4096 &&
-        direct_resolve_conversion == 0 && ((plan.dest_info >> 16) & 3u) == 2 &&
-        plan.x0 >= 0 && plan.y0 >= 0 && !((extent_start | extent_length | plan.dest_base) & 1023u)) {
-      const TextureCache::DirectResolveTarget& target = direct_resolve_targets_[0];
-      const auto& key = target.texture->key();
-      if (uint32_t(plan.x1) <= key.GetWidth() &&
-          target.row_offset + uint32_t(plan.y1) <= key.GetHeight()) {
-        defer_memory_ = true;
-        deferred_plan_ = DeferredMemoryWrite();
-        deferred_plan_.start = extent_start;
-        deferred_plan_.length = extent_length;
-        deferred_plan_.texture = target.texture;
-        deferred_plan_.dest_base = plan.dest_base;
-        deferred_plan_.dest_pitch = plan.dest_pitch;
-        deferred_plan_.dest_info = plan.dest_info;
-        deferred_plan_.x0 = plan.x0;
-        deferred_plan_.y0 = plan.y0;
-        deferred_plan_.x1 = plan.x1;
-        deferred_plan_.y1 = plan.y1;
-        deferred_plan_.frame = frame_;
-        deferred_plan_.owed.assign(((extent_length >> 10) + 63) >> 6, 0);
-        for (uint32_t block = 0; block < (extent_length >> 10); ++block) {
-          deferred_plan_.owed[block >> 6] |= uint64_t(1) << (block & 63);
-        }
-        deferred_plan_.owed_count = extent_length >> 10;
       }
     }
     bool complete = true;
@@ -3882,7 +3590,6 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
                       : uint32_t(direct_resolve_targets_[0].texture->key().base_page << 12),
                   complete ? "complete" : "incomplete");
     }
-    defer_memory_ = false;
     if (complete && !direct_resolve_targets_.empty()) {
       config_.textures->CompleteDirectResolve(direct_resolve_targets_);
       counters_.Count("resolve_to_texture", direct_resolve_targets_.size());
