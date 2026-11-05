@@ -187,7 +187,12 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
   } else {
     spirv_version = spv::Spv_1_0;
   }
-  if (spirv_version < spv::Spv_1_3) {
+  // The Imagination PowerVR driver (Pixel 10 Pro, driver 0x696BD0) fails
+  // vkCreateGraphicsPipelines with VK_ERROR_UNKNOWN for every pixel shader
+  // with an OpGroupNonUniformQuadSwap, so whatever those shaders draw is
+  // missing (arcanite24/pinyon-shift#936).
+  if (spirv_version < spv::Spv_1_3 ||
+      vulkan_device->properties().driverID == VK_DRIVER_ID_IMAGINATION_PROPRIETARY) {
     quad_operations_fragment = false;
   }
   const auto& device_properties = vulkan_device->properties();
