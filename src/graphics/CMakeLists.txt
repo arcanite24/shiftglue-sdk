@@ -33,6 +33,7 @@ set(REXGPU_XENOS_SOURCES
     pipeline/texture/cache.cpp
     pipeline/texture/replacement.cpp
     cube_lut.cpp
+    texture_transcode_astc.cpp
     pipeline/shader/interpreter.cpp
 
     # Null backend (gpu_backend=null): packets without a device

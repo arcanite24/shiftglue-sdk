@@ -111,6 +111,8 @@ class VulkanDevice {
     bool subgroupQuadFragment = false;
     bool depthClamp = false;
     bool fillModeNonSolid = false;
+    bool textureCompressionBC = false;
+    bool textureCompressionASTC_LDR = false;
     bool samplerAnisotropy = false;
     bool occlusionQueryPrecise = false;
     bool vertexPipelineStoresAndAtomics = false;

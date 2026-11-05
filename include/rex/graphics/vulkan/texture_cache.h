@@ -239,6 +239,10 @@ class VulkanTextureCache final : public TextureCache {
 
     // Set up dynamically based on what's supported by the device.
     bool linear_filterable;
+
+    // Nonzero when the loaded BC blocks are transcoded to ASTC 4x4 before the
+    // copy (1 BC1, 2 BC2, 3 BC3); format is then the ASTC format.
+    uint8_t transcode_mode = 0;
   };
 
   struct HostFormatPair {
@@ -519,6 +523,8 @@ class VulkanTextureCache final : public TextureCache {
   VkPipeline copy_pipelines_[3] = {};
   std::array<VkPipeline, kLoadShaderCount> load_pipelines_{};
   std::array<VkPipeline, kLoadShaderCount> load_pipelines_scaled_{};
+  // BC to ASTC 4x4 transcoding over the scratch buffer (vulkan_bc_transcode).
+  VkPipeline transcode_pipeline_ = VK_NULL_HANDLE;
 
   // If both images can be placed in the same allocation, it's one allocation,
   // otherwise it's two separate.

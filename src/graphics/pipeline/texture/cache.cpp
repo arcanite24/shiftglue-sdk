@@ -372,6 +372,13 @@ namespace {
 std::atomic<uint64_t> memory_reduction_until_ms{0};
 constexpr uint64_t kMemoryReductionDurationMs = 10000;
 constexpr uint32_t kMemoryReductionFloorMb = 256;
+// A reduction trims to this share of what the cache held when it began (never
+// below the floor), so a low-memory signal on a phone cuts textures by a
+// fraction instead of dropping them all and reloading them on screen.
+constexpr uint32_t kMemoryReductionKeepPercent = 60;
+// The limit of the current reduction window; 0 until its first completed
+// submission sets it.
+std::atomic<uint32_t> memory_reduction_limit_mb{0};
 constexpr uint32_t kMemoryReductionLifetimeMs = 1000;
 }  // namespace
 
@@ -379,6 +386,7 @@ void TextureCache::RequestMemoryReduction() {
   memory_reduction_until_ms.store(
       rex::chrono::Clock::QueryHostUptimeMillis() + kMemoryReductionDurationMs,
       std::memory_order_relaxed);
+  memory_reduction_limit_mb.store(0, std::memory_order_relaxed);
 }
 
 void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_index) {
@@ -403,7 +411,14 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
   }
   const bool reducing = current_time < memory_reduction_until_ms.load(std::memory_order_relaxed);
   if (reducing) {
-    limit_soft_mb = std::min(limit_soft_mb, kMemoryReductionFloorMb);
+    uint32_t reduction_limit_mb = memory_reduction_limit_mb.load(std::memory_order_relaxed);
+    if (!reduction_limit_mb) {
+      reduction_limit_mb = std::max<uint32_t>(
+          kMemoryReductionFloorMb,
+          uint32_t((textures_total_host_memory_usage_ >> 20) * kMemoryReductionKeepPercent / 100));
+      memory_reduction_limit_mb.store(reduction_limit_mb, std::memory_order_relaxed);
+    }
+    limit_soft_mb = std::min(limit_soft_mb, reduction_limit_mb);
     limit_soft_lifetime = std::min(limit_soft_lifetime, kMemoryReductionLifetimeMs);
   }
   const uint64_t usage_before = textures_total_host_memory_usage_;
