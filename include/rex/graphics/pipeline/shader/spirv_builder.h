@@ -42,6 +42,55 @@ class SpirvBuilder : public spv::Builder {
   spv::Id createNoContractionBinOp(spv::Op op_code, spv::Id type_id, spv::Id operand1,
                                    spv::Id operand2);
 
+  // When set, 32-bit float arithmetic emitted through the NoContraction
+  // helpers (FAdd, FSub, FMul, FDiv) and the GLSL.std.450 math helpers (the
+  // rounding, min/max/clamp, sqrt, inverse sqrt, sin and cos functions) is
+  // performed in 16-bit floats: the operands are converted with OpFConvert
+  // right before the operation and the result right after it, so every value
+  // outside the operation stays a 32-bit float (fh1_shader_float16). The
+  // module must declare the Float16 capability. Sign-only operations (FAbs,
+  // FNegate), exp2/log2 (a 16-bit float overflows past 2^16), conversions and
+  // packing stay 32-bit.
+  bool float16_arithmetic = false;
+
+  // Which operation classes float16_arithmetic applies to, for bisecting
+  // image differences (fh1_shader_float16_ops). All classes by default.
+  enum Float16OpClass : uint32_t {
+    kFloat16OpAdd = 1u << 0,       // FAdd, FSub
+    kFloat16OpMul = 1u << 1,       // FMul
+    kFloat16OpDiv = 1u << 2,       // FDiv
+    kFloat16OpRound = 1u << 3,     // Round, RoundEven, Trunc, Floor, Ceil, Fract
+    kFloat16OpTrig = 1u << 4,      // Sin, Cos
+    kFloat16OpSqrt = 1u << 5,      // Sqrt, InverseSqrt
+    kFloat16OpMinMax = 1u << 6,    // FMin, FMax, FClamp, NMin, NMax, NClamp
+    kFloat16OpAll = 0x7Fu,
+  };
+  uint32_t float16_op_classes = kFloat16OpAll;
+
+  // Clamp each non-constant operand to the finite 16-bit range (+-65504) with
+  // NClamp before the OpFConvert to 16 bits, so a 32-bit value past it
+  // saturates instead of becoming an infinity (fh1_shader_float16_clamp); the
+  // operations that stay 32-bit (exp2, log2, reciprocals) can produce such
+  // values. Needs the GLSL.std.450 import in float16_builtins.
+  bool float16_clamp_operands = false;
+  spv::Id float16_builtins = 0;
+
+  // Sets float16_arithmetic for a scope and restores the previous value.
+  class Float16ArithmeticScope {
+   public:
+    Float16ArithmeticScope(SpirvBuilder& builder, bool enable)
+        : builder_(builder), previous_(builder.float16_arithmetic) {
+      builder_.float16_arithmetic = enable;
+    }
+    ~Float16ArithmeticScope() { builder_.float16_arithmetic = previous_; }
+
+   private:
+    Float16ArithmeticScope(const Float16ArithmeticScope&) = delete;
+    Float16ArithmeticScope& operator=(const Float16ArithmeticScope&) = delete;
+    SpirvBuilder& builder_;
+    bool previous_;
+  };
+
   spv::Id createUnaryBuiltinCall(spv::Id result_type, spv::Id builtins, int entry_point,
                                  spv::Id operand);
   spv::Id createBinBuiltinCall(spv::Id result_type, spv::Id builtins, int entry_point,
@@ -145,6 +194,19 @@ class SpirvBuilder : public spv::Builder {
 
     Branch current_branch_ = Branch::kSelection;
   };
+
+ private:
+  // The 16-bit float type with the shape of a 32-bit float scalar or vector
+  // type under float16_arithmetic, or spv::NoType when the type is not one or
+  // the mode is off.
+  spv::Id GetFloat16ArithmeticType(spv::Id float32_type);
+  bool IsFloat16BinOp(spv::Op op_code) const;
+  bool IsFloat16BuiltinCall(int entry_point) const;
+  spv::Id createFloat16BuiltinCall(spv::Id result_type, spv::Id float16_type, spv::Id builtins,
+                                   int entry_point, const spv::Id* operands, int operand_count);
+  // The 32-bit operand converted to the 16-bit type, clamped first when
+  // float16_clamp_operands is set.
+  spv::Id ConvertToFloat16(spv::Id float16_type, spv::Id operand);
 };
 
 }  // namespace rex::graphics

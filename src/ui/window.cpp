@@ -563,6 +563,14 @@ bool Window::OnActualSizeUpdate(uint32_t new_physical_width, uint32_t new_physic
   return true;
 }
 
+void Window::OnSurfaceStateUpdate(WindowDestructionReceiver& destruction_receiver) {
+  if (presenter_surface_) {
+    presenter_->OnSurfaceResizeFromUIThread();
+  }
+  UISetupEvent e(this);
+  SendEventToListeners([&e](auto listener) { listener->OnResize(e); }, destruction_receiver);
+}
+
 void Window::OnFocusUpdate(bool new_has_focus, WindowDestructionReceiver& destruction_receiver) {
   if (has_focus_ == new_has_focus) {
     return;

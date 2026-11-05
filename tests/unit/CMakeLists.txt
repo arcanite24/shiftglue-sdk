@@ -40,6 +40,7 @@ add_executable(unit_tests
     graphics/cube_lut_test.cpp
     graphics/texture_cache_test.cpp
     graphics/fh1_edram_resolve_test.cpp
+    ui/frame_generation_pacer_test.cpp
     ui/presentation_pacer_test.cpp
 )
 

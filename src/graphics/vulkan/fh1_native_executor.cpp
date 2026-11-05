@@ -78,6 +78,10 @@ REXCVAR_DEFINE_BOOL(fh1_trace_resolve_cpu_accesses, false, "GPU",
                     "reads and writes of it (thread and link register), to find the resolves "
                     "the CPU reads (FH1 native executor, Vulkan)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_native_gpu_profile_renderings_only, false, "GPU",
+                    "With fh1_native_gpu_profile, time only the draw renderings and the frame: "
+                    "about two timestamps a rendering, so a busy FH1 frame fits a MoltenVK pool")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(fh1_native_stats_frames, 600, "GPU",
                      "Frames between the FH1 native executor's periodic stats and GPU profile "
                      "logs (Vulkan); shorter windows separate heavy stretches of play")
@@ -516,6 +520,7 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   const VkDevice device = vulkan_device->device();
 
   if (REXCVAR_GET(fh1_native_gpu_profile)) {
+    gpu_profile_renderings_only_ = REXCVAR_GET(fh1_native_gpu_profile_renderings_only);
     VkQueryPoolCreateInfo query_pool_info = {};
     query_pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     query_pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -1672,7 +1677,7 @@ void Fh1NativeExecutor::FlushTransfers() {
     }
     if (Surface* dest = FindSurface(pending_transfers_[group].dest)) {
       uint64_t label_timing = UINT64_MAX;
-      if (gpu_query_pool_ != VK_NULL_HANDLE) {
+      if (gpu_query_pool_ != VK_NULL_HANDLE && !gpu_profile_renderings_only_) {
         const Surface* first_source = FindSurface(pending_transfers_[group].source);
         const std::string label = fmt::format("T {}={}",
             first_source ? first_source->key.Describe() : std::string("?"), dest->key.Describe());
@@ -2484,9 +2489,15 @@ bool Fh1NativeExecutor::BindTargets(VulkanRenderTargetCache::RenderPassKey& key_
 }
 
 void Fh1NativeExecutor::UpdateCoarseShading() {
-  const std::string spec = command_processor_.GetVulkanDevice()->properties().pipelineFragmentShadingRate
-                               ? REXCVAR_GET(fh1_coarse_shading)
-                               : std::string();
+  const bool supported =
+      command_processor_.GetVulkanDevice()->properties().pipelineFragmentShadingRate;
+  const std::string spec = supported ? REXCVAR_GET(fh1_coarse_shading) : std::string();
+  if (!supported && !REXCVAR_GET(fh1_coarse_shading).empty() && !coarse_shading_warned_) {
+    coarse_shading_warned_ = true;
+    REXGPU_WARN("FH1 native executor (Vulkan): fh1_coarse_shading set, but the device has no "
+                "VK_KHR_fragment_shading_rate (vulkan_fragment_shading_rate); nothing is "
+                "shaded coarsely");
+  }
   if (spec == coarse_shading_spec_) return;
   coarse_shading_spec_ = spec;
   coarse_shading_.clear();
@@ -2742,7 +2753,11 @@ void Fh1NativeExecutor::BeginDrawRendering() {
   if (clears) FoldPendingClears(bound, clear_width, clear_height, colors, &depth, true);
   rendering_id_ = id;
   const auto& skip_renderings = REXCVAR_GET(fh1_debug_skip_renderings);
-  if (gpu_query_pool_ != VK_NULL_HANDLE || !skip_renderings.empty()) {
+  if (gpu_query_pool_ != VK_NULL_HANDLE || !skip_renderings.empty() ||
+      command_processor_.debug_labels()) {
+    // The rendering's name is its bound surfaces, for the GPU profile,
+    // diagnostic selection, and debug labels (vulkan_debug_labels). GpuLabel
+    // keeps the string so its pointer stays valid for the deferred commands.
     std::string label;
     for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
       if (bound_bits_ & (1u << i)) label += (label.empty() ? "" : "+") + pending_keys_[i].Describe();
@@ -2750,7 +2765,11 @@ void Fh1NativeExecutor::BeginDrawRendering() {
     if (label.empty()) label = "none";
     debug_skip_rendering_ = !skip_renderings.empty() &&
         ("," + skip_renderings + ",").find("," + label + ",") != std::string::npos;
-    if (gpu_query_pool_ != VK_NULL_HANDLE) GpuMarkRendering(GpuLabel(label));
+    const uint32_t label_id = GpuLabel(label);
+    if (gpu_query_pool_ != VK_NULL_HANDLE) GpuMarkRendering(label_id);
+    if (command_processor_.debug_labels()) {
+      command_processor_.SetNextRenderingLabel(gpu_labels_[label_id].c_str());
+    }
   }
   if (vis_frame_) VisMarkRendering();
   command_processor_.SubmitBarriersAndBeginFh1Rendering(info, id);
@@ -2937,7 +2956,7 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
       if (begin != UINT32_MAX) executor.GpuEnd(GpuPhase(kGpuPhases + label), begin);
     }
   } label_timer{*this};
-  if (gpu_query_pool_ != VK_NULL_HANDLE) {
+  if (gpu_query_pool_ != VK_NULL_HANDLE && !gpu_profile_renderings_only_) {
     label_timer.label = GpuLabel(fmt::format("R {} {}x{}", surface.key.Describe(),
                                              source.rect.right - source.rect.left,
                                              source.rect.bottom - source.rect.top));
@@ -3487,6 +3506,19 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     }
     bool complete = true;
     for (const SourceRect& source : plan.sources) {
+      {
+        // Is the source one of the open rendering's attachments? If so the
+        // pass end is inherent: the resolve reads what the draws wrote.
+        bool bound = false;
+        for (uint32_t b = 0; b < 1 + xenos::kMaxColorRenderTargets; ++b) {
+          if ((bound_bits_ & (1u << b)) && pending_keys_[b].Pack() == source.surface->key.Pack()) {
+            bound = true;
+          }
+        }
+        Count(!command_processor_.IsFh1RenderingOpen(DrawRenderingId(bound_bits_))
+                  ? "resolve_no_rendering_open"
+                  : bound ? "resolve_source_bound" : "resolve_source_unbound");
+      }
       if (source.rect.left >= source.rect.right || source.rect.top >= source.rect.bottom) {
         continue;
       }
@@ -3725,6 +3757,7 @@ void Fh1NativeExecutor::OnSwap(uint64_t frame) {
       vis_draws_.clear();
     }
   }
+  if (config_.memory) config_.memory->BeginUploadFrame();
   frame_ = frame;
   PERF_counter_set(kFh1TransferSpecializationEntries, specialized_transfer_pipelines_);
   PERF_counter_set(kFh1ResolveSpecializationEntries, specialized_resolve_pipelines_.size());
@@ -3915,19 +3948,25 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
     REXGPU_INFO("FH1 native executor (Vulkan) transfer tile-passes: {}", top);
     transfer_volume_.clear();
   }
-  const uint64_t window_frames = frame >= 600 ? 600 : std::max<uint64_t>(frame, 1);
+  // The per-frame rates below cover the frames since the previous stats line.
+  const uint64_t stats_interval = uint64_t(std::max<int32_t>(1, REXCVAR_GET(fh1_native_stats_frames)));
+  const uint64_t window_frames =
+      frame >= stats_interval ? stats_interval : std::max<uint64_t>(frame, 1);
   const auto causes = command_processor_.TakeFh1RenderingCauses();
   const double per_frame = 1.0 / double(window_frames);
   REXGPU_INFO(
       "FH1 native executor (Vulkan) per frame over {} frames: renderings {:.1f} barrier "
       "batches {:.1f}; renderings begun after barriers on the same surfaces {:.1f}, barriers "
-      "and new surfaces {:.1f}, new surfaces {:.1f}, other work {:.1f}",
+      "and new surfaces {:.1f}, new surfaces {:.1f}, other work {:.1f}; uploads hoisted "
+      "behind the open rendering {:.1f} in {:.1f} barrier pairs",
       window_frames, double(command_processor_.TakeRenderingBeginCount()) * per_frame,
       double(command_processor_.TakeBarrierBatchCount()) * per_frame,
       double(causes[VulkanCommandProcessor::kFh1RenderingBarriersSameSurfaces]) * per_frame,
       double(causes[VulkanCommandProcessor::kFh1RenderingBarriersNewSurfaces]) * per_frame,
       double(causes[VulkanCommandProcessor::kFh1RenderingNewSurfaces]) * per_frame,
-      double(causes[VulkanCommandProcessor::kFh1RenderingEndedElsewhere]) * per_frame);
+      double(causes[VulkanCommandProcessor::kFh1RenderingEndedElsewhere]) * per_frame,
+      double(command_processor_.TakeFh1HoistedUploadCount()) * per_frame,
+      double(command_processor_.TakeFh1HoistedBarrierPairCount()) * per_frame);
   std::vector<std::pair<uint64_t, std::string>> enders;
   for (auto& [name, count] : command_processor_.TakeFh1RenderingEnders()) {
     enders.emplace_back(count, name);
@@ -3940,6 +3979,19 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
   }
   if (!top.empty()) {
     REXGPU_INFO("FH1 native executor (Vulkan) renderings ended by other work, per frame: {}", top);
+  }
+  if (config_.memory) {
+    // Cumulative shared-memory uploads by kind, as the D3D12 executor logs
+    // them: requests that uploaded, page ranges and bytes.
+    using Kind = SharedMemory::UploadKind;
+    const auto stats = [this](Kind kind) {
+      const SharedMemory::UploadStats& s = config_.memory->upload_stats(kind);
+      return fmt::format("{}/{}/{:.1f}MB (repeat {:.1f}MB)", s.requests, s.ranges,
+                         double(s.bytes) / 1048576.0, double(s.repeat_bytes) / 1048576.0);
+    };
+    REXGPU_INFO("Shared memory uploads: vertex {} index {} texture {} memexport {} other {}",
+                stats(Kind::kVertex), stats(Kind::kIndex), stats(Kind::kTexture),
+                stats(Kind::kMemexport), stats(Kind::kOther));
   }
 }
 

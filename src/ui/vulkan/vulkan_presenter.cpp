@@ -27,6 +27,8 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/platform.h>
+#include <rex/perf/counter.h>
+#include <rex/ui/vulkan/frame_generator.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -289,6 +291,8 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
 }
 
 VulkanPresenter::~VulkanPresenter() {
+  // The frame pacing thread paints through this object; join it first.
+  ShutdownFrameGenerationPacer();
   // Retirement drains drawing and presentation before releasing their objects.
   paint_context_.DestroySwapchainAndVulkanSurface();
 
@@ -336,6 +340,16 @@ VulkanPresenter::~VulkanPresenter() {
   for (VkFramebuffer& framebuffer : paint_context_.guest_output_intermediate_framebuffers) {
     util::DestroyAndNullHandle(dfn.vkDestroyFramebuffer, device, framebuffer);
   }
+  // Paint submissions were awaited above; the images go with the pool that
+  // holds their descriptor.
+  paint_context_.frame_generation.generator.reset();
+  paint_context_.frame_generation.generated.reset();
+  for (auto& history : paint_context_.frame_generation.history) {
+    history.reset();
+  }
+  util::DestroyAndNullHandle(dfn.vkDestroyCommandPool, device,
+                             paint_context_.frame_generation.external_copy_pool);
+  paint_context_.frame_generation.external_copy_command_buffer = VK_NULL_HANDLE;
   util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
                              paint_context_.guest_output_descriptor_pool);
   for (PaintContext::GuestOutputPaintPipeline& guest_output_paint_pipeline :
@@ -1551,6 +1565,329 @@ void VulkanPresenter::GuestOutputRefreshSubmitted(uint32_t mailbox_index) {
   }
 }
 
+FrameGenerationAvailability VulkanPresenter::ProbeFrameGenerationBackend(
+    FrameGenerationBackend backend) {
+  return ProbeVulkanFrameGenerationBackend(backend, vulkan_device_);
+}
+
+bool VulkanPresenter::IsFrameGenerationOffered() const {
+  // The row is offered where a real backend is built for this platform;
+  // the repeat debug backend alone does not offer it.
+#if REX_PLATFORM_MAC
+  return true;
+#else
+  return false;
+#endif
+}
+
+void VulkanPresenter::ResetFrameGenerationHistory() {
+  paint_context_.frame_generation.reset_requested.store(true, std::memory_order_relaxed);
+}
+
+bool VulkanPresenter::EnsureFrameGenerationResources(
+    const std::shared_ptr<GuestOutputImage>& guest_output_image) {
+  PaintContext::FrameGeneration& generation = paint_context_.frame_generation;
+  const VkExtent2D& extent = guest_output_image->extent();
+  const bool size_changed =
+      generation.generated && (generation.generated->extent().width != extent.width ||
+                               generation.generated->extent().height != extent.height);
+  if (size_changed) {
+    paint_context_.submission_tracker.AwaitSubmissionCompletion(generation.last_submission);
+    generation.generated.reset();
+    for (auto& history : generation.history) {
+      history.reset();
+    }
+    generation.generated_ever_written = false;
+    generation.newest = SIZE_MAX;
+    generation.history_sequences = {UINT64_MAX, UINT64_MAX};
+    generation.reset_requested.store(true, std::memory_order_relaxed);
+  }
+  const bool exportable = generation.generator_external_queue;
+  if (!generation.generated) {
+    generation.generated =
+        GuestOutputImage::Create(vulkan_device_, extent.width, extent.height, exportable);
+    if (!generation.generated) {
+      return false;
+    }
+    // The generated image's descriptor, written once per image.
+    VkDescriptorImageInfo image_info;
+    image_info.sampler = VK_NULL_HANDLE;
+    image_info.imageView = generation.generated->view();
+    image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet write;
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.pNext = nullptr;
+    write.dstSet = paint_context_.guest_output_descriptor_sets
+                       [PaintContext::kGuestOutputDescriptorSetGeneratedSampled];
+    write.dstBinding = 0;
+    write.dstArrayElement = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    write.pImageInfo = &image_info;
+    write.pBufferInfo = nullptr;
+    write.pTexelBufferView = nullptr;
+    vulkan_device_->functions().vkUpdateDescriptorSets(vulkan_device_->device(), 1, &write, 0,
+                                                       nullptr);
+  }
+  for (auto& history : generation.history) {
+    if (!history) {
+      history = GuestOutputImage::Create(vulkan_device_, extent.width, extent.height, exportable);
+      if (!history) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+void VulkanPresenter::RecordFrameGenerationHistoryCopy(
+    VkCommandBuffer command_buffer, const std::shared_ptr<GuestOutputImage>& guest_output_image,
+    uint64_t submission_index) {
+  PaintContext::FrameGeneration& generation = paint_context_.frame_generation;
+  if (!EnsureFrameGenerationResources(guest_output_image)) {
+    return;
+  }
+  const uint64_t sequence = GetGuestOutputRefreshSequence();
+  if (generation.newest != SIZE_MAX && generation.history_sequences[generation.newest] == sequence) {
+    // The same real frame painted again (a UI repaint, a duplicate).
+    return;
+  }
+  if (generation.reset_requested.exchange(false, std::memory_order_relaxed)) {
+    // The previous frame is not this one's pair; start the history over with
+    // this frame as the newest, so the next publish can pair with it. The
+    // generation of this frame (if any) then finds no pair and the backend's
+    // next generation gets reset_history.
+    generation.newest = SIZE_MAX;
+    generation.history_sequences = {UINT64_MAX, UINT64_MAX};
+    generation.backend_reset_pending = true;
+  }
+  const size_t slot = generation.newest == SIZE_MAX ? 0 : (generation.newest + 1) % 2;
+  const GuestOutputImage& history = *generation.history[slot];
+  const bool history_written = generation.history_sequences[slot] != UINT64_MAX;
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkPipelineStageFlags read_stages =
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+  VkImageMemoryBarrier barriers[2];
+  for (VkImageMemoryBarrier& barrier : barriers) {
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.pNext = nullptr;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.subresourceRange = util::InitializeSubresourceRange();
+  }
+  // The guest output image sits in kGuestOutputInternalLayout after its
+  // refresh; the paint reads it back there afterwards.
+  barriers[0].srcAccessMask = kGuestOutputInternalAccessMask;
+  barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  barriers[0].oldLayout = kGuestOutputInternalLayout;
+  barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  barriers[0].image = guest_output_image->image();
+  barriers[1].srcAccessMask = history_written ? VK_ACCESS_SHADER_READ_BIT : 0;
+  barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barriers[1].oldLayout =
+      history_written ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+  barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  barriers[1].image = history.image();
+  dfn.vkCmdPipelineBarrier(command_buffer,
+                           kGuestOutputInternalStageMask | read_stages |
+                               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
+  VkImageCopy region;
+  region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  region.srcSubresource.mipLevel = 0;
+  region.srcSubresource.baseArrayLayer = 0;
+  region.srcSubresource.layerCount = 1;
+  region.srcOffset = {0, 0, 0};
+  region.dstSubresource = region.srcSubresource;
+  region.dstOffset = {0, 0, 0};
+  region.extent = {history.extent().width, history.extent().height, 1};
+  dfn.vkCmdCopyImage(command_buffer, guest_output_image->image(),
+                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, history.image(),
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+  barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  barriers[0].dstAccessMask = kGuestOutputInternalAccessMask;
+  barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  barriers[0].newLayout = kGuestOutputInternalLayout;
+  barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  barriers[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           kGuestOutputInternalStageMask | read_stages, 0, 0, nullptr, 0, nullptr, 2,
+                           barriers);
+  generation.history_sequences[slot] = sequence;
+  generation.newest = slot;
+  generation.last_submission = submission_index;
+}
+
+void VulkanPresenter::LogFrameGenerationSkip(const char* reason) {
+  // The first few, to explain a run whose generated presents stay low.
+  if (frame_generation_skips_logged_ >= 8) {
+    return;
+  }
+  ++frame_generation_skips_logged_;
+  REXLOG_INFO("VulkanPresenter: frame generation skipped: {}", reason);
+}
+
+bool VulkanPresenter::RecordFrameGeneration(
+    VkCommandBuffer command_buffer, const std::shared_ptr<GuestOutputImage>& guest_output_image,
+    const GuestOutputProperties& properties, uint64_t submission_index) {
+  PaintContext::FrameGeneration& generation = paint_context_.frame_generation;
+  if (!generation.generator) {
+    return false;
+  }
+  // This frame into the history first (a no-op when already there). The
+  // external-queue backends need the copy on its own submission before their
+  // own-queue work; the in-command-buffer backends record it here.
+  if (generation.generator_external_queue) {
+    if (!SubmitFrameGenerationHistoryCopy(guest_output_image)) {
+      LogFrameGenerationSkip("the history copy submission failed");
+      return false;
+    }
+  } else {
+    RecordFrameGenerationHistoryCopy(command_buffer, guest_output_image, submission_index);
+  }
+  if (generation.newest == SIZE_MAX) {
+    LogFrameGenerationSkip("no frame in the history");
+    return false;
+  }
+  const size_t previous = (generation.newest + 1) % 2;
+  if (generation.history_sequences[previous] == UINT64_MAX) {
+    // Only one frame since the reset: no pair yet.
+    LogFrameGenerationSkip("one frame since the reset, no pair");
+    return false;
+  }
+  const bool reset = generation.backend_reset_pending;
+  generation.backend_reset_pending = false;
+  VulkanFrameGenerationInputs inputs;
+  inputs.command_buffer = command_buffer;
+  inputs.previous = generation.history[previous]->image();
+  inputs.previous_view = generation.history[previous]->view();
+  inputs.current = generation.history[generation.newest]->image();
+  inputs.current_view = generation.history[generation.newest]->view();
+  inputs.output = generation.generated->image();
+  inputs.output_view = generation.generated->view();
+  inputs.output_ever_written = generation.generated_ever_written;
+  inputs.extent = generation.generated->extent();
+  inputs.reset_history = reset;
+  inputs.delta_s = float(double(GetFrameGenerationIntervalNs()) * 1e-9);
+  (void)properties;
+  if (!generation.generator->Generate(inputs)) {
+    LogFrameGenerationSkip("the backend failed");
+    return false;
+  }
+  generation.generated_ever_written = true;
+  generation.last_submission = submission_index;
+  const uint64_t gpu_ns = generation.generator->TakeLastGpuTimeNs();
+  if (gpu_ns) {
+    PROFILE_FRAME_GENERATION_GPU_NS(int64_t(gpu_ns));
+  }
+  return true;
+}
+
+bool VulkanPresenter::SubmitFrameGenerationHistoryCopy(
+    const std::shared_ptr<GuestOutputImage>& guest_output_image) {
+  // The external-queue backends (MetalFX) read the history on another API's
+  // queue, so the copy cannot sit in the paint command buffer that is only
+  // submitted afterwards; it is its own submission on the graphics/compute
+  // queue, which MoltenVK's synchronous submits keep before the Metal work.
+  PaintContext::FrameGeneration& generation = paint_context_.frame_generation;
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  if (generation.external_copy_pool == VK_NULL_HANDLE) {
+    VkCommandPoolCreateInfo pool_info;
+    pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    pool_info.pNext = nullptr;
+    pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    pool_info.queueFamilyIndex = vulkan_device_->queue_family_graphics_compute();
+    if (dfn.vkCreateCommandPool(device, &pool_info, nullptr, &generation.external_copy_pool) !=
+        VK_SUCCESS) {
+      return false;
+    }
+    VkCommandBufferAllocateInfo allocate_info;
+    allocate_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocate_info.pNext = nullptr;
+    allocate_info.commandPool = generation.external_copy_pool;
+    allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocate_info.commandBufferCount = 1;
+    if (dfn.vkAllocateCommandBuffers(device, &allocate_info,
+                                     &generation.external_copy_command_buffer) != VK_SUCCESS) {
+      dfn.vkDestroyCommandPool(device, generation.external_copy_pool, nullptr);
+      generation.external_copy_pool = VK_NULL_HANDLE;
+      return false;
+    }
+  }
+  if (dfn.vkResetCommandPool(device, generation.external_copy_pool, 0) != VK_SUCCESS) {
+    return false;
+  }
+  VkCommandBuffer command_buffer = generation.external_copy_command_buffer;
+  VkCommandBufferBeginInfo begin_info;
+  begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  begin_info.pNext = nullptr;
+  begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  begin_info.pInheritanceInfo = nullptr;
+  if (dfn.vkBeginCommandBuffer(command_buffer, &begin_info) != VK_SUCCESS) {
+    return false;
+  }
+  const uint64_t submission_index = paint_context_.submission_tracker.GetCurrentSubmission();
+  RecordFrameGenerationHistoryCopy(command_buffer, guest_output_image, submission_index);
+  if (dfn.vkEndCommandBuffer(command_buffer) != VK_SUCCESS) {
+    return false;
+  }
+  VkSubmitInfo submit_info;
+  submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  submit_info.pNext = nullptr;
+  submit_info.waitSemaphoreCount = 0;
+  submit_info.pWaitSemaphores = nullptr;
+  submit_info.pWaitDstStageMask = nullptr;
+  submit_info.commandBufferCount = 1;
+  submit_info.pCommandBuffers = &command_buffer;
+  submit_info.signalSemaphoreCount = 0;
+  submit_info.pSignalSemaphores = nullptr;
+  VulkanSubmissionTracker::FenceAcquisition fence_acquisition(
+      paint_context_.submission_tracker.AcquireFenceToAdvanceSubmission());
+  const VulkanDevice::Queue::Acquisition queue_acquisition =
+      vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
+  if (dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence_acquisition.fence()) !=
+      VK_SUCCESS) {
+    fence_acquisition.SubmissionFailedOrDropped();
+    return false;
+  }
+  return true;
+}
+
+void VulkanPresenter::RefreshFrameGenerator(const GuestOutputPaintConfig& config) {
+  PaintContext::FrameGeneration& generation = paint_context_.frame_generation;
+  const FrameGenerationBackend wanted = config.GetFrameGeneration();
+  if (generation.generator_backend == wanted) {
+    return;
+  }
+  // The old generator's work may still be queued.
+  paint_context_.submission_tracker.AwaitSubmissionCompletion(generation.last_submission);
+  generation.generator.reset();
+  generation.generator_backend = wanted;
+  generation.reset_requested.store(true, std::memory_order_relaxed);
+  // A backend change invalidates the exportable-ness of the images; drop them
+  // so EnsureFrameGenerationResources recreates them for the new backend.
+  generation.generated.reset();
+  for (auto& history : generation.history) {
+    history.reset();
+  }
+  generation.generated_ever_written = false;
+  generation.newest = SIZE_MAX;
+  generation.history_sequences = {UINT64_MAX, UINT64_MAX};
+  if (wanted != FrameGenerationBackend::kOff) {
+    generation.generator = CreateVulkanFrameGenerator(wanted, vulkan_device_);
+    if (generation.generator) {
+      REXLOG_INFO("VulkanPresenter: frame generation '{}' is on",
+                  FrameGenerationBackendName(wanted));
+    }
+  }
+  generation.generator_external_queue =
+      generation.generator && generation.generator->UsesExternalQueue();
+  SetFrameGenerationReady(generation.generator != nullptr);
+}
+
 namespace {
 std::atomic<bool> hdr_output_offered = false;
 std::atomic<bool> hdr_output_active = false;
@@ -2176,6 +2513,15 @@ bool VulkanPresenter::GuestOutputImage::CreateImage(VkImage& image, VkDeviceMemo
   VkImageCreateInfo image_create_info;
   image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
   image_create_info.pNext = nullptr;
+#if REX_PLATFORM_MAC
+  VkExportMetalObjectCreateInfoEXT export_metal_object;
+  if (exportable_) {
+    export_metal_object.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT;
+    export_metal_object.pNext = nullptr;
+    export_metal_object.exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT;
+    image_create_info.pNext = &export_metal_object;
+  }
+#endif
   image_create_info.flags = 0;
   image_create_info.imageType = VK_IMAGE_TYPE_2D;
   image_create_info.format = format;
@@ -2225,7 +2571,8 @@ bool VulkanPresenter::GuestOutputImage::CreateImage(VkImage& image, VkDeviceMemo
   return true;
 }
 
-Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
+Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers,
+                                                            PaintSource source) {
   // present_hdr switched (#442): recreate the swapchain in the other format
   // through the reconnection. Where the surface offers no scRGB, nothing
   // changes.
@@ -2366,6 +2713,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   }
 
   SetPaintedGuestOutputRect(nullptr);
+  SetLastPaintSource(PaintSource::kGuestOutput);
+  // Frame generation follows the setting read with the config above; the
+  // generator lives in the paint context, so it changes here, on the paint
+  // thread.
+  RefreshFrameGenerator(guest_output_paint_config);
   if (guest_output_image) {
     VkExtent2D max_framebuffer_extent =
         util::GetMax2DFramebufferExtent(vulkan_device_->properties());
@@ -2438,6 +2790,30 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         guest_output_image_descriptor_write.pBufferInfo = nullptr;
         guest_output_image_descriptor_write.pTexelBufferView = nullptr;
         dfn.vkUpdateDescriptorSets(device, 1, &guest_output_image_descriptor_write, 0, nullptr);
+      }
+
+      // Frame generation: copy this real frame into the history (once per
+      // sequence), and for a generated paint make the generated image from the
+      // previous and this frame, which the effects below then sample instead
+      // of the guest output. Everything is recorded into the draw command
+      // buffer before its render passes.
+      bool paint_generated = false;
+      if (source == PaintSource::kGenerated) {
+        paint_generated = RecordFrameGeneration(draw_command_buffer, guest_output_image,
+                                                guest_output_properties,
+                                                current_paint_submission_index);
+        if (!paint_generated) {
+          // No generated frame: this paint shows the real frame instead, and
+          // reports so, so it is counted as the real present.
+          PROFILE_FRAME_GENERATION_SKIPPED();
+        }
+      } else if (paint_context_.frame_generation.generator) {
+        RecordFrameGenerationHistoryCopy(draw_command_buffer, guest_output_image,
+                                         current_paint_submission_index);
+      }
+
+      if (paint_generated) {
+        SetLastPaintSource(PaintSource::kGenerated);
       }
 
       // Make sure intermediate textures of the needed size are available, and
@@ -2903,6 +3279,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           if (i) {
             effect_src_descriptor_set = PaintContext::GuestOutputDescriptorSet(
                 PaintContext::kGuestOutputDescriptorSetIntermediate0Sampled + (i - 1));
+          } else if (paint_generated) {
+            effect_src_descriptor_set = PaintContext::kGuestOutputDescriptorSetGeneratedSampled;
           } else {
             effect_src_descriptor_set = PaintContext::GuestOutputDescriptorSet(
                 PaintContext::kGuestOutputDescriptorSetGuestOutput0Sampled +
@@ -2980,8 +3358,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
             dfn.vkCmdBindDescriptorSets(
                 draw_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, mask_pipeline_layout, 0, 1,
                 &paint_context_.guest_output_descriptor_sets
-                     [PaintContext::kGuestOutputDescriptorSetGuestOutput0Sampled +
-                      guest_output_image_paint_ref_index],
+                     [paint_generated
+                          ? uint32_t(PaintContext::kGuestOutputDescriptorSetGeneratedSampled)
+                          : PaintContext::kGuestOutputDescriptorSetGuestOutput0Sampled +
+                                guest_output_image_paint_ref_index],
                 0, nullptr);
             dfn.vkCmdPushConstants(draw_command_buffer, mask_pipeline_layout,
                                    VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(effect_rect_constants),

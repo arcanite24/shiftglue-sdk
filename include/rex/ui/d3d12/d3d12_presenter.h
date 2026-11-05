@@ -102,7 +102,8 @@ class D3D12Presenter final : public Presenter {
                               std::function<bool(GuestOutputRefreshContext& context)> refresher,
                               bool& is_8bpc_out) override;
 
-  PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override;
+  PaintResult PaintAndPresentImpl(bool execute_ui_drawers,
+                                  PaintSource source = PaintSource::kGuestOutput) override;
 
  private:
   struct GuestOutputPaintRectangleConstants {

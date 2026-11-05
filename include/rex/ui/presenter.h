@@ -32,6 +32,8 @@
 #include <rex/platform.h>
 #include <rex/types.h>
 #include <rex/ui/flags.h>
+#include <rex/ui/frame_generation_pacer.h>
+#include <rex/ui/frame_generator.h>
 #include <rex/ui/presentation_pacer.h>
 #include <rex/ui/surface.h>
 #include <rex/ui/upscaler.h>
@@ -320,6 +322,25 @@ class Presenter {
     bool GetDither() const { return dither_; }
     void SetDither(bool new_dither) { dither_ = new_dither; }
 
+    // Frame generation (opt-in, off by default): one generated frame between
+    // each pair of the title's frames. The real frame is presented
+    // `GetFrameGenerationDelay()` of the measured base interval after it was
+    // produced (1/2 spaces the presents evenly; less trades evenness for
+    // latency).
+    static constexpr float kFrameGenerationDelayMin = 0.1f;
+    static constexpr float kFrameGenerationDelayMax = 0.5f;
+    static constexpr float kFrameGenerationDelayDefault = 0.5f;
+    FrameGenerationBackend GetFrameGeneration() const { return frame_generation_; }
+    void SetFrameGeneration(FrameGenerationBackend new_frame_generation) {
+      frame_generation_ = new_frame_generation;
+    }
+    float GetFrameGenerationDelay() const { return frame_generation_delay_; }
+    void SetFrameGenerationDelay(float new_frame_generation_delay) {
+      frame_generation_delay_ =
+          std::min(kFrameGenerationDelayMax,
+                   std::max(kFrameGenerationDelayMin, new_frame_generation_delay));
+    }
+
    private:
     // Tools, rather than the emulator itself, must not allow overscan cutoff
     // and must use the kBilinear effect as the image must be as close to the
@@ -333,6 +354,8 @@ class Presenter {
     FsrQualityMode fsr_quality_mode_ = FsrQualityMode::kAuto;
 #endif
     bool dither_ = false;
+    FrameGenerationBackend frame_generation_ = FrameGenerationBackend::kOff;
+    float frame_generation_delay_ = kFrameGenerationDelayDefault;
   };
 
   Presenter(const Presenter& presenter) = delete;
@@ -776,8 +799,66 @@ class Presenter {
   // May be called from the non-UI thread, but only to paint the guest output
   // (no UI drawing, with execute_ui_drawers disabled).
   //
+  // What a paint presents: the newest real frame, or the frame the generator
+  // made from the last two (frame generation).
+  enum class PaintSource {
+    kGuestOutput,
+    kGenerated,
+  };
+
   // Call via PaintAndPresent.
-  virtual PaintResult PaintAndPresentImpl(bool execute_ui_drawers) = 0;
+  virtual PaintResult PaintAndPresentImpl(bool execute_ui_drawers,
+                                          PaintSource source = PaintSource::kGuestOutput) = 0;
+
+  // Frame generation, for the implementation's PublishGuestOutput path: after
+  // a real frame was published, whether to present a generated one now and
+  // the real one later. The implementation records or submits the
+  // generation inside PaintAndPresentImpl(kGenerated); the base class owns
+  // the pacing, the counters and the delayed present.
+  struct FrameGenerationPlan {
+    bool generate = false;
+    bool reset_history = false;
+    int64_t interval_ns = 0;
+    int64_t delayed_present_deadline_ns = 0;
+  };
+  // The implementation reports, from its paint thread, whether a generator is
+  // ready for the requested backend; false means every present is real.
+  void SetFrameGenerationReady(bool ready) {
+    frame_generation_ready_.store(ready, std::memory_order_relaxed);
+  }
+  bool IsFrameGenerationReady() const {
+    return frame_generation_ready_.load(std::memory_order_relaxed);
+  }
+  // The implementation forgets its history (the next generation gets
+  // reset_history); called on the publish or pacing thread.
+  virtual void ResetFrameGenerationHistory() {}
+  // What PaintAndPresentImpl showed: an implementation asked for kGenerated
+  // reports kGuestOutput when it painted the real frame instead (no pair
+  // yet, a backend failure), so the present is counted as the real one.
+  void SetLastPaintSource(PaintSource source) { last_paint_source_ = source; }
+  // The sequence of the newest published guest output, for the
+  // implementation's history bookkeeping.
+  uint64_t GetGuestOutputRefreshSequence() const {
+    return guest_output_refresh_sequence_.load(std::memory_order_acquire);
+  }
+  // Joins the pacing thread. An implementation's destructor calls this first,
+  // before it destroys anything the thread's paint could still touch.
+  void ShutdownFrameGenerationPacer();
+  // The base interval the pacer measured at the last publish, in
+  // nanoseconds, for the implementation's generator (0 when unknown).
+  int64_t GetFrameGenerationIntervalNs() const {
+    return frame_generation_interval_ns_.load(std::memory_order_relaxed);
+  }
+
+  // Frame generation. The base presenter builds no generator: every backend
+  // is unavailable and the FRAME GENERATION row is not offered. A presenter
+  // with generators overrides both; it reads the requested backend from
+  // GetGuestOutputPaintConfig.
+  virtual FrameGenerationAvailability ProbeFrameGenerationBackend(FrameGenerationBackend backend);
+  virtual bool IsFrameGenerationOffered() const;
+  // Publishes GetFrameGenerationState for the menu and diagnostics after a
+  // config change; called on the UI thread.
+  void PublishFrameGenerationStateFromUIThread(FrameGenerationBackend requested);
 
   // For calling from the painting implementations if requested.
   void ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context);
@@ -906,7 +987,21 @@ class Presenter {
   // may not be made outdated if that happens - though if it's
   // kPresentedSuboptimal rather than kNotPresentedConnectionOutdated, the image
   // has been successfully sent to the OS presentation at least.
-  PaintResult PaintAndPresent(bool execute_ui_drawers);
+  // kGenerated paints a generated frame: counted as a present (and a
+  // generated one), never as a source frame or a duplicate.
+  PaintResult PaintAndPresent(bool execute_ui_drawers,
+                              PaintSource source = PaintSource::kGuestOutput);
+  // The pacing thread's delayed real present of `sequence`, if it is still
+  // the newest published frame and painting still belongs to the guest output
+  // thread.
+  void PresentScheduledRealFrame(uint64_t sequence);
+  // The pacer is created on first use (frame generation on) and joined in the
+  // destructor.
+  FrameGenerationPacer& GetOrCreateFrameGenerationPacer();
+  // Drops a scheduled real present and resets the pacer's intervals and the
+  // implementation's history, for a paint mode change or a config change.
+  void StopFrameGenerationFromAnyThread();
+
 
   void HandleUIDrawersChangeFromUIThread(bool drawers_were_empty);
 
@@ -999,6 +1094,9 @@ class Presenter {
   std::mutex guest_output_paint_config_mutex_;
   // UI thread: writable, guest output thread: read-only.
   GuestOutputPaintConfig guest_output_paint_config_;
+  // The backend whose unavailability was last logged, so the warning is
+  // written once per change rather than once per config refresh.
+  FrameGenerationBackend frame_generation_unavailable_logged_ = FrameGenerationBackend::kOff;
 
   // Single-producer-multiple-consumers (lock-free SPSC + consumer lock) mailbox
   // for presenting of the most up-to-date guest output image without long
@@ -1045,6 +1143,49 @@ class Presenter {
   uint64_t last_seen_refresh_sequence_ = UINT64_MAX;
   int64_t last_refresh_change_ns_ = 0;
   int64_t last_present_time_ns_ = 0;
+
+  // Frame generation. The pacer is touched on the publish thread (under
+  // paint_mode_mutex_) and on its own thread. `frame_generation_pacer_mutex_`
+  // guards its creation.
+  std::mutex frame_generation_pacer_mutex_;
+  std::unique_ptr<FrameGenerationPacer> frame_generation_pacer_;
+  // Whether the last publish presented a generated frame, so a paint mode
+  // change knows there may be a pending real present.
+  std::atomic<bool> frame_generation_was_active_{false};
+  std::atomic<int64_t> frame_generation_interval_ns_{0};
+  std::atomic<bool> frame_generation_ready_{false};
+  std::atomic<bool> frame_generation_headroom_logged_{false};
+  // Paint thread only (under presentation_pacing_mutex_).
+  PaintSource last_paint_source_ = PaintSource::kGuestOutput;
+  // In kUIThreadOnRequest, the publish thread (a generated frame) and the
+  // pacing thread (the real frame) ask the UI thread to paint through the
+  // window; what it should paint waits here.
+  struct FrameGenerationUIPaintRequest {
+    PaintSource source = PaintSource::kGuestOutput;
+    uint64_t sequence = 0;
+    // The previous frame's real present the pacer still held when this frame
+    // arrived (early): shown before this frame's generated one, never dropped.
+    uint64_t overdue_real_sequence = UINT64_MAX;
+    int64_t publish_ns = 0;
+    int64_t interval_ns = 0;
+    int64_t shortest_interval_ns = 0;
+    float delay = 0.5f;
+  };
+  // A pending real frame is painted before a newer generated one; when the
+  // display cannot keep up, a generated request is dropped, never a real one.
+  std::mutex frame_generation_ui_request_mutex_;
+  FrameGenerationUIPaintRequest frame_generation_ui_real_request_;
+  FrameGenerationUIPaintRequest frame_generation_ui_generated_request_;
+  // Takes the next request to paint: the real one first. `more_pending_out`
+  // tells the caller to ask for another paint for the request left behind.
+  FrameGenerationUIPaintRequest TakeFrameGenerationUIRequest(bool& more_pending_out);
+  // Runs the pacer for a published frame; returns the UI request to paint
+  // (kGenerated when a generated frame should be shown now). Called with
+  // paint_mode_mutex_ held on the publish thread.
+  FrameGenerationUIPaintRequest PlanFrameGenerationForPublish();
+  // Paints a generated frame and schedules its real one; false when nothing
+  // was presented (the caller paints the real frame).
+  bool PaintGeneratedFrameAndScheduleReal(const FrameGenerationUIPaintRequest& request);
 
   std::array<GuestOutputProperties, kGuestOutputMailboxSize> guest_output_properties_;
   // Accessible only by refreshing, whether the last refresh contained an image

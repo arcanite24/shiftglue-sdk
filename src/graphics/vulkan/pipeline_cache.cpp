@@ -47,6 +47,7 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
+#include <rex/graphics/shader_compile_status.h>
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/vulkan/shader_overrides.h>
 #include <rex/graphics/vulkan/shader_override_files.h>
@@ -877,8 +878,12 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
 
     std::atomic<size_t> next_creation_index(0);
     std::atomic<size_t> created_pipeline_count(0);
+    ShaderCompileStatus& compile_status = ShaderCompileStatus::Get();
+    compile_status.startup_pipelines_done.store(0, std::memory_order_relaxed);
+    compile_status.startup_pipelines_total.store(uint32_t(pipeline_creations.size()),
+                                                 std::memory_order_release);
     auto creation_worker = [this, &pipeline_creations, &next_creation_index,
-                            &created_pipeline_count]() {
+                            &created_pipeline_count, &compile_status]() {
       while (true) {
         size_t creation_index = next_creation_index.fetch_add(1);
         if (creation_index >= pipeline_creations.size()) {
@@ -887,6 +892,8 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
         if (EnsurePipelineCreated(pipeline_creations[creation_index])) {
           created_pipeline_count.fetch_add(1);
         }
+        // Attempted, not necessarily created: the display counts progress.
+        compile_status.startup_pipelines_done.fetch_add(1, std::memory_order_relaxed);
       }
     };
 
@@ -913,6 +920,8 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
       std::lock_guard<std::mutex> lock(creation_request_lock_);
       startup_loading_ = false;
     }
+    compile_status.startup_pipelines_done.store(uint32_t(pipeline_creations.size()),
+                                                std::memory_order_release);
   }
   // The ahead-of-time list is several thousand pipelines, too many to build
   // before the title starts on a phone.
@@ -1261,6 +1270,8 @@ void VulkanPipelineCache::Shutdown() {
     while (!creation_queue_.empty()) {
       creation_queue_.pop();
     }
+    // The workers are gone with whatever they had popped: nothing pending.
+    ShaderCompileStatus::Get().pending_pipelines.store(0, std::memory_order_relaxed);
     creation_threads_busy_ = 0;
     startup_loading_ = false;
     creation_completion_set_event_ = false;
@@ -1544,6 +1555,7 @@ VulkanPipelineCache::TranslationRequest VulkanPipelineCache::RequestShadersTrans
         translation_thread_->set_name("Vulkan Shaders");
       }
       translations_pending_.insert(translation);
+      ShaderCompileStatus::Get().pending_translations.fetch_add(1, std::memory_order_relaxed);
       {
         std::lock_guard<std::mutex> lock(translation_mutex_);
         translation_queue_.push_back(translation);
@@ -1597,6 +1609,7 @@ void VulkanPipelineCache::CollectTranslations() {
                    job.translation->shader().ucode_data_hash());
     }
     translations_pending_.erase(job.translation);
+    ShaderCompileStatus::Get().pending_translations.fetch_sub(1, std::memory_order_relaxed);
   }
 }
 
@@ -1740,6 +1753,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
         {
           std::lock_guard<std::mutex> lock(creation_request_lock_);
           creation_queue_.push(creation_arguments);
+          ShaderCompileStatus::Get().pending_pipelines.fetch_add(1, std::memory_order_relaxed);
         }
         creation_request_cond_.notify_one();
       } else if (!EnsurePipelineCreated(creation_arguments)) {
@@ -1858,6 +1872,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
     {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
       creation_queue_.push(creation_arguments_real);
+      ShaderCompileStatus::Get().pending_pipelines.fetch_add(1, std::memory_order_relaxed);
     }
     creation_request_cond_.notify_one();
     if (pipeline_storage_file_ && !description.inspection_view) {
@@ -1889,6 +1904,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
         {
           std::lock_guard<std::mutex> lock(creation_request_lock_);
           creation_queue_.push(creation_arguments_real);
+          ShaderCompileStatus::Get().pending_pipelines.fetch_add(1, std::memory_order_relaxed);
         }
         creation_request_cond_.notify_one();
         queued_async_creation = true;
@@ -4826,6 +4842,7 @@ void VulkanPipelineCache::CreationThread(size_t thread_index) {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
       --creation_threads_busy_;
     }
+    ShaderCompileStatus::Get().pending_pipelines.fetch_sub(1, std::memory_order_relaxed);
   }
 }
 
@@ -4841,6 +4858,7 @@ void VulkanPipelineCache::CreateQueuedPipelinesOnProcessorThread() {
       creation_arguments = creation_queue_.top();
       creation_queue_.pop();
     }
+    ShaderCompileStatus::Get().pending_pipelines.fetch_sub(1, std::memory_order_relaxed);
     bool created = EnsurePipelineCreated(creation_arguments);
     if (!created) {
       bool has_placeholder =

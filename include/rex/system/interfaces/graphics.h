@@ -162,6 +162,29 @@ struct GraphicsFinalDrawTextureIdentity {
 };
 
 
+// Shader and pipeline compilation in progress, for a host status display
+// (a cold start builds its stored pipelines before the first frame, which
+// otherwise looks like a hang). Plain data: the plugin keeps the live
+// counters, the host reads a snapshot through the interface.
+struct GraphicsShaderCompileStatus {
+  // Pipelines read back from the on-disk storage at start and how many of
+  // them are built so far; both zero when the storage was empty.
+  uint32_t startup_pipelines_total = 0;
+  uint32_t startup_pipelines_done = 0;
+  // Pipelines queued to the asynchronous workers and shaders still being
+  // translated. Frames that would draw with one are not presented.
+  uint32_t pending_pipelines = 0;
+  uint32_t pending_translations = 0;
+  // Frames held back for a placeholder pipeline, and frames presented.
+  uint64_t frames_held = 0;
+  uint64_t frames_presented = 0;
+
+  bool busy() const {
+    return (startup_pipelines_total && startup_pipelines_done < startup_pipelines_total) ||
+           pending_pipelines || pending_translations;
+  }
+};
+
 class IGraphicsSystem {
  public:
   virtual ~IGraphicsSystem() = default;
@@ -200,6 +223,8 @@ class IGraphicsSystem {
   virtual bool HasNativeGuestOutputRenderer() const { return false; }
   // The draw resolution scale the renderer uses, 0 when unknown.
   virtual uint32_t draw_resolution_scale() const { return 0; }
+  // What the renderer is still compiling; all zero when it does not report.
+  virtual GraphicsShaderCompileStatus shader_compile_status() const { return {}; }
   // FH1: the guest memory of the screen's shadow mask texture, once the GPU
   // backend has resolved it (the Vulkan FH1 executor), for a title hook that
   // replaces the shadow passes with a lit mask; resolves counts its resolves.

@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
 #include <cstring>
 
 #include <rex/assert.h>
@@ -30,6 +31,14 @@ DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& comma
 
 void DeferredCommandBuffer::Reset() {
   command_stream_.clear();
+}
+
+void DeferredCommandBuffer::MoveTailBefore(size_t to, size_t from) {
+  const size_t end = command_stream_.size();
+  if (to >= from || from >= end) return;
+  // [to, from) is the rendering so far, [from, end) the work hoisted ahead of it.
+  std::rotate(command_stream_.begin() + to, command_stream_.begin() + from,
+              command_stream_.end());
 }
 
 void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {

@@ -13,10 +13,113 @@
 #include <utility>
 #include <vector>
 
+#include <SPIRV/GLSL.std.450.h>
+
 #include <rex/assert.h>
 #include <rex/graphics/pipeline/shader/spirv_builder.h>
 
 namespace rex::graphics {
+
+spv::Id SpirvBuilder::GetFloat16ArithmeticType(spv::Id float32_type) {
+  if (!float16_arithmetic || float32_type == spv::NoType) {
+    return spv::NoType;
+  }
+  int component_count = 1;
+  spv::Id scalar_type = float32_type;
+  if (isVectorType(float32_type)) {
+    component_count = getNumTypeComponents(float32_type);
+    scalar_type = getContainedTypeId(float32_type);
+  }
+  if (!isFloatType(scalar_type) || getScalarTypeWidth(scalar_type) != 32) {
+    return spv::NoType;
+  }
+  spv::Id float16_type = makeFloatType(16);
+  return component_count > 1 ? makeVectorType(float16_type, component_count) : float16_type;
+}
+
+bool SpirvBuilder::IsFloat16BinOp(spv::Op op_code) const {
+  switch (op_code) {
+    case spv::OpFAdd:
+    case spv::OpFSub:
+      return (float16_op_classes & kFloat16OpAdd) != 0;
+    case spv::OpFMul:
+      return (float16_op_classes & kFloat16OpMul) != 0;
+    case spv::OpFDiv:
+      return (float16_op_classes & kFloat16OpDiv) != 0;
+    default:
+      return false;
+  }
+}
+
+bool SpirvBuilder::IsFloat16BuiltinCall(int entry_point) const {
+  switch (entry_point) {
+    case GLSLstd450Round:
+    case GLSLstd450RoundEven:
+    case GLSLstd450Trunc:
+    case GLSLstd450Floor:
+    case GLSLstd450Ceil:
+    case GLSLstd450Fract:
+      return (float16_op_classes & kFloat16OpRound) != 0;
+    case GLSLstd450Sin:
+    case GLSLstd450Cos:
+      return (float16_op_classes & kFloat16OpTrig) != 0;
+    case GLSLstd450Sqrt:
+    case GLSLstd450InverseSqrt:
+      return (float16_op_classes & kFloat16OpSqrt) != 0;
+    case GLSLstd450FMin:
+    case GLSLstd450FMax:
+    case GLSLstd450FClamp:
+    case GLSLstd450NMin:
+    case GLSLstd450NMax:
+    case GLSLstd450NClamp:
+      return (float16_op_classes & kFloat16OpMinMax) != 0;
+    default:
+      return false;
+  }
+}
+
+spv::Id SpirvBuilder::ConvertToFloat16(spv::Id float16_type, spv::Id operand) {
+  if (float16_clamp_operands && float16_builtins && !isConstant(operand)) {
+    spv::Id type = getTypeId(operand);
+    int component_count = isVectorType(type) ? getNumTypeComponents(type) : 1;
+    spv::Id min_scalar = makeFloatConstant(-65504.0f);
+    spv::Id max_scalar = makeFloatConstant(65504.0f);
+    spv::Id min_value = min_scalar, max_value = max_scalar;
+    if (component_count > 1) {
+      std::vector<spv::Id> min_components(component_count, min_scalar);
+      std::vector<spv::Id> max_components(component_count, max_scalar);
+      min_value = makeCompositeConstant(type, min_components);
+      max_value = makeCompositeConstant(type, max_components);
+    }
+    std::unique_ptr<spv::Instruction> clamp =
+        std::make_unique<spv::Instruction>(getUniqueId(), type, spv::OpExtInst);
+    clamp->addIdOperand(float16_builtins);
+    // NClamp: a NaN operand stays a NaN rather than becoming a bound, so the
+    // 32-bit NaN semantics the multiply rule relies on are unchanged.
+    clamp->addImmediateOperand(GLSLstd450NClamp);
+    clamp->addIdOperand(operand);
+    clamp->addIdOperand(min_value);
+    clamp->addIdOperand(max_value);
+    operand = clamp->getResultId();
+    getBuildPoint()->addInstruction(std::move(clamp));
+  }
+  return createUnaryOp(spv::OpFConvert, float16_type, operand);
+}
+
+spv::Id SpirvBuilder::createFloat16BuiltinCall(spv::Id result_type, spv::Id float16_type,
+                                               spv::Id builtins, int entry_point,
+                                               const spv::Id* operands, int operand_count) {
+  std::unique_ptr<spv::Instruction> instruction =
+      std::make_unique<spv::Instruction>(getUniqueId(), float16_type, spv::OpExtInst);
+  instruction->addIdOperand(builtins);
+  instruction->addImmediateOperand(entry_point);
+  for (int i = 0; i < operand_count; ++i) {
+    instruction->addIdOperand(ConvertToFloat16(float16_type, operands[i]));
+  }
+  spv::Id result = instruction->getResultId();
+  getBuildPoint()->addInstruction(std::move(instruction));
+  return createUnaryOp(spv::OpFConvert, result_type, result);
+}
 
 spv::Id SpirvBuilder::createQuadOp(spv::Op op_code, spv::Id type_id, spv::Id operand1,
                                    spv::Id operand2, spv::Id operand3, spv::Id operand4) {
@@ -50,15 +153,32 @@ spv::Id SpirvBuilder::createNoContractionUnaryOp(spv::Op op_code, spv::Id type_i
 
 spv::Id SpirvBuilder::createNoContractionBinOp(spv::Op op_code, spv::Id type_id, spv::Id operand1,
                                                spv::Id operand2) {
-  spv::Id result = createBinOp(op_code, type_id, operand1, operand2);
+  spv::Id float16_type = IsFloat16BinOp(op_code) ? GetFloat16ArithmeticType(type_id) : spv::NoType;
+  spv::Id result;
+  if (float16_type != spv::NoType) {
+    result = createBinOp(op_code, float16_type, ConvertToFloat16(float16_type, operand1),
+                         ConvertToFloat16(float16_type, operand2));
+  } else {
+    result = createBinOp(op_code, type_id, operand1, operand2);
+  }
   if (!allow_contraction) {
     addDecoration(result, spv::DecorationNoContraction);
+  }
+  if (float16_type != spv::NoType) {
+    result = createUnaryOp(spv::OpFConvert, type_id, result);
   }
   return result;
 }
 
 spv::Id SpirvBuilder::createUnaryBuiltinCall(spv::Id result_type, spv::Id builtins, int entry_point,
                                              spv::Id operand) {
+  if (IsFloat16BuiltinCall(entry_point)) {
+    spv::Id float16_type = GetFloat16ArithmeticType(result_type);
+    if (float16_type != spv::NoType) {
+      return createFloat16BuiltinCall(result_type, float16_type, builtins, entry_point, &operand,
+                                      1);
+    }
+  }
   std::unique_ptr<spv::Instruction> instruction =
       std::make_unique<spv::Instruction>(getUniqueId(), result_type, spv::OpExtInst);
   instruction->addIdOperand(builtins);
@@ -71,6 +191,14 @@ spv::Id SpirvBuilder::createUnaryBuiltinCall(spv::Id result_type, spv::Id builti
 
 spv::Id SpirvBuilder::createBinBuiltinCall(spv::Id result_type, spv::Id builtins, int entry_point,
                                            spv::Id operand1, spv::Id operand2) {
+  if (IsFloat16BuiltinCall(entry_point)) {
+    spv::Id float16_type = GetFloat16ArithmeticType(result_type);
+    if (float16_type != spv::NoType) {
+      const spv::Id operands[] = {operand1, operand2};
+      return createFloat16BuiltinCall(result_type, float16_type, builtins, entry_point, operands,
+                                      2);
+    }
+  }
   std::unique_ptr<spv::Instruction> instruction =
       std::make_unique<spv::Instruction>(getUniqueId(), result_type, spv::OpExtInst);
   instruction->addIdOperand(builtins);
@@ -84,6 +212,14 @@ spv::Id SpirvBuilder::createBinBuiltinCall(spv::Id result_type, spv::Id builtins
 
 spv::Id SpirvBuilder::createTriBuiltinCall(spv::Id result_type, spv::Id builtins, int entry_point,
                                            spv::Id operand1, spv::Id operand2, spv::Id operand3) {
+  if (IsFloat16BuiltinCall(entry_point)) {
+    spv::Id float16_type = GetFloat16ArithmeticType(result_type);
+    if (float16_type != spv::NoType) {
+      const spv::Id operands[] = {operand1, operand2, operand3};
+      return createFloat16BuiltinCall(result_type, float16_type, builtins, entry_point, operands,
+                                      3);
+    }
+  }
   std::unique_ptr<spv::Instruction> instruction =
       std::make_unique<spv::Instruction>(getUniqueId(), result_type, spv::OpExtInst);
   instruction->addIdOperand(builtins);
