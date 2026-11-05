@@ -81,6 +81,8 @@ class Fh1NativeExecutor {
   void Shutdown();
   // Counts an event in the rendering stats (such as occlusion query ends).
   void CountEvent(const char* stat) { Count(stat); }
+  // MR-0 knock-out: suppress only the selected rendering's draw commands.
+  bool DebugSkipRenderingDraw(const Fh1DrawInfo& draw);
   // fh1_untile_predicated_tiling: after the last tile, the bands the later
   // tiles resolved are copied down to the EDRAM rows of their surfaces, where
   // the last tile leaves them on the console.
@@ -115,7 +117,8 @@ class Fh1NativeExecutor {
   void BeginDrawRendering();
   // Local one-frame shader identities and the actual bound render surfaces.
   void DiscoverShaderDraw(const VulkanShader::VulkanTranslation* vertex,
-                          const VulkanShader::VulkanTranslation* pixel);
+                          const VulkanShader::VulkanTranslation* pixel, uint32_t texture_mask,
+                          const Fh1DrawInfo& draw, bool suppressed);
   // After BindTargets: the draw has no depth, stencil or color target to use.
   bool BoundNothing() const { return bound_bits_ == 0; }
   void CountDrawSkippedWithoutEffect() { Count("draw_skipped_without_effect"); }
@@ -245,6 +248,7 @@ class Fh1NativeExecutor {
   void VisEnd(uint32_t query);
 
  private:
+  bool debug_skip_rendering_ = false;
   using SurfaceKey = Fh1SurfaceKey;
   struct Rect {
     int32_t left, top, right, bottom;
@@ -626,6 +630,8 @@ class Fh1NativeExecutor {
   std::vector<TextureCache::DirectResolveTarget> direct_resolve_targets_;
   std::vector<TextureCache::DirectResolveTarget> direct_resolve_candidates_;
   std::vector<uint32_t> direct_resolve_conversions_;
+  // fh1_debug_resolve_textures_only for the resolve being dispatched.
+  bool resolve_textures_only_ = false;
   // A descriptor pool per frame in flight, reset when the frame reopens.
   static constexpr uint32_t kDescriptorPoolFrames = 3;
   std::array<std::vector<VkDescriptorPool>, kDescriptorPoolFrames> descriptor_pools_;
@@ -686,8 +692,13 @@ class Fh1NativeExecutor {
   SurfaceKey pending_keys_[1 + xenos::kMaxColorRenderTargets];
   uint32_t bound_bits_ = 0;
   std::ofstream shader_discovery_draws_;
+  std::ofstream shader_discovery_resolves_;
+  uint32_t shader_discovery_draw_index_ = 0;
   bool shader_discovery_started_ = false;
   std::set<std::string> shader_discovery_written_;
+  bool BeginShaderDiscovery();
+  void DiscoverShaderResolve(const CopyPlan& plan, uint32_t address, uint32_t length,
+                              uint32_t untile_band);
   // DrawRenderingId(bound_bits_), set by BindTargets for BeginDrawRendering.
   uint64_t bound_rendering_id_ = 0;
   // fh1_coarse_shading, parsed at swaps, and the rate of each draw rendering.

@@ -46,6 +46,7 @@ FH1_PUSH_CONSTANTS cbuffer Fh1NativeResolveMemoryConstants FH1_CONSTANTS_REGISTE
   // 24-bit unorm depth to float, 2: 20e4 depth to float).
   uint fh1_image_endian;
   // The same for a second texture over the same memory and rows (bit 5: it
+  // exists; bit 6: write the textures only, not guest memory)
   // exists), such as an 8_8_8_8 texture reading a depth resolve's words.
   uint fh1_image2_endian;
 #endif
@@ -161,6 +162,11 @@ uint ImageTexel(uint word, uint endian_and_conversion) {
 
 // Stores a 32-bit destination word (already in the guest memory's byte order).
 void StoreWord(uint address, uint2 host_pixel, uint word) {
+#ifdef FH1_DEST_IMAGE
+  // Bit 6 of the second texture's word: the textures only, not guest memory
+  // (fh1_debug_resolve_textures_only, a cost probe).
+  if (!((FH1_IMAGE2_ENDIAN >> 6u) & 1u))
+#endif
   fh1_memory.Store(address, word);
 #ifdef FH1_DEST_IMAGE
   // A resolve's area may be larger than a small texture it writes (an 8x8

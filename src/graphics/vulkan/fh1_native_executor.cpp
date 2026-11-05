@@ -14,6 +14,7 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/pipeline/shader/shader.h>
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/command_processor.h>
@@ -30,7 +31,8 @@
 
 
 REXCVAR_DEFINE_STRING(vulkan_shader_discovery_dir, "", "GPU/Vulkan",
-                      "Local output directory for one frame's translated shaders and draws.jsonl")
+                      "Local output directory for one frame's translated shaders, draws.jsonl "
+                      "(including sampled texture bindings) and ordered resolves.jsonl")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(vulkan_shader_discovery_frame, 0, "GPU/Vulkan",
                      "Swap count to discover shaders on (0 disables discovery)")
@@ -132,6 +134,12 @@ REXCVAR_DEFINE_BOOL(fh1_readback_small_float_resolves, true, "GPU",
                     "Read completed 32_FLOAT resolves of 4 KB or less back to guest RAM for "
                     "the title's CPU auto exposure")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(fh1_debug_resolve_textures_only, false, "GPU",
+                    "Diagnostics (renders wrong where guest memory is read): a resolve with a "
+                    "current texture over its destination writes that texture only, not the "
+                    "guest memory copy, for the cost of the memory writes (MR-6). Resolves "
+                    "of 4 KB or less, which the CPU reads, keep writing memory")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_resolve_two_textures, true, "GPU",
                     "Resolves write up to two textures over their destination directly (such as "
                     "a depth texture and an 8_8_8_8 one reading the same words), not one")
@@ -161,10 +169,24 @@ REXCVAR_DEFINE_BOOL(fh1_debug_skip_clears, false, "GPU",
                     "Diagnostics: skip every EDRAM clear (wrong image), to bound what clears "
                     "cost")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(fh1_debug_skip_renderings, "", "GPU",
+                      "Diagnostics (MR-0): comma-separated exact draw-rendering labels from "
+                      "fh1_native_gpu_profile for fh1_debug_skip_rendering_draws; empty selects "
+                      "nothing. State, clears, resolves, queries and fences still run")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_debug_skip_rendering_draws, false, "GPU",
+                    "Diagnostics (renders wrong): suppress draw commands for the renderings "
+                    "selected by fh1_debug_skip_renderings, to measure their marginal GPU cost")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_UINT64(fh1_debug_skip_pixel_shader, 0, "GPU",
+                     "Diagnostics: restrict fh1_debug_skip_rendering_draws to this decimal "
+                     "guest pixel-shader hash (0: any shader), to separate post work from HUD "
+                     "draws sharing the same attachments")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_debug_skip_resolve_dispatches, false, "GPU",
                     "Diagnostics: keep every resolve's barriers but not its compute dispatch "
                     "(wrong image), to bound what the resolve shaders cost (Vulkan)")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 #if REX_HAS_D3D12
 REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
 REXCVAR_DECLARE(int32_t, fh1_resolve_dump_frame);
@@ -2508,23 +2530,36 @@ uint64_t Fh1NativeExecutor::DrawRenderingId(uint32_t used_bits) const {
   return id | 1;
 }
 
-void Fh1NativeExecutor::DiscoverShaderDraw(const VulkanShader::VulkanTranslation* vertex,
-                                          const VulkanShader::VulkanTranslation* pixel) {
+bool Fh1NativeExecutor::BeginShaderDiscovery() {
   const auto& dir = REXCVAR_GET(vulkan_shader_discovery_dir);
-  if (dir.empty() || REXCVAR_GET(vulkan_shader_discovery_frame) <= 0) return;
+  if (dir.empty() || REXCVAR_GET(vulkan_shader_discovery_frame) <= 0) return false;
   if (frame_ != uint64_t(REXCVAR_GET(vulkan_shader_discovery_frame))) {
     if (shader_discovery_draws_.is_open()) shader_discovery_draws_.close();
-    return;
+    if (shader_discovery_resolves_.is_open()) shader_discovery_resolves_.close();
+    return false;
   }
   const auto root = rex::to_path(dir);
   if (!shader_discovery_started_) {
     shader_discovery_started_ = true;
     std::error_code error;
     std::filesystem::create_directories(root, error);
-    if (!error) shader_discovery_draws_.open(root / "draws.jsonl", std::ios::trunc);
-    if (!shader_discovery_draws_) REXGPU_WARN("Cannot write shader discovery to {}", dir);
+    if (!error) {
+      shader_discovery_draws_.open(root / "draws.jsonl", std::ios::trunc);
+      shader_discovery_resolves_.open(root / "resolves.jsonl", std::ios::trunc);
+    }
+    if (!shader_discovery_draws_.is_open() || !shader_discovery_resolves_.is_open()) {
+      REXGPU_WARN("Cannot write shader discovery to {}", dir);
+    }
   }
-  if (!shader_discovery_draws_) return;
+  return shader_discovery_draws_.is_open() && shader_discovery_resolves_.is_open();
+}
+
+void Fh1NativeExecutor::DiscoverShaderDraw(const VulkanShader::VulkanTranslation* vertex,
+                                          const VulkanShader::VulkanTranslation* pixel,
+                                          uint32_t texture_mask, const Fh1DrawInfo& draw,
+                                          bool suppressed) {
+  if (!BeginShaderDiscovery()) return;
+  const auto root = rex::to_path(REXCVAR_GET(vulkan_shader_discovery_dir));
   auto capture = [&](const VulkanShader::VulkanTranslation* translation) {
     if (!translation || !translation->is_valid()) return std::string();
     const auto& bytes = translation->replaced_binary().empty()
@@ -2542,8 +2577,13 @@ void Fh1NativeExecutor::DiscoverShaderDraw(const VulkanShader::VulkanTranslation
   };
   const auto vs = capture(vertex), ps = capture(pixel);
   shader_discovery_draws_ << fmt::format(
-      "{{\"frame\":{},\"vertex\":\"{}\",\"pixel\":\"{}\",\"hud\":{},\"surfaces\":[",
-      frame_, vs, ps, hud_draw_);
+      "{{\"frame\":{},\"index\":{},\"vertex\":\"{}\",\"pixel\":\"{}\",\"hud\":{},"
+      "\"probe_shader\":\"{:016X}\",\"probe_rendering\":{},\"probe_on\":{},"
+      "\"draw_pixel\":\"{:016X}\",\"suppressed\":{},\"surfaces\":[",
+      frame_, shader_discovery_draw_index_++, vs, ps, hud_draw_,
+      REXCVAR_GET(fh1_debug_skip_pixel_shader), debug_skip_rendering_,
+      REXCVAR_GET(fh1_debug_skip_rendering_draws),
+      draw.pixel_shader ? draw.pixel_shader->ucode_data_hash() : 0, suppressed);
   bool first = true;
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
     if (!(bound_bits_ & (1u << i))) continue;
@@ -2557,7 +2597,58 @@ void Fh1NativeExecutor::DiscoverShaderDraw(const VulkanShader::VulkanTranslation
         key.format, surface->width * scale_, surface->image_height * scale_, surface->samples);
     first = false;
   }
+  shader_discovery_draws_ << "],\"textures\":[";
+  first = true;
+  for (uint32_t slot = 0; slot < 32; ++slot) {
+    if (!(texture_mask & (1u << slot))) continue;
+    const auto fetch = register_file_.GetTextureFetch(slot);
+    const bool valid = fetch.type == xenos::FetchConstantType::kTexture ||
+        (fetch.type == xenos::FetchConstantType::kInvalidTexture &&
+         REXCVAR_GET(gpu_allow_invalid_fetch_constants));
+    shader_discovery_draws_ << fmt::format("{}{{\"slot\":{},\"valid\":{}", first ? "" : ",",
+                                           slot, valid);
+    if (valid) {
+      uint32_t width, height, layers, base, mips, mip_min, mip_max;
+      texture_util::GetSubresourcesFromFetchConstant(fetch, &width, &height, &layers, &base,
+                                                      &mips, &mip_min, &mip_max);
+      const auto ranges = config_.textures->GetActiveTextureGuestRanges(slot);
+      shader_discovery_draws_ << fmt::format(
+          ",\"base\":{},\"base_length\":{},\"mips\":{},\"mips_length\":{},"
+          "\"width\":{},\"height\":{},\"layers\":{},"
+          "\"format\":{},\"dimension\":{},\"pitch\":{},\"tiled\":{},\"packed_mips\":{},"
+          "\"mip_min\":{},\"mip_max\":{}",
+          base << 12, ranges[0].second, mips << 12, ranges[1].second,
+          width + 1, height + 1, layers + 1, uint32_t(fetch.format),
+          uint32_t(fetch.dimension), uint32_t(fetch.pitch) << 5, bool(fetch.tiled),
+          bool(fetch.packed_mips), mip_min, mip_max);
+    }
+    shader_discovery_draws_ << "}";
+    first = false;
+  }
   shader_discovery_draws_ << "]}\n";
+}
+
+void Fh1NativeExecutor::DiscoverShaderResolve(const CopyPlan& plan, uint32_t address,
+                                             uint32_t length, uint32_t untile_band) {
+  if (!BeginShaderDiscovery()) return;
+  shader_discovery_resolves_ << fmt::format(
+      "{{\"frame\":{},\"after_draw\":{},\"address\":{},\"length\":{},\"base\":{},"
+      "\"pitch\":{},\"format\":{},\"sample_select\":{},\"dest_info\":{},"
+      "\"untile_band\":{},\"resolve_key\":\"{:08X}\","
+      "\"rect\":[{},{},{},{}],\"sources\":[",
+      frame_, shader_discovery_draw_index_, address, length, plan.dest_base, plan.dest_pitch,
+      uint32_t(plan.info.copy_dest_info.copy_dest_format), plan.sample_select, plan.dest_info,
+      untile_band,
+      plan.resolve_key.Pack(), plan.x0, plan.y0, plan.x1, plan.y1);
+  bool first = true;
+  for (const auto& source : plan.sources) {
+    shader_discovery_resolves_ << fmt::format(
+        "{}{{\"key\":\"{:08X}\",\"rect\":[{},{},{},{}]}}", first ? "" : ",",
+        source.surface->key.Pack(), source.rect.left, source.rect.top, source.rect.right,
+        source.rect.bottom);
+    first = false;
+  }
+  shader_discovery_resolves_ << "]}\n";
 }
 
 void Fh1NativeExecutor::BeginDrawRendering() {
@@ -2661,15 +2752,19 @@ void Fh1NativeExecutor::BeginDrawRendering() {
   }
   if (clears) FoldPendingClears(bound, clear_width, clear_height, colors, &depth, true);
   rendering_id_ = id;
-  if (gpu_query_pool_ != VK_NULL_HANDLE || command_processor_.debug_labels()) {
-    // The rendering's name is its bound surfaces, for the GPU profile and for
-    // the debug label a GPU trace shows (vulkan_debug_labels). GpuLabel keeps
-    // the string, so the label pointer stays valid for the deferred commands.
+  const auto& skip_renderings = REXCVAR_GET(fh1_debug_skip_renderings);
+  if (gpu_query_pool_ != VK_NULL_HANDLE || !skip_renderings.empty() ||
+      command_processor_.debug_labels()) {
+    // The rendering's name is its bound surfaces, for the GPU profile,
+    // diagnostic selection, and debug labels (vulkan_debug_labels). GpuLabel
+    // keeps the string so its pointer stays valid for the deferred commands.
     std::string label;
     for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
       if (bound_bits_ & (1u << i)) label += (label.empty() ? "" : "+") + pending_keys_[i].Describe();
     }
     if (label.empty()) label = "none";
+    debug_skip_rendering_ = !skip_renderings.empty() &&
+        ("," + skip_renderings + ",").find("," + label + ",") != std::string::npos;
     const uint32_t label_id = GpuLabel(label);
     if (gpu_query_pool_ != VK_NULL_HANDLE) GpuMarkRendering(label_id);
     if (command_processor_.debug_labels()) {
@@ -2679,6 +2774,18 @@ void Fh1NativeExecutor::BeginDrawRendering() {
   if (vis_frame_) VisMarkRendering();
   command_processor_.SubmitBarriersAndBeginFh1Rendering(info, id);
   if (clears) FoldPendingClears(bound, clear_width, clear_height, nullptr, nullptr, false);
+}
+
+bool Fh1NativeExecutor::DebugSkipRenderingDraw(const Fh1DrawInfo& draw) {
+  if (!debug_skip_rendering_ || !REXCVAR_GET(fh1_debug_skip_rendering_draws)) return false;
+  const uint64_t shader = REXCVAR_GET(fh1_debug_skip_pixel_shader);
+  if (shader && (!draw.pixel_shader || draw.pixel_shader->ucode_data_hash() != shader)) return false;
+  if (draw.memexport || draw.occlusion_query_active) {
+    Count("debug_rendering_draw_preserved");
+    return false;
+  }
+  Count("debug_rendering_draw_skipped");
+  return true;
 }
 
 void Fh1NativeExecutor::NativeDrawIssued(const Fh1DrawInfo& draw) {
@@ -2977,6 +3084,10 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   constants[8] = image_row * scale_;
   constants[9] = image_endian;
   constants[10] = image2_view != VK_NULL_HANDLE ? image2_endian | (1u << 5) : 0u;
+  if (image_view != VK_NULL_HANDLE && resolve_textures_only_) {
+    constants[10] |= 1u << 6;
+    Count("debug_resolve_textures_only");
+  }
   if (const VkPipeline specialized = GetSpecializedResolvePipeline(
           image_view != VK_NULL_HANDLE, kind, msaa, constants)) {
     pipeline = specialized;
@@ -2996,6 +3107,8 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   if (!REXCVAR_GET(fh1_debug_skip_resolve_dispatches)) {
     command_buffer.CmdVkDispatch((uint32_t(rect.right - rect.left) + 15) / 16,
                                  (uint32_t(rect.bottom - rect.top) + 15) / 16, 1);
+  } else {
+    Count("debug_resolve_dispatch_skipped");
   }
   command_processor_.EndDebugLabel();
   return true;
@@ -3375,6 +3488,8 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
         direct_resolve_conversion = direct_resolve_conversions_[0];
       }
     }
+    resolve_textures_only_ = REXCVAR_GET(fh1_debug_resolve_textures_only) &&
+                             extent_length > 4096;
     // Up to two textures, written by the resolve's own dispatch; any others
     // reload.
     VkImageView direct_resolve_view = VK_NULL_HANDLE, direct_resolve_view2 = VK_NULL_HANDLE;
@@ -3528,6 +3643,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     if (written_address) *written_address = extent_start;
     if (written_length) *written_length = extent_length;
     if (complete) {
+      DiscoverShaderResolve(plan, extent_start, extent_length, untile_band);
       ++resolves_;
       Count(plan.sources.size() > 1 ? "resolve_multi_owner" : "resolve_single_owner");
     }

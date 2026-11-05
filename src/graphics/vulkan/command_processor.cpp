@@ -146,6 +146,16 @@ REXCVAR_DEFINE_BOOL(fh1_debug_skip_draw_calls, false, "GPU",
                     "Diagnostics: record every draw's state but not its draw command (wrong "
                     "image), to bound what the GPU spends per draw (Vulkan)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_frame_replay_present, true, "GPU",
+                    "Diagnostics: present offline frame replays; disable for GPU benchmarks "
+                    "so swapchain acquisition cannot cap them to the display refresh rate. "
+                    "Live gameplay and the frame inspector always present")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(fh1_frame_replay_output_path, "", "GPU",
+                      "Offline replay: write the post-swap-effect guest output as PPM at exit "
+                      "(requires fh1_frame_replay_present; parent directory must exist). "
+                      "This is before presenter upscaling and host UI")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(gpu_d3d_program_probe, 0, "GPU",
                      "Diagnostics: for the draws inside the lists gpu_d3d_program marks, 1 "
                      "draws only their first triangle and 2 skips their draw commands (wrong "
@@ -3809,7 +3819,10 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
     fh1_native_executor_->GpuFrameSwapped();
   }
 
-  if (!graphics_system_) {
+  const bool replay_without_present = !REXCVAR_GET(fh1_frame_replay_present) &&
+      !rex::cvar::GetFlagByName("fh1_frame_replay").empty() &&
+      rex::cvar::GetFlagByName("fh1_frame_inspector_replay") != "true";
+  if (!graphics_system_ || replay_without_present) {
     // Frame replays: still a frame, for the frames in flight.
     EndSubmission(true);
     return;
@@ -5397,7 +5410,7 @@ void VulkanCommandProcessor::RunFrameReplay(const std::filesystem::path& path, b
     inspector_->SetStatus("Replaying " + rex::path_to_utf8(path));
     fh1_native_executor_->BeginInspection();
   }
-  const int exit_code = RunFh1FrameReplay(
+  int exit_code = RunFh1FrameReplay(
       *this, *register_file_, *memory_, *shared_memory_,
       [this](uint32_t address, uint32_t length, std::vector<uint8_t>& out) {
         // The swap closed the frame's submission; the readback needs its own.
@@ -5446,6 +5459,32 @@ void VulkanCommandProcessor::RunFrameReplay(const std::filesystem::path& path, b
       inspector_->SetStatus("Replay failed; see the GPU log for details");
     }
     return;
+  }
+  const auto& output_path = REXCVAR_GET(fh1_frame_replay_output_path);
+  if (exit_code == 0 && !output_path.empty()) {
+    Fh1AwaitAllQueueOperations();
+    ui::RawImage image;
+    ui::Presenter* presenter = graphics_system_ ? graphics_system_->presenter() : nullptr;
+    bool captured = REXCVAR_GET(fh1_frame_replay_present) && presenter &&
+        presenter->CaptureGuestOutput(image) && image.width && image.height &&
+        image.stride >= size_t(image.width) * 4 &&
+        image.data.size() >= (size_t(image.height) - 1) * image.stride + size_t(image.width) * 4;
+    if (captured) {
+      std::ofstream output(rex::to_path(output_path), std::ios::binary | std::ios::trunc);
+      output << "P6\n" << image.width << " " << image.height << "\n255\n";
+      for (uint32_t y = 0; output && y < image.height; ++y) {
+        const uint8_t* row = image.data.data() + size_t(y) * image.stride;
+        for (uint32_t x = 0; x < image.width; ++x) {
+          output.write(reinterpret_cast<const char*>(row + size_t(x) * 4), 3);
+        }
+      }
+      output.close();
+      captured = bool(output);
+    }
+    if (!captured) {
+      REXGPU_ERROR("Cannot capture replay output to {} (requires replay presentation)", output_path);
+      exit_code = 1;
+    }
   }
   // A replay is a tool run with the title suspended: end the process here.
   rex::FlushLogging();
@@ -7244,11 +7283,14 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   }
 
   DrawCostMark(kCostBeginRendering);
-  if (fh1_native_executor_) {
-    fh1_native_executor_->DiscoverShaderDraw(vertex_shader_translation, pixel_shader_translation);
-  }
   // Draws inside the lists gpu_d3d_program marks, for the NA-3.2 ceiling.
   const int32_t program_probe = draw_program_ ? REXCVAR_GET(gpu_d3d_program_probe) : 0;
+  const bool skip_draw_command = REXCVAR_GET(fh1_debug_skip_draw_calls) || program_probe == 2 ||
+      (fh1_native_executor_ && fh1_native_executor_->DebugSkipRenderingDraw(fh1_draw));
+  if (fh1_native_executor_) {
+    fh1_native_executor_->DiscoverShaderDraw(vertex_shader_translation, pixel_shader_translation,
+                                             used_texture_mask, fh1_draw, skip_draw_command);
+  }
   uint64_t draw_gpu_timing = UINT64_MAX;
   if (fh1_native_executor_ && REXCVAR_GET(fh1_native_gpu_profile_draws)) {
     draw_gpu_timing = fh1_native_executor_->BeginLabelGpuTiming(
@@ -7264,7 +7306,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
       shader_32bit_index_dma) {
     ++pending_draw_calls_;
-    if (!REXCVAR_GET(fh1_debug_skip_draw_calls) && program_probe != 2) deferred_command_buffer_.CmdVkDraw(
+    if (!skip_draw_command) deferred_command_buffer_.CmdVkDraw(
         (REXCVAR_GET(fh1_debug_tiny_draws) || program_probe == 1)
             ? std::min(primitive_processing_result.host_draw_vertex_count, uint32_t(3))
             : primitive_processing_result.host_draw_vertex_count,
@@ -7306,7 +7348,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
             ? VK_INDEX_TYPE_UINT16
             : VK_INDEX_TYPE_UINT32);
     ++pending_draw_calls_;
-    if (!REXCVAR_GET(fh1_debug_skip_draw_calls) && program_probe != 2) deferred_command_buffer_.CmdVkDrawIndexed(
+    if (!skip_draw_command) deferred_command_buffer_.CmdVkDrawIndexed(
         (REXCVAR_GET(fh1_debug_tiny_draws) || program_probe == 1)
             ? std::min(primitive_processing_result.host_draw_vertex_count, uint32_t(3))
             : primitive_processing_result.host_draw_vertex_count,
@@ -7314,7 +7356,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
                                               0, 0, 0);
   }
 #if defined(REXGPU_FH1_ORDERED_CENSUS)
-  if (!REXCVAR_GET(fh1_debug_skip_draw_calls) && d3d12::Fh1FrameCensus::OrderedEnabled()) {
+  if (!skip_draw_command && d3d12::Fh1FrameCensus::OrderedEnabled()) {
     d3d12::Fh1FrameCensus::ObserveOrderedDraw(
         observation_frame_sequence_, ordered_census_pass_, pipeline_handle);
   }

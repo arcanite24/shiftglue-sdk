@@ -133,6 +133,18 @@ class TextureCache {
 
   // "ActiveTexture" means as of the latest RequestTextures call.
 
+  // Unscaled guest (address, length) ranges for the base and mip allocations.
+  // Diagnostics use the same padded layout as uploads, including packed mips.
+  std::array<std::pair<uint32_t, uint32_t>, 2> GetActiveTextureGuestRanges(
+      uint32_t fetch_constant_index) const {
+    const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+    if (!binding) return {};
+    const auto& key = binding->key;
+    const auto layout = key.GetGuestLayout();
+    return {{{key.base_page << 12, key.base_page ? layout.base.level_data_extent_bytes : 0},
+             {key.mip_page << 12, key.mip_page ? layout.mips_total_extent_bytes : 0}}};
+  }
+
   uint32_t GetActiveTextureHostSwizzle(uint32_t fetch_constant_index) const {
     const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
     return binding ? binding->host_swizzle : xenos::XE_GPU_TEXTURE_SWIZZLE_0000;
