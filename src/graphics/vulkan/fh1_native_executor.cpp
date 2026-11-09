@@ -25,6 +25,7 @@
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/perf/counter.h>
+#include <rex/platform.h>
 #include <rex/thread.h>
 #include <rex/system/thread_state.h>
 #include <rex/ui/vulkan/util.h>
@@ -63,11 +64,12 @@ REXCVAR_DEFINE_BOOL(fh1_async_specialized_passes, true, "GPU",
                     "GPU commands thread for it (tens of milliseconds a pipeline on a cold "
                     "driver cache)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_BOOL(fh1_color_overwrite_claims, true, "GPU",
+REXCVAR_DEFINE_BOOL(fh1_color_overwrite_claims, REX_PLATFORM_WIN32, "GPU",
                     "A depth-overwriting rectangle draw that also writes every channel of a "
                     "color target without blending claims that target's tiles without a "
                     "transfer too, as its depth does (FH1 clears color, depth and stencil "
-                    "with one such draw; Vulkan FH1 native executor)")
+                    "with one such draw; Vulkan FH1 native executor). On only on Windows "
+                    "until measured on other devices")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_share_msaa_aliases, false, "GPU",
                     "Store FH1's half-size 4x MSAA views of its 1x surfaces at pitches 16 and 13 "
