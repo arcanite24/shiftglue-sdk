@@ -198,6 +198,10 @@ REXCVAR_DEFINE_UINT64(fh1_debug_skip_pixel_shader, 0, "GPU",
                      "guest pixel-shader hash (0: any shader), to separate post work from HUD "
                      "draws sharing the same attachments")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(fh1_debug_skip_resolves, "", "GPU",
+                      "Diagnostics: skip the resolve dispatches whose source and size, written "
+                      "<surface>@<width>x<height>, are in this list, to see what they feed")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_debug_skip_resolve_dispatches, false, "GPU",
                     "Diagnostics: keep every resolve's barriers but not its compute dispatch "
                     "(wrong image), to bound what the resolve shaders cost (Vulkan)")
@@ -3198,7 +3202,14 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
       "resolve_class_12", "resolve_class_13", "resolve_class_14", "resolve_class_15"};
   counters_.Count(kClassNames[resolve_class],
                   rect_width * uint32_t(source.rect.bottom - source.rect.top));
-  if (!REXCVAR_GET(fh1_debug_skip_resolve_dispatches) &&
+  static const std::string skip_resolves = REXCVAR_GET(fh1_debug_skip_resolves);
+  const bool skip_this =
+      !skip_resolves.empty() &&
+      skip_resolves.find(fmt::format("{}@{}x{}", surface.key.Describe(),
+                                     source.rect.right - source.rect.left,
+                                     source.rect.bottom - source.rect.top)) != std::string::npos;
+  if (skip_this) Count("debug_resolve_skipped");
+  if (!REXCVAR_GET(fh1_debug_skip_resolve_dispatches) && !skip_this &&
       !((uint32_t(REXCVAR_GET(fh1_debug_skip_resolve_classes)) >> resolve_class) & 1)) {
     command_buffer.CmdVkDispatch((uint32_t(rect.right - rect.left) + 15) / 16,
                                  (uint32_t(rect.bottom - rect.top) + 15) / 16, 1);
