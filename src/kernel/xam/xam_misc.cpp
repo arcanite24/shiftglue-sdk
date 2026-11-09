@@ -8,10 +8,22 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <rex/cvar.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
 #include <rex/memory/utils.h>
+
+// Forza Horizon 2 sends requests here first and falls back to the older call
+// when it gets a failure HRESULT (4099 goes to PsCamDeviceRequest; 4101 takes
+// its other path on E_INVALIDARG). Left alone, r3 still holds the request id,
+// which the game reads as success; it then uses outputs nothing wrote as
+// handles, and the garage and paint shop stay under their loading screen
+// (found by fh2-recompiled). FH1 keeps the old behavior until its calls are
+// understood.
+REXCVAR_DEFINE_BOOL(xam_xstudio_request_unsupported, false, "Kernel",
+                    "Fail XamXStudioRequest with E_INVALIDARG (Forza Horizon 2) instead "
+                    "of leaving r3 untouched");
 
 namespace {
 
@@ -805,7 +817,10 @@ REX_HOOK_RAW(__imp__XamXStudioRequest) {
     }
   }
 
-  // Preserve the former stub's register behavior while gathering ABI evidence.
+  if (REXCVAR_GET(xam_xstudio_request_unsupported)) {
+    ctx.r3.u64 = 0x80070057;  // E_INVALIDARG: request not supported
+  }
+  // Otherwise keep the former stub's register behavior while gathering ABI evidence.
 }
 static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__XamXStudioRequest(
     "__imp__XamXStudioRequest", &__imp__XamXStudioRequest);
