@@ -42,6 +42,13 @@ REXCVAR_DEFINE_BOOL(host_present_sleep_spin, true, "UI/Presenter",
 REXCVAR_DEFINE_BOOL(pinyon_shift_fh1_source_presentation, false, "Pinyon Shift",
                     "Present each real FH1 source frame exactly once");
 
+REXCVAR_DEFINE_INT32(present_window_interval, 1, "UI/Presenter",
+                     "Present the window on one of every N guest frames (1: every frame). For "
+                     "VR, where the headset takes its own copy of each frame and the window is "
+                     "only a mirror: its present call can block the submission thread")
+    .range(1, 8)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
                     "Enable letterboxing for non-native aspect ratios");
 
@@ -604,8 +611,15 @@ void Presenter::PublishGuestOutput() {
         // Only window paint requesting is accessible.
         RequestPaintOrConnectionRecoveryViaWindow(true);
         break;
-      case PaintMode::kGuestOutputThreadImmediately:
+      case PaintMode::kGuestOutputThreadImmediately: {
         // Both painting and window paint requesting are accessible.
+        // present_window_interval: the frames between are published (the
+        // next paint shows the newest) but not presented.
+        static uint32_t window_frames = 0;
+        const uint32_t interval = uint32_t(std::max(1, REXCVAR_GET(present_window_interval)));
+        if (interval > 1 && ++window_frames % interval) {
+          break;
+        }
         if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
           paint_result = PaintAndPresent(false);
           if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
@@ -613,6 +627,7 @@ void Presenter::PublishGuestOutput() {
           }
         }
         break;
+      }
     }
   }
   // Handle GPU loss when not in the middle of the function anymore, and
