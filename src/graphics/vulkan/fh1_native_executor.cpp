@@ -71,6 +71,12 @@ REXCVAR_DEFINE_BOOL(fh1_color_overwrite_claims, REX_PLATFORM_WIN32, "GPU",
                     "with one such draw; Vulkan FH1 native executor). On only on Windows "
                     "until measured on other devices")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(fh1_native_per_axis_scale, REX_PLATFORM_WIN32, "GPU",
+                    "Let the Vulkan FH1 native executor draw at a different resolution scale "
+                    "on each axis (such as VR's 2x4). Off: unequal scales fall back to the "
+                    "render target cache. Equal scales draw the same either way. On only on "
+                    "Windows until measured on other devices")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_share_msaa_aliases, false, "GPU",
                     "Store FH1's half-size 4x MSAA views of its 1x surfaces at pitches 16 and 13 "
                     "in the 1x surfaces, rendering their draws single-sampled at twice the "
@@ -528,8 +534,11 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   } else if (two_sample_msaa_) {
     REXGPU_INFO("FH1 native executor (Vulkan): 4x MSAA surfaces with 2 host samples");
   }
-  // Each axis's scale - 1 has two bits in the shaders' constants.
-  if (scale_x_ > 4 || scale_y_ > 4) {
+  // Each axis's scale - 1 has two bits in the shaders' constants. Without
+  // fh1_native_per_axis_scale, unequal scales leave the render target cache
+  // to draw, as before the executor kept one per axis.
+  if (scale_x_ > 4 || scale_y_ > 4 ||
+      (scale_x_ != scale_y_ && !REXCVAR_GET(fh1_native_per_axis_scale))) {
     REXGPU_WARN("FH1 native executor (Vulkan): resolution scale {}x{} is not supported",
                 config_.textures->draw_resolution_scale_x(),
                 config_.textures->draw_resolution_scale_y());
