@@ -203,6 +203,14 @@ REXCVAR_DEFINE_INT32(gpu_idle_spin_count, 500, "GPU",
                      "when no other thread wants the core)")
     .range(0, 100000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(gpu_read_pointer_publish_dwords, 0, "GPU",
+                     "Write the ring read pointer back every this many dwords inside a "
+                     "burst, not only at its end, and wake guest threads waiting on GPU "
+                     "writes whenever it moves. For titles whose D3D layer polls the read "
+                     "pointer while it waits for ring space (FH2); 0 keeps the end-of-burst "
+                     "writeback only")
+    .range(0, 1 << 20)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(wait_reg_mem_sleep_us, -1, "GPU",
                      "How long each WAIT_REG_MEM sleep after the yield period lasts, even without vsync; "
                      "0 retains busy polling without vsync, or uses the packet interval with vsync. Short sleeps "
@@ -268,6 +276,12 @@ REXCVAR_DEFINE_STRING(fh1_debug_null_fetch, "", "GPU",
 REXCVAR_DEFINE_BOOL(fh1_debug_log_draws, false, "GPU",
                     "Diagnostics: log every draw's index in its frame, primitive type, index "
                     "count and vertex and pixel shader hashes (for frame replays)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(gpu_pixel_constant_fixups, "", "GPU",
+                      "Title fixes for pixel shader constants, as comma-separated "
+                      "<ucode hash>:<constant>.<x|y|z|w>:<bits>=<bits> entries in hex (the "
+                      "constant in decimal): while a draw uses that pixel shader and the "
+                      "component holds the first bits, it sees the second")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
@@ -555,6 +569,7 @@ void CommandProcessor::WorkerThreadMain() {
     if (read_ptr_writeback_ptr_) {
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
                                        read_ptr_index_);
+      if (REXCVAR_GET(gpu_read_pointer_publish_dwords) > 0) system::SignalGpuWrite();
     }
 
     // FIXME: We're supposed to process the WAIT_UNTIL register at this point,
@@ -1797,12 +1812,30 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
   reader.set_read_offset(read_index * sizeof(uint32_t));
   reader.set_write_offset(write_index * sizeof(uint32_t));
+  // Publishing the read pointer inside a long burst frees ring space sooner
+  // for a guest that waits on it (gpu_read_pointer_publish_dwords).
+  const uint32_t publish_bytes =
+      read_ptr_writeback_ptr_
+          ? uint32_t(std::max(REXCVAR_GET(gpu_read_pointer_publish_dwords), 0)) * 4
+          : 0;
+  uint32_t published_offset = reader.read_offset();
   do {
     if (!ExecutePacket(&reader)) {
       // This probably should be fatal - but we're going to continue anyways.
       REXGPU_ERROR("**** PRIMARY RINGBUFFER: Failed to execute packet.");
       assert_always();
       break;
+    }
+    if (publish_bytes) {
+      const uint32_t offset = reader.read_offset();
+      const uint32_t advanced =
+          (offset + primary_buffer_size_ - published_offset) % primary_buffer_size_;
+      if (advanced >= publish_bytes && reader.read_count()) {
+        published_offset = offset;
+        memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
+                                         offset / sizeof(uint32_t));
+        system::SignalGpuWrite();
+      }
     }
   } while (reader.read_count());
 
@@ -3416,7 +3449,8 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
         REXGPU_INFO(
             "FH1 debug draw {} mode={} prim={} indices={} vs={:016X} ps={:016X} color0={:08X} "
             "surface={:08X} mask={:08X} blend0={:08X} depth={:08X} vte={:08X} "
-            "window_scissor={:08X}/{:08X} copy_dest={:08X} copy_info={:08X} copy_ctrl={:08X}{}",
+            "window_scissor={:08X}/{:08X} copy_dest={:08X} copy_info={:08X} copy_ctrl={:08X} "
+            "stencil={:08X}/{:08X} colorcontrol={:08X} depth_info={:08X}{}",
             draw_index, regs[XE_GPU_REG_RB_MODECONTROL] & 7, uint32_t(vgt_draw_initiator.prim_type),
             uint32_t(vgt_draw_initiator.num_indices),
             active_vertex_shader_ ? active_vertex_shader_->ucode_data_hash() : 0,
@@ -3426,7 +3460,9 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
             regs[XE_GPU_REG_RB_DEPTHCONTROL], regs[XE_GPU_REG_PA_CL_VTE_CNTL],
             regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL], regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR],
             regs[XE_GPU_REG_RB_COPY_DEST_BASE], regs[XE_GPU_REG_RB_COPY_DEST_INFO],
-            regs[XE_GPU_REG_RB_COPY_CONTROL], textures);
+            regs[XE_GPU_REG_RB_COPY_CONTROL], regs[XE_GPU_REG_RB_STENCILREFMASK],
+            regs[XE_GPU_REG_RB_STENCILREFMASK_BF], regs[XE_GPU_REG_RB_COLORCONTROL],
+            regs[XE_GPU_REG_RB_DEPTH_INFO], textures);
       }
       static const auto null_fetch = [] {
         uint32_t draw = UINT32_MAX, fetch = 0;
@@ -3453,8 +3489,60 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
                         (saved_fetch_word & ~uint32_t(3)) |
                             uint32_t(xenos::FetchConstantType::kVertex));
         }
+        // gpu_pixel_constant_fixups, also through WriteRegister.
+        struct ConstantFixup {
+          uint64_t shader_hash;
+          uint32_t register_index;
+          uint32_t from;
+          uint32_t to;
+        };
+        static const auto constant_fixups = [] {
+          std::vector<ConstantFixup> fixups;
+          const std::string list = REXCVAR_GET(gpu_pixel_constant_fixups);
+          for (size_t start = 0; start < list.size();) {
+            const size_t end = std::min(list.find(',', start), list.size());
+            const std::string entry = list.substr(start, end - start);
+            start = end + 1;
+            unsigned long long hash = 0;
+            uint32_t constant = 0, from = 0, to = 0;
+            char component = 0;
+            const char* components = "xyzw";
+            if (std::sscanf(entry.c_str(), "%llx:%u.%c:%x=%x", &hash, &constant, &component,
+                            &from, &to) != 5 ||
+                constant >= 256 || !component || !std::strchr(components, component)) {
+              REXGPU_ERROR("gpu_pixel_constant_fixups: ignoring \"{}\"", entry);
+              continue;
+            }
+            fixups.push_back({hash,
+                              XE_GPU_REG_SHADER_CONSTANT_256_X + constant * 4 +
+                                  uint32_t(std::strchr(components, component) - components),
+                              from, to});
+          }
+          return fixups;
+        }();
+        const ConstantFixup* constant_fixup = nullptr;
+        if (!constant_fixups.empty() && active_pixel_shader_) {
+          const uint64_t hash = active_pixel_shader_->ucode_data_hash();
+          for (const ConstantFixup& fixup : constant_fixups) {
+            if (fixup.shader_hash == hash &&
+                register_file_->values[fixup.register_index] == fixup.from) {
+              constant_fixup = &fixup;
+              static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+              if (!logged.test_and_set(std::memory_order_relaxed)) {
+                REXGPU_INFO("gpu_pixel_constant_fixups: pixel shader {:016X} sees {:08X} for "
+                            "{:08X}",
+                            hash, fixup.to, fixup.from);
+              }
+              WriteRegister(fixup.register_index, fixup.to);
+              break;
+            }
+          }
+        }
         draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                    is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
+        if (constant_fixup) {
+          WriteRegister(constant_fixup->register_index, constant_fixup->from);
+        }
         if (draw_index == null_fetch.first) {
           WriteRegister(null_fetch_register, saved_fetch_word);
         }
