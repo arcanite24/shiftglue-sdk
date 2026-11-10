@@ -4430,7 +4430,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
               }
               VkDescriptorSet set = swap_scene_post_descriptor_sets_[swap_frame_index];
               // Without occlusion, its bindings take the snapshot (never read).
-              const VkImageView ao_view = scene_ao ? swap_ao_view_ : hud_snapshot_view;
+              const VkImageView ao_view = scene_ao ? swap_ao_views_[swap_ao_current_] : hud_snapshot_view;
               const VkImageView depth_view = scene_ao ? ao_depth_view : hud_snapshot_view;
               VkDescriptorImageInfo infos[7] = {
                   {swap_sampler_linear_clamp_, swap_fxaa_source_image_view_,

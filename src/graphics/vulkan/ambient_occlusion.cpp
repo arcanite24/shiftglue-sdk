@@ -10,11 +10,24 @@
 // depth and FH2's reversed depth alike, and x and y come from the vertical
 // field of view and the output's aspect.
 //
-// The pass writes the occlusion and the view z it was computed at
-// (RG16F), so the blur needs no second depth fetch per tap.
+// Twelve samples a pixel are too few to hold still: up close the spiral
+// spreads over a hundred pixels and its noise crawled as the camera moved.
+// So each frame turns the pattern by a new step, and a second pass blends
+// the estimate with the previous frame's result, found through the
+// camera's reprojection (the one the upscalers' motion vectors use). The
+// history is dropped where its view z disagrees (disocclusion, moving cars)
+// or after a camera cut, and clamped to the range of this frame's estimate
+// around the pixel: a moving occluder's shade (the wheels' on the road,
+// where the depth is unchanged) otherwise trailed behind it as a row of
+// fading copies. Two result images alternate: one written, the other read
+// as history.
+//
+// The passes write the occlusion and the view z it was computed at
+// (RG16F), so the blur and the history test need no second depth fetch.
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -28,11 +41,14 @@ namespace rex::graphics::vulkan {
 
 namespace {
 
-const char* const kAmbientOcclusionSource = R"(#version 450
+// Bindings: 0 the camera depth, 1 this frame's estimate, 2 the result, 3 the
+// previous result (history).
+const char* const kAmbientOcclusionCommon = R"(#version 450
 #extension GL_EXT_samplerless_texture_functions : require
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(push_constant) uniform AmbientOcclusionConstants {
+  layout(row_major) mat4 reprojection;
   uvec2 full_size;
   uvec2 ao_size;
   float depth_a;
@@ -42,13 +58,18 @@ layout(push_constant) uniform AmbientOcclusionConstants {
   float radius;
   float fade_start;
   float fade_end;
+  // 1: the history is this view's previous frame; 2: the matrix's depth is
+  // 1 minus the stored one (FH1).
+  uint flags;
+  float rotation;
 } c;
 
 layout(set = 0, binding = 0) uniform texture2D depth;
-layout(set = 0, binding = 1, rg16f) writeonly uniform image2D dest;
+layout(set = 0, binding = 3) uniform texture2D history;
 
-const int kSamples = 12;
-const float kTurns = 7.0;
+// The share of each new frame in the running result: about 7 frames of
+// memory, short enough that moving shade does not trail.
+const float kNewWeight = 0.15;
 
 // The stored depth at a screen pixel. The scene is drawn turned 180 degrees
 // (the post pass turns it back), so its depth is at the opposite pixel.
@@ -68,6 +89,51 @@ vec3 ViewPosition(ivec2 p) {
   return vec3(ndc.x * c.tan_half_x * vz, -ndc.y * c.tan_half_y * vz, vz);
 }
 
+// The previous frame's result at the full-size pixel p's place in it, or -1.
+float History(ivec2 p, float stored_z) {
+  if ((c.flags & 1u) == 0u) return -1.0;
+  vec2 uv = (vec2(p) + 0.5) / vec2(c.full_size);
+  vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+  float matrix_z = (c.flags & 2u) != 0u ? 1.0 - stored_z : stored_z;
+  // The scene's clip x and y are the screen's negated (turned 180 degrees).
+  vec4 previous = c.reprojection * vec4(-ndc, matrix_z, 1.0);
+  if (!(previous.w > 1e-6)) return -1.0;
+  vec3 previous_clip = previous.xyz / previous.w;
+  vec2 previous_uv = vec2(-previous_clip.x * 0.5 + 0.5, 0.5 + previous_clip.y * 0.5);
+  if (any(lessThan(previous_uv, vec2(0.0))) || any(greaterThan(previous_uv, vec2(1.0)))) {
+    return -1.0;
+  }
+  float previous_stored = (c.flags & 2u) != 0u ? 1.0 - previous_clip.z : previous_clip.z;
+  float previous_view_z = ViewZ(previous_stored);
+  // Bilinear over the half-size texels, each kept only if it saw the same
+  // surface (view z within 3 %).
+  vec2 texel = previous_uv * vec2(c.full_size) * 0.5 - 0.5;
+  ivec2 base = ivec2(floor(texel));
+  vec2 f = texel - vec2(base);
+  float sum = 0.0;
+  float weights = 0.0;
+  for (int y = 0; y < 2; ++y) {
+    for (int x = 0; x < 2; ++x) {
+      ivec2 tap = base + ivec2(x, y);
+      if (any(lessThan(tap, ivec2(0))) || any(greaterThanEqual(tap, ivec2(c.ao_size)))) continue;
+      vec2 h = texelFetch(history, tap, 0).rg;
+      float w = (x == 1 ? f.x : 1.0 - f.x) * (y == 1 ? f.y : 1.0 - f.y);
+      if (abs(h.g - previous_view_z) > 0.03 * previous_view_z + 0.02) continue;
+      sum += h.r * w;
+      weights += w;
+    }
+  }
+  return weights > 0.25 ? sum / weights : -1.0;
+}
+)";
+
+// This frame's estimate.
+const char* const kAmbientOcclusionEstimate = R"(
+layout(set = 0, binding = 1, rg16f) writeonly uniform image2D raw;
+
+const int kSamples = 12;
+const float kTurns = 7.0;
+
 void main() {
   ivec2 ao_pixel = ivec2(gl_GlobalInvocationID.xy);
   if (any(greaterThanEqual(uvec2(ao_pixel), c.ao_size))) {
@@ -77,7 +143,7 @@ void main() {
   vec3 position = ViewPosition(p);
   // The sky, and anything past the fade, gets none.
   if (!(position.z > 0.0) || position.z >= c.fade_end) {
-    imageStore(dest, ao_pixel, vec4(1.0, 1e6, 0.0, 0.0));
+    imageStore(raw, ao_pixel, vec4(1.0, 1e6, 0.0, 0.0));
     return;
   }
   // The normal from the neighbour on the smoother side, so silhouettes do not
@@ -96,14 +162,20 @@ void main() {
   float radius_pixels = c.radius * 0.5 * float(c.full_size.y) / (c.tan_half_y * position.z);
   float occlusion = 0.0;
   if (radius_pixels >= 2.0) {
-    radius_pixels = min(radius_pixels, 0.12 * float(c.full_size.y));
-    // A 4x4 ordered pattern rotates the spiral per pixel; the upsample's 4x4
-    // box holds all 16 rotations wherever it sits, so the pattern averages
-    // out instead of showing as stripes.
+    // Up close the spiral would spread past what 12 samples can cover
+    // without blotches; a world radius that shrinks there is the lesser
+    // error.
+    float max_pixels = 0.06 * float(c.full_size.y);
+    float radius = c.radius * min(1.0, max_pixels / radius_pixels);
+    radius_pixels = min(radius_pixels, max_pixels);
+    // A 4x4 ordered pattern turns the spiral per pixel, and each frame turns
+    // it all by a further step: the upsample's 4x4 box holds all 16 turns
+    // wherever it sits, and the history averages the frames' steps.
     const float kBayer[16] = float[16](0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0,
                                        3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
-    float noise = (kBayer[(ao_pixel.y & 3) * 4 + (ao_pixel.x & 3)] + 0.5) / 16.0;
-    float radius2 = c.radius * c.radius;
+    float noise =
+        fract((kBayer[(ao_pixel.y & 3) * 4 + (ao_pixel.x & 3)] + 0.5) / 16.0 + c.rotation);
+    float radius2 = radius * radius;
     float bias = 0.02 + 0.002 * position.z;
     float sum = 0.0;
     for (int i = 0; i < kSamples; ++i) {
@@ -118,9 +190,49 @@ void main() {
     occlusion = min(1.0, sum * 5.0 / (radius2 * radius2 * radius2 * float(kSamples)));
   }
   occlusion *= 1.0 - smoothstep(c.fade_start, c.fade_end, position.z);
-  imageStore(dest, ao_pixel, vec4(1.0 - occlusion, position.z, 0.0, 0.0));
+  imageStore(raw, ao_pixel, vec4(1.0 - occlusion, position.z, 0.0, 0.0));
 }
 )";
+
+// The estimate blended with the clamped history.
+const char* const kAmbientOcclusionTemporal = R"(
+layout(set = 0, binding = 1, rg16f) readonly uniform image2D raw;
+layout(set = 0, binding = 2, rg16f) writeonly uniform image2D dest;
+
+void main() {
+  ivec2 ao_pixel = ivec2(gl_GlobalInvocationID.xy);
+  if (any(greaterThanEqual(uvec2(ao_pixel), c.ao_size))) {
+    return;
+  }
+  vec2 center = imageLoad(raw, ao_pixel).rg;
+  float ao = center.r;
+  if (center.g < 1e5) {
+    // The range of this frame's estimate over the 3x3 texels on the same
+    // surface: every 3x3 window holds most of the pattern's turns, so a
+    // shade the history keeps but no turn here sees is a trail.
+    float low = center.r;
+    float high = center.r;
+    float tolerance = 0.04 * center.g + 0.05;
+    for (int y = -1; y <= 1; ++y) {
+      for (int x = -1; x <= 1; ++x) {
+        ivec2 tap = clamp(ao_pixel + ivec2(x, y), ivec2(0), ivec2(c.ao_size) - 1);
+        vec2 t = imageLoad(raw, tap).rg;
+        if (abs(t.g - center.g) > tolerance) continue;
+        low = min(low, t.r);
+        high = max(high, t.r);
+      }
+    }
+    // The stored depth back from the view z.
+    float stored_z = c.depth_a + c.depth_b / center.g;
+    float previous = History(ao_pixel * 2, stored_z);
+    if (previous >= 0.0) ao = mix(clamp(previous, low, high), ao, kNewWeight);
+  }
+  imageStore(dest, ao_pixel, vec4(ao, center.g, 0.0, 0.0));
+}
+)";
+
+// The golden ratio's fraction: successive frames' turns stay spread out.
+constexpr double kRotationStep = 0.61803399;
 
 }  // namespace
 
@@ -132,18 +244,17 @@ bool VulkanCommandProcessor::EnsureSwapAmbientOcclusion(uint32_t full_width,
   if (swap_ao_pipeline_ == VK_NULL_HANDLE) {
     if (swap_ao_failed_) return false;
     swap_ao_failed_ = true;
-    VkDescriptorSetLayoutBinding bindings[2] = {};
-    bindings[0].binding = 0;
-    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    bindings[0].descriptorCount = 1;
-    bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    bindings[1].binding = 1;
-    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    bindings[1].descriptorCount = 1;
-    bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutBinding bindings[4] = {};
+    for (uint32_t i = 0; i < 4; ++i) {
+      bindings[i].binding = i;
+      bindings[i].descriptorType = (i == 1 || i == 2) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                                      : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+      bindings[i].descriptorCount = 1;
+      bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
     VkDescriptorSetLayoutCreateInfo set_layout_info = {};
     set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    set_layout_info.bindingCount = 2;
+    set_layout_info.bindingCount = 4;
     set_layout_info.pBindings = bindings;
     if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
                                         &swap_ao_set_layout_) != VK_SUCCESS) {
@@ -151,7 +262,7 @@ bool VulkanCommandProcessor::EnsureSwapAmbientOcclusion(uint32_t full_width,
       return false;
     }
     VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                               sizeof(uint32_t) * 11};
+                                               sizeof(float) * 16 + sizeof(uint32_t) * 13};
     VkPipelineLayoutCreateInfo pipeline_layout_info = {};
     pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pipeline_layout_info.setLayoutCount = 1;
@@ -164,8 +275,8 @@ bool VulkanCommandProcessor::EnsureSwapAmbientOcclusion(uint32_t full_width,
       return false;
     }
     VkDescriptorPoolSize pool_sizes[2] = {
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxFramesInFlight},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kMaxFramesInFlight},
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2 * kMaxFramesInFlight},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * kMaxFramesInFlight},
     };
     VkDescriptorPoolCreateInfo pool_info = {};
     pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -189,65 +300,71 @@ bool VulkanCommandProcessor::EnsureSwapAmbientOcclusion(uint32_t full_width,
       REXGPU_WARN("Failed to allocate the ambient occlusion descriptor sets");
       return false;
     }
-    std::vector<uint32_t> spirv;
-    std::string compile_error;
-    if (!CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, kAmbientOcclusionSource, spirv,
-                            compile_error)) {
-      REXGPU_WARN("Failed to compile the ambient occlusion shader: {}", compile_error);
-      return false;
-    }
-    swap_ao_pipeline_ = ui::vulkan::util::CreateComputePipeline(
-        vulkan_device, swap_ao_pipeline_layout_, spirv.data(), sizeof(uint32_t) * spirv.size());
-    if (swap_ao_pipeline_ == VK_NULL_HANDLE) {
-      REXGPU_WARN("Failed to create the ambient occlusion pipeline");
-      return false;
+    for (VkPipeline* pipeline : {&swap_ao_pipeline_, &swap_ao_temporal_pipeline_}) {
+      const std::string source = std::string(kAmbientOcclusionCommon) +
+                                 (pipeline == &swap_ao_pipeline_ ? kAmbientOcclusionEstimate
+                                                                 : kAmbientOcclusionTemporal);
+      std::vector<uint32_t> spirv;
+      std::string compile_error;
+      if (!CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, source.c_str(), spirv,
+                              compile_error)) {
+        REXGPU_WARN("Failed to compile the ambient occlusion shader: {}", compile_error);
+        return false;
+      }
+      *pipeline = ui::vulkan::util::CreateComputePipeline(
+          vulkan_device, swap_ao_pipeline_layout_, spirv.data(),
+          sizeof(uint32_t) * spirv.size());
+      if (*pipeline == VK_NULL_HANDLE) {
+        REXGPU_WARN("Failed to create the ambient occlusion pipeline");
+        return false;
+      }
     }
     swap_ao_failed_ = false;
   }
 
   const uint32_t width = (full_width + 1) / 2;
   const uint32_t height = (full_height + 1) / 2;
-  if (swap_ao_image_ != VK_NULL_HANDLE && swap_ao_width_ == width && swap_ao_height_ == height) {
+  if (swap_ao_images_[0] != VK_NULL_HANDLE && swap_ao_width_ == width &&
+      swap_ao_height_ == height) {
     return true;
   }
-  const uint64_t submission = GetCurrentSubmission();
-  if (swap_ao_view_ != VK_NULL_HANDLE) destroy_image_views_.emplace_back(submission, swap_ao_view_);
-  if (swap_ao_image_ != VK_NULL_HANDLE) destroy_images_.emplace_back(submission, swap_ao_image_);
-  if (swap_ao_memory_ != VK_NULL_HANDLE) destroy_memory_.emplace_back(submission, swap_ao_memory_);
-  swap_ao_view_ = VK_NULL_HANDLE;
-  swap_ao_image_ = VK_NULL_HANDLE;
-  swap_ao_memory_ = VK_NULL_HANDLE;
-  swap_ao_width_ = 0;
-  swap_ao_height_ = 0;
-  swap_ao_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+  DestroySwapAmbientOcclusionImages();
 
-  VkImageCreateInfo image_info = {};
-  image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-  image_info.imageType = VK_IMAGE_TYPE_2D;
-  image_info.format = VK_FORMAT_R16G16_SFLOAT;
-  image_info.extent = {width, height, 1};
-  image_info.mipLevels = 1;
-  image_info.arrayLayers = 1;
-  image_info.samples = VK_SAMPLE_COUNT_1_BIT;
-  image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-  image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
-  image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-  image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  if (!ui::vulkan::util::CreateDedicatedAllocationImage(
-          vulkan_device, image_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
-          swap_ao_image_, swap_ao_memory_)) {
-    REXGPU_WARN("Failed to create the ambient occlusion image");
-    return false;
-  }
-  VkImageViewCreateInfo view_info = {};
-  view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-  view_info.image = swap_ao_image_;
-  view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-  view_info.format = VK_FORMAT_R16G16_SFLOAT;
-  view_info.subresourceRange = ui::vulkan::util::InitializeSubresourceRange();
-  if (dfn.vkCreateImageView(device, &view_info, nullptr, &swap_ao_view_) != VK_SUCCESS) {
-    REXGPU_WARN("Failed to create the ambient occlusion image view");
-    return false;
+  // Two results (this frame's and the history), then the estimate.
+  for (uint32_t i = 0; i < 3; ++i) {
+    VkImage& image = i < 2 ? swap_ao_images_[i] : swap_ao_raw_image_;
+    VkDeviceMemory& memory = i < 2 ? swap_ao_memory_[i] : swap_ao_raw_memory_;
+    VkImageView& view = i < 2 ? swap_ao_views_[i] : swap_ao_raw_view_;
+    VkImageCreateInfo image_info = {};
+    image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.format = VK_FORMAT_R16G16_SFLOAT;
+    image_info.extent = {width, height, 1};
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            vulkan_device, image_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, image,
+            memory)) {
+      REXGPU_WARN("Failed to create the ambient occlusion image");
+      DestroySwapAmbientOcclusionImages();
+      return false;
+    }
+    VkImageViewCreateInfo view_info = {};
+    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_info.image = image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = VK_FORMAT_R16G16_SFLOAT;
+    view_info.subresourceRange = ui::vulkan::util::InitializeSubresourceRange();
+    if (dfn.vkCreateImageView(device, &view_info, nullptr, &view) != VK_SUCCESS) {
+      REXGPU_WARN("Failed to create the ambient occlusion image view");
+      DestroySwapAmbientOcclusionImages();
+      return false;
+    }
   }
   swap_ao_width_ = width;
   swap_ao_height_ = height;
@@ -261,44 +378,71 @@ void VulkanCommandProcessor::DispatchSwapAmbientOcclusion(
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   const VkImageSubresourceRange range = ui::vulkan::util::InitializeSubresourceRange();
-  PushImageMemoryBarrier(swap_ao_image_, range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+  // The other image holds the previous frame's result, if the previous swap
+  // ran this pass for the same view.
+  const uint32_t current = swap_ao_current_ ^ 1;
+  const uint32_t previous = swap_ao_current_;
+  const bool history = swap_ao_history_valid_ && swap_ao_last_frame_ + 1 == frame_current_ &&
+                       !camera.cut;
+  PushImageMemoryBarrier(swap_ao_images_[current], range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
-                         VK_ACCESS_SHADER_WRITE_BIT, swap_ao_layout_, VK_IMAGE_LAYOUT_GENERAL);
+                         VK_ACCESS_SHADER_WRITE_BIT, swap_ao_layouts_[current],
+                         VK_IMAGE_LAYOUT_GENERAL);
+  // The estimate stays in GENERAL: written by the first pass, loaded by the
+  // second.
+  PushImageMemoryBarrier(swap_ao_raw_image_, range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                         VK_ACCESS_SHADER_WRITE_BIT, swap_ao_raw_layout_,
+                         VK_IMAGE_LAYOUT_GENERAL);
+  swap_ao_raw_layout_ = VK_IMAGE_LAYOUT_GENERAL;
+  if (swap_ao_layouts_[previous] != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+    // Never written (the first frame): bound but not read.
+    PushImageMemoryBarrier(swap_ao_images_[previous], range,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_READ_BIT,
+                           swap_ao_layouts_[previous], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    swap_ao_layouts_[previous] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  }
   SubmitBarriers(true);
 
   VkDescriptorSet set = swap_ao_descriptor_sets_[frame_index];
-  VkDescriptorImageInfo infos[2] = {
+  VkDescriptorImageInfo infos[4] = {
       {VK_NULL_HANDLE, camera_depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-      {VK_NULL_HANDLE, swap_ao_view_, VK_IMAGE_LAYOUT_GENERAL},
+      {VK_NULL_HANDLE, swap_ao_raw_view_, VK_IMAGE_LAYOUT_GENERAL},
+      {VK_NULL_HANDLE, swap_ao_views_[current], VK_IMAGE_LAYOUT_GENERAL},
+      {VK_NULL_HANDLE, swap_ao_views_[previous], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
   };
-  const VkDescriptorType types[2] = {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-                                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
-  VkWriteDescriptorSet writes[2] = {};
-  for (uint32_t i = 0; i < 2; ++i) {
+  VkWriteDescriptorSet writes[4] = {};
+  for (uint32_t i = 0; i < 4; ++i) {
     writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[i].dstSet = set;
     writes[i].dstBinding = i;
     writes[i].descriptorCount = 1;
-    writes[i].descriptorType = types[i];
+    writes[i].descriptorType = (i == 1 || i == 2) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                                  : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     writes[i].pImageInfo = &infos[i];
   }
-  dfn.vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+  dfn.vkUpdateDescriptorSets(device, 4, writes, 0, nullptr);
   deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
                                                    swap_ao_pipeline_layout_, 0, 1, &set, 0,
                                                    nullptr);
   const float tan_half_y = std::tan(camera.fov_y * 0.5f);
   const float radius = float(REXCVAR_GET(swap_ambient_occlusion_radius));
   struct {
+    float reprojection[16];
     uint32_t full_size[2];
     uint32_t ao_size[2];
-    float near_plane;
-    float far_plane;
+    float depth_a;
+    float depth_b;
     float tan_half_x;
     float tan_half_y;
     float radius;
     float fade_start;
     float fade_end;
-  } constants = {{full_width, full_height},
+    uint32_t flags;
+    float rotation;
+  } constants = {{},
+                 {full_width, full_height},
                  {swap_ao_width_, swap_ao_height_},
                  camera.depth_a,
                  camera.depth_b,
@@ -306,36 +450,64 @@ void VulkanCommandProcessor::DispatchSwapAmbientOcclusion(
                  tan_half_y,
                  radius,
                  radius * 80.0f,
-                 radius * 200.0f};
+                 radius * 200.0f,
+                 (history ? 1u : 0u) | (camera.depth_matrix_flipped ? 2u : 0u),
+                 float(std::fmod(double(frame_current_) * kRotationStep, 1.0))};
+  std::copy(std::begin(camera.reprojection), std::end(camera.reprojection),
+            constants.reprojection);
+  static_assert(sizeof(constants) == sizeof(float) * 16 + sizeof(uint32_t) * 13);
   deferred_command_buffer_.CmdVkPushConstants(swap_ao_pipeline_layout_,
                                               VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants),
                                               &constants);
   BindExternalComputePipeline(swap_ao_pipeline_);
   deferred_command_buffer_.CmdVkDispatch((swap_ao_width_ + 7) / 8, (swap_ao_height_ + 7) / 8, 1);
+  PushImageMemoryBarrier(swap_ao_raw_image_, range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                         VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_IMAGE_LAYOUT_GENERAL);
+  SubmitBarriers(true);
+  BindExternalComputePipeline(swap_ao_temporal_pipeline_);
+  deferred_command_buffer_.CmdVkDispatch((swap_ao_width_ + 7) / 8, (swap_ao_height_ + 7) / 8, 1);
 
-  PushImageMemoryBarrier(swap_ao_image_, range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+  PushImageMemoryBarrier(swap_ao_images_[current], range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                          VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
   SubmitBarriers(true);
-  swap_ao_layout_ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  swap_ao_layouts_[current] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  swap_ao_current_ = current;
+  swap_ao_history_valid_ = true;
+  swap_ao_last_frame_ = frame_current_;
+}
+
+void VulkanCommandProcessor::DestroySwapAmbientOcclusionImages() {
+  const uint64_t submission = GetCurrentSubmission();
+  for (uint32_t i = 0; i < 3; ++i) {
+    VkImageView& view = i < 2 ? swap_ao_views_[i] : swap_ao_raw_view_;
+    VkImage& image = i < 2 ? swap_ao_images_[i] : swap_ao_raw_image_;
+    VkDeviceMemory& memory = i < 2 ? swap_ao_memory_[i] : swap_ao_raw_memory_;
+    if (view != VK_NULL_HANDLE) destroy_image_views_.emplace_back(submission, view);
+    if (image != VK_NULL_HANDLE) destroy_images_.emplace_back(submission, image);
+    if (memory != VK_NULL_HANDLE) destroy_memory_.emplace_back(submission, memory);
+    view = VK_NULL_HANDLE;
+    image = VK_NULL_HANDLE;
+    memory = VK_NULL_HANDLE;
+  }
+  swap_ao_layouts_ = {VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_UNDEFINED};
+  swap_ao_raw_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+  swap_ao_width_ = 0;
+  swap_ao_height_ = 0;
+  swap_ao_history_valid_ = false;
 }
 
 void VulkanCommandProcessor::DestroySwapAmbientOcclusion() {
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
-  const uint64_t submission = GetCurrentSubmission();
-  if (swap_ao_view_ != VK_NULL_HANDLE) destroy_image_views_.emplace_back(submission, swap_ao_view_);
-  if (swap_ao_image_ != VK_NULL_HANDLE) destroy_images_.emplace_back(submission, swap_ao_image_);
-  if (swap_ao_memory_ != VK_NULL_HANDLE) destroy_memory_.emplace_back(submission, swap_ao_memory_);
-  swap_ao_view_ = VK_NULL_HANDLE;
-  swap_ao_image_ = VK_NULL_HANDLE;
-  swap_ao_memory_ = VK_NULL_HANDLE;
-  swap_ao_width_ = 0;
-  swap_ao_height_ = 0;
-  swap_ao_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+  DestroySwapAmbientOcclusionImages();
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_ao_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                         swap_ao_temporal_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
                                          swap_ao_pipeline_layout_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,

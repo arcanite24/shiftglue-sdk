@@ -419,6 +419,7 @@ void Fh1NativeExecutor::FinishCameraFrame() {
     if (std::isfinite(a) && std::isfinite(b) && std::abs(b) > 1e-9) {
       camera.depth_a = float(b < 0.0 ? 1.0 - a : a);
       camera.depth_b = float(std::abs(b));
+      camera.depth_matrix_flipped = b < 0.0;
     }
   }
 

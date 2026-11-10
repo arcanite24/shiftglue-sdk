@@ -1271,18 +1271,31 @@ class VulkanCommandProcessor : public CommandProcessor {
                                     uint32_t full_height, uint32_t frame_index);
   // Into the destroy queues.
   void DestroySwapAmbientOcclusion();
+  void DestroySwapAmbientOcclusionImages();
   bool swap_ao_failed_ = false;
   VkDescriptorSetLayout swap_ao_set_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout swap_ao_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline swap_ao_pipeline_ = VK_NULL_HANDLE;
+  VkPipeline swap_ao_temporal_pipeline_ = VK_NULL_HANDLE;
   VkDescriptorPool swap_ao_descriptor_pool_ = VK_NULL_HANDLE;
   std::array<VkDescriptorSet, kMaxFramesInFlight> swap_ao_descriptor_sets_{};
-  VkImage swap_ao_image_ = VK_NULL_HANDLE;
-  VkDeviceMemory swap_ao_memory_ = VK_NULL_HANDLE;
-  VkImageView swap_ao_view_ = VK_NULL_HANDLE;
+  // This frame's estimate, before the history.
+  VkImage swap_ao_raw_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory swap_ao_raw_memory_ = VK_NULL_HANDLE;
+  VkImageView swap_ao_raw_view_ = VK_NULL_HANDLE;
+  VkImageLayout swap_ao_raw_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+  // Two images alternate: the one written this frame (swap_ao_current_ after
+  // the dispatch) and the previous frame's, read as history.
+  std::array<VkImage, 2> swap_ao_images_{};
+  std::array<VkDeviceMemory, 2> swap_ao_memory_{};
+  std::array<VkImageView, 2> swap_ao_views_{};
+  std::array<VkImageLayout, 2> swap_ao_layouts_{VK_IMAGE_LAYOUT_UNDEFINED,
+                                                VK_IMAGE_LAYOUT_UNDEFINED};
+  uint32_t swap_ao_current_ = 0;
+  bool swap_ao_history_valid_ = false;
+  uint64_t swap_ao_last_frame_ = 0;
   uint32_t swap_ao_width_ = 0;
   uint32_t swap_ao_height_ = 0;
-  VkImageLayout swap_ao_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
   VkPipelineLayout resolve_downscale_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline resolve_downscale_pipeline_ = VK_NULL_HANDLE;
   VkBuffer resolve_downscale_buffer_ = VK_NULL_HANDLE;

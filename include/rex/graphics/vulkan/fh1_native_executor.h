@@ -165,6 +165,9 @@ class Fh1NativeExecutor {
     // matrix's z and w rows; B is 0 when the rows do not fit.
     float depth_a;
     float depth_b;
+    // The matrix's depth is 1 minus the stored one (FH1, flipped by its
+    // viewport); FH2's matrix gives the stored depth itself.
+    bool depth_matrix_flipped;
     // Vertical field of view, radians.
     float fov_y;
     // No continuation of the previous frame (a cut, a load, a rebase): the
