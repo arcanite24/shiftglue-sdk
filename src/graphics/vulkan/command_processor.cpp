@@ -197,6 +197,9 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
 
 // Defined by the backend-independent command processor.
 REXCVAR_DECLARE(bool, gpu_template_stats);
+REXCVAR_DECLARE(bool, fh1_msaa_single_sample);
+REXCVAR_DECLARE(bool, fh1_msaa_2x);
+REXCVAR_DECLARE(uint32_t, vulkan_texture_max_size);
 REXCVAR_DECLARE(bool, spirv_specialize_texture_signs);
 #if REX_HAS_D3D12
 REXCVAR_DECLARE(double, fh1_hud_squeeze);
@@ -2581,9 +2584,26 @@ bool VulkanCommandProcessor::CreateScaledComponents(uint32_t draw_resolution_sca
   }
   // A new texture cache has no samplers yet.
   sampler_mip_lod_bias_ = REXCVAR_GET(texture_mip_lod_bias);
+  built_texture_max_size_ = REXCVAR_GET(vulkan_texture_max_size);
 
-  if (REXCVAR_GET(vulkan_fh1_native_executor) && REXCVAR_GET(vulkan_dynamic_rendering) &&
-      render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
+  CreateNativeExecutor();
+
+  // Dumps use the 1x guest layout; abort if the resolution scale changes.
+  if (draw_resolution_scale_x != 1 || draw_resolution_scale_y != 1) {
+    frame_dump_.reset();
+  }
+  return true;
+}
+
+// The FH1 native executor over the current render target and texture caches.
+// Its sample counts (fh1_msaa_*) and surface heights (untile) are fixed here,
+// so a change to them recreates only the executor.
+void VulkanCommandProcessor::CreateNativeExecutor() {
+  if (!REXCVAR_GET(vulkan_fh1_native_executor) || !REXCVAR_GET(vulkan_dynamic_rendering) ||
+      render_target_cache_->GetPath() != RenderTargetCache::Path::kHostRenderTargets) {
+    return;
+  }
+  {
     debug_labels_ = REXCVAR_GET(vulkan_debug_labels) &&
                     GetVulkanDevice()->vulkan_instance()->functions().vkCmdBeginDebugUtilsLabelEXT;
     fh1_native_executor_ = std::make_unique<Fh1NativeExecutor>(*this, *register_file_, *memory_);
@@ -2602,14 +2622,10 @@ bool VulkanCommandProcessor::CreateScaledComponents(uint32_t draw_resolution_sca
       fh1_native_executor_.reset();
     }
     untile_tiling_ = fh1_native_executor_ && native_config.untile_height;
+    built_msaa_single_sample_ = REXCVAR_GET(fh1_msaa_single_sample);
+    built_msaa_2x_ = REXCVAR_GET(fh1_msaa_2x);
     untile_select_all_ = untile_tiling_ && !(REXCVAR_GET(fh1_debug_untile) & 1);
   }
-
-  // Dumps use the 1x guest layout; abort if the resolution scale changes.
-  if (draw_resolution_scale_x != 1 || draw_resolution_scale_y != 1) {
-    frame_dump_.reset();
-  }
-  return true;
 }
 
 void VulkanCommandProcessor::WriteSharedMemoryAndEdramDescriptorSet() {
@@ -2706,7 +2722,16 @@ void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
   // change rebuilds the same components as a scale switch, at the same scale.
   const bool untile_changed =
       fh1_native_executor_ && REXCVAR_GET(fh1_untile_predicated_tiling) != untile_tiling_;
-  if (scale_x == previous_scale_x && scale_y == previous_scale_y && !untile_changed) {
+  // The executor's sample counts (fh1_msaa_*) and the texture cache's
+  // largest top level (vulkan_texture_max_size) are fixed when they are
+  // created, so a change rebuilds them the same way, at the same scale.
+  const bool msaa_changed =
+      fh1_native_executor_ && (REXCVAR_GET(fh1_msaa_single_sample) != built_msaa_single_sample_ ||
+                               REXCVAR_GET(fh1_msaa_2x) != built_msaa_2x_);
+  const bool texture_size_changed =
+      REXCVAR_GET(vulkan_texture_max_size) != built_texture_max_size_;
+  if (scale_x == previous_scale_x && scale_y == previous_scale_y && !untile_changed &&
+      !msaa_changed && !texture_size_changed) {
     declined_draw_resolution_scale_ = 0;
     return;
   }
@@ -2723,6 +2748,35 @@ void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
         "applies after a restart",
         scale_x, scale_y);
     return;
+  }
+
+  // Only the executor's sample counts or surface heights changed: its
+  // surfaces and pass pipelines are rebuilt, and the render target, texture
+  // and pipeline caches stay. Guest pipelines carry their sample count in
+  // their key, so those of the other count are already in the pipeline cache
+  // (created from storage) or are created like any new pipeline.
+  if (scale_x == previous_scale_x && scale_y == previous_scale_y && !texture_size_changed) {
+    const auto executor_start = std::chrono::steady_clock::now();
+    if (!AwaitAllQueueOperationsCompletion()) {
+      return;
+    }
+    AwaitSubmissionWorker();
+    fh1_native_executor_->FlushResolveReadbacks();
+    fh1_native_executor_.reset();
+    CreateNativeExecutor();
+    if (!fh1_native_executor_) {
+      REXGPU_ERROR("Could not recreate the FH1 native executor; rebuilding the renderer");
+      declined_draw_resolution_scale_ = 0;
+    } else {
+      ResetCachedDrawState();
+      REXGPU_INFO("Rebuilt the FH1 native executor between frames (MSAA {}, untile {}) in {:.0f} ms",
+                  built_msaa_single_sample_ ? "off" : built_msaa_2x_ ? "2x" : "4x",
+                  untile_tiling_ ? "on" : "off",
+                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                            executor_start)
+                      .count());
+      return;
+    }
   }
 
   // Between frames, with the GPU idle: the render targets, surfaces,
@@ -2773,7 +2827,25 @@ void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
     return CreateScaledComponents(x, y) && render_target_cache_->GetPath() == path &&
            (fh1_native_executor_ != nullptr) == native_executor;
   };
+  const auto ms_since = [](std::chrono::steady_clock::time_point from) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - from)
+        .count();
+  };
+  const double idle_ms = ms_since(start);
+  const auto destroy_start = std::chrono::steady_clock::now();
+  // The driver's pipeline cache goes to the new pipeline cache as it is,
+  // instead of being saved here and read back from the file below.
+  // Its translations are kept for a later switch back to this scale.
+  if (pipeline_cache_) {
+    pipeline_cache_->RetainTranslations(retained_translations_);
+  }
+  bool vk_pipeline_cache_unsaved = false;
+  VkPipelineCache vk_pipeline_cache =
+      pipeline_cache_ ? pipeline_cache_->ReleasePersistentVkPipelineCache(vk_pipeline_cache_unsaved)
+                      : VK_NULL_HANDLE;
   destroy();
+  const double destroy_ms = ms_since(destroy_start);
+  const auto create_start = std::chrono::steady_clock::now();
   if (!create(scale_x, scale_y)) {
     REXGPU_ERROR("Could not switch to draw resolution scale {}x; staying at {}x", scale_x,
                  previous_scale_x);
@@ -2782,6 +2854,11 @@ void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
     if (!create(previous_scale_x, previous_scale_y)) {
       REXGPU_ERROR("Could not restore draw resolution scale {}x{}", previous_scale_x,
                    previous_scale_y);
+      if (vk_pipeline_cache != VK_NULL_HANDLE) {
+        const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+        vulkan_device->functions().vkDestroyPipelineCache(vulkan_device->device(),
+                                                           vk_pipeline_cache, nullptr);
+      }
       device_lost_ = true;
       if (graphics_system_) {
         graphics_system_->OnHostGpuLossFromAnyThread(true);
@@ -2789,10 +2866,14 @@ void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
       return;
     }
   }
+  pipeline_cache_->AdoptPersistentVkPipelineCache(vk_pipeline_cache, vk_pipeline_cache_unsaved);
+  pipeline_cache_->UseRetainedTranslations(&retained_translations_);
   // The EDRAM buffer (fragment shader interlock) is the new render target
   // cache's.
+  const double create_ms = ms_since(create_start);
   WriteSharedMemoryAndEdramDescriptorSet();
   ResetCachedDrawState();
+  const auto storage_start = std::chrono::steady_clock::now();
   if (!shader_storage_cache_root_.empty()) {
     // Blocking: the stored pipelines are created before the next frame instead
     // of while it draws.
@@ -2807,13 +2888,20 @@ void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
     active_pixel_shader_ = LoadShader(xenos::ShaderType::kPixel, 0, pixel_ucode.data(),
                                       uint32_t(pixel_ucode.size()));
   }
+  const double storage_ms = ms_since(storage_start);
   draw_resolution_scale_.store(texture_cache_->draw_resolution_scale_x(),
                                std::memory_order_relaxed);
-  REXGPU_INFO("Switched the draw resolution scale from {}x to {}x in {} ms", previous_scale_x,
-              texture_cache_->draw_resolution_scale_x(),
+  REXGPU_INFO("Rebuilt the renderer between frames (scale {}x to {}x, MSAA {}, texture size {}) "
+              "in {} ms: GPU idle {:.0f}, destroy {:.0f}, create {:.0f}, shader storage {:.0f}; "
+              "{} translations kept ({} MB)",
+              previous_scale_x, texture_cache_->draw_resolution_scale_x(),
+              built_msaa_single_sample_ ? "off" : built_msaa_2x_ ? "2x" : "4x",
+              built_texture_max_size_,
               std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::steady_clock::now() - start)
-                  .count());
+                  .count(),
+              idle_ms, destroy_ms, create_ms, storage_ms, retained_translations_.entries.size(),
+              retained_translations_.bytes >> 20);
 }
 
 void VulkanCommandProcessor::RecreateSamplersIfMipLodBiasChanged() {

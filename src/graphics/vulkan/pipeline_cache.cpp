@@ -493,7 +493,19 @@ bool VulkanPipelineCache::Initialize() {
 
 void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                                   uint32_t title_id, bool blocking) {
+  // Phase times, logged at the end: a live rebuild (draw resolution scale,
+  // MSAA) runs this between frames, so each phase is part of the stall.
+  using StorageClock = std::chrono::steady_clock;
+  const StorageClock::time_point storage_start = StorageClock::now();
+  StorageClock::time_point phase_start = storage_start;
+  const auto phase_ms = [&phase_start]() {
+    const StorageClock::time_point now = StorageClock::now();
+    const double ms = std::chrono::duration<double, std::milli>(now - phase_start).count();
+    phase_start = now;
+    return ms;
+  };
   ShutdownShaderStorage();
+  const double shutdown_ms = phase_ms();
   {
     std::lock_guard<std::mutex> lock(creation_request_lock_);
     startup_loading_ = false;
@@ -748,8 +760,23 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
                      aot_descriptions, shader_translations_needed);
   }
 
+  const double read_ms = phase_ms();
   // Translate shader modifications needed for stored pipelines.
   StopTranslationThread();
+  // The translations are made here and translated on worker threads, each
+  // with its own translator, as the async translation thread does; finishing
+  // them stays on this thread. A live rebuild (draw resolution scale) runs
+  // this between frames, where 756 serial translations took 0.5 s on the
+  // RTX 4080 desktop. One worker takes all of a shader's modifications, as
+  // a precompiled binary writes the shader's bindings.
+  struct PendingTranslation {
+    VulkanShader* shader;
+    VulkanShader::VulkanTranslation* translation;
+    bool is_new;
+    bool translated = false;
+    bool observe = false;
+  };
+  std::vector<PendingTranslation> pending_translations;
   for (const std::pair<uint64_t, uint64_t>& translation_needed : shader_translations_needed) {
     auto shader_it = shaders_.find(translation_needed.first);
     if (shader_it == shaders_.end()) {
@@ -762,18 +789,76 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     bool translation_is_new = false;
     auto* translation = static_cast<VulkanShader::VulkanTranslation*>(
         shader->GetOrCreateTranslation(translation_needed.second, &translation_is_new));
-    if (!translation->is_translated() &&
-        !TranslateAnalyzedShader(*shader_translator_, *translation)) {
-      if (translation_is_new) {
-        shader->DestroyTranslation(translation_needed.second);
-      }
+    if (!translation->is_translated()) {
+      pending_translations.push_back({shader, translation, translation_is_new});
     }
   }
+  const size_t translated_count = pending_translations.size();
+  // Sorted by shader hash already (a std::set of pairs): split into runs of
+  // one shader each.
+  std::vector<std::pair<size_t, size_t>> shader_runs;
+  for (size_t i = 0; i < pending_translations.size();) {
+    size_t end = i + 1;
+    while (end < pending_translations.size() &&
+           pending_translations[end].shader == pending_translations[i].shader) {
+      ++end;
+    }
+    shader_runs.emplace_back(i, end);
+    i = end;
+  }
+  uint32_t translation_thread_count = rex::thread::logical_processor_count() * 3 / 4;
+  translation_thread_count =
+      uint32_t(std::min<size_t>(std::max(translation_thread_count, 1u), shader_runs.size()));
+  std::atomic<size_t> next_shader_run(0);
+  const auto translation_worker = [&](SpirvShaderTranslator& translator) {
+    while (true) {
+      const size_t run = next_shader_run.fetch_add(1);
+      if (run >= shader_runs.size()) {
+        break;
+      }
+      for (size_t i = shader_runs[run].first; i < shader_runs[run].second; ++i) {
+        PendingTranslation& pending = pending_translations[i];
+        pending.translated =
+            TranslateShaderBinary(translator, *pending.translation, pending.observe);
+      }
+    }
+  };
+  if (translation_thread_count <= 1) {
+    translation_worker(*shader_translator_);
+  } else {
+    std::vector<std::unique_ptr<SpirvShaderTranslator>> translators;
+    std::vector<std::unique_ptr<rex::thread::Thread>> translation_threads;
+    for (uint32_t i = 0; i < translation_thread_count; ++i) {
+      translators.push_back(std::make_unique<SpirvShaderTranslator>(
+          SpirvShaderTranslator::Features(command_processor_.GetVulkanDevice()),
+          render_target_cache_.msaa_2x_attachments_supported(),
+          render_target_cache_.msaa_2x_no_attachments_supported(), edram_fragment_shader_interlock,
+          render_target_cache_.draw_resolution_scale_x(),
+          render_target_cache_.draw_resolution_scale_y()));
+      SpirvShaderTranslator* translator = translators.back().get();
+      translation_threads.push_back(rex::thread::Thread::Create(
+          {}, [&translation_worker, translator]() { translation_worker(*translator); }));
+      translation_threads.back()->set_name("Vulkan Shader Storage");
+    }
+    for (const auto& thread : translation_threads) {
+      rex::thread::Wait(thread.get(), false);
+    }
+  }
+  for (PendingTranslation& pending : pending_translations) {
+    if (pending.translated) {
+      FinishShaderTranslation(*pending.translation, pending.observe);
+    } else if (pending.is_new) {
+      pending.shader->DestroyTranslation(pending.translation->modification());
+    }
+  }
+  const double translate_ms = phase_ms();
 
+  const uint64_t retained_hits = retained_translation_hits_.exchange(0);
   // The driver's cache first, so the stored pipelines below come from it.
   shader_storage_cache_root_ = cache_root;
   shader_storage_title_id_ = title_id;
   LoadVkPipelineCache();
+  const double driver_cache_ms = phase_ms();
 
   // Create the pipelines.
   std::vector<PipelineCreationArguments> pipeline_creations, aot_creations;
@@ -936,6 +1021,17 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
   }
 
 
+  const double create_ms = phase_ms();
+  REXGPU_INFO(
+      "Shader storage ready in {:.0f} ms: shutdown {:.0f}, read {:.0f}, {} of {} shader "
+      "translations {:.0f} ({} kept from an earlier scale), driver cache {:.0f}, pipelines {} "
+      "stored + {} specialized {:.0f}",
+      std::chrono::duration<double, std::milli>(StorageClock::now() - storage_start).count(),
+      shutdown_ms, read_ms, translated_count, shader_translations_needed.size(), translate_ms,
+      retained_hits,
+      driver_cache_ms, pipeline_stored_descriptions.size(), specialized_stored_descriptions.size(),
+      create_ms);
+
   // Start the storage writing thread.
   storage_write_flush_shaders_ = false;
   storage_write_flush_pipelines_ = false;
@@ -1063,10 +1159,19 @@ void VulkanPipelineCache::ShutdownShaderStorage() {
     shader_storage_file_flush_needed_ = false;
   }
 
-  SaveVkPipelineCache();
+  if (release_vk_pipeline_cache_) {
+    // Kept for the next pipeline cache (ReleasePersistentVkPipelineCache).
+    adopted_vk_pipeline_cache_ = vk_pipeline_cache_;
+    adopted_vk_pipeline_cache_unsaved_ =
+        vk_pipeline_cache_creations_.load(std::memory_order_relaxed) !=
+        vk_pipeline_cache_saved_creations_;
+    vk_pipeline_cache_ = VK_NULL_HANDLE;
+  } else {
+    SaveVkPipelineCache();
+  }
+  const ui::vulkan::VulkanDevice* storage_device = command_processor_.GetVulkanDevice();
   if (vk_pipeline_cache_ != VK_NULL_HANDLE) {
-    const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
-    vulkan_device->functions().vkDestroyPipelineCache(vulkan_device->device(),
+    storage_device->functions().vkDestroyPipelineCache(storage_device->device(),
                                                        vk_pipeline_cache_, nullptr);
     vk_pipeline_cache_ = VK_NULL_HANDLE;
   }
@@ -1074,6 +1179,46 @@ void VulkanPipelineCache::ShutdownShaderStorage() {
 
   shader_storage_cache_root_.clear();
   shader_storage_title_id_ = 0;
+}
+
+void VulkanPipelineCache::RetainTranslations(VulkanRetainedTranslations& store) {
+  // A translation still on the async thread is not finished: left out.
+  StopTranslationThread();
+  const uint32_t scale_x = render_target_cache_.draw_resolution_scale_x();
+  const uint32_t scale_y = render_target_cache_.draw_resolution_scale_y();
+  std::lock_guard<std::mutex> lock(store.mutex);
+  for (const auto& [hash, shader] : shaders_) {
+    for (const auto& [modification, base_translation] : shader->translations()) {
+      const auto* translation =
+          static_cast<const VulkanShader::VulkanTranslation*>(base_translation);
+      if (!translation->is_translated() || !translation->is_valid() ||
+          translation->translated_binary().empty()) {
+        continue;
+      }
+      auto [entry, inserted] = store.entries.try_emplace(
+          {scale_x, scale_y, uint32_t(shader->type()), hash, modification});
+      if (!inserted) {
+        continue;
+      }
+      entry->second.binary = translation->translated_binary();
+      entry->second.texture_bindings = shader->GetTextureBindingsAfterTranslation();
+      entry->second.sampler_bindings = shader->GetSamplerBindingsAfterTranslation();
+      entry->second.used_texture_mask = shader->GetUsedTextureMaskAfterTranslation();
+      store.bytes += entry->second.binary.size();
+    }
+  }
+}
+
+VkPipelineCache VulkanPipelineCache::ReleasePersistentVkPipelineCache(bool& unsaved) {
+  release_vk_pipeline_cache_ = true;
+  adopted_vk_pipeline_cache_ = VK_NULL_HANDLE;
+  ShutdownShaderStorage();
+  release_vk_pipeline_cache_ = false;
+  const VkPipelineCache cache = adopted_vk_pipeline_cache_;
+  unsaved = adopted_vk_pipeline_cache_unsaved_;
+  adopted_vk_pipeline_cache_ = VK_NULL_HANDLE;
+  adopted_vk_pipeline_cache_unsaved_ = false;
+  return cache;
 }
 
 void VulkanPipelineCache::LoadVkPipelineCache() {
@@ -1088,6 +1233,17 @@ void VulkanPipelineCache::LoadVkPipelineCache() {
       shader_storage_cache_root_ / "shaders" /
       fmt::format("{:08X}.vkpipelinecache.{:04X}_{:08X}_{:08X}.bin", shader_storage_title_id_,
                   properties.vendorID, properties.deviceID, properties.driverVersion);
+  if (adopted_vk_pipeline_cache_ != VK_NULL_HANDLE) {
+    // Handed over by the pipeline cache this one replaced: already holds what
+    // the file would, and whatever that one had not saved yet.
+    vk_pipeline_cache_ = adopted_vk_pipeline_cache_;
+    adopted_vk_pipeline_cache_ = VK_NULL_HANDLE;
+    vk_pipeline_cache_creations_ = adopted_vk_pipeline_cache_unsaved_ ? 1 : 0;
+    vk_pipeline_cache_saved_creations_ = 0;
+    vk_pipeline_cache_requested_creations_ = 0;
+    vk_pipeline_cache_saved_time_ms_ = rex::chrono::Clock::QueryHostUptimeMillis();
+    return;
+  }
   std::vector<uint8_t> data;
   if (FILE* file = rex::filesystem::OpenFile(vk_pipeline_cache_path_, "rb")) {
     fseek(file, 0, SEEK_END);
@@ -1271,6 +1427,12 @@ void VulkanPipelineCache::Shutdown() {
   ShutdownShaderStorage();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  if (adopted_vk_pipeline_cache_ != VK_NULL_HANDLE) {
+    // Adopted but never loaded (persistence off): nothing to save it to.
+    vulkan_device->functions().vkDestroyPipelineCache(vulkan_device->device(),
+                                                       adopted_vk_pipeline_cache_, nullptr);
+    adopted_vk_pipeline_cache_ = VK_NULL_HANDLE;
+  }
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
@@ -2201,6 +2363,24 @@ bool VulkanPipelineCache::TranslateShaderBinary(SpirvShaderTranslator& translato
         translation.LoadPrecompiledBinary(precompiled->bytecode);
     if (used_precompiled_shader) {
       fh1_shader_pack_hits_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  if (!used_precompiled_shader && retained_translations_) {
+    std::lock_guard<std::mutex> lock(retained_translations_->mutex);
+    const auto retained = retained_translations_->entries.find(
+        {render_target_cache_.draw_resolution_scale_x(),
+         render_target_cache_.draw_resolution_scale_y(), uint32_t(shader.type()),
+         shader.ucode_data_hash(), translation.modification()});
+    if (retained != retained_translations_->entries.end()) {
+      used_precompiled_shader =
+          shader.LoadPrecompiledBindings(retained->second.texture_bindings,
+                                         retained->second.sampler_bindings,
+                                         retained->second.used_texture_mask) &&
+          translation.LoadPrecompiledBinary(retained->second.binary);
+      if (used_precompiled_shader) {
+        retained_translation_hits_.fetch_add(1, std::memory_order_relaxed);
+      }
     }
   }
 

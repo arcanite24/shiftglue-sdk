@@ -123,13 +123,14 @@ REXCVAR_DEFINE_DOUBLE(texture_mip_lod_bias, 0.0, "GPU",
     .range(-3.0, 3.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Both backends switch the scale between frames (up to 4x, square scales).
 REXCVAR_DEFINE_INT32(draw_resolution_scale_x, 1, "GPU", "Draw resolution scale X (1 = no scaling)")
     .range(1, 8)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(draw_resolution_scale_y, 1, "GPU", "Draw resolution scale Y (1 = no scaling)")
     .range(1, 8)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(resolution_scale, 1, "GPU",
                      "Draw resolution scale for both X and Y axes (same as setting "

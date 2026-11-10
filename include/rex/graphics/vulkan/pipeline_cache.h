@@ -18,12 +18,14 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <map>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <queue>
 #include <set>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -48,6 +50,26 @@ class VulkanCommandProcessor;
 
 // TODO(Triang3l): Create a common base for both the Vulkan and the Direct3D
 // implementations.
+// Shader translations kept across live renderer rebuilds, by draw resolution
+// scale (baked into the SPIR-V): a rebuild back to a scale used before loads
+// them as precompiled binaries instead of translating them again. Filled
+// from the outgoing pipeline cache at a rebuild only, so it costs nothing
+// until the scale changes.
+class VulkanRetainedTranslations {
+ public:
+  struct Entry {
+    std::vector<uint8_t> binary;
+    std::vector<SpirvShader::TextureBinding> texture_bindings;
+    std::vector<SpirvShader::SamplerBinding> sampler_bindings;
+    uint32_t used_texture_mask = 0;
+  };
+  // Scale x, scale y, shader type, ucode hash, modification.
+  using Key = std::tuple<uint32_t, uint32_t, uint32_t, uint64_t, uint64_t>;
+  std::mutex mutex;
+  std::map<Key, Entry> entries;
+  size_t bytes = 0;
+};
+
 class VulkanPipelineCache {
  public:
   static constexpr size_t kLayoutUIDEmpty = 0;
@@ -105,6 +127,21 @@ class VulkanPipelineCache {
   VkPipelineCache UsePersistentVkPipelineCache() {
     vk_pipeline_cache_creations_.fetch_add(1, std::memory_order_relaxed);
     return vk_pipeline_cache_;
+  }
+  // A live rebuild (draw resolution scale) hands the driver's pipeline cache
+  // from the old pipeline cache to the new one, so tens of megabytes are not
+  // saved and read back between frames. Release closes the shader storage and
+  // returns the cache (or null) and whether it holds unsaved pipelines; Adopt,
+  // before InitializeShaderStorage, makes the next load take it instead of
+  // the file.
+  VkPipelineCache ReleasePersistentVkPipelineCache(bool& unsaved);
+  // Adds this cache's translations to the store (for its draw resolution
+  // scale); the next caches take theirs from it (UseRetainedTranslations).
+  void RetainTranslations(VulkanRetainedTranslations& store);
+  void UseRetainedTranslations(VulkanRetainedTranslations* store) { retained_translations_ = store; }
+  void AdoptPersistentVkPipelineCache(VkPipelineCache cache, bool unsaved) {
+    adopted_vk_pipeline_cache_ = cache;
+    adopted_vk_pipeline_cache_unsaved_ = unsaved;
   }
 
   bool ConfigurePipeline(
@@ -568,6 +605,12 @@ class VulkanPipelineCache {
   // The GPU commands thread's view: the creation count of the last save it
   // requested (the save itself runs on the storage write thread).
   uint64_t vk_pipeline_cache_requested_creations_ = 0;
+  // Release/Adopt: set while ShutdownShaderStorage keeps the cache.
+  bool release_vk_pipeline_cache_ = false;
+  VulkanRetainedTranslations* retained_translations_ = nullptr;
+  std::atomic<uint64_t> retained_translation_hits_{0};
+  VkPipelineCache adopted_vk_pipeline_cache_ = VK_NULL_HANDLE;
+  bool adopted_vk_pipeline_cache_unsaved_ = false;
   void LoadVkPipelineCache();
   void SaveVkPipelineCache();
 

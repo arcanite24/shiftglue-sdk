@@ -365,6 +365,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   // scale.
   bool CreateScaledComponents(uint32_t draw_resolution_scale_x,
                               uint32_t draw_resolution_scale_y);
+  // The FH1 native executor alone, over the current caches; recreated by
+  // itself when only its sample counts or surface heights change.
+  void CreateNativeExecutor();
   // Points the shared memory and EDRAM descriptor set at the shared memory and
   // at the render target cache's EDRAM buffer.
   void WriteSharedMemoryAndEdramDescriptorSet();
@@ -1094,6 +1097,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool rendering_label_open_ = false;
   const char* next_rendering_label_ = nullptr;
 
+  // Outlives the pipeline caches a draw resolution scale switch replaces.
+  VulkanRetainedTranslations retained_translations_;
   std::unique_ptr<VulkanPipelineCache> pipeline_cache_;
 
   std::unique_ptr<VulkanTextureCache> texture_cache_;
@@ -1106,6 +1111,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint32_t declined_draw_resolution_scale_ = 0;
   // texture_mip_lod_bias when the texture cache's samplers were last dropped.
   double sampler_mip_lod_bias_ = 0.0;
+  // fh1_msaa_single_sample, fh1_msaa_2x and vulkan_texture_max_size when the
+  // scaled components were last created; a change rebuilds them between
+  // frames (SwitchDrawResolutionScaleIfRequested).
+  bool built_msaa_single_sample_ = true;
+  bool built_msaa_2x_ = false;
+  uint32_t built_texture_max_size_ = 0;
 
   VkDescriptorPool shared_memory_and_edram_descriptor_pool_ = VK_NULL_HANDLE;
   // R32_UINT over the whole shared memory (vulkan_shared_memory_texel_buffer).

@@ -67,7 +67,7 @@ REXCVAR_DEFINE_UINT32(vulkan_texture_max_size, 0, "GPU/Vulkan",
                       "Largest width or height of a mipmapped texture's top level; "
                       "larger ones drop their top levels (0: no limit, otherwise at "
                       "least 64)")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(vulkan_force_bc_decode, false, "GPU/Vulkan",
                     "Decode BC (DXT, DXN) textures to uncompressed formats on the GPU as on a "
                     "device without them, to measure that path where BC is supported")

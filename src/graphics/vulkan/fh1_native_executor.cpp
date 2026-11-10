@@ -52,7 +52,7 @@ REXCVAR_DEFINE_BOOL(fh1_msaa_2x, false, "GPU",
                     "Store FH1's 4x MSAA surfaces with 2 host samples (its top and bottom "
                     "sample pairs each in one): smoother edges than fh1_msaa_single_sample "
                     "for about half the cost of 4x (Vulkan FH1 native executor)")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_specialize_edram_passes, true, "GPU",
                     "Vulkan FH1 resolves and EDRAM transfers use pipelines specialized for "
                     "each kind (formats, MSAA, pitches); GPUs otherwise run every kind's code "
@@ -67,7 +67,7 @@ REXCVAR_DEFINE_BOOL(fh1_msaa_single_sample, true, "GPU",
                     "Keep the guest's 2x and 4x MSAA surfaces as single-sampled images at any "
                     "resolution scale (Vulkan): at 1x the game renders without MSAA - harder "
                     "edges - for much less GPU work, the cheaper choice for phones")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_native_stencil_export, true, "GPU",
                     "Transfer depth and stencil into a depth surface in one pass where the "
                     "device exports stencil from shaders (FH1 native executor, Vulkan), "
