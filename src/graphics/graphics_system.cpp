@@ -57,8 +57,9 @@ REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "runtime spikes and freezes when playing the game not for the first time.");
 REXCVAR_DEFINE_UINT32(
     pinyon_shift_fh1_render_fps_limit, 0, "Pinyon Shift",
-    "FH1 source-render FPS limit (0 follows the host display)")
-    .range(0, 240);
+    "FH1 source-render FPS limit (0 follows the host display; up to 1000 for an "
+    "effectively unlocked rate)")
+    .range(0, 1000);
 REXCVAR_DEFINE_BOOL(gpu_log_register_reads, false, "GPU",
                     "Log the first guest read of each GPU register (a census of what the "
                     "title polls, for deciding which reads need emulation)");
