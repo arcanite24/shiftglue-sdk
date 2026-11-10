@@ -1,5 +1,6 @@
-// Scene-only post effects at swap (#528, #521): FXAA and a 3D colour LUT
-// applied to the pixels the HUD left alone. The pass reads the gamma-applied
+// Scene-only post effects at swap (#528, #521): FXAA, a 3D colour LUT and
+// ambient occlusion (ambient_occlusion.cpp) applied to the pixels the HUD
+// left alone. The pass reads the gamma-applied
 // frame (the FXAA source image, luma in alpha), compares the frame with the
 // snapshot taken before the HUD was drawn to find the HUD, and writes the
 // guest output. Frames without a scene snapshot (menus) skip it.
@@ -22,7 +23,8 @@ namespace rex::graphics::vulkan {
 
 namespace {
 
-// flags: 1 FXAA, 2 extreme quality, 4 LUT, 8 FXAA over the HUD too.
+// flags: 1 FXAA, 2 extreme quality, 4 LUT, 8 FXAA over the HUD too, 16
+// ambient occlusion, 32 the occlusion term alone (a debug view).
 const char* const kScenePostSource = R"(#version 450
 #extension GL_EXT_samplerless_texture_functions : require
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
@@ -34,6 +36,10 @@ layout(push_constant) uniform ScenePostConstants {
   float lut_strength;
   float lut_scale;
   float lut_offset;
+  uvec2 ao_size;
+  float ao_strength;
+  float depth_a;
+  float depth_b;
 } c;
 
 layout(set = 0, binding = 0) uniform sampler2D source;
@@ -41,6 +47,9 @@ layout(set = 0, binding = 1) uniform texture2D frame;
 layout(set = 0, binding = 2) uniform texture2D scene;
 layout(set = 0, binding = 3) uniform sampler3D lut;
 layout(set = 0, binding = 4, rgb10_a2) writeonly uniform image2D dest;
+// The half-resolution occlusion and its view z, and the camera depth.
+layout(set = 0, binding = 5) uniform texture2D ao;
+layout(set = 0, binding = 6) uniform texture2D depth;
 
 const vec3 kLumaWeights = vec3(0.299, 0.587, 0.114);
 
@@ -100,6 +109,32 @@ vec3 Fxaa(vec2 uv, vec4 rgbm, bool extreme) {
   return (lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB;
 }
 
+// A 4x4 bilateral box over the half-size occlusion: every 4x4 window holds
+// all 16 rotations of its sampling pattern, so the box removes the pattern;
+// each tap is weighted by how close its view z is to this pixel's, so edges
+// do not bleed.
+float AmbientOcclusion(ivec2 pixel) {
+  // The scene is drawn turned 180 degrees, as in ambient_occlusion.cpp.
+  float d = texelFetch(depth, ivec2(c.size) - 1 - pixel, 0).r - c.depth_a;
+  float view_z = abs(d) > 1e-7 ? c.depth_b / d : 1e9;
+  if (!(view_z > 0.0) || view_z >= 1e6) return 1.0;
+  vec2 position = (vec2(pixel) + 0.5) * 0.5 - 0.5;
+  ivec2 base = ivec2(floor(position)) - 1;
+  float tolerance = 0.04 * view_z + 0.05;
+  float sum = 0.0;
+  float weights = 0.0;
+  for (int y = 0; y < 4; ++y) {
+    for (int x = 0; x < 4; ++x) {
+      ivec2 tap = clamp(base + ivec2(x, y), ivec2(0), ivec2(c.ao_size) - 1);
+      vec2 sample_ao = texelFetch(ao, tap, 0).rg;
+      float weight = exp(-abs(sample_ao.g - view_z) / tolerance);
+      sum += sample_ao.r * weight;
+      weights += weight;
+    }
+  }
+  return weights > 1e-4 ? sum / weights : 1.0;
+}
+
 void main() {
   ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
   if (any(greaterThanEqual(uvec2(pixel), c.size))) {
@@ -112,6 +147,10 @@ void main() {
   if ((c.flags & 1u) != 0u && (!hud || (c.flags & 8u) != 0u)) {
     color = Fxaa(uv, rgbm, (c.flags & 2u) != 0u);
   }
+  if ((c.flags & 16u) != 0u && !hud) {
+    float ao = mix(1.0, AmbientOcclusion(pixel), c.ao_strength);
+    color = (c.flags & 32u) != 0u ? vec3(ao) : color * ao;
+  }
   if ((c.flags & 4u) != 0u && !hud) {
     vec3 graded = textureLod(lut, clamp(color, 0.0, 1.0) * c.lut_scale + c.lut_offset, 0.0).rgb;
     color = mix(color, graded, c.lut_strength);
@@ -120,7 +159,7 @@ void main() {
 }
 )";
 
-constexpr uint32_t kScenePostBindings = 5;
+constexpr uint32_t kScenePostBindings = 7;
 
 uint32_t PackA2B10G10R10(float r, float g, float b) {
   const auto unorm10 = [](float value) {
@@ -141,7 +180,8 @@ bool VulkanCommandProcessor::EnsureSwapScenePost() {
   const VkDescriptorType types[kScenePostBindings] = {
       VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
       VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-      VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+      VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+      VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE};
   VkDescriptorSetLayoutBinding bindings[kScenePostBindings] = {};
   for (uint32_t i = 0; i < kScenePostBindings; ++i) {
     bindings[i].binding = i;
@@ -159,7 +199,7 @@ bool VulkanCommandProcessor::EnsureSwapScenePost() {
     return false;
   }
   VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                             sizeof(uint32_t) * 8};
+                                             sizeof(uint32_t) * 13};
   VkPipelineLayoutCreateInfo pipeline_layout_info = {};
   pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
   pipeline_layout_info.setLayoutCount = 1;
@@ -173,7 +213,7 @@ bool VulkanCommandProcessor::EnsureSwapScenePost() {
   }
   VkDescriptorPoolSize pool_sizes[3] = {
       {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * kMaxFramesInFlight},
-      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2 * kMaxFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4 * kMaxFramesInFlight},
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kMaxFramesInFlight},
   };
   VkDescriptorPoolCreateInfo pool_info = {};

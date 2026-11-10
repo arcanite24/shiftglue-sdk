@@ -3085,6 +3085,7 @@ void VulkanCommandProcessor::ShutdownContext() {
                                          swap_hud_mask_set_layout_);
   // Into the destroy queues, emptied below.
   DestroySceneLut();
+  DestroySwapAmbientOcclusion();
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_scene_post_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
                                          swap_scene_post_pipeline_layout_);
@@ -4081,13 +4082,18 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
       swap_post_effect != SwapPostEffect::kNone && REXCVAR_GET(swap_post_effect_scene_only);
   const bool scene_lut =
       !REXCVAR_GET(scene_lut_path).empty() && REXCVAR_GET(scene_lut_strength) > 0;
+  // Ambient occlusion (ambient_occlusion.cpp) needs the camera depth and the
+  // pre-HUD snapshot, as an upscaler does.
+  const bool ambient_occlusion =
+      REXCVAR_GET(swap_ambient_occlusion) && REXCVAR_GET(swap_ambient_occlusion_strength) > 0;
+  VkImageView ao_depth_view = VK_NULL_HANDLE;
   if (fh1_native_executor_) {
     hdr_active = ui::vulkan::GetHdrOutputState().active;
     fh1_native_executor_->SetHudSnapshotEnabled(hdr_active || scene_fxaa || scene_lut ||
-                                                hudless_wanted);
+                                                hudless_wanted || ambient_occlusion);
     hud_snapshot_view =
         fh1_native_executor_->TakeHudSnapshot(guest_output_width, guest_output_height);
-    fh1_native_executor_->SetCameraTrackingEnabled(camera_wanted);
+    fh1_native_executor_->SetCameraTrackingEnabled(camera_wanted || ambient_occlusion);
     // UP-1.7: once the object slot image is the guest output's size (made
     // between frames, IssueSwap) and initialised by a camera pass.
     const bool object_motion_wanted =
@@ -4100,9 +4106,13 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
         object_slot_image_height_ == guest_output_height);
     fh1_native_executor_->SetJitterPhases(camera_wanted ? presenter->GuestOutputJitterPhases()
                                                         : 0u);
-    if (camera_wanted) {
-      camera_depth_view =
+    if (camera_wanted || ambient_occlusion) {
+      VkImageView depth_view =
           fh1_native_executor_->TakeCameraFrame(guest_output_width, guest_output_height, camera);
+      if (camera_wanted) camera_depth_view = depth_view;
+      if (ambient_occlusion && camera.depth_b != 0.0f) {
+        ao_depth_view = depth_view;
+      }
     }
   }
 
@@ -4111,7 +4121,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
       [this, guest_output_width, guest_output_height, display_width, display_height,
        frontbuffer_format, swap_texture_view, swap_post_effect, swap_source_needs_rb_swap,
        hud_snapshot_view, hdr_active, scene_fxaa, scene_lut, hudless_wanted, camera_depth_view,
-       camera](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+       ao_depth_view, camera](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         // In case the swap command is the only one in the frame.
         if (!BeginSubmission(true)) {
           return false;
@@ -4133,10 +4143,15 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
         // the FXAA source image and replaces the FXAA pass.
         bool scene_post = false;
         bool scene_lut_ready = false;
-        if (hud_snapshot_view != VK_NULL_HANDLE && (scene_fxaa || scene_lut) &&
+        bool scene_ao = false;
+        if (hud_snapshot_view != VK_NULL_HANDLE &&
+            (scene_fxaa || scene_lut || ao_depth_view != VK_NULL_HANDLE) &&
             EnsureSwapScenePost()) {
           scene_lut_ready = UpdateSceneLut() && scene_lut;
-          scene_post = scene_lut_view_ != VK_NULL_HANDLE && (scene_fxaa || scene_lut_ready);
+          scene_ao = ao_depth_view != VK_NULL_HANDLE &&
+                     EnsureSwapAmbientOcclusion(guest_output_width, guest_output_height);
+          scene_post =
+              scene_lut_view_ != VK_NULL_HANDLE && (scene_fxaa || scene_lut_ready || scene_ao);
         }
         if (scene_fxaa && !scene_post) {
           // No scene in this frame: nothing to antialias but the HUD.
@@ -4409,8 +4424,15 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             swap_fxaa_source_image_submission_ = GetCurrentSubmission();
 
             if (scene_post) {
+              if (scene_ao) {
+                DispatchSwapAmbientOcclusion(ao_depth_view, camera, guest_output_width,
+                                             guest_output_height, swap_frame_index);
+              }
               VkDescriptorSet set = swap_scene_post_descriptor_sets_[swap_frame_index];
-              VkDescriptorImageInfo infos[5] = {
+              // Without occlusion, its bindings take the snapshot (never read).
+              const VkImageView ao_view = scene_ao ? swap_ao_view_ : hud_snapshot_view;
+              const VkImageView depth_view = scene_ao ? ao_depth_view : hud_snapshot_view;
+              VkDescriptorImageInfo infos[7] = {
                   {swap_sampler_linear_clamp_, swap_fxaa_source_image_view_,
                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                   {VK_NULL_HANDLE, swap_texture_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
@@ -4418,13 +4440,16 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                   {swap_sampler_linear_clamp_, scene_lut_view_,
                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                   {VK_NULL_HANDLE, vulkan_context.image_view(), VK_IMAGE_LAYOUT_GENERAL},
+                  {VK_NULL_HANDLE, ao_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                  {VK_NULL_HANDLE, depth_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
               };
-              const VkDescriptorType types[5] = {
+              const VkDescriptorType types[7] = {
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
                   VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
-              VkWriteDescriptorSet writes[5] = {};
-              for (uint32_t i = 0; i < 5; ++i) {
+                  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                  VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE};
+              VkWriteDescriptorSet writes[7] = {};
+              for (uint32_t i = 0; i < 7; ++i) {
                 writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                 writes[i].dstSet = set;
                 writes[i].dstBinding = i;
@@ -4432,7 +4457,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                 writes[i].descriptorType = types[i];
                 writes[i].pImageInfo = &infos[i];
               }
-              dfn.vkUpdateDescriptorSets(device, 5, writes, 0, nullptr);
+              dfn.vkUpdateDescriptorSets(device, 7, writes, 0, nullptr);
               deferred_command_buffer_.CmdVkBindDescriptorSets(
                   VK_PIPELINE_BIND_POINT_COMPUTE, swap_scene_post_pipeline_layout_, 0, 1, &set, 0,
                   nullptr);
@@ -4443,13 +4468,23 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                 float lut_strength;
                 float lut_scale;
                 float lut_offset;
+                uint32_t ao_size[2];
+                float ao_strength;
+                float depth_a;
+                float depth_b;
               } constants = {
                   {guest_output_width, guest_output_height},
                   {1.0f / float(guest_output_width), 1.0f / float(guest_output_height)},
                   0,
                   float(REXCVAR_GET(scene_lut_strength)) / 100.0f,
                   float(scene_lut_size_ - 1) / float(scene_lut_size_),
-                  0.5f / float(scene_lut_size_)};
+                  0.5f / float(scene_lut_size_),
+                  {swap_ao_width_, swap_ao_height_},
+                  float(REXCVAR_GET(swap_ambient_occlusion_strength)) / 100.0f,
+                  camera.depth_a,
+                  camera.depth_b};
+              if (scene_ao) constants.flags |= 16u;
+              if (scene_ao && REXCVAR_GET(swap_ambient_occlusion_debug)) constants.flags |= 32u;
               if (fxaa_requested) {
                 constants.flags |= 1u;
                 if (swap_post_effect == SwapPostEffect::kFxaaExtreme) constants.flags |= 2u;

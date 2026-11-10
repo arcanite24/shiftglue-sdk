@@ -1262,6 +1262,27 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkImage scene_lut_image_ = VK_NULL_HANDLE;
   VkDeviceMemory scene_lut_memory_ = VK_NULL_HANDLE;
   VkImageView scene_lut_view_ = VK_NULL_HANDLE;
+  // Screen-space ambient occlusion at swap (ambient_occlusion.cpp): a
+  // half-resolution pass over the camera depth, blurred and applied by the
+  // scene-only post.
+  bool EnsureSwapAmbientOcclusion(uint32_t full_width, uint32_t full_height);
+  void DispatchSwapAmbientOcclusion(VkImageView camera_depth,
+                                    const Fh1NativeExecutor::Camera& camera, uint32_t full_width,
+                                    uint32_t full_height, uint32_t frame_index);
+  // Into the destroy queues.
+  void DestroySwapAmbientOcclusion();
+  bool swap_ao_failed_ = false;
+  VkDescriptorSetLayout swap_ao_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout swap_ao_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline swap_ao_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool swap_ao_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_ao_descriptor_sets_{};
+  VkImage swap_ao_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory swap_ao_memory_ = VK_NULL_HANDLE;
+  VkImageView swap_ao_view_ = VK_NULL_HANDLE;
+  uint32_t swap_ao_width_ = 0;
+  uint32_t swap_ao_height_ = 0;
+  VkImageLayout swap_ao_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
   VkPipelineLayout resolve_downscale_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline resolve_downscale_pipeline_ = VK_NULL_HANDLE;
   VkBuffer resolve_downscale_buffer_ = VK_NULL_HANDLE;

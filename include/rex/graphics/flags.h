@@ -65,6 +65,10 @@ REXCVAR_DECLARE(std::string, swap_post_effect);
 REXCVAR_DECLARE(bool, swap_post_effect_scene_only);
 REXCVAR_DECLARE(std::string, scene_lut_path);
 REXCVAR_DECLARE(int32_t, scene_lut_strength);
+REXCVAR_DECLARE(bool, swap_ambient_occlusion);
+REXCVAR_DECLARE(int32_t, swap_ambient_occlusion_strength);
+REXCVAR_DECLARE(double, swap_ambient_occlusion_radius);
+REXCVAR_DECLARE(bool, swap_ambient_occlusion_debug);
 
 // Guest shader translation cvars (dxbc_switch, dxbc_source_map,
 // use_fuzzy_alpha_epsilon, draw_resolution_scaled_texture_offsets) are

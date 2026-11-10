@@ -404,6 +404,23 @@ void Fh1NativeExecutor::FinishCameraFrame() {
   const double near_plane = (k * current[15] / w_length - current[11] / w_length) / k;
   camera.near_plane = float(near_plane);
   camera.far_plane = k > 1.0 ? float(k * near_plane / (k - 1.0)) : 0.0f;
+  // Depth as A + B / view z: the z row is A times the w row plus B. The w
+  // row's length scales view z (1 for a rigid world matrix).
+  {
+    const double w_dot = current[12] * current[12] + current[13] * current[13] +
+                         current[14] * current[14];
+    const double a = (current[8] * current[12] + current[9] * current[13] +
+                      current[10] * current[14]) / w_dot;
+    const double b = (current[11] - a * current[15]) / std::sqrt(w_dot);
+    // Both titles store the depth reversed (1 near): FH1's matrix gives the
+    // usual 0-near depth and its viewport flips it, FH2's matrix is reversed
+    // itself (A -1.5e-5, B 0.3: near 0.3 m, far 20 km). A 0-near matrix
+    // (B < 0) is turned into the stored form, 1 minus it.
+    if (std::isfinite(a) && std::isfinite(b) && std::abs(b) > 1e-9) {
+      camera.depth_a = float(b < 0.0 ? 1.0 - a : a);
+      camera.depth_b = float(std::abs(b));
+    }
+  }
 
   // The previous frame's matrix for the same objects.
   std::unordered_map<std::array<float, 16>, size_t, MatrixHash> previous_matches;
@@ -448,6 +465,7 @@ void Fh1NativeExecutor::FinishCameraFrame() {
         "far {:.0f}",
         world->second, matched, camera.cut, camera.fov_y * 57.29578f, camera.near_plane,
         camera.far_plane);
+    REXGPU_INFO("FH1 camera: depth = {:.6g} + {:.6g} / view z", camera.depth_a, camera.depth_b);
   }
   camera_ready_ = camera;
   camera_ready_valid_ = true;

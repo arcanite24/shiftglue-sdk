@@ -160,6 +160,11 @@ class Fh1NativeExecutor {
     float reprojection[16];
     float near_plane;
     float far_plane;
+    // The stored scene depth (1 near, 0 far, as the camera depth snapshot
+    // holds it) as A + B / view z, so view z is B / (depth - A). From the
+    // matrix's z and w rows; B is 0 when the rows do not fit.
+    float depth_a;
+    float depth_b;
     // Vertical field of view, radians.
     float fov_y;
     // No continuation of the previous frame (a cut, a load, a rebase): the

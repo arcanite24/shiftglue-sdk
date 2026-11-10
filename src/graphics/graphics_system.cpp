@@ -51,6 +51,22 @@ REXCVAR_DEFINE_STRING(scene_lut_path, "", "GPU",
 REXCVAR_DEFINE_INT32(scene_lut_strength, 100, "GPU",
                      "Vulkan: how much of the scene LUT applies, in percent")
     .range(0, 100);
+REXCVAR_DEFINE_BOOL(swap_ambient_occlusion, false, "GPU",
+                    "Vulkan FH1 executor: screen-space ambient occlusion from the scene's depth, "
+                    "applied at swap to the scene only (not the HUD)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(swap_ambient_occlusion_strength, 70, "GPU",
+                     "Vulkan: how dark ambient occlusion can make a pixel, in percent")
+    .range(0, 100)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(swap_ambient_occlusion_debug, false, "GPU",
+                    "Vulkan: show only the ambient occlusion term, white for none")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(swap_ambient_occlusion_radius, 1.0, "GPU",
+                      "Vulkan: ambient occlusion radius in the title's world units (metres in "
+                      "FH1 and FH2)")
+    .range(0.1, 10.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
