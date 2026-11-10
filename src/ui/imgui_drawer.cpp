@@ -501,7 +501,11 @@ void ImGuiDrawer::OnKeyChar(KeyEvent& e) {
   unsigned int character = static_cast<unsigned int>(e.virtual_key());
   if (character > 0 && character < 0x10000) {
     io.AddInputCharacter(character);
-    e.set_handled(true);
+    // Only a focused ImGui text field consumes typing; otherwise listeners
+    // below (a title's own text entry) still get the character.
+    if (io.WantTextInput) {
+      e.set_handled(true);
+    }
   }
 }
 
