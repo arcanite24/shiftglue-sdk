@@ -50,6 +50,34 @@ HostPathEntry* HostPathEntry::Create(Device* device, Entry* parent,
   return entry;
 }
 
+void HostPathEntry::ListChildren() {
+  if (listed_ || !(attributes_ & kFileAttributeDirectory)) {
+    return;
+  }
+  std::lock_guard<std::recursive_mutex> tree_lock(tree_mutex());
+  if (listed_) {
+    return;
+  }
+  listed_ = true;
+  // Entries a lookup already added by name (HostPathDevice::ResolvePath) or
+  // the game created stay; the listing adds the rest.
+  const size_t known = children_.size();
+  for (const auto& info : rex::filesystem::ListFiles(host_path_)) {
+    const std::string name = rex::path_to_utf8(info.name);
+    bool present = false;
+    for (size_t i = 0; i < known && !present; ++i) {
+      present = children_[i]->name().size() == name.size() &&
+                rex::string::utf8_equal_case(children_[i]->name(), name);
+    }
+    if (present) {
+      continue;
+    }
+    if (auto* child = Create(device_, this, host_path_ / info.name, info)) {
+      children_.push_back(std::unique_ptr<Entry>(child));
+    }
+  }
+}
+
 X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
   if (is_read_only() &&
       (desired_access & (FileAccess::kFileWriteData | FileAccess::kFileAppendData))) {

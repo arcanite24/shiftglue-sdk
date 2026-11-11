@@ -41,7 +41,7 @@ void Entry::Dump(rex::string::StringBuffer* string_buffer, int indent) {
   }
   string_buffer->Append(name());
   string_buffer->Append('\n');
-  for (auto& child : children_) {
+  for (auto& child : children()) {
     child->Dump(string_buffer, indent + 2);
   }
 }
@@ -52,6 +52,7 @@ bool Entry::is_read_only() const {
 
 Entry* Entry::GetChild(const std::string_view name) {
   std::lock_guard<std::recursive_mutex> tree_lock(tree_mutex());
+  ListChildren();
   // The size test is exact, not just a hint: the fold is ASCII-only, so any two
   // names it calls equal hold the same bytes per codepoint. It skips the UTF-8
   // decode for nearly every child, and a game directory can hold thousands.
@@ -80,6 +81,7 @@ Entry* Entry::ResolvePath(const std::string_view path) {
 Entry* Entry::IterateChildren(const rex::filesystem::WildcardEngine& engine,
                               size_t* current_index) {
   std::lock_guard<std::recursive_mutex> tree_lock(tree_mutex());
+  ListChildren();
   while (*current_index < children_.size()) {
     auto& child = children_[*current_index];
     *current_index = *current_index + 1;

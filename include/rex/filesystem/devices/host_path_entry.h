@@ -51,8 +51,13 @@ class HostPathEntry : public Entry {
                                              uint32_t attributes) override;
   bool DeleteEntryInternal(Entry* entry) override;
   X_STATUS RenameEntryInternal(const std::vector<std::string_view>& path_parts) override;
+  void ListChildren() override;
 
   std::filesystem::path host_path_;
+  // Whether the host folder's entries were listed. Listing waits for the
+  // first look inside: walking a whole game tree at mount costs seconds on
+  // Android's FUSE-backed storage.
+  bool listed_ = false;
 };
 
 }  // namespace rex::filesystem

@@ -45,8 +45,9 @@ bool HostPathDevice::Initialize() {
 
   auto root_entry = new HostPathEntry(this, nullptr, "", host_path_);
   root_entry->attributes_ = kFileAttributeDirectory;
+  // Folders list their entries when first looked in (HostPathEntry::
+  // ListChildren), not all at mount.
   root_entry_ = std::unique_ptr<Entry>(root_entry);
-  PopulateEntry(root_entry);
 
   return true;
 }
@@ -140,24 +141,8 @@ size_t HostPathDevice::MergeEntry(HostPathEntry* entry,
     }
     entry->children_.push_back(std::unique_ptr<Entry>(child));
     ++added;
-    if (directory) {
-      PopulateEntry(child);
-    }
   }
   return added;
-}
-
-void HostPathDevice::PopulateEntry(HostPathEntry* parent_entry) {
-  auto child_infos = rex::filesystem::ListFiles(parent_entry->host_path());
-  for (auto& child_info : child_infos) {
-    auto child = HostPathEntry::Create(this, parent_entry,
-                                       parent_entry->host_path() / child_info.name, child_info);
-    parent_entry->children_.push_back(std::unique_ptr<Entry>(child));
-
-    if (child_info.type == rex::filesystem::FileInfo::Type::kDirectory) {
-      PopulateEntry(child);
-    }
-  }
 }
 
 }  // namespace rex::filesystem

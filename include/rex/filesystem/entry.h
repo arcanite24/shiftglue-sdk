@@ -113,8 +113,11 @@ class Entry {
   /// nullptr if any intermediate component does not exist.
   Entry* ResolvePath(const std::string_view path);
 
-  const std::vector<std::unique_ptr<Entry>>& children() const { return children_; }
-  size_t child_count() const { return children_.size(); }
+  const std::vector<std::unique_ptr<Entry>>& children() const {
+    const_cast<Entry*>(this)->ListChildren();
+    return children_;
+  }
+  size_t child_count() const { return children().size(); }
   Entry* IterateChildren(const rex::filesystem::WildcardEngine& engine, size_t* current_index);
 
   Entry* CreateEntry(const std::string_view name, uint32_t attributes);
@@ -147,6 +150,10 @@ class Entry {
     (void)attributes;
     return nullptr;
   }
+  // Adds the children a device lists on demand (a host folder, the first
+  // time anything looks inside it) before children_ is read.
+  virtual void ListChildren() {}
+
   virtual bool DeleteEntryInternal(Entry* entry) {
     (void)entry;
     return false;

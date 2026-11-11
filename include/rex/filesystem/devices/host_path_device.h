@@ -53,7 +53,6 @@ class HostPathDevice : public Device {
   uint32_t bytes_per_sector() const override { return 0x200; }
 
  private:
-  void PopulateEntry(HostPathEntry* parent_entry);
   size_t MergeEntry(HostPathEntry* entry, const std::filesystem::path& other_directory);
 
   std::string name_;
