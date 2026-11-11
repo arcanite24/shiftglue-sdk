@@ -75,6 +75,12 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
     }
 
     auto* child = current_entry->GetChild(part);
+    if (!child && current_entry->listed_ && read_only_) {
+      // GetChild listed the folder and compared without case: the name is not
+      // there. Games probe for missing files often (FH2 thousands of times a
+      // load), and on Android's FUSE storage each scan costs milliseconds.
+      return nullptr;
+    }
     if (!child) {
       // Stat the exact name first: enumerating a directory of hundreds of
       // archives costs milliseconds a walk. Only casing mismatch reaches
@@ -89,6 +95,10 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
         current_entry->children_.push_back(std::unique_ptr<Entry>(exact_child));
         current_entry = static_cast<HostPathEntry*>(exact_child);
         continue;
+      }
+      if (current_entry->listed_) {
+        // The listing already compared without case.
+        return nullptr;
       }
 
       auto child_infos = rex::filesystem::ListFiles(current_entry->host_path());
