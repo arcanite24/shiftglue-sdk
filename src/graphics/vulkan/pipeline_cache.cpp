@@ -1911,6 +1911,8 @@ bool VulkanPipelineCache::ConfigurePipeline(
     }
     Pipeline& specialized = entry->second->second;
     last_pipeline_ = nullptr;
+    // The flag first, as in GetPipelineAndLayoutByHandle.
+    const bool specialized_pending = specialized.is_placeholder.load(std::memory_order_acquire);
     pipeline_out = specialized.pipeline.load(std::memory_order_acquire);
     pipeline_layout_out = specialized.pipeline_layout.load(std::memory_order_acquire);
     if (pipeline_handle_out) {
@@ -1922,8 +1924,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
       pipeline_layout_out = specialized.generic->pipeline_layout.load(std::memory_order_acquire);
       return true;
     }
-    if (pipeline_out == VK_NULL_HANDLE && use_async_specialized &&
-        specialized.is_placeholder.load(std::memory_order_acquire)) {
+    if (pipeline_out == VK_NULL_HANDLE && use_async_specialized && specialized_pending) {
       // A worker is still building it: the caller skips the draw.
       pipeline_layout_out = nullptr;
       return true;
@@ -2113,14 +2114,20 @@ void VulkanPipelineCache::GetPipelineAndLayoutByHandle(
     return;
   }
   const auto* pipeline = reinterpret_cast<const Pipeline*>(handle);
+  // The flag before the pipeline: a worker stores the pipeline and then
+  // clears the flag, so a cleared flag guarantees the pipeline is visible.
+  // Read the other way round, a build finishing between the two loads gave a
+  // null pipeline that was not pending, and the draw failed once.
+  bool is_placeholder = pipeline->is_placeholder.load(std::memory_order_acquire);
   pipeline_out = pipeline->pipeline.load(std::memory_order_acquire);
   if (pipeline_out == VK_NULL_HANDLE && IsBuilt(pipeline->generic)) {
     pipeline = pipeline->generic;
+    is_placeholder = pipeline->is_placeholder.load(std::memory_order_acquire);
     pipeline_out = pipeline->pipeline.load(std::memory_order_acquire);
   }
   pipeline_layout_out = pipeline->pipeline_layout.load(std::memory_order_acquire);
   if (is_placeholder_out) {
-    *is_placeholder_out = pipeline->is_placeholder.load(std::memory_order_acquire);
+    *is_placeholder_out = is_placeholder;
   }
 }
 
