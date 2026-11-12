@@ -395,6 +395,7 @@ u32 KeQueryPerformanceFrequency_entry() {
 }
 
 u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 interval_ptr) {
+  rex::ppc::VerifyHostFpControl("KeDelayExecutionThread");
   XThread* thread = XThread::GetCurrentThread();
 
   if (alertable) {
@@ -494,6 +495,7 @@ uint32_t xeKeSetEvent(X_KEVENT* event_ptr, uint32_t increment, uint32_t wait) {
 }
 
 u32 KeSetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
+  rex::ppc::VerifyHostFpControl("KeSetEvent");
   return xeKeSetEvent(event_ptr, increment, wait);
 }
 
@@ -859,6 +861,7 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
 
 u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 processor_mode,
                                 u32 alertable, mapped_u64 timeout_ptr) {
+  rex::ppc::VerifyHostFpControl("KeWaitForSingleObject");
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
   // REXKRNL_IMPORT_TRACE("KeWaitForSingleObject", "obj={:#x} reason={} mode={} alertable={}
   // timeout={}",
@@ -873,6 +876,7 @@ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 pro
 
 u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertable,
                                   mapped_u64 timeout_ptr) {
+  rex::ppc::VerifyHostFpControl("NtWaitForSingleObjectEx");
   X_STATUS result = X_STATUS_SUCCESS;
 
   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
@@ -892,6 +896,7 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
 u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_type,
                                    u32 wait_reason, u32 processor_mode, u32 alertable,
                                    mapped_u64 timeout_ptr, mapped_void wait_block_array_ptr) {
+  rex::ppc::VerifyHostFpControl("KeWaitForMultipleObjects");
   assert_true(wait_type <= 1);
 
   std::vector<object_ref<XObject>> objects;
@@ -940,6 +945,7 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
 
 u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_type, u32 wait_mode,
                                      u32 alertable, mapped_u64 timeout_ptr) {
+  rex::ppc::VerifyHostFpControl("NtWaitForMultipleObjectsEx");
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
   return xeNtWaitForMultipleObjectsEx(count, handles, wait_type, wait_mode, alertable,
                                       timeout_ptr ? &timeout : nullptr);
@@ -947,6 +953,7 @@ u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_typ
 
 u32 NtSignalAndWaitForSingleObjectEx_entry(u32 signal_handle, u32 wait_handle, u32 alertable,
                                            u32 r6, mapped_u64 timeout_ptr) {
+  rex::ppc::VerifyHostFpControl("NtSignalAndWaitForSingleObjectEx");
   X_STATUS result = X_STATUS_SUCCESS;
 
   auto signal_object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(signal_handle);

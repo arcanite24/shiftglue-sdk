@@ -83,6 +83,28 @@ namespace rex::ppc {
 std::atomic<bool> g_fixed_fp_mode{REX_FIXED_FP_MODE_DEFAULT};
 std::atomic<int> g_db16cyc_hint{0};
 
+void VerifyHostFpControl(const char* where) noexcept {
+  // Outside fixed mode the guest's own toggles turn flush-to-zero on around
+  // VMX code and the cached csr records it, so there is nothing to check.
+  if (!g_fixed_fp_mode.load(std::memory_order_relaxed)) {
+    return;
+  }
+  using Platform = FPSCRRegister::Platform;
+  const uint32_t raw = Platform::getcsr();
+  const uint32_t unexpected = raw & uint32_t(Platform::FlushMask);
+  if (!unexpected) [[likely]] {
+    return;
+  }
+  Platform::setcsr(raw & ~unexpected);
+  static std::atomic<uint64_t> found{0};
+  const uint64_t n = found.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n <= 20 || (n & (n - 1)) == 0) {
+    REXLOG_WARN("[fp] flush-to-zero found on a guest thread in fixed FP mode ({}, control {:08X}); "
+                "cleared ({} times)",
+                where, raw, n);
+  }
+}
+
 void Db16cycHint(int mode) noexcept {
   if (mode == 2) {
     std::this_thread::yield();

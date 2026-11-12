@@ -153,6 +153,16 @@ constexpr uint32_t kRoundMask = 0x03;
 // register writes are skipped. Read on the toggles' rare path only.
 extern REX_RUNTIME_DATA std::atomic<bool> g_fixed_fp_mode;
 
+// Fixed mode trusts the cached csr: the toggles compare against it and never
+// read the register. Host code that runs on a guest thread (a driver or a
+// library called through an import) can turn flush-to-zero on in the register
+// and leave it, flushing the scalar FPU's denormals for the rest of the
+// session. The kernel's wait and event calls check the register and clear
+// what fixed mode never sets, logging where it was found. After
+// fh2-recompiled (its BSD-3 sdk/, commit 862ae81), where it made car parts
+// flicker in the chase cameras on Android.
+void VerifyHostFpControl(const char* where) noexcept;
+
 // What db16cyc, the Xenon spin-wait delay hint, does on the host (#601, cvar
 // ppc_db16cyc_hint): 0 nothing, 1 a CPU pause, 2 yield the thread. Generated
 // code tests the flag inline and calls Db16cycHint only when it is set.
