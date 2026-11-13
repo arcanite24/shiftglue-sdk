@@ -628,6 +628,18 @@ void WindowSDL::HandleWindowEvent(SDL_Event& event) {
       // The platform cannot retain the previous image; force the paint.
       OnPaint(true);
       break;
+    case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
+    case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
+      // Sent when the transition has finished. On macOS the pixel size
+      // changes while the window is still animating into the fullscreen
+      // Space, so the swapchain made then is bound to a CAMetalLayer state
+      // the transition replaces: frames keep presenting and nothing shows
+      // (black fullscreen, the clear colour back in the window) until
+      // something else rebuilds the connection. The size event SDL sends
+      // afterwards carries the same size and changes nothing, so rebuild
+      // here.
+      OnSurfaceStateUpdate(destruction_receiver);
+      break;
     case SDL_EVENT_WINDOW_MINIMIZED:
       OnMinimized(destruction_receiver);
       break;

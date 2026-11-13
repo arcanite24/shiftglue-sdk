@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -24,6 +25,7 @@
 #include <rex/ui/surface.h>
 #include <rex/ui/vulkan/device.h>
 #include <rex/ui/vulkan/instance.h>
+#include <rex/ui/vulkan/frame_generator.h>
 #include <rex/ui/vulkan/submission_tracker.h>
 #include <rex/ui/vulkan/ui_samplers.h>
 #include <rex/ui/vulkan/upscaler.h>
@@ -212,18 +214,28 @@ class VulkanPresenter final : public Presenter {
                               bool& is_8bpc_out_ref) override;
   void GuestOutputRefreshSubmitted(uint32_t mailbox_index) override;
 
-  PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override;
+  PaintResult PaintAndPresentImpl(bool execute_ui_drawers,
+                                  PaintSource source = PaintSource::kGuestOutput) override;
+
+  // Frame generation.
+  FrameGenerationAvailability ProbeFrameGenerationBackend(FrameGenerationBackend backend) override;
+  bool IsFrameGenerationOffered() const override;
+  void ResetFrameGenerationHistory() override;
 
  private:
   // Usable for both the guest output image itself and for intermediate images.
   class GuestOutputImage {
    public:
+    // `exportable` chains VkExportMetalObjectCreateInfoEXT so MoltenVK can hand
+    // the image to Metal (frame generation's external-queue backends); it is
+    // ignored off macOS.
     static std::unique_ptr<GuestOutputImage> Create(const VulkanDevice* const vulkan_device,
-                                                    const uint32_t width, const uint32_t height) {
+                                                    const uint32_t width, const uint32_t height,
+                                                    bool exportable = false) {
       assert_not_zero(width);
       assert_not_zero(height);
-      auto image =
-          std::unique_ptr<GuestOutputImage>(new GuestOutputImage(vulkan_device, width, height));
+      auto image = std::unique_ptr<GuestOutputImage>(
+          new GuestOutputImage(vulkan_device, width, height, exportable));
       if (!image->Initialize()) {
         return nullptr;
       }
@@ -255,8 +267,8 @@ class VulkanPresenter final : public Presenter {
 
    private:
     GuestOutputImage(const VulkanDevice* const vulkan_device, const uint32_t width,
-                     const uint32_t height)
-        : vulkan_device_(vulkan_device) {
+                     const uint32_t height, bool exportable)
+        : vulkan_device_(vulkan_device), exportable_(exportable) {
       extent_.width = width;
       extent_.height = height;
     }
@@ -268,6 +280,8 @@ class VulkanPresenter final : public Presenter {
                                                VK_IMAGE_USAGE_SAMPLED_BIT |
                                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                                                VK_IMAGE_USAGE_STORAGE_BIT);
+
+    bool exportable_ = false;
 
     const VulkanDevice* vulkan_device_;
 
@@ -419,9 +433,43 @@ class VulkanPresenter final : public Presenter {
       kGuestOutputDescriptorSetIntermediate0Sampled =
           kGuestOutputDescriptorSetGuestOutput0Sampled + kGuestOutputMailboxSize,
 
-      kGuestOutputDescriptorSetCount =
+      // Frame generation: the generated image, painted like a guest output.
+      kGuestOutputDescriptorSetGeneratedSampled =
           kGuestOutputDescriptorSetIntermediate0Sampled + kMaxGuestOutputPaintEffects - 1,
+
+      kGuestOutputDescriptorSetCount = kGuestOutputDescriptorSetGeneratedSampled + 1,
     };
+
+    // Frame generation: the presenter's own copies of the last two real
+    // frames (the mailbox releases a frame as soon as the next is taken), the
+    // generated image, and the generator. All at the guest output size; a
+    // size change recreates them after their last paint completed.
+    struct FrameGeneration {
+      std::array<std::unique_ptr<GuestOutputImage>, 2> history;
+      // Which history slot holds the newest copied frame; the other is the
+      // previous. SIZE_MAX: none copied since the last reset.
+      size_t newest = SIZE_MAX;
+      // The refresh sequence each slot holds, to skip copying a frame twice.
+      std::array<uint64_t, 2> history_sequences = {UINT64_MAX, UINT64_MAX};
+      std::unique_ptr<GuestOutputImage> generated;
+      bool generated_ever_written = false;
+      // The paint submission that last used any of the images.
+      uint64_t last_submission = 0;
+      std::unique_ptr<VulkanFrameGenerator> generator;
+      FrameGenerationBackend generator_backend = FrameGenerationBackend::kOff;
+      // Whether the generator runs on another API's queue (MetalFX): the
+      // history and output images are then exportable and the history copy is
+      // its own submission before Generate, not part of the paint buffer.
+      bool generator_external_queue = false;
+      // The external-queue history copy's one-off command pool and buffer.
+      VkCommandPool external_copy_pool = VK_NULL_HANDLE;
+      VkCommandBuffer external_copy_command_buffer = VK_NULL_HANDLE;
+      // Set by ResetFrameGenerationHistory (any thread), consumed by the next
+      // history copy, which then hands the backend its reset.
+      std::atomic<bool> reset_requested{true};
+      bool backend_reset_pending = true;
+    };
+    FrameGeneration frame_generation;
 
     struct UISetupCommandBuffer {
       UISetupCommandBuffer(VkCommandPool command_pool, VkCommandBuffer command_buffer,
@@ -614,6 +662,29 @@ class VulkanPresenter final : public Presenter {
                                 const GuestOutputPaintConfig& config,
                                 const GuestOutputImage* camera_source = nullptr,
                                 const UpscalerCamera* camera = nullptr);
+
+  // Frame generation (paint thread). The generator follows the setting;
+  // images follow the guest output size.
+  void RefreshFrameGenerator(const GuestOutputPaintConfig& config);
+  void LogFrameGenerationSkip(const char* reason);
+  uint32_t frame_generation_skips_logged_ = 0;
+  bool EnsureFrameGenerationResources(const std::shared_ptr<GuestOutputImage>& guest_output_image);
+  // Copies the real frame being painted into the history, once per refresh
+  // sequence, recorded into the draw command buffer before its render passes.
+  void RecordFrameGenerationHistoryCopy(VkCommandBuffer command_buffer,
+                                        const std::shared_ptr<GuestOutputImage>& guest_output_image,
+                                        uint64_t submission_index);
+  // Records the generation of the frame between the previous and the current
+  // real frame into the generated image; false when there is no pair yet or
+  // the backend failed.
+  bool RecordFrameGeneration(VkCommandBuffer command_buffer,
+                             const std::shared_ptr<GuestOutputImage>& guest_output_image,
+                             const GuestOutputProperties& properties, uint64_t submission_index);
+  // External-queue backends only: submits the history copy as its own
+  // graphics-queue submission, before the backend's own-queue generation.
+  bool SubmitFrameGenerationHistoryCopy(
+      const std::shared_ptr<GuestOutputImage>& guest_output_image);
+
 
   const VulkanDevice* vulkan_device_;
   const UISamplers* ui_samplers_;

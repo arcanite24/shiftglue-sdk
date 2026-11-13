@@ -2,6 +2,8 @@
 
 # Core UI sources
 set(REXUI_CORE_SOURCES
+    frame_generation_pacer.cpp
+    frame_generator.cpp
     graphics_upload_buffer_pool.cpp
     graphics_util.cpp
     image_decode.cpp
@@ -42,6 +44,7 @@ set(REXUI_VULKAN_SOURCES
     vulkan/vulkan_dlss_upscaler.cpp
     vulkan/vulkan_ffx_upscaler.cpp
     vulkan/vulkan_device.cpp
+    vulkan/vulkan_frame_generator.cpp
     vulkan/vulkan_immediate_drawer.cpp
     vulkan/vulkan_instance.cpp
     $<$<BOOL:${ANDROID}>:vulkan/android_gpu_driver.cpp>
@@ -194,6 +197,18 @@ elseif(UNIX AND NOT APPLE)
     )
 elseif(APPLE)
     target_link_libraries(rexui PRIVATE "-framework CoreFoundation")
+    if(REXGLUE_USE_VULKAN AND REXGLUE_ENABLE_METALFX)
+        # MetalFX frame interpolation (frame generation). MetalFX is linked
+        # weakly: the binary still launches on macOS 13-25, where the backend
+        # reports itself unavailable.
+        target_sources(rexui PRIVATE vulkan/vulkan_metalfx_frame_generator.mm)
+        set_source_files_properties(vulkan/vulkan_metalfx_frame_generator.mm PROPERTIES
+            COMPILE_OPTIONS "-fno-objc-arc"
+            SKIP_PRECOMPILE_HEADERS ON)
+        target_compile_definitions(rexui PRIVATE REX_HAS_METALFX=1)
+        target_link_libraries(rexui PRIVATE
+            "-framework Foundation" "-framework Metal" "-weak_framework MetalFX")
+    endif()
 endif()
 
 if(WIN32)

@@ -458,11 +458,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     // #106, for HDR10 output (present_hdr).
     XE_UI_VULKAN_STRUCT_EXTENSION(EXT_hdr_metadata)
+#if REX_PLATFORM_MAC
+    // MoltenVK's Metal objects, for MetalFX frame generation.
+    XE_UI_VULKAN_STRUCT_EXTENSION(EXT_metal_objects)
+#endif
   }
 
   bool ext_1_2_KHR_sampler_mirror_clamp_to_edge = false;
   bool ext_1_1_KHR_maintenance1 = false;
   bool ext_1_2_KHR_shader_float_controls = false;
+  bool ext_1_2_KHR_shader_float16_int8 = false;
   bool ext_EXT_fragment_shader_interlock = false;
   bool ext_1_3_EXT_shader_demote_to_helper_invocation = false;
   bool ext_EXT_non_seamless_cube_map = false;
@@ -482,6 +487,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_sampler_ycbcr_conversion, 1, 1)
       // #198. Also must be enabled for VK_KHR_spirv_1_4.
       XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_shader_float_controls, 1, 2)
+      // #83, for 16-bit float arithmetic in pixel shaders
+      // (fh1_shader_float16).
+      XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_shader_float16_int8, 1, 2)
       // #252.
       XE_UI_VULKAN_LOCAL_EXTENSION(EXT_fragment_shader_interlock)
       // #277.
@@ -609,6 +617,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT>
       features_EXT_fragment_shader_interlock;
+  // Only below Vulkan 1.2; 1.2 devices carry shaderFloat16 in features_1_2.
+  VulkanFeatures<VkPhysicalDeviceShaderFloat16Int8FeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR>
+      features_1_2_KHR_shader_float16_int8;
   VulkanFeatures<VkPhysicalDeviceDynamicRenderingFeaturesKHR,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR>
       features_1_3_KHR_dynamic_rendering;
@@ -683,6 +695,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (ext_EXT_fragment_shader_interlock) {
       features_EXT_fragment_shader_interlock.Link(supported_features_2, device_create_info);
+    }
+    if (properties.apiVersion < VK_MAKE_API_VERSION(0, 1, 2, 0) &&
+        ext_1_2_KHR_shader_float16_int8) {
+      features_1_2_KHR_shader_float16_int8.Link(supported_features_2, device_create_info);
     }
     if (ext_EXT_non_seamless_cube_map) {
       features_EXT_non_seamless_cube_map.Link(supported_features_2, device_create_info);
@@ -984,6 +1000,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
 
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+    if (with_swapchain) {
+      XE_UI_VULKAN_FEATURE_2(features_1_2, timelineSemaphore);
+    }
     if (with_gpu_emulation) {
       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
 #if defined(REXGLUE_ENABLE_CS_PROBES)
@@ -997,6 +1016,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingSampledImageUpdateAfterBind);
       XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingPartiallyBound);
       XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingUpdateUnusedWhilePending);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, shaderFloat16);
       XE_UI_VULKAN_PROPERTY_2(properties_1_2, maxDescriptorSetUpdateAfterBindSampledImages);
       XE_UI_VULKAN_PROPERTY_2(properties_1_2, maxDescriptorSetUpdateAfterBindSamplers);
       XE_UI_VULKAN_PROPERTY_2(properties_1_2, maxPerStageDescriptorUpdateAfterBindSampledImages);
@@ -1006,6 +1026,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   } else {
     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
       XE_UI_VULKAN_FEATURE_IMPLIED(samplerMirrorClampToEdge)
+    }
+    if (ext_1_2_KHR_shader_float16_int8 && with_gpu_emulation) {
+      XE_UI_VULKAN_FEATURE_2(features_1_2_KHR_shader_float16_int8, shaderFloat16);
     }
   }
 
@@ -1195,6 +1218,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (device->extensions_.ext_KHR_fragment_shading_rate) {
 #include <rex/ui/vulkan/functions/device_khr_fragment_shading_rate.inc>
   }
+  if (device->properties_.timelineSemaphore) {
+#include <rex/ui/vulkan/functions/device_1_2_khr_timeline_semaphore.inc>
+  }
+#if REX_PLATFORM_MAC
+  if (device->extensions_.ext_EXT_metal_objects) {
+#include <rex/ui/vulkan/functions/device_ext_metal_objects.inc>
+  }
+#endif
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 
 #undef XE_UI_VULKAN_FUNCTION

@@ -34,6 +34,15 @@ class DeferredCommandBuffer {
   // stream and leaves an empty one to record into).
   void Swap(DeferredCommandBuffer& other) { command_stream_.swap(other.command_stream_); }
 
+  // The position the next command is written at; stable until Reset or Swap.
+  size_t position() const { return command_stream_.size(); }
+  // Moves the commands recorded from `from` to the end so they sit before the
+  // command at `to` (`to` <= `from`): work recorded while a rendering was
+  // open is placed ahead of that rendering's begin, so the GPU runs it and
+  // then the rendering as one unbroken pass. The commands moved must not
+  // depend on the commands they are moved ahead of.
+  void MoveTailBefore(size_t to, size_t from);
+
   // render_pass_begin->pNext of all barriers must be null.
   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
                             VkSubpassContents contents) {

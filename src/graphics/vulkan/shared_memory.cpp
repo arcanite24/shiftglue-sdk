@@ -26,6 +26,17 @@
 #include <rex/perf/counter.h>
 #include <rex/ui/vulkan/util.h>
 
+// Apple M1 (MoltenVK, Metal argument buffers): every pipeline barrier outside
+// a render pass ends the Metal compute encoder, and the 21 ms free-roam drive
+// frame was 9 ms of 15-20 us gaps between ~390 encoders a frame, ~90 of them
+// single resolve dispatches split from their neighbours by this buffer's
+// write-after-write barrier.
+REXCVAR_DEFINE_BOOL(fh1_coalesce_resolve_writes, false, "GPU",
+                    "Vulkan: skip the shared-memory barrier between consecutive compute "
+                    "writes (resolves) to non-overlapping ranges; the next read's barrier "
+                    "commits them all. Fewer encoder splits on MoltenVK")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
                     "Use sparse shared memory on Vulkan")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -233,6 +244,24 @@ void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_
   written_range.first = std::min(written_range.first, kBufferSize);
   written_range.second = std::min(written_range.second, kBufferSize - written_range.first);
   assert_true(usage != Usage::kRead || !written_range.second);
+  // Consecutive compute writes (FH1's resolves, ~90 a drive frame in bursts)
+  // to ranges that do not overlap need no barrier between them: nothing reads
+  // the earlier write before the next read usage, whose barrier commits every
+  // write since the last one. On MoltenVK with Metal argument buffers each
+  // pipeline barrier outside a render pass ends the compute encoder, so the
+  // write-after-write barrier here cost a 15-20 us encoder gap per resolve;
+  // the pending range grows to cover all the uncommitted writes.
+  if (REXCVAR_GET(fh1_coalesce_resolve_writes) && usage == Usage::kComputeWrite &&
+      last_usage_ == usage && last_written_range_.second && written_range.second &&
+      (written_range.first >= last_written_range_.first + last_written_range_.second ||
+       written_range.first + written_range.second <= last_written_range_.first)) {
+    const uint32_t start = std::min(last_written_range_.first, written_range.first);
+    const uint32_t end =
+        std::max(last_written_range_.first + last_written_range_.second,
+                 written_range.first + written_range.second);
+    last_written_range_ = std::make_pair(start, end - start);
+    return;
+  }
   if (last_usage_ != usage || last_written_range_.second) {
     VkPipelineStageFlags src_stage_mask, dst_stage_mask;
     VkAccessFlags src_access_mask, dst_access_mask;
@@ -324,12 +353,78 @@ bool VulkanSharedMemory::UploadRanges(
   }
   // upload_page_ranges are sorted, use them to determine the range for the
   // ordering barrier.
-  Use(Usage::kTransferDestination,
-      std::make_pair(upload_page_ranges.front().first << page_size_log2(),
-                     (upload_page_ranges.back().first + upload_page_ranges.back().second -
-                      upload_page_ranges.front().first)
-                         << page_size_log2()));
+  // A draw's upload found while its rendering is open goes behind the
+  // rendering's begin instead of ending it (see BeginFh1HoistedUpload). The
+  // usage barriers are recorded with the copy: the rendering read the buffer
+  // before and reads it after, so the barrier state is the same on both sides.
+  // Only a draw's reads are reordered: a write usage before the upload keeps
+  // the guest order.
+  // The uploads hoisted ahead of one rendering share one barrier pair: the
+  // first records the barrier into the transfer (the whole buffer) before its
+  // copies and the one back to the read after them; a later one, with the
+  // buffer in the read state the group left, records only its copies, which
+  // go between the group's copies and its barrier back. Its pages must not
+  // repeat the group's: copies to the same range are unordered without a
+  // barrier between them.
+  const bool read_state = last_usage_ == Usage::kRead && !last_written_range_.second;
+  bool merge = read_state && command_processor_.IsFh1HoistGroupOpen();
+  if (merge) {
+    for (const auto& range : upload_page_ranges) {
+      for (const auto& group_range : hoist_group_page_ranges_) {
+        if (range.first < group_range.first + group_range.second &&
+            group_range.first < range.first + range.second) {
+          merge = false;
+          break;
+        }
+      }
+      if (!merge) break;
+    }
+  }
+  const VulkanCommandProcessor::Fh1HoistedUpload hoisted =
+      (last_usage_ == Usage::kRead || last_usage_ == Usage::kTransferDestination)
+          ? command_processor_.BeginFh1HoistedUpload(merge)
+          : VulkanCommandProcessor::Fh1HoistedUpload::kNone;
+  const std::pair<uint32_t, uint32_t> written_range(
+      upload_page_ranges.front().first << page_size_log2(),
+      (upload_page_ranges.back().first + upload_page_ranges.back().second -
+       upload_page_ranges.front().first)
+          << page_size_log2());
+  if (hoisted == VulkanCommandProcessor::Fh1HoistedUpload::kMerged) {
+    // Copies only, into the open group; the usage stays the read the group
+    // left. If the rendering ends meanwhile the copies stay after its end,
+    // outside the group, and get the barriers of their own they then need.
+    hoist_group_page_ranges_.insert(hoist_group_page_ranges_.end(), upload_page_ranges.begin(),
+                                    upload_page_ranges.end());
+    const bool successful = UploadRangesCopies(upload_page_ranges);
+    if (!command_processor_.EndFh1HoistedUpload()) {
+      Use(Usage::kTransferDestination, written_range);
+      command_processor_.RecordFh1CancelledHoistBarriers();
+      Use(Usage::kRead);
+    }
+    return successful;
+  }
+  Use(Usage::kTransferDestination, written_range);
+  if (hoisted == VulkanCommandProcessor::Fh1HoistedUpload::kGroup) {
+    // The barrier into the transfer goes before the copies, the one back to
+    // the reading usage after them, then the whole upload moves ahead of the
+    // rendering's begin, so its draws see the data.
+    hoist_group_page_ranges_.assign(upload_page_ranges.begin(), upload_page_ranges.end());
+    command_processor_.RecordFh1HoistedBarriers();
+    struct EndHoist {
+      VulkanSharedMemory& memory;
+      ~EndHoist() {
+        memory.Use(Usage::kRead);
+        memory.command_processor_.EndFh1HoistedUpload();
+      }
+    } end_hoist{*this};
+    return UploadRangesCopies(upload_page_ranges);
+  }
   command_processor_.SubmitBarriers(true);
+  return UploadRangesCopies(upload_page_ranges);
+}
+
+bool VulkanSharedMemory::UploadRangesCopies(
+    const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
   Fh1NativeExecutor* const gpu_profile_executor = command_processor_.GetFh1NativeExecutor();
   const uint64_t gpu_timing =
       gpu_profile_executor ? gpu_profile_executor->BeginLabelGpuTiming("upload") : UINT64_MAX;

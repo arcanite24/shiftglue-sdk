@@ -425,6 +425,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
     bool signed_zero_inf_nan_preserve_float32;
     bool denorm_flush_to_zero_float32;
     bool rounding_mode_rte_float32;
+    // 16-bit float arithmetic (shaderFloat16, core in Vulkan 1.2), for
+    // fh1_shader_float16.
+    bool float16_arithmetic;
 
     bool fragment_shader_sample_interlock;
 
@@ -694,6 +697,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id ZeroIfNan(spv::Id value, int num_components, spv::Id replacement = spv::NoResult);
   // Conditionally discard the current fragment. Changes the build point.
   void KillPixel(spv::Id condition, uint8_t memexport_eM_potentially_written_before);
+
+  // Decorates a float variable or result with RelaxedPrecision when
+  // fh1_shader_relaxed_precision applies to the current shader; a no-op
+  // otherwise and for constants (which may be shared with exact code).
+  void DecorateRelaxed(spv::Id id);
   // Return type is a rex::bit_count(result.GetUsedResultComponents())-component
   // float vector or a single float, depending on whether it's a reduction
   // instruction (check getTypeId of the result), or returns spv::NoResult if
@@ -822,6 +830,19 @@ class SpirvShaderTranslator : public ShaderTranslator {
   bool fast_pixel_math_ = false;
   // spirv_ieee_vertex_math for the current (vertex) shader: no multiply rule.
   bool ieee_math_ = false;
+  // fh1_shader_relaxed_precision for the current (pixel) shader: the r#
+  // registers, the interpolator inputs and the ALU results carry
+  // RelaxedPrecision, so MoltenVK may run them as half.
+  bool relaxed_precision_ = false;
+  // fh1_shader_float16 for the current (pixel) shader, on a device with
+  // shaderFloat16: the vector and scalar ALU arithmetic is performed in
+  // 16-bit floats (SpirvBuilder::float16_arithmetic), converted from and back
+  // to the 32-bit registers around each operation.
+  bool float16_math_ = false;
+  // fh1_shader_float16_clamp mode 1: the results of the scalar operations the
+  // lowering keeps in 32 bits (exp2, log2, reciprocals, inverse square roots)
+  // are clamped to the finite 16-bit range before they are stored.
+  bool float16_clamp_sources_ = false;
 
   std::unique_ptr<SpirvBuilder> builder_;
 

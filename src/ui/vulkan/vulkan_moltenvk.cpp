@@ -22,7 +22,24 @@
 #include <string_view>
 #include <system_error>
 
+#include <rex/cvar.h>
 #include <rex/filesystem.h>
+
+// With Metal 3 argument buffers (MoltenVK's default) MoltenVK keeps resources
+// resident through an MTLResidencySet and implements Vulkan barriers with
+// MTLFences, which means every vkCmdPipelineBarrier outside a render pass ends
+// the current Metal encoder. FH1's free roam issues ~90 resolves a frame, each
+// behind a barrier, so on the Apple M1 the 21 ms drive frame spent 9 ms idle
+// in encoder gaps and 19 ms with discrete-index binding (two clean runs
+// against 21.0-21.1 ms controls, the fixed-clock captures unchanged). The
+// device still reports 128 sampled images and 16 samplers a stage without
+// them; FH1's shaders bind a handful.
+REXCVAR_DEFINE_BOOL(vulkan_moltenvk_argument_buffers, false, "UI/Vulkan",
+                    "macOS: let MoltenVK bind descriptor sets through Metal argument buffers "
+                    "(its default). Off, descriptors bind by resource index and pipeline "
+                    "barriers no longer end Metal compute encoders: fewer encoder gaps. A "
+                    "MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS already in the environment wins")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::ui::vulkan {
 namespace {
@@ -190,8 +207,10 @@ void ConfigureMacOSVulkanEnvironment(const MacOSVulkanRuntimePaths& paths) {
   // Metal argument buffers make every descriptor set update an encode into a
   // GPU buffer. FH1 rewrites sets for most draws, and without them an M4 Pro
   // free-roam drive's median frame falls from 10.9 to 10.3 ms. A value the
-  // player sets is kept.
-  setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0", 0);
+  // player sets is kept; vulkan_moltenvk_argument_buffers turns them back on
+  // for an A/B. Read by MoltenVK when the instance is created, after this.
+  setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS",
+         REXCVAR_GET(vulkan_moltenvk_argument_buffers) ? "1" : "0", 0);
   if (!paths.sdk_root.empty()) {
     const char* vulkan_sdk = std::getenv("VULKAN_SDK");
     if (!vulkan_sdk || !vulkan_sdk[0]) {
