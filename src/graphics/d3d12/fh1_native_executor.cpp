@@ -1529,7 +1529,9 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
                             owner.is_depth, owner.format) |
                  (host_sample_mode << 27);
   constants[4] = sample_select;
-  constants[5] = dest_info | ((scale_ - 1) << 20) | (unscaled_dest ? 1u << 22 : 0u);
+  // The scale - 1 for x (20:21) and y (23:24), both scale_ here.
+  constants[5] = dest_info | ((scale_ - 1) << 20) | (unscaled_dest ? 1u << 22 : 0u) |
+                 ((scale_ - 1) << 23);
   constants[6] = dest_base;
   constants[7] = dest_pitch;
   auto& list = command_processor_.GetDeferredCommandList();

@@ -347,10 +347,11 @@ class Fh1NativeExecutor {
     return {LONG(rect.left * LONG(scale_)), LONG(rect.top * LONG(scale_)),
             LONG(rect.right * LONG(scale_)), LONG(rect.bottom * LONG(scale_))};
   }
-  // Flags shared by the transfer shaders.
+  // Flags shared by the transfer shaders. The shaders take the x and y scale
+  // apart (12:13, 14:15); this executor's scale is square.
   uint32_t TransferFlags() const {
     return (config_.depth_float24_round ? 1u : 0u) | (config_.gamma_as_unorm16 ? 2u : 0u) |
-           (config_.fixed16_truncated ? 0u : 4u) | ((scale_ - 1) << 12);
+           (config_.fixed16_truncated ? 0u : 4u) | ((scale_ - 1) << 12) | ((scale_ - 1) << 14);
   }
   struct PrepareSignature {
     uint64_t generation = 0;
