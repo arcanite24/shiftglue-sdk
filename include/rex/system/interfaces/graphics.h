@@ -206,6 +206,12 @@ class IGraphicsSystem {
   virtual bool fh1_shadow_mask(uint32_t* base, uint32_t* length, uint32_t* resolves) const {
     return false;
   }
+  // FH1 (#1070): the scene's size when the title runs its scaled bands
+  // (CommandProcessor::set_fh1_scene_size); 0x0 for 1280x720.
+  virtual void set_fh1_scene_size(uint32_t width, uint32_t height) {
+    (void)width;
+    (void)height;
+  }
 
   // Guest GPU services reached from the xboxkrnl Vd* exports.
   virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data) {

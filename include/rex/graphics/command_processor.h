@@ -119,6 +119,21 @@ class CommandProcessor {
     fh1_shadow_mask_.store(uint64_t(base) << 32 | length, std::memory_order_relaxed);
     fh1_shadow_mask_resolves_.fetch_add(1, std::memory_order_release);
   }
+  // FH1 (#1070): the title's scene runs at a smaller size with its three
+  // 720p bands scaled (pinyon_shift_fh1_scene_size). The static world's
+  // command lists keep the 720p bands' window offset and window scissor;
+  // while a size is set, writes of exactly those values into a surface of
+  // the scene's pitch are rewritten to the scaled bands. 0x0 turns it off.
+  void set_fh1_scene_size(uint32_t width, uint32_t height) {
+    fh1_scene_size_.store(width && height ? (height << 16) | width : 0,
+                          std::memory_order_relaxed);
+  }
+  uint32_t fh1_scene_width() const {
+    return fh1_scene_size_.load(std::memory_order_relaxed) & 0xFFFF;
+  }
+  uint32_t fh1_scene_height() const {
+    return fh1_scene_size_.load(std::memory_order_relaxed) >> 16;
+  }
   bool fh1_shadow_mask(uint32_t* base, uint32_t* length, uint32_t* resolves) const {
     if (resolves) *resolves = fh1_shadow_mask_resolves_.load(std::memory_order_acquire);
     const uint64_t mask = fh1_shadow_mask_.load(std::memory_order_relaxed);
@@ -515,6 +530,8 @@ class CommandProcessor {
   uint64_t bin_select_ = 0xFFFFFFFFull;
   std::atomic<uint64_t> fh1_shadow_mask_{0};
   std::atomic<uint32_t> fh1_shadow_mask_resolves_{0};
+  std::atomic<uint32_t> fh1_scene_size_{0};
+  uint32_t Fh1SceneWindowRegister(uint32_t index, uint32_t value, uint32_t surface_info) const;
   uint64_t bin_mask_ = 0xFFFFFFFFull;
  public:
   // gpu_trace_bins_vblank: swaps decoded, to trace one whole frame.

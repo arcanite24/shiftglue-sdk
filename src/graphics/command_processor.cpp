@@ -1057,7 +1057,41 @@ int64_t ReplayProbeNowNs() {
 }
 }  // namespace
 
+uint32_t CommandProcessor::Fh1SceneWindowRegister(uint32_t index, uint32_t value,
+                                                  uint32_t surface_info) const {
+  const uint32_t size = fh1_scene_size_.load(std::memory_order_relaxed);
+  const uint32_t width = size & 0xFFFF, height = size >> 16;
+  if (!size || (surface_info & 0x3FFF) != width) return value;
+  // The 720p bands are rows 0-256, 256-512 and 512-720 (0-512 and 512-720
+  // with 2x MSAA); the scaled bands never share those values.
+  const auto row = [height](uint32_t y, bool bottom) {
+    if (y == 256 || y == 512) return y * height / 720;
+    return bottom && y == 720 ? height : y;
+  };
+  switch (index) {
+    case XE_GPU_REG_PA_SC_WINDOW_OFFSET: {
+      const int32_t y = int32_t(value << 1) >> 17;
+      if (y != -256 && y != -512) return value;
+      const int32_t scaled = y * int32_t(height) / 720;
+      return (value & ~(0x7FFFu << 16)) | ((uint32_t(scaled) & 0x7FFF) << 16);
+    }
+    case XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL:
+      return (value & ~(0x3FFFu << 16)) | (row((value >> 16) & 0x3FFF, false) << 16);
+    case XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR: {
+      const uint32_t x = value & 0x7FFF;
+      return (value & ~0x3FFF7FFFu) | (x == 1280 ? width : x) |
+             (row((value >> 16) & 0x3FFF, true) << 16);
+    }
+    default:
+      return value;
+  }
+}
+
 void CommandProcessor::PacketWriteRegister(uint32_t index, uint32_t value) {
+  if (index >= XE_GPU_REG_PA_SC_WINDOW_OFFSET && index <= XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR &&
+      fh1_scene_size_.load(std::memory_order_relaxed)) {
+    value = Fh1SceneWindowRegister(index, value, decode_regs().values[XE_GPU_REG_RB_SURFACE_INFO]);
+  }
   if (replay_probe.capturing) {
     ReplayProbeTouch(index, 1);
   }
@@ -1108,6 +1142,36 @@ void CommandProcessor::PacketWriteRegistersFromMem(uint32_t start_index, const u
                                                    uint32_t num_registers) {
   if (!num_registers) {
     return;
+  }
+  // set_fh1_scene_size: a run through the window registers is rewritten in
+  // a copy (base is guest memory, big-endian).
+  uint32_t scene_run[32];
+  if (start_index <= XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR &&
+      start_index + num_registers > XE_GPU_REG_PA_SC_WINDOW_OFFSET &&
+      fh1_scene_size_.load(std::memory_order_relaxed)) {
+    if (num_registers > 32) {
+      // A long run: write it in three parts around the window registers.
+      const uint32_t window = XE_GPU_REG_PA_SC_WINDOW_OFFSET;
+      const uint32_t window_end = XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR + 1;
+      const uint32_t end = start_index + num_registers;
+      const uint32_t first = std::max(start_index, window);
+      const uint32_t last = std::min(end, window_end);
+      if (first > start_index) PacketWriteRegistersFromMem(start_index, base, first - start_index);
+      PacketWriteRegistersFromMem(first, base + (first - start_index), last - first);
+      if (end > last) PacketWriteRegistersFromMem(last, base + (last - start_index), end - last);
+      return;
+    }
+    uint32_t surface_info = decode_regs().values[XE_GPU_REG_RB_SURFACE_INFO];
+    for (uint32_t i = 0; i < num_registers; ++i) {
+      const uint32_t index = start_index + i;
+      uint32_t value = rex::byte_swap(base[i]);
+      if (index == XE_GPU_REG_RB_SURFACE_INFO) surface_info = value;
+      if (index >= XE_GPU_REG_PA_SC_WINDOW_OFFSET && index <= XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR) {
+        value = Fh1SceneWindowRegister(index, value, surface_info);
+      }
+      scene_run[i] = rex::byte_swap(value);
+    }
+    base = scene_run;
   }
   if (replay_probe.capturing) {
     ReplayProbeTouch(start_index, num_registers);

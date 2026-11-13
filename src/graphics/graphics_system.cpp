@@ -558,6 +558,14 @@ bool GraphicsSystem::fh1_shadow_mask(uint32_t* base, uint32_t* length,
   return command_processor_ && command_processor_->fh1_shadow_mask(base, length, resolves);
 }
 
+void GraphicsSystem::set_fh1_scene_size(uint32_t width, uint32_t height) {
+  if (!command_processor_) {
+    REXGPU_WARN("FH1 scene size {}x{} set before the command processor exists", width, height);
+    return;
+  }
+  command_processor_->set_fh1_scene_size(width, height);
+}
+
 void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                              uint32_t title_id, bool blocking) {
   // A requested frame replay runs once the title's shader storage is ready.
