@@ -89,11 +89,12 @@ REXCVAR_DEFINE_BOOL(present_upscaler_object_motion, true, "GPU",
 REXCVAR_DEFINE_INT32(present_upscaler_object_debug, 0, "GPU",
                      "UP-1.7 debug: 1 shows the object slots in the motion view (red: slot, green: its depth is the pixel's)");
 
-REXCVAR_DEFINE_BOOL(fh1_untile_predicated_tiling, REX_PLATFORM_ANDROID || REX_PLATFORM_MAC, "GPU",
+REXCVAR_DEFINE_BOOL(fh1_untile_predicated_tiling, REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "GPU",
                     "Render FH1's predicated tiling passes once: the first tile draws every "
                     "tile's objects over the whole surface height and the later tiles only "
                     "resolve their bands (Vulkan FH1 native executor; 3 ms a frame on the "
-                    "Odin 2 Portal). A change rebuilds the renderer between frames")
+                    "Odin 2 Portal, 2.5-3 ms of CPU on the Steam Deck). A change rebuilds the "
+                    "renderer between frames")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(fh1_debug_untile, 0, "GPU",
                      "fh1_untile_predicated_tiling diagnostics: 1 keeps the first tile's "
