@@ -1,5 +1,6 @@
 #include <rex/platform.h>
 #include <rex/platform/dynlib.h>
+#include <rex/platform/huge_page_code.h>
 
 static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
 
@@ -28,6 +29,9 @@ bool DynamicLibrary::Load(const std::filesystem::path& path, SymbolResolution mo
   Close();
   int flags = (mode == SymbolResolution::kImmediate) ? RTLD_NOW : RTLD_LAZY;
   handle_ = dlopen(path.c_str(), flags);
+  if (handle_) {
+    BackCodeWithHugePages();
+  }
   return handle_ != nullptr;
 }
 

@@ -46,6 +46,8 @@
 #include <rex/system.h>
 #endif
 
+#include <rex/platform/huge_page_code.h>
+
 namespace {
 
 int RunWindowedApp(int argc, char** argv) {
@@ -71,6 +73,7 @@ int RunWindowedApp(int argc, char** argv) {
   auto remaining = rex::cvar::Init(argc, argv);
   rex::cvar::ApplyEnvironment();
   rex::InitLoggingEarly();
+  rex::platform::BackCodeWithHugePages();
 
   int result;
   {
