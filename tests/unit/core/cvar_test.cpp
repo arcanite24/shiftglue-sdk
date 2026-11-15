@@ -324,6 +324,18 @@ TEST_CASE("cvar source precedence", "[cvar]") {
     CHECK(REXCVAR_GET(test_int32_flag) == 333);
   }
 
+  SECTION("A repeated option takes its last value and keeps the others") {
+    char argv0[] = "cvar_test";
+    char arg1[] = "--test_int32_flag=111";
+    char arg2[] = "--test_string_flag=first";
+    char arg3[] = "--test_int32_flag=222";
+    char* argv[] = {argv0, arg1, arg2, arg3};
+    rex::cvar::Init(4, argv);
+
+    CHECK(REXCVAR_GET(test_int32_flag) == 222);
+    CHECK(REXCVAR_GET(test_string_flag) == "first");
+  }
+
   SECTION("Boolean negation from the command line beats the config file") {
     {
       std::ofstream file(config_path);

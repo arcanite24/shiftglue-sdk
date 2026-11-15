@@ -705,10 +705,14 @@ std::vector<std::string> Init(int argc, char** argv) {
           },
           entry.description);
     } else {
+      // A repeated option takes its last value. CLI11's default throws on
+      // the second one, and the parse error then applies no option at all
+      // (Android activities add arguments from more than one source).
       app.add_option_function<std::string>(
-          "--" + entry.name,
-          [&entry](const std::string& val) { ApplyFromSource(entry, val, Source::kCommandLine); },
-          entry.description);
+             "--" + entry.name,
+             [&entry](const std::string& val) { ApplyFromSource(entry, val, Source::kCommandLine); },
+             entry.description)
+          ->multi_option_policy(CLI::MultiOptionPolicy::TakeLast);
     }
   }
 
