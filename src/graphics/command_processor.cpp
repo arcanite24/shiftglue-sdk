@@ -977,6 +977,16 @@ void ReplayProbeTouch(uint32_t start_index, uint32_t count) {
   }
 }
 
+// Whether a register was written inside the innermost open capture (or no
+// capture is open): a capture may elide or merge against it, since a replay
+// of the capture sets it itself.
+bool ReplayProbeWritten(uint32_t index) {
+  if (!replay_probe.active) return true;
+  const ReplayProbeCapture& capture = replay_probe.levels[replay_probe.active - 1];
+  return index < capture.touched_generation.size() &&
+         capture.touched_generation[index] == capture.generation;
+}
+
 // Returns the new capture's level; levels may move when a nested one starts.
 uint32_t ReplayProbeBegin() {
   if (replay_probe.levels.size() <= replay_probe.active) {
@@ -1112,6 +1122,7 @@ void CommandProcessor::PacketWriteRegister(uint32_t index, uint32_t value) {
       fh1_scene_size_.load(std::memory_order_relaxed)) {
     value = Fh1SceneWindowRegister(index, value, decode_regs().values[XE_GPU_REG_RB_SURFACE_INFO]);
   }
+  const bool may_elide = ReplayProbeWritten(index);
   if (replay_probe.capturing) {
     ReplayProbeTouch(index, 1);
   }
@@ -1137,8 +1148,7 @@ void CommandProcessor::PacketWriteRegister(uint32_t index, uint32_t value) {
   } else if (index == XE_GPU_REG_SCRATCH_UMSK || index == XE_GPU_REG_SCRATCH_ADDR) {
     FlushPendingScratchWrites();
   }
-  if (elide_unchanged_registers_ && !replay_probe.capturing &&
-      index < RegisterFile::kRegisterCount &&
+  if (elide_unchanged_registers_ && may_elide && index < RegisterFile::kRegisterCount &&
       decode_register_file_->values[index] == value && !RegisterWriteAlwaysMatters(index)) {
     // The recorder's register file already holds this value.
     return;
@@ -1194,7 +1204,11 @@ void CommandProcessor::PacketWriteRegistersFromMem(uint32_t start_index, const u
     }
     base = scene_run;
   }
+  bool run_may_elide = true;
   if (replay_probe.capturing) {
+    for (uint32_t i = 0; i < num_registers && run_may_elide; ++i) {
+      run_may_elide = ReplayProbeWritten(start_index + i);
+    }
     ReplayProbeTouch(start_index, num_registers);
   }
   if (!record_split_) {
@@ -1212,7 +1226,7 @@ void CommandProcessor::PacketWriteRegistersFromMem(uint32_t start_index, const u
     }
     return;
   }
-  if (elide_unchanged_registers_ && !replay_probe.capturing) {
+  if (elide_unchanged_registers_ && run_may_elide) {
     // Record only the sub-runs that change a register (or whose write always
     // matters); the rest would leave the recorder's register file as it is.
     uint32_t* shadow = decode_register_file_->values + start_index;
@@ -1273,7 +1287,7 @@ void CommandProcessor::RecordRegisterRun(uint32_t start_index, const uint32_t* b
   // gap holding the registers' current values (rewriting a float constant
   // with its own value only stores it again).
   constexpr uint32_t kConstantRunMergeGap = 16;
-  if (REXCVAR_GET(gpu_record_merge_constant_runs) && !replay_probe.capturing &&
+  if (REXCVAR_GET(gpu_record_merge_constant_runs) &&
       start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
       start_index + num_registers - 1 <= XE_GPU_REG_SHADER_CONSTANT_511_W &&
       last_constant_run_batch_ == record_batch_.get() &&
@@ -1281,7 +1295,15 @@ void CommandProcessor::RecordRegisterRun(uint32_t start_index, const uint32_t* b
     const uint32_t previous_start = words[last_constant_run_offset_ + 1];
     const uint32_t previous_count = words[last_constant_run_offset_ + 2];
     const uint32_t previous_end = previous_start + previous_count;
-    if (start_index >= previous_end && start_index - previous_end <= kConstantRunMergeGap) {
+    bool gap_written = true;
+    if (replay_probe.capturing && start_index >= previous_end &&
+        start_index - previous_end <= kConstantRunMergeGap) {
+      for (uint32_t i = previous_end; i < start_index && gap_written; ++i) {
+        gap_written = ReplayProbeWritten(i);
+      }
+    }
+    if (gap_written && start_index >= previous_end &&
+        start_index - previous_end <= kConstantRunMergeGap) {
       const uint32_t gap = start_index - previous_end;
       const size_t offset = words.size();
       words.resize(offset + gap + num_registers);
@@ -4108,8 +4130,7 @@ void CommandProcessor::LoadGuestShader(xenos::ShaderType shader_type, uint32_t a
     decode_shader_loads_.store(decode_shader_loads_.load(std::memory_order_relaxed) + 1,
                                std::memory_order_relaxed);
     LastShaderLoad& last = decode_last_shader_load_[shader_type == xenos::ShaderType::kPixel];
-    if (last.valid && last.hash == ucode_hash && last.dword_count == size_dwords &&
-        !replay_probe.capturing) {
+    if (last.valid && last.hash == ucode_hash && last.dword_count == size_dwords) {
       // The recorder would look up the same shader and set it again.
       decode_shader_loads_skipped_.store(
           decode_shader_loads_skipped_.load(std::memory_order_relaxed) + 1,
