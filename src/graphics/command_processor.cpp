@@ -153,15 +153,20 @@ REXCVAR_DEFINE_BOOL(gpu_ib_identity_stats, false, "GPU",
                     "compiler's potential hit rate)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(gpu_replay_floor_probe, 0, "GPU",
-                     "Diagnostics (NN-0.10, G0): without gpu_record_thread, capture the exit "
+                     "Diagnostics (NN-0.10, G0; FR-3 M2 at 3): without gpu_record_thread, capture the exit "
                      "state (registers, bins, shaders) of every indirect buffer, at any depth, "
                      "whose bytes repeat its previous execution and, at 2, skip a buffer whose "
                      "bytes and nested buffers match its capture and "
                      "that holds only state, constants, shader loads and draws, applying the "
                      "exit state instead: its draws are dropped (a wrong image), so the CPU "
                      "left is the floor of re-executing recorded lists. 1 captures and counts "
-                     "only (the census)")
-    .range(0, 2)
+                     "only (the census). With gpu_record_thread, 3 captures such a buffer's "
+                     "record entries (none that are calls) and the decoder's exit registers, "
+                     "and replays a repeat by appending the entries and writing the exit "
+                     "registers to the decoder's shadow: its draws are recorded, the decode "
+                     "is skipped (registers the capture elided against its entry state may "
+                     "be missing on the recorder: an image may be wrong); 1 counts")
+    .range(0, 3)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(gpu_trace_ib_writers, 0, "GPU",
                      "Diagnostics (NN-0.10): watch the pages of the first N indirect buffers "
@@ -905,9 +910,17 @@ struct ReplayProbeIb {
   uint64_t exit_bin_select = 0, exit_bin_mask = 0;
   Shader* exit_vertex_shader = nullptr;
   Shader* exit_pixel_shader = nullptr;
+  // Split decoding (mode 3): the record entries the buffer appended.
+  std::vector<uint32_t> words;
+  bool words_ok = false;
 };
 struct ReplayProbeCapture {
   bool skippable = true;
+  // Split decoding: entries appended so far (earlier batches) and where the
+  // capture starts in the current batch; false once a call is recorded.
+  std::vector<uint32_t> words;
+  size_t word_offset = 0;
+  bool words_ok = true;
   uint32_t generation = 0;
   std::vector<uint32_t> touched_generation;
   std::vector<uint32_t> touched;
@@ -975,6 +988,9 @@ uint32_t ReplayProbeBegin() {
   }
   capture.touched.clear();
   capture.nested.clear();
+  capture.words.clear();
+  capture.word_offset = 0;
+  capture.words_ok = true;
   return level;
 }
 
@@ -1300,6 +1316,10 @@ void CommandProcessor::RecordCall(std::function<void()> fn) {
   }
   // A call may read any register.
   FlushPendingScratchWrites();
+  // A capture with a call can't be replayed by copying entries.
+  for (uint32_t level = 0; level < replay_probe.active; ++level) {
+    replay_probe.levels[level].words_ok = false;
+  }
   RecordBatch& batch = *record_batch_;
   batch.words.push_back(kRecordCall);
   batch.words.push_back(uint32_t(batch.fns.size()));
@@ -1319,6 +1339,12 @@ void CommandProcessor::PublishRecordBatch() {
   FlushPendingScratchWrites();
   if (record_batch_->words.empty()) {
     return;
+  }
+  for (uint32_t level = 0; level < replay_probe.active; ++level) {
+    ReplayProbeCapture& capture = replay_probe.levels[level];
+    const RecordWords& words = record_batch_->words;
+    capture.words.insert(capture.words.end(), words.begin() + capture.word_offset, words.end());
+    capture.word_offset = 0;
   }
   last_constant_run_batch_ = nullptr;
   std::unique_ptr<RecordBatch> next;
@@ -2012,7 +2038,9 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
       memory_->EnablePhysicalMemoryAccessCallbacks(physical, bytes, false, false, true);
     }
   }
-  const int32_t probe_mode = !record_split_ ? REXCVAR_GET(gpu_replay_floor_probe) : 0;
+  int32_t probe_mode = REXCVAR_GET(gpu_replay_floor_probe);
+  // 2 needs unsplit decoding, 3 split; otherwise they only count.
+  if (probe_mode >= 2 && (probe_mode == 3) != record_split_) probe_mode = 1;
   ReplayProbeIb* probe_ib = nullptr;
   bool probe_repeat = false, probe_outer_repeat = false;
   int32_t probe_level = -1;
@@ -2036,7 +2064,50 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
       PERF_counter_inc(kReplayProbeRepeatIbs);
     }
     probe_outer_repeat = probe_repeat && !replay_probe.repeat_depth;
-    if (probe_repeat && capture_valid && probe_ib->skippable && probe_mode >= 2) {
+    if (probe_repeat && capture_valid && probe_ib->skippable && probe_mode == 3 &&
+        probe_ib->words_ok) {
+      // M2's floor: the entries a decode would append, without the decode.
+      const int64_t apply_start_ns = ReplayProbeNowNs();
+      FlushPendingScratchWrites();
+      last_constant_run_batch_ = nullptr;
+      RecordWords& words = record_batch_->words;
+      const size_t offset = words.size();
+      words.resize(offset + probe_ib->words.size());
+      std::memcpy(words.data() + offset, probe_ib->words.data(),
+                  sizeof(uint32_t) * probe_ib->words.size());
+      uint32_t* shadow = decode_register_file_->values;
+      for (const auto& [index, value] : probe_ib->exit_registers) {
+        shadow[index] = value;
+      }
+      if (replay_probe.capturing) {
+        for (const auto& [index, value] : probe_ib->exit_registers) {
+          ReplayProbeTouch(index, 1);
+        }
+      }
+      bin_select_ = probe_ib->exit_bin_select;
+      bin_mask_ = probe_ib->exit_bin_mask;
+      decode_last_shader_load_[0].valid = false;
+      decode_last_shader_load_[1].valid = false;
+      replay_probe.replayed_draws += probe_ib->drawn_draws;
+      // Batches publish as decoding would (every 32 draws or 64 Ki words).
+      record_batch_draws_ += probe_ib->drawn_draws;
+      if (record_batch_draws_ >= 32 || words.size() >= 65536) {
+        PublishRecordBatch();
+      }
+      PERF_counter_add(kReplayProbeApplyNs, ReplayProbeNowNs() - apply_start_ns);
+      PERF_counter_inc(kReplayProbeSkippedIbs);
+      PERF_counter_add(kReplayProbeSkippedDrawnDraws, probe_ib->drawn_draws);
+      PERF_counter_add(kReplayProbeExitRegisters, probe_ib->exit_registers.size());
+      if (probe_outer_repeat) {
+        PERF_counter_add(kReplayProbeDrawnInRepeatIbs, probe_ib->drawn_draws);
+        PERF_counter_add(kReplayProbeDrawnInSkippableRepeatIbs, probe_ib->drawn_draws);
+      }
+      if (trace_ib_depth_ == 1) {
+        PERF_counter_add(kReplayProbeDrawnInIbs, probe_ib->drawn_draws);
+      }
+      return;
+    }
+    if (probe_repeat && capture_valid && probe_ib->skippable && probe_mode == 2) {
       // The floor: what is left without decoding or recording the buffer.
       const int64_t apply_start_ns = ReplayProbeNowNs();
       for (const auto& [index, value] : probe_ib->exit_registers) {
@@ -2069,6 +2140,12 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
       probe_ib->entry_bin_mask = bin_mask_;
       probe_ib->entry_select_all = untile_select_all_;
       probe_level = int32_t(ReplayProbeBegin());
+      if (record_split_) {
+        // The capture starts on an entry boundary and no run merges across it.
+        FlushPendingScratchWrites();
+        last_constant_run_batch_ = nullptr;
+        replay_probe.levels[probe_level].word_offset = record_batch_->words.size();
+      }
     }
     if (probe_repeat) {
       ++replay_probe.repeat_depth;
@@ -2137,8 +2214,46 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
       ib.nested.swap(capture.nested);
       ib.exit_registers.clear();
       ib.exit_registers.reserve(capture.touched.size());
+      const uint32_t* exit_values = decode_regs().values;
       for (uint32_t index : capture.touched) {
-        ib.exit_registers.emplace_back(index, register_file_->values[index]);
+        ib.exit_registers.emplace_back(index, exit_values[index]);
+      }
+      ib.words.clear();
+      ib.words_ok = false;
+      if (record_split_) {
+        FlushPendingScratchWrites();
+        last_constant_run_batch_ = nullptr;
+        const RecordWords& words = record_batch_->words;
+        capture.words.insert(capture.words.end(), words.begin() + capture.word_offset,
+                             words.end());
+        ib.words.swap(capture.words);
+        ib.words_ok = capture.words_ok;
+        uint32_t draws = 0;
+        for (size_t i = 0; i < ib.words.size();) {
+          switch (ib.words[i]) {
+            case kRecordRun:
+              i += 3 + ib.words[i + 2];
+              break;
+            case kRecordOne:
+              i += 3;
+              break;
+            case kRecordCall:
+              i += 2;
+              break;
+            case kRecordDraw:
+              ++draws;
+              i += 1 + kDrawRecordWords;
+              break;
+            case kRecordLoadShader:
+              i += 1 + kLoadShaderRecordWords;
+              break;
+            default:
+              ib.words_ok = false;
+              i = ib.words.size();
+              break;
+          }
+        }
+        ib.drawn_draws = draws;
       }
       ib.exit_bin_select = bin_select_;
       ib.exit_bin_mask = bin_mask_;
@@ -3332,6 +3447,9 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   auto write_draw_register = [&](uint32_t index, uint32_t value) {
     if (fuse_registers) {
       decode_register_file_->values[index] = value;
+      if (replay_probe.capturing) {
+        ReplayProbeTouch(index, 1);
+      }
       ++fused_registers;
     } else {
       PacketWriteRegister(index, value);
@@ -3774,7 +3892,7 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, 
     return true;
   }
   if (replay_probe.capturing &&
-      register_file_->Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy) {
+      decode_regs().Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy) {
     ReplayProbeMarkUnskippable();
   }
   // "initiate fetch of index buffer and draw"
@@ -3800,7 +3918,7 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX_2(memory::RingBuffer* reader
     return true;
   }
   if (replay_probe.capturing &&
-      register_file_->Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy) {
+      decode_regs().Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy) {
     ReplayProbeMarkUnskippable();
   }
   // "draw using supplied indices in packet"
