@@ -3355,13 +3355,11 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
       untile_height_ ? uint32_t(std::max(0, -int32_t(regs.Get<reg::PA_SC_WINDOW_OFFSET>()
                                                          .window_y_offset)))
                      : 0u;
-  // Untiled, the scene is whole at its first resolve, before the last
-  // band is copied down over it (FR-3b: by the HUD the copy read zeros).
   // UP-1.3: each predicated tile's resolve ends a band of the scene depth
   // (the window offset moves its screen rows to the top of EDRAM).
   // Untiled, the scene is whole at its first tile's resolve, before the
-  // last band is copied down over it (FR-3b: by the HUD the copy read
-  // zeros).
+  // last band is copied down over it: the FR-3b occlusion grid reduces it
+  // there (the camera copy still waits for the HUD).
   if (camera_tracking_enabled_ && camera_scene_depth_valid_ && (!untile_height_ || !untile_band)) {
     const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
     const auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
@@ -3370,7 +3368,6 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
                      msaa, depth_info.depth_format)
             .Pack() == camera_scene_depth_) {
       if (untile_height_) {
-        SnapshotCameraDepth(0);
         ReduceOcclusionDepth();
       } else {
         SnapshotCameraDepth(uint32_t(
