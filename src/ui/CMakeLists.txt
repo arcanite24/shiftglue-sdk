@@ -156,6 +156,12 @@ if(REXGLUE_USE_VULKAN AND REXGLUE_FFX_API_INCLUDE_DIR)
     target_include_directories(rexui PRIVATE "${REXGLUE_FFX_API_INCLUDE_DIR}")
     target_compile_definitions(rexui PRIVATE REX_HAS_FFX_API=1)
 endif()
+# The LSFG provider runs the player's own Lossless.dll shaders
+# (thirdparty/lsfg).
+if(REXGLUE_USE_VULKAN AND TARGET lsfg_framegen)
+    target_link_libraries(rexui PRIVATE lsfg_framegen lsfg_dxbc)
+    target_compile_definitions(rexui PRIVATE REX_HAS_LSFG=1)
+endif()
 # The DLSS provider, when the build opted in (cmake/rexglue_dlss.cmake).
 if(REXGLUE_USE_VULKAN AND REXGLUE_DLSS_INCLUDE_DIR AND REXGLUE_DLSS_LIBRARY)
     target_include_directories(rexui PRIVATE "${REXGLUE_DLSS_INCLUDE_DIR}")

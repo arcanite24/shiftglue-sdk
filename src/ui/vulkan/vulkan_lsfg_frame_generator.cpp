@@ -1,14 +1,13 @@
 /**
- * Lossless Scaling frame generation (UP-5.2), the provider slot.
+ * Lossless Scaling frame generation (UP-5.2).
  *
  * LSFG runs from the player's own Lossless.dll (docs/LEGAL.md in Pinyon
  * Shift: it is never fetched, shipped or cached). This finds the DLL (a path
- * the player sets, or the Lossless Scaling folder in their Steam libraries)
- * and counts the DXBC shader containers in its resources without copying
- * them. Running them needs a DXBC to SPIR-V translation that is not written
- * yet, so the provider always reports itself unavailable, with the reason.
- * Nothing is looked for unless present_lsfg_dll or present_lsfg_experimental
- * is set.
+ * the player sets, or the Lossless Scaling folder in their Steam libraries),
+ * reads its DXBC shaders in memory, translates them to SPIR-V with DXVK's
+ * compiler and runs lsfg-vk's LSFG 3.1 passes on the presenter's device, in
+ * its command buffer (thirdparty/lsfg). Nothing is looked for unless
+ * present_lsfg_dll or present_lsfg_experimental is set.
  */
 
 #include <rex/ui/vulkan/frame_generator.h>
@@ -16,11 +15,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <functional>
-#include <iterator>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -28,14 +24,31 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ui/vulkan/device.h>
+#include <rex/ui/vulkan/instance.h>
+
+#if REX_HAS_LSFG
+#include <exception>
+#include <map>
+
+#include "lsfg_embedded.h"
+#include "lsfg_shaders.h"
+#endif
 
 REXCVAR_DEFINE_STRING(present_lsfg_dll, "", "UI/Presenter",
                       "Path to the player's own Lossless.dll for LSFG frame generation")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(present_lsfg_experimental, false, "UI/Presenter",
-                    "Untested: look for Lossless.dll in the Steam library folders when "
+                    "Look for Lossless.dll in the Steam library folders when "
                     "present_lsfg_dll is empty")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(present_lsfg_performance, false, "UI/Presenter",
+                    "LSFG performance mode: lighter passes, softer generated frames")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_DOUBLE(present_lsfg_flow_scale, 1.0, "UI/Presenter",
+                      "LSFG motion search resolution as a share of the frame (0.25 to 1)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex {
@@ -116,7 +129,11 @@ fs::path FindLosslessDll() {
   std::error_code error;
   const std::string configured = REXCVAR_GET(present_lsfg_dll);
   if (!configured.empty()) {
-    return fs::is_regular_file(configured, error) ? fs::path(configured) : fs::path();
+    if (fs::is_regular_file(configured, error)) {
+      return fs::path(configured);
+    }
+    REXLOG_WARN("LSFG: present_lsfg_dll \"{}\" is not a file", configured);
+    return {};
   }
   for (const fs::path& library : GetSteamLibraries()) {
     const fs::path dll = library / "steamapps" / "common" / "Lossless Scaling" / "Lossless.dll";
@@ -127,145 +144,166 @@ fs::path FindLosslessDll() {
   return {};
 }
 
-template <typename T>
-bool ReadAt(const std::vector<uint8_t>& data, size_t offset, T* value) {
-  if (offset > data.size() || data.size() - offset < sizeof(T)) {
-    return false;
+#if REX_HAS_LSFG
+// What the translated shaders need: SPIR-V 1.6 (Vulkan 1.3) with the Vulkan
+// memory model, typeless storage images, and null descriptors for the inputs
+// a pass leaves unbound.
+std::string MissingFeature(const VulkanDevice& device) {
+  const VulkanDevice::Properties& properties = device.properties();
+  if (properties.apiVersion < VK_MAKE_API_VERSION(0, 1, 3, 0)) {
+    return "needs Vulkan 1.3";
   }
-  std::memcpy(value, data.data() + offset, sizeof(T));
-  return true;
+  if (!properties.vulkanMemoryModel) {
+    return "needs the Vulkan memory model";
+  }
+  if (!properties.shaderStorageImageReadWithoutFormat ||
+      !properties.shaderStorageImageWriteWithoutFormat) {
+    return "needs storage images without a format";
+  }
+  if (!properties.nullDescriptor) {
+    return "needs null descriptors";
+  }
+  return {};
 }
-
-// The number of resources in a PE file's resource tree that start with a
-// DXBC container header, or -1 when the file is not a PE file with
-// resources. Nothing is copied out.
-int CountDxbcResources(const fs::path& path) {
-  std::ifstream file(path, std::ios::binary);
-  const std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
-                                  std::istreambuf_iterator<char>());
-  uint16_t mz = 0;
-  uint32_t pe_offset = 0;
-  uint32_t signature = 0;
-  if (!ReadAt(data, 0, &mz) || mz != 0x5A4D || !ReadAt(data, 0x3C, &pe_offset) ||
-      !ReadAt(data, pe_offset, &signature) || signature != 0x00004550) {
-    return -1;
-  }
-  const size_t file_header = size_t(pe_offset) + 4;
-  const size_t optional = file_header + 20;
-  uint16_t section_count = 0;
-  uint16_t optional_size = 0;
-  uint16_t magic = 0;
-  if (!ReadAt(data, file_header + 2, &section_count) ||
-      !ReadAt(data, file_header + 16, &optional_size) || !ReadAt(data, optional, &magic)) {
-    return -1;
-  }
-  // The data directories follow the PE32 (0x10B) or PE32+ (0x20B) fields;
-  // the resource directory is the third.
-  const size_t directories = optional + (magic == 0x20B ? 112 : 96);
-  uint32_t resource_rva = 0;
-  if (!ReadAt(data, directories + 2 * 8, &resource_rva) || !resource_rva) {
-    return -1;
-  }
-  struct Section {
-    uint32_t virtual_address = 0;
-    uint32_t virtual_size = 0;
-    uint32_t raw_size = 0;
-    uint32_t raw_offset = 0;
-  };
-  std::vector<Section> sections;
-  const size_t section_table = optional + optional_size;
-  for (uint16_t i = 0; i < section_count; ++i) {
-    const size_t entry = section_table + size_t(i) * 40;
-    Section section;
-    if (!ReadAt(data, entry + 8, &section.virtual_size) ||
-        !ReadAt(data, entry + 12, &section.virtual_address) ||
-        !ReadAt(data, entry + 16, &section.raw_size) ||
-        !ReadAt(data, entry + 20, &section.raw_offset)) {
-      return -1;
-    }
-    sections.push_back(section);
-  }
-  auto to_offset = [&sections](uint32_t rva, size_t* offset) {
-    for (const Section& section : sections) {
-      const uint32_t size = std::max(section.virtual_size, section.raw_size);
-      if (rva >= section.virtual_address && rva - section.virtual_address < size) {
-        *offset = size_t(section.raw_offset) + (rva - section.virtual_address);
-        return true;
-      }
-    }
-    return false;
-  };
-  size_t resource_base = 0;
-  if (!to_offset(resource_rva, &resource_base)) {
-    return -1;
-  }
-  int count = 0;
-  // Type, name and language directories: three levels.
-  std::function<void(size_t, int)> walk = [&](size_t directory, int depth) {
-    uint16_t named = 0;
-    uint16_t numbered = 0;
-    if (depth > 3 || !ReadAt(data, directory + 12, &named) ||
-        !ReadAt(data, directory + 14, &numbered)) {
-      return;
-    }
-    for (uint32_t i = 0; i < uint32_t(named) + numbered; ++i) {
-      uint32_t target = 0;
-      if (!ReadAt(data, directory + 16 + size_t(i) * 8 + 4, &target)) {
-        return;
-      }
-      if (target & 0x80000000u) {
-        walk(resource_base + (target & 0x7FFFFFFFu), depth + 1);
-        continue;
-      }
-      uint32_t data_rva = 0;
-      uint32_t data_size = 0;
-      size_t data_offset = 0;
-      char header[4] = {};
-      if (ReadAt(data, resource_base + target, &data_rva) &&
-          ReadAt(data, resource_base + target + 4, &data_size) && data_size >= 4 &&
-          to_offset(data_rva, &data_offset) && ReadAt(data, data_offset, &header) &&
-          !std::memcmp(header, "DXBC", 4)) {
-        ++count;
-      }
-    }
-  };
-  walk(resource_base, 1);
-  return count;
-}
+#endif
 
 class VulkanLsfgFrameGenerator final : public VulkanFrameGenerator {
  public:
-  VulkanLsfgFrameGenerator() {
+  explicit VulkanLsfgFrameGenerator(const VulkanDevice* device) : device_(device) {
     info_.id = "lsfg";
     info_.name = "Lossless Scaling frame generation";
+    info_.version = "3.1";
     const fs::path dll = FindLosslessDll();
     if (dll.empty()) {
       info_.unavailable_reason = "no Lossless.dll found";
       return;
     }
-    const int shaders = CountDxbcResources(dll);
-    REXLOG_INFO("LSFG: {} has {} DXBC shaders", dll.string(), shaders);
-    info_.unavailable_reason = shaders > 0
-                                   ? "Lossless.dll found; its shaders are not translated yet"
-                                   : "Lossless.dll has no shaders this version can read";
+#if REX_HAS_LSFG
+    if (const std::string missing = MissingFeature(*device); !missing.empty()) {
+      info_.unavailable_reason = missing;
+      return;
+    }
+    resources_ = lsfg::ReadRcdataResources(dll);
+    const bool performance = REXCVAR_GET(present_lsfg_performance);
+    for (const std::string& name : lsfg::ShaderNames()) {
+      if ((name.rfind("p_", 0) == 0) != performance) {
+        continue;
+      }
+      if (!resources_.count(lsfg::ShaderResourceId(name))) {
+        REXLOG_WARN("LSFG: {} has no shader {}", dll.string(), name);
+        info_.unavailable_reason = "Lossless.dll is a version this build cannot read";
+        resources_.clear();
+        return;
+      }
+    }
+    REXLOG_INFO("LSFG: shaders from {} ({} resources)", dll.string(), resources_.size());
+    info_.available = true;
+#else
+    info_.unavailable_reason = "this build has no LSFG support";
+#endif
   }
 
   const FrameGeneratorInfo& info() const override { return info_; }
-  bool Prepare(uint32_t, uint32_t, uint32_t, uint32_t) override { return false; }
-  bool Dispatch(VkCommandBuffer, const VulkanFrameGeneratorInputs&) override { return false; }
-  void Release() override {}
+
+  bool Prepare(uint32_t display_width, uint32_t display_height, uint32_t,
+               uint32_t) override {
+#if REX_HAS_LSFG
+    if (!info_.available) {
+      return false;
+    }
+    std::string error;
+    if (!embedded_) {
+      const VulkanInstance* instance = device_->vulkan_instance();
+      lsfg::EmbeddedDevice embedded_device;
+      embedded_device.get_instance_proc_addr = instance->functions().vkGetInstanceProcAddr;
+      embedded_device.instance = instance->instance();
+      embedded_device.get_device_proc_addr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+          embedded_device.get_instance_proc_addr(instance->instance(), "vkGetDeviceProcAddr"));
+      embedded_device.device = device_->device();
+      embedded_device.physical_device = device_->physical_device();
+      embedded_device.queue_family = device_->queue_family_graphics_compute();
+      lsfg::EmbeddedSettings settings;
+      settings.performance = REXCVAR_GET(present_lsfg_performance);
+      settings.flow_scale = float(REXCVAR_GET(present_lsfg_flow_scale));
+      // Translated as the passes ask for them; the pipelines are kept.
+      lsfg::ShaderSource source = [this](const std::string& name) {
+        const auto it = resources_.find(lsfg::ShaderResourceId(name));
+        if (it == resources_.end()) {
+          return std::vector<uint8_t>();
+        }
+        try {
+          return lsfg::TranslateShader(it->second);
+        } catch (const std::exception& exception) {
+          REXLOG_ERROR("LSFG: shader {} did not translate: {}", name, exception.what());
+          return std::vector<uint8_t>();
+        }
+      };
+      embedded_ = lsfg::Embedded::Create(embedded_device, std::move(source), settings, &error);
+      if (!embedded_) {
+        REXLOG_ERROR("LSFG: setup failed: {}", error);
+        info_.available = false;
+        info_.unavailable_reason = "setup failed";
+        return false;
+      }
+    }
+    if (!embedded_->Resize(display_width, display_height, &error)) {
+      REXLOG_ERROR("LSFG: {}x{} failed: {}", display_width, display_height, error);
+      return false;
+    }
+    return true;
+#else
+    (void)display_width;
+    (void)display_height;
+    return false;
+#endif
+  }
+
+  bool Dispatch(VkCommandBuffer command_buffer,
+                const VulkanFrameGeneratorInputs& inputs) override {
+#if REX_HAS_LSFG
+    if (!embedded_) {
+      return false;
+    }
+    // A cut still goes into the history; its generated frame would blend
+    // two unrelated pictures, so the real one is shown twice instead. The
+    // presenter also marks the frame after any that generated nothing as a
+    // reset, so only a reset that follows a generated frame is a cut: the
+    // warm-up frames would otherwise keep it set for good.
+    const bool cut = inputs.frame.reset && last_generated_;
+    last_generated_ = embedded_->Record(command_buffer, inputs.present_color.image,
+                                        inputs.output.image, !cut);
+    return last_generated_;
+#else
+    (void)command_buffer;
+    (void)inputs;
+    return false;
+#endif
+  }
+
+  void Release() override {
+#if REX_HAS_LSFG
+    embedded_.reset();
+    last_generated_ = false;
+#endif
+  }
 
  private:
+  const VulkanDevice* device_;
   FrameGeneratorInfo info_;
+#if REX_HAS_LSFG
+  std::map<uint32_t, std::vector<uint8_t>> resources_;
+  std::unique_ptr<lsfg::Embedded> embedded_;
+  bool last_generated_ = false;
+#endif
 };
 
 }  // namespace
 
-std::unique_ptr<VulkanFrameGenerator> CreateVulkanLsfgFrameGenerator(const VulkanDevice*) {
+std::unique_ptr<VulkanFrameGenerator> CreateVulkanLsfgFrameGenerator(const VulkanDevice* device) {
   if (REXCVAR_GET(present_lsfg_dll).empty() && !REXCVAR_GET(present_lsfg_experimental)) {
     return nullptr;
   }
-  return std::make_unique<VulkanLsfgFrameGenerator>();
+  return std::make_unique<VulkanLsfgFrameGenerator>(device);
 }
 
 }  // namespace vulkan

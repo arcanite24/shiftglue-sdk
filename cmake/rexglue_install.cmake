@@ -27,6 +27,10 @@ if(REXGLUE_USE_VULKAN)
     )
 endif()
 
+if(TARGET lsfg_framegen)
+    list(APPEND REXGLUE_INSTALL_TARGETS lsfg_framegen lsfg_dxbc)
+endif()
+
 if(REXGLUE_USE_D3D12)
     list(APPEND REXGLUE_INSTALL_TARGETS dxc-headers)
 endif()

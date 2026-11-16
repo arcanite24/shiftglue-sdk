@@ -354,6 +354,13 @@ if(REXGLUE_USE_VULKAN)
     endif()
     add_subdirectory(spirv-tools EXCLUDE_FROM_ALL)
 
+    # LSFG frame generation (UP-5.2): DXVK's DXBC compiler and lsfg-vk's
+    # passes, for the player's own Lossless.dll. Windows and desktop Linux.
+    if((WIN32 OR (UNIX AND NOT APPLE AND NOT ANDROID)) AND NOT REXGLUE_DISABLE_LSFG)
+        set(LSFG_SPIRV_HEADERS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/spirv-headers/include")
+        add_subdirectory(lsfg)
+    endif()
+
     # glslang/SPIRV - SPIR-V code generation for shader translation
     set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
     set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
