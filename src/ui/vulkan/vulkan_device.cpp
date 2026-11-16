@@ -981,6 +981,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_FEATURE(sparseBinding)
     XE_UI_VULKAN_FEATURE(sparseResidencyBuffer)
     XE_UI_VULKAN_FEATURE(shaderSampledImageArrayDynamicIndexing)
+    // UP-5.2: LSFG's shaders, translated from DXBC, use typed storage images
+    // without a declared format.
+    XE_UI_VULKAN_FEATURE(shaderStorageImageReadWithoutFormat)
+    XE_UI_VULKAN_FEATURE(shaderStorageImageWriteWithoutFormat)
   }
 
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -1003,6 +1007,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_PROPERTY_2(properties_1_2, maxPerStageDescriptorUpdateAfterBindSamplers);
       XE_UI_VULKAN_PROPERTY_2(properties_1_2, maxUpdateAfterBindDescriptorsInAllPools);
     }
+    // The SPIR-V that LSFG frame generation's shaders are translated to
+    // (vulkan_lsfg_frame_generator.cpp) declares the Vulkan memory model.
+    XE_UI_VULKAN_FEATURE_2(features_1_2, vulkanMemoryModel);
   } else {
     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
       XE_UI_VULKAN_FEATURE_IMPLIED(samplerMirrorClampToEdge)

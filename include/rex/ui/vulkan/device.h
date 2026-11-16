@@ -115,6 +115,8 @@ class VulkanDevice {
     bool occlusionQueryPrecise = false;
     bool vertexPipelineStoresAndAtomics = false;
     bool fragmentStoresAndAtomics = false;
+    bool shaderStorageImageReadWithoutFormat = false;
+    bool shaderStorageImageWriteWithoutFormat = false;
     bool shaderClipDistance = false;
     bool shaderCullDistance = false;
     bool sparseBinding = false;
@@ -131,6 +133,10 @@ class VulkanDevice {
     // VK_EXT_scalar_block_layout (#222, promoted to 1.2)
 
     bool scalarBlockLayout = false;
+
+    // VK_KHR_vulkan_memory_model (#212, promoted to 1.2)
+
+    bool vulkanMemoryModel = false;
 
     // VK_KHR_portability_subset (#164)
 
