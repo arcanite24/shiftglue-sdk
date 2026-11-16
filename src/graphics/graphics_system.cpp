@@ -266,8 +266,17 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             rex::thread::Sleep(std::chrono::milliseconds(20));
             continue;
           }
-          const uint32_t current_render_fps_limit =
-              REXCVAR_GET(pinyon_shift_fh1_render_fps_limit);
+          uint32_t current_render_fps_limit = REXCVAR_GET(pinyon_shift_fh1_render_fps_limit);
+          // UP-4.2: with a generated frame after each real one, the game
+          // renders at no more than half the refresh, so both are shown.
+          if (presenter_ && presenter_->IsFrameGenerating()) {
+            const uint32_t half_refresh =
+                uint32_t(REXCVAR_GET(video_mode_refresh_rate) * 0.5 + 0.5);
+            if (half_refresh &&
+                (!current_render_fps_limit || current_render_fps_limit > half_refresh)) {
+              current_render_fps_limit = half_refresh;
+            }
+          }
           if (current_render_fps_limit != render_fps_limit) {
             render_fps_limit = current_render_fps_limit;
             const double refresh_rate_hz = Fh1GuestVblankHzForRenderLimit(

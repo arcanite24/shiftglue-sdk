@@ -10,6 +10,7 @@
  * override.
  */
 
+#include <rex/ui/vulkan/frame_generator.h>
 #include <rex/ui/vulkan/upscaler.h>
 
 #include <algorithm>
@@ -31,6 +32,7 @@
 
 #if defined(REX_HAS_FFX_API) && REX_HAS_FFX_API
 #include <ffx_api/ffx_api.h>
+#include <ffx_api/ffx_framegeneration.h>
 #include <ffx_api/ffx_upscale.h>
 #include <ffx_api/vk/ffx_api_vk.h>
 #if REX_PLATFORM_WIN32
@@ -58,9 +60,12 @@ struct FfxRuntime {
   PfnFfxDestroyContext destroy_context = nullptr;
   PfnFfxQuery query = nullptr;
   PfnFfxDispatch dispatch = nullptr;
+  PfnFfxConfigure configure = nullptr;
   std::string source;
   std::string error;
-  bool loaded() const { return create_context && destroy_context && query && dispatch; }
+  bool loaded() const {
+    return create_context && destroy_context && query && dispatch && configure;
+  }
 };
 
 // Compares dotted versions ("1.1.10" after "1.1.4") number by number.
@@ -88,6 +93,7 @@ const FfxRuntime& GetFfxRuntime() {
     runtime.destroy_context = &ffxDestroyContext;
     runtime.query = &ffxQuery;
     runtime.dispatch = &ffxDispatch;
+    runtime.configure = &ffxConfigure;
     runtime.source = "linked";
 #else
 #if REX_PLATFORM_WIN32
@@ -150,6 +156,7 @@ const FfxRuntime& GetFfxRuntime() {
           reinterpret_cast<PfnFfxDestroyContext>(symbol("ffxDestroyContext"));
       runtime.query = reinterpret_cast<PfnFfxQuery>(symbol("ffxQuery"));
       runtime.dispatch = reinterpret_cast<PfnFfxDispatch>(symbol("ffxDispatch"));
+      runtime.configure = reinterpret_cast<PfnFfxConfigure>(symbol("ffxConfigure"));
       if (runtime.loaded()) {
         runtime.source = path.string();
         runtime.error.clear();
@@ -546,6 +553,198 @@ class VulkanFfxUpscaler final : public VulkanUpscaler {
   bool neutral_inputs_need_clear_ = false;
 };
 
+// A FidelityFX API resource for a Vulkan image.
+FfxApiResource FfxImageResource(const VulkanUpscalerImage& image, uint32_t usage, uint32_t state) {
+  VkImageCreateInfo create_info = {};
+  create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  create_info.imageType = VK_IMAGE_TYPE_2D;
+  create_info.format = image.format;
+  create_info.extent = {image.width, image.height, 1};
+  create_info.mipLevels = 1;
+  create_info.arrayLayers = 1;
+  create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  create_info.usage = image.usage;
+  return ffxApiGetResourceVK(reinterpret_cast<void*>(image.image),
+                             ffxApiGetImageResourceDescriptionVK(image.image, create_info, usage),
+                             state);
+}
+
+// FSR 3.1 frame generation: the API's frame generation provider, dispatched
+// by the presenter itself (configure, prepare with depth and motion, then
+// interpolate into an image of ours). AMD's swapchain replacement is not
+// used, so pacing and presentation stay the presenter's.
+class VulkanFfxFrameGenerator final : public VulkanFrameGenerator {
+ public:
+  explicit VulkanFfxFrameGenerator(const VulkanDevice* device) : device_(device) {
+    info_.id = "fsr3";
+    info_.name = "AMD FidelityFX Super Resolution 3 frame generation";
+    info_.uses_depth = true;
+    info_.uses_motion_vectors = true;
+    const FfxRuntime& runtime = GetFfxRuntime();
+    if (!runtime.loaded()) {
+      info_.unavailable_reason = runtime.error;
+      return;
+    }
+    uint64_t count = 8;
+    uint64_t ids[8] = {};
+    const char* names[8] = {};
+    ffxQueryDescGetVersions query = {};
+    query.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+    query.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
+    query.outputCount = &count;
+    query.versionIds = ids;
+    query.versionNames = names;
+    if (runtime.query(nullptr, &query.header) != FFX_API_RETURN_OK || !count || !names[0]) {
+      info_.unavailable_reason = "the FidelityFX runtime has no frame generation";
+      return;
+    }
+    info_.version = names[0];
+    version_id_ = ids[0];
+    info_.available = true;
+  }
+  ~VulkanFfxFrameGenerator() override { Release(); }
+
+  const FrameGeneratorInfo& info() const override { return info_; }
+
+  bool Prepare(uint32_t display_width, uint32_t display_height, uint32_t max_render_width,
+               uint32_t max_render_height) override {
+    if (!info_.available) {
+      return false;
+    }
+    if (context_ && display_width == display_width_ && display_height == display_height_ &&
+        max_render_width <= max_render_width_ && max_render_height <= max_render_height_) {
+      return true;
+    }
+    const std::array<uint32_t, 4> request = {display_width, display_height, max_render_width,
+                                             max_render_height};
+    if (request == failed_request_) {
+      return false;
+    }
+    Release();
+    ffxCreateContextDescFrameGeneration create_desc = {};
+    create_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
+    create_desc.flags = 0;
+    create_desc.displaySize = {display_width, display_height};
+    create_desc.maxRenderSize = {max_render_width, max_render_height};
+    create_desc.backBufferFormat = FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM;
+    ffxCreateBackendVKDesc backend_desc = {};
+    backend_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+    backend_desc.vkDevice = device_->device();
+    backend_desc.vkPhysicalDevice = device_->physical_device();
+    const VulkanInstance* instance = device_->vulkan_instance();
+    g_get_device_proc_addr.store(reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+                                     instance->functions().vkGetInstanceProcAddr(
+                                         instance->instance(), "vkGetDeviceProcAddr")),
+                                 std::memory_order_relaxed);
+    backend_desc.vkDeviceProcAddr = GetDeviceProcAddrCompat;
+    create_desc.header.pNext = &backend_desc.header;
+    ffxOverrideVersion override_desc = {};
+    override_desc.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+    override_desc.versionId = version_id_;
+    backend_desc.header.pNext = &override_desc.header;
+    ffxContext context = nullptr;
+    const ffxReturnCode_t created =
+        GetFfxRuntime().create_context(&context, &create_desc.header, nullptr);
+    if (created != FFX_API_RETURN_OK) {
+      REXLOG_WARN(
+          "FidelityFX: could not create the frame generation context ({}x{}, render up to "
+          "{}x{}): error {}",
+          display_width, display_height, max_render_width, max_render_height, created);
+      failed_request_ = request;
+      return false;
+    }
+    failed_request_ = {};
+    context_ = context;
+    display_width_ = display_width;
+    display_height_ = display_height;
+    max_render_width_ = max_render_width;
+    max_render_height_ = max_render_height;
+    REXLOG_INFO("FidelityFX: frame generation {} for {}x{}, render up to {}x{}", info_.version,
+                display_width, display_height, max_render_width, max_render_height);
+    return true;
+  }
+
+  bool Dispatch(VkCommandBuffer command_buffer,
+                const VulkanFrameGeneratorInputs& inputs) override {
+    if (!context_ || !inputs.present_color.image || !inputs.output.image ||
+        !inputs.depth.image || !inputs.motion_vectors.image) {
+      return false;
+    }
+    const FfxRuntime& runtime = GetFfxRuntime();
+    const UpscalerFrame& frame = inputs.frame;
+    ffxContext context = context_;
+    // No swapchain to notify: this only runs the interpolation.
+    ffxConfigureDescFrameGeneration configure = {};
+    configure.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+    configure.frameGenerationEnabled = true;
+    configure.allowAsyncWorkloads = false;
+    configure.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
+    configure.generationRect = {inputs.generation_x, inputs.generation_y,
+                                int32_t(inputs.generation_width),
+                                int32_t(inputs.generation_height)};
+    configure.frameID = inputs.frame_id;
+    if (runtime.configure(&context, &configure.header) != FFX_API_RETURN_OK) {
+      return false;
+    }
+    ffxDispatchDescFrameGenerationPrepare prepare = {};
+    prepare.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
+    prepare.frameID = inputs.frame_id;
+    prepare.commandList = command_buffer;
+    prepare.renderSize = {frame.render_width, frame.render_height};
+    prepare.jitterOffset = {frame.jitter_x, frame.jitter_y};
+    prepare.motionVectorScale = {frame.motion_vector_scale_x, frame.motion_vector_scale_y};
+    prepare.frameTimeDelta = frame.frame_delta_ms;
+    prepare.cameraNear = frame.camera_near;
+    prepare.cameraFar = frame.camera_far;
+    prepare.cameraFovAngleVertical = frame.camera_fov_y;
+    prepare.viewSpaceToMetersFactor = 1.0f;
+    prepare.depth = FfxImageResource(inputs.depth, FFX_API_RESOURCE_USAGE_READ_ONLY,
+                                     FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    prepare.motionVectors =
+        FfxImageResource(inputs.motion_vectors, FFX_API_RESOURCE_USAGE_READ_ONLY,
+                         FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    if (runtime.dispatch(&context, &prepare.header) != FFX_API_RETURN_OK) {
+      return false;
+    }
+    ffxDispatchDescFrameGeneration dispatch = {};
+    dispatch.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION;
+    dispatch.commandList = command_buffer;
+    dispatch.presentColor =
+        FfxImageResource(inputs.present_color, FFX_API_RESOURCE_USAGE_READ_ONLY,
+                         FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    dispatch.outputs[0] = FfxImageResource(inputs.output, FFX_API_RESOURCE_USAGE_UAV,
+                                           FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+    dispatch.numGeneratedFrames = 1;
+    dispatch.reset = frame.reset;
+    dispatch.backbufferTransferFunction = FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
+    dispatch.minMaxLuminance[0] = 0.0f;
+    dispatch.minMaxLuminance[1] = 1.0f;
+    dispatch.generationRect = configure.generationRect;
+    dispatch.frameID = inputs.frame_id;
+    return runtime.dispatch(&context, &dispatch.header) == FFX_API_RETURN_OK;
+  }
+
+  void Release() override {
+    if (context_) {
+      ffxContext context = context_;
+      GetFfxRuntime().destroy_context(&context, nullptr);
+      context_ = nullptr;
+    }
+    display_width_ = display_height_ = max_render_width_ = max_render_height_ = 0;
+  }
+
+ private:
+  const VulkanDevice* device_;
+  FrameGeneratorInfo info_;
+  uint64_t version_id_ = 0;
+  void* context_ = nullptr;
+  uint32_t display_width_ = 0;
+  uint32_t display_height_ = 0;
+  uint32_t max_render_width_ = 0;
+  uint32_t max_render_height_ = 0;
+  std::array<uint32_t, 4> failed_request_ = {};
+};
+
 }  // namespace
 #endif  // defined(REX_HAS_FFX_API) && REX_HAS_FFX_API
 
@@ -560,6 +759,15 @@ std::vector<std::unique_ptr<VulkanUpscaler>> CreateVulkanUpscalers(
   upscalers.push_back(std::make_unique<VulkanFfxUpscaler>(device, 2));
 #endif
   return upscalers;
+}
+
+std::unique_ptr<VulkanFrameGenerator> CreateVulkanFfxFrameGenerator(
+    [[maybe_unused]] const VulkanDevice* device) {
+#if defined(REX_HAS_FFX_API) && REX_HAS_FFX_API
+  return std::make_unique<VulkanFfxFrameGenerator>(device);
+#else
+  return nullptr;
+#endif
 }
 
 }  // namespace vulkan

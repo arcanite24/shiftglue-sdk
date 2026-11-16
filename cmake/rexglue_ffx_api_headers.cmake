@@ -35,6 +35,7 @@ set(_rexglue_ffx_api_files
     "ffx_api.h|29061c00601017954d88074714ebc6917e3ee08a72ccee898b1d01450268da40"
     "ffx_api_types.h|dee2782813d22047c068e0fb27d1347324f8ce79d280a4672848b3b294cb12fe"
     "ffx_upscale.h|1155bcdcea9c10e6a95507bc9422ca062a853ac84250f0b09a637a66836b3ac1"
+    "ffx_framegeneration.h|344936dccf49267d4421d1d74dc6db617d0a83c5a9f5991841325e812a38f127"
     "vk/ffx_api_vk.h|a50a8d5ff5689a10a6ce378f2df5569fd880c89ec46e8356aaf35eb40512edd9")
 foreach(_entry IN LISTS _rexglue_ffx_api_files)
     string(REPLACE "|" ";" _entry "${_entry}")

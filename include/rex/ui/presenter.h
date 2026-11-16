@@ -392,6 +392,9 @@ class Presenter {
 
   // What the guest output can be scaled with on this presenter.
   virtual std::vector<UpscalerInfo> GetUpscalers() const { return GetSpatialUpscalerInfos(); }
+  // UP-8.2: the frame generation providers present_frame_generation takes
+  // (kind temporal; available, or why not).
+  virtual std::vector<UpscalerInfo> GetFrameGenerators() const { return {}; }
   // Whether painting would use a copy of the guest output without the game's
   // HUD (a temporal upscaler, UP-1.2); the refresher then writes one where it
   // can tell the HUD apart. Read by the refresher at any time.
@@ -399,6 +402,9 @@ class Presenter {
   // Whether painting would use the game's depth and camera motion with the
   // guest output (a temporal upscaler, UP-1.3 and UP-1.4).
   virtual bool WantsGuestOutputCamera() const { return false; }
+  // UP-4.2: whether painting shows a generated frame after each real one,
+  // so the game should render at no more than half the display's refresh.
+  virtual bool IsFrameGenerating() const { return false; }
   // UP-1.5: the length of the jitter sequence the game should render with
   // (0: no jitter), for the temporal upscaler's ratio.
   virtual uint32_t GuestOutputJitterPhases() const { return 0; }

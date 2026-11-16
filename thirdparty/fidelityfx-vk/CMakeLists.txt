@@ -1,5 +1,5 @@
-# Builds AMD's FidelityFX API library for Vulkan (amd_fidelityfx_vk: FSR 2.3
-# and the FSR 3.1 upscaler) where AMD ships no signed runtime: Linux, Android
+# Builds AMD's FidelityFX API library for Vulkan (amd_fidelityfx_vk: FSR 2.3,
+# the FSR 3.1 upscaler and FSR 3.1 frame generation) where AMD ships no signed runtime: Linux, Android
 # and macOS. The provider (src/ui/vulkan/vulkan_ffx_upscaler.cpp) loads it
 # at run time from upscalers/fidelityfx/<version>/ beside the game (from the
 # package's libraries on Android), so this is a separate project:
@@ -13,13 +13,19 @@
 # The SDK compiles its shader permutations only with the Windows
 # FidelityFX_SC.exe, so vk-permutations.tar.gz holds its Vulkan output for
 # the pinned commit (generated on Windows with the ffx_shader_permutations_vk
-# target, FSR 2 and the FSR 3 upscaler only), checked by hash here.
+# target, configured with FFX_API_ENABLE_FRAMEGEN_PROVIDER=ON: FSR 2, the
+# FSR 3 upscaler, frame interpolation and optical flow; .d files left out),
+# checked by hash here.
+#
+# Frame generation is the API's frame generation provider, which the game
+# dispatches itself (src/ui/vulkan/vulkan_ffx_frame_generator.cpp). AMD's
+# replacement swapchain is Windows-only code and is not built.
 cmake_minimum_required(VERSION 3.21)
 project(rexglue_fidelityfx_vk C CXX)
 
 set(REXGLUE_FFX_COMMIT eee08db1688ac3d1275a70b728f4a8ba22914213)
 set(REXGLUE_FFX_PERMUTATIONS_SHA256
-    79445964fb9464a70a4f36871f6932cf1f6ea8f0d57216a221a4f5fb0ba1ef12)
+    71dae8a59dfffb66f0f8bae0016df8ed63cbee5a5cbb75a6522b6efd9900d92f)
 set(REXGLUE_FFX_SOURCE_DIR "" CACHE PATH
     "A checkout of rexglue/FidelityFX-SDK at ${REXGLUE_FFX_COMMIT} (fetched when empty)")
 
@@ -91,6 +97,36 @@ if(NOT _ffx_text MATCHES "fallbackCandidate")
     file(WRITE "${_ffx_vk}" "${_ffx_text}")
 endif()
 
+# The frame generation provider without AMD's swapchain replacement, whose
+# implementation (FrameInterpolationSwapchain) the SDK only builds on Windows.
+set(_ffx_provider "${_ffx_source}/ffx-api/src/ffx_provider.cpp")
+file(READ "${_ffx_provider}" _ffx_text)
+set(_ffx_swapchain_include "#include \"vk/ffx_provider_framegenerationswapchain_vk.h\"")
+set(_ffx_swapchain_entry "&ffxProvider_FrameGenerationSwapChain_VK::Instance,")
+string(FIND "${_ffx_text}" "${_ffx_swapchain_entry}" _ffx_at)
+if(NOT _ffx_at EQUAL -1)
+    string(FIND "${_ffx_text}" "${_ffx_swapchain_include}" _ffx_at)
+    if(_ffx_at EQUAL -1)
+        message(FATAL_ERROR "FidelityFX: ffx_provider.cpp is not the pinned version")
+    endif()
+    string(REPLACE "${_ffx_swapchain_include}" "// (no swapchain replacement)" _ffx_text "${_ffx_text}")
+    string(REPLACE "${_ffx_swapchain_entry}" "" _ffx_text "${_ffx_text}")
+    file(WRITE "${_ffx_provider}" "${_ffx_text}")
+endif()
+set(_ffx_api_lists "${_ffx_source}/ffx-api/CMakeLists.txt")
+file(READ "${_ffx_api_lists}" _ffx_text)
+if(NOT _ffx_text MATCHES "REXGLUE: no swapchain")
+    set(_ffx_framegen_check "if (NOT FFX_API_ENABLE_FRAMEGEN_PROVIDER)")
+    string(FIND "${_ffx_text}" "${_ffx_framegen_check}" _ffx_at)
+    if(_ffx_at EQUAL -1)
+        message(FATAL_ERROR "FidelityFX: ffx-api/CMakeLists.txt is not the pinned version")
+    endif()
+    string(REPLACE "${_ffx_framegen_check}"
+        "# REXGLUE: no swapchain replacement\nlist(FILTER private_ffx_api_backend_vk EXCLUDE REGEX \"framegenerationswapchain_vk\")\n${_ffx_framegen_check}"
+        _ffx_text "${_ffx_text}")
+    file(WRITE "${_ffx_api_lists}" "${_ffx_text}")
+endif()
+
 # The backend's output path: <ffx-api binary>/sdk/src/backends/shaders/vk.
 set(_ffx_archive "${CMAKE_CURRENT_SOURCE_DIR}/vk-permutations.tar.gz")
 file(SHA256 "${_ffx_archive}" _ffx_archive_hash)
@@ -117,7 +153,7 @@ elseif(UNIX AND NOT APPLE AND NOT Vulkan_LIBRARY)
 endif()
 
 set(FFX_API_BACKEND VK_X64 CACHE STRING "" FORCE)
-set(FFX_API_ENABLE_FRAMEGEN_PROVIDER OFF CACHE BOOL "" FORCE)
+set(FFX_API_ENABLE_FRAMEGEN_PROVIDER ON CACHE BOOL "" FORCE)
 set(FFX_API_AUTO_COMPILE_SHADERS OFF CACHE BOOL "" FORCE)
 set(FFX_PREBUILT_SHADER_PERMUTATIONS ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)

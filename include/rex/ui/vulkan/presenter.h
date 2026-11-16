@@ -23,6 +23,7 @@
 #include <rex/ui/presenter.h>
 #include <rex/ui/surface.h>
 #include <rex/ui/vulkan/device.h>
+#include <rex/ui/vulkan/frame_generator.h>
 #include <rex/ui/vulkan/instance.h>
 #include <rex/ui/vulkan/submission_tracker.h>
 #include <rex/ui/vulkan/ui_samplers.h>
@@ -182,11 +183,15 @@ class VulkanPresenter final : public Presenter {
   bool CaptureGuestOutput(RawImage& image_out) override;
   bool CapturePresentedOutput(RawImage& image_out) override;
   std::vector<UpscalerInfo> GetUpscalers() const override;
+  std::vector<UpscalerInfo> GetFrameGenerators() const override;
   bool WantsHudlessGuestOutput() const override {
     return hudless_guest_output_wanted_.load(std::memory_order_relaxed);
   }
   bool WantsGuestOutputCamera() const override {
     return guest_output_camera_wanted_.load(std::memory_order_relaxed);
+  }
+  bool IsFrameGenerating() const override {
+    return frame_generating_.load(std::memory_order_relaxed);
   }
   uint32_t GuestOutputJitterPhases() const override {
     return guest_output_jitter_phases_.load(std::memory_order_relaxed);
@@ -386,6 +391,10 @@ class VulkanPresenter final : public Presenter {
       ~Submission();
 
       VkSemaphore acquire_semaphore() const { return acquire_semaphore_; }
+      // The second image of a paint that presents a generated frame.
+      VkSemaphore frame_generation_acquire_semaphore() const {
+        return frame_generation_acquire_semaphore_;
+      }
       VkCommandPool draw_command_pool() const { return draw_command_pool_; }
       VkCommandBuffer draw_command_buffer() const { return draw_command_buffer_; }
 
@@ -396,6 +405,7 @@ class VulkanPresenter final : public Presenter {
 
       const VulkanDevice* vulkan_device_;
       VkSemaphore acquire_semaphore_ = VK_NULL_HANDLE;
+      VkSemaphore frame_generation_acquire_semaphore_ = VK_NULL_HANDLE;
       VkCommandPool draw_command_pool_ = VK_NULL_HANDLE;
       VkCommandBuffer draw_command_buffer_ = VK_NULL_HANDLE;
     };
@@ -481,7 +491,7 @@ class VulkanPresenter final : public Presenter {
         const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
         VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out,
         VkFormat& image_format_out, VkExtent2D& image_extent_out, bool& is_fifo_out,
-        bool& hdr_out, bool& ui_surface_unusable_out);
+        bool& hdr_out, bool& ui_surface_unusable_out, bool& frame_generation_out);
 
     // Destroys the swapchain and its derivatives, nulls `swapchain` and returns
     // the original swapchain object, if it existed, for use as oldSwapchain if
@@ -562,6 +572,12 @@ class VulkanPresenter final : public Presenter {
     uint64_t swapchain_last_present_id = 0;
     VkExtent2D swapchain_extent = {};
     bool swapchain_is_fifo = false;
+    // UP-4: the images can be copied to and from (present_frame_generation
+    // was on when the swapchain was made) and there is one for a generated
+    // frame besides the real one.
+    bool swapchain_frame_generation = false;
+    // present_frame_generation was on when the swapchain was made.
+    bool swapchain_frame_generation_requested = false;
     std::vector<VkImage> swapchain_images;
     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
     bool swapchain_hdr = false;
@@ -614,6 +630,21 @@ class VulkanPresenter final : public Presenter {
                                 const GuestOutputPaintConfig& config,
                                 const GuestOutputImage* camera_source = nullptr,
                                 const UpscalerCamera* camera = nullptr);
+
+  // UP-4: after the paint of a new guest frame, copies the finished image,
+  // generates the frame between the previous one and it, and copies that
+  // into a second swapchain image (generated_image_index_out). False when
+  // nothing was recorded: frame generation off, unusable or skipped.
+  bool RecordFrameGeneration(VkCommandBuffer command_buffer, VkSemaphore acquire_semaphore,
+                             uint32_t swapchain_image_index,
+                             const GuestOutputImage* guest_output_image,
+                             uint64_t guest_output_refresh_serial,
+                             const UpscalerCamera* camera, uint32_t render_width,
+                             uint32_t render_height, uint32_t& generated_image_index_out);
+  void ReleaseFrameGenerationImages();
+  // Counts each present for the frame generation log line, and writes the
+  // line every 5 seconds while the swapchain was made for frame generation.
+  void NoteFrameGenerationPresent(bool generated);
 
   const VulkanDevice* vulkan_device_;
   const UISamplers* ui_samplers_;
@@ -675,11 +706,53 @@ class VulkanPresenter final : public Presenter {
     uint64_t repeat_count = 0;
   };
   TemporalUpscaleState temporal_upscale_;
+  // UP-4 frame generation, used by painting only.
+  std::vector<std::unique_ptr<VulkanFrameGenerator>> frame_generators_;
+  struct FrameGenerationImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+  };
+  struct FrameGenerationState {
+    VulkanFrameGenerator* generator = nullptr;
+    // The finished real frame and the generated one, at the swapchain size.
+    FrameGenerationImage color;
+    FrameGenerationImage output;
+    VkExtent2D extent = {};
+    uint64_t last_image_submission = 0;
+    uint64_t frame_id = 0;
+    uint64_t refresh_serial = 0;
+    uint64_t last_real_us = 0;
+    // Mean time between real frames, for the pacing of the generated ones.
+    float interval_ms = 0.0f;
+    bool reset = true;
+    // Counts since the last log line.
+    uint64_t generated = 0;
+    uint64_t skipped_no_camera = 0;
+    uint64_t skipped_no_image = 0;
+    uint64_t skipped_repeat = 0;
+    uint64_t skipped_no_size = 0;
+    uint64_t failed = 0;
+    double gap_ms_sum = 0.0;
+    // Present spacing, from one vkQueuePresentKHR return to the next.
+    uint64_t presents = 0;
+    uint64_t presents_generated = 0;
+    double present_ms_sum = 0.0;
+    double present_ms_max = 0.0;
+    // Intervals under 12 ms, 12-22 ms, 22-40 ms and longer.
+    uint64_t present_buckets[4] = {};
+    uint64_t last_present_us = 0;
+    uint64_t last_log_us = 0;
+    bool logged_unusable = false;
+  };
+  FrameGenerationState frame_generation_;
   // UP-1.2: whether the last paint fed a temporal upscaler the guest output
   // directly, so the refresher should write the HUD-less copy.
   std::atomic<bool> hudless_guest_output_wanted_ = false;
   // UP-1.3: whether it would use the depth and camera motion.
   std::atomic<bool> guest_output_camera_wanted_ = false;
+  // Set by painting: the last new guest frame got a generated one.
+  std::atomic<bool> frame_generating_ = false;
   // UP-1.5: the jitter sequence length it wants, 0 for none.
   std::atomic<uint32_t> guest_output_jitter_phases_ = 0;
   // UP-1.2: draws the HUD over the upscale of the HUD-less copy
