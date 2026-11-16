@@ -98,10 +98,11 @@ REXCVAR_DEFINE_STRING(present_upscaler_view, "upscale", "UI/Presenter",
     .allowed({"upscale", "depth", "motion"});
 
 REXCVAR_DEFINE_STRING(present_frame_generation, "off", "UI/Presenter",
-                      "Show a generated frame between each two real ones: off, or fsr3 (AMD "
-                      "FSR 3.1 frame generation, needs the game's depth and camera motion). "
+                      "Show a generated frame between each two real ones: off, fsr3 (AMD FSR "
+                      "3.1 frame generation, needs the game's depth and camera motion), dlss "
+                      "(untested, present_dlssg_experimental) or lsfg (not runnable yet). "
                       "The swapchain is remade when it is turned on. SDR only")
-    .allowed({"off", "fsr3", "dlss"})
+    .allowed({"off", "fsr3", "dlss", "lsfg"})
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(present_frame_generation_log, false, "UI/Presenter",
@@ -4193,7 +4194,10 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
           CreateVulkanDlssFrameGenerator(vulkan_device_)) {
     frame_generators_.push_back(std::move(generator));
   }
-  frame_generators_.push_back(CreateVulkanLsfgFrameGenerator(vulkan_device_));
+  if (std::unique_ptr<VulkanFrameGenerator> generator =
+          CreateVulkanLsfgFrameGenerator(vulkan_device_)) {
+    frame_generators_.push_back(std::move(generator));
+  }
   for (const std::unique_ptr<VulkanFrameGenerator>& generator : frame_generators_) {
     const FrameGeneratorInfo& info = generator->info();
     if (info.available) {

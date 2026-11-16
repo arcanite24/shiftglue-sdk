@@ -7,6 +7,8 @@
  * and counts the DXBC shader containers in its resources without copying
  * them. Running them needs a DXBC to SPIR-V translation that is not written
  * yet, so the provider always reports itself unavailable, with the reason.
+ * Nothing is looked for unless present_lsfg_dll or present_lsfg_experimental
+ * is set.
  */
 
 #include <rex/ui/vulkan/frame_generator.h>
@@ -28,8 +30,12 @@
 #include <rex/ui/vulkan/device.h>
 
 REXCVAR_DEFINE_STRING(present_lsfg_dll, "", "UI/Presenter",
-                      "Path to the player's own Lossless.dll for LSFG frame generation; empty "
-                      "looks in the Steam library folders")
+                      "Path to the player's own Lossless.dll for LSFG frame generation")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(present_lsfg_experimental, false, "UI/Presenter",
+                    "Untested: look for Lossless.dll in the Steam library folders when "
+                    "present_lsfg_dll is empty")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex {
@@ -256,6 +262,9 @@ class VulkanLsfgFrameGenerator final : public VulkanFrameGenerator {
 }  // namespace
 
 std::unique_ptr<VulkanFrameGenerator> CreateVulkanLsfgFrameGenerator(const VulkanDevice*) {
+  if (REXCVAR_GET(present_lsfg_dll).empty() && !REXCVAR_GET(present_lsfg_experimental)) {
+    return nullptr;
+  }
   return std::make_unique<VulkanLsfgFrameGenerator>();
 }
 
