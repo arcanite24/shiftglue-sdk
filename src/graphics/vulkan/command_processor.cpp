@@ -7447,8 +7447,26 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   }
 #if defined(REXGPU_FH1_ORDERED_CENSUS)
   if (!skip_draw_command && d3d12::Fh1FrameCensus::OrderedEnabled()) {
-    d3d12::Fh1FrameCensus::ObserveOrderedDraw(
-        observation_frame_sequence_, ordered_census_pass_, pipeline_handle);
+    d3d12::Fh1FrameCensus::OrderedDrawInputs inputs;
+    const auto mix = [](uint64_t& hash, const uint32_t* words, size_t count) {
+      for (size_t i = 0; i < count; ++i) {
+        hash = (hash ^ words[i]) * 0x100000001B3ull;
+      }
+    };
+    inputs.textures = 0xCBF29CE484222325ull;
+    for (uint32_t mask = used_texture_mask, index; rex::bit_scan_forward(mask, &index);
+         mask &= ~(uint32_t(1) << index)) {
+      mix(inputs.textures, &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 6 * index], 6);
+    }
+    inputs.vertices = 0xCBF29CE484222325ull;
+    for (const Shader::VertexBinding& binding : vertex_shader->vertex_bindings()) {
+      mix(inputs.vertices,
+          &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 2 * binding.fetch_constant], 2);
+    }
+    inputs.index_base = index_buffer_info ? index_buffer_info->guest_base : 0;
+    inputs.blend = regs.values[XE_GPU_REG_RB_BLENDCONTROL0];
+    d3d12::Fh1FrameCensus::ObserveOrderedDraw(observation_frame_sequence_,
+                                              ordered_census_pass_, pipeline_handle, inputs);
   }
 #endif
   Checkpoint(CheckpointKind::kDrawEnd);

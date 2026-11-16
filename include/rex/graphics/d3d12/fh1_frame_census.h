@@ -40,7 +40,17 @@ class Fh1FrameCensus {
   // Optional Vulkan ordered census: selected cache-entry identity per emitted
   // guest draw, grouped by actual host rendering instance. Process-local IDs.
   static bool OrderedEnabled();
-  static void ObserveOrderedDraw(uint64_t frame, uint64_t pass, const void* pipeline);
+  // What an owned renderer would have to share to merge draws (FR-3's
+  // batching census): the texture and vertex fetch constants the draw's
+  // shaders read, its guest index base and RB_BLENDCONTROL0.
+  struct OrderedDrawInputs {
+    uint64_t textures = 0;
+    uint64_t vertices = 0;
+    uint32_t index_base = 0;
+    uint32_t blend = 0;
+  };
+  static void ObserveOrderedDraw(uint64_t frame, uint64_t pass, const void* pipeline,
+                                 const OrderedDrawInputs& inputs);
   static void ObserveOrderedSwap(uint64_t frame, uint64_t output_frame);
 #endif
   static bool Enabled();
