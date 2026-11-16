@@ -31,9 +31,14 @@ endfunction()
 # NVIDIA's DLSS runtime and licence (cmake/rexglue_dlss.cmake).
 function(_rexglue_stage_dlss_runtime target_name)
     if(REXGLUE_DLSS_RUNTIME_DIR AND REXGLUE_DLSS_INCLUDE_DIR)
+        # Frame generation's DLL is staged when present (kits made before
+        # UP-4.3 do not carry it).
+        set(_files "${REXGLUE_DLSS_RUNTIME_DIR}/nvngx_dlss.dll")
+        if(EXISTS "${REXGLUE_DLSS_RUNTIME_DIR}/nvngx_dlssg.dll")
+            list(APPEND _files "${REXGLUE_DLSS_RUNTIME_DIR}/nvngx_dlssg.dll")
+        endif()
         _rexglue_stage_upscaler_files(${target_name} "dlss/${REXGLUE_DLSS_VERSION}"
-            "${REXGLUE_DLSS_RUNTIME_DIR}/nvngx_dlss.dll"
-            "${REXGLUE_DLSS_RUNTIME_DIR}/LICENSE.txt")
+            ${_files} "${REXGLUE_DLSS_RUNTIME_DIR}/LICENSE.txt")
     endif()
 endfunction()
 

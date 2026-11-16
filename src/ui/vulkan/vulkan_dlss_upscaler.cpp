@@ -43,10 +43,9 @@ REXCVAR_DEFINE_STRING(present_dlss_preset, "default", "UI/Presenter",
                       "NVIDIA app's override replaces), j, k, l or m")
     .allowed({"default", "j", "k", "l", "m"});
 
-REXCVAR_DEFINE_BOOL(present_dlssg_experimental, false, "UI/Presenter",
-                    "Untested: offer DLSS frame generation (present_frame_generation=dlss) "
-                    "through NGX; needs nvngx_dlssg.dll beside nvngx_dlss.dll and an RTX 40 "
-                    "or newer GPU")
+REXCVAR_DEFINE_BOOL(present_dlss_frame_generation, true, "UI/Presenter",
+                    "Offer DLSS frame generation (present_frame_generation=dlss) through NGX; "
+                    "needs nvngx_dlssg.dll beside nvngx_dlss.dll and an RTX 40 or newer GPU")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_INT32(present_dlss_jitter_sign, 0, "UI/Presenter",
@@ -458,8 +457,7 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
 };
 
 // UP-4.3: DLSS frame generation through NGX, driven by the presenter like
-// FSR 3 frame generation. Untested (written without an RTX 40 GPU to run
-// it on): offered only with present_dlssg_experimental. The camera
+// FSR 3 frame generation (first run on an RTX 4080, 2026-11-16). The camera
 // matrices are built from the field of view; the motion vectors include the
 // camera's motion.
 class VulkanDlssFrameGenerator final : public VulkanFrameGenerator {
@@ -500,7 +498,7 @@ class VulkanDlssFrameGenerator final : public VulkanFrameGenerator {
     }
     info_.version = std::filesystem::path(setup.paths[0]).filename().string();
     info_.available = true;
-    REXLOG_INFO("DLSS frame generation available (untested, present_dlssg_experimental)");
+    REXLOG_INFO("DLSS frame generation available");
   }
 
   ~VulkanDlssFrameGenerator() override {
@@ -674,7 +672,7 @@ std::vector<const char*> GetVulkanUpscalerInstanceExtensions() {
     return {};
   }
   std::vector<const char*> names = KeepExtensionNames(properties, count);
-  if (REXCVAR_GET(present_dlssg_experimental)) {
+  if (REXCVAR_GET(present_dlss_frame_generation)) {
     NVSDK_NGX_FeatureDiscoveryInfo discovery = setup.discovery;
     discovery.FeatureID = NVSDK_NGX_Feature_FrameGeneration;
     count = 0;
@@ -709,7 +707,7 @@ std::vector<const char*> GetVulkanUpscalerDeviceExtensions(VkInstance instance,
     return {};
   }
   std::vector<const char*> names = KeepExtensionNames(properties, count);
-  if (REXCVAR_GET(present_dlssg_experimental)) {
+  if (REXCVAR_GET(present_dlss_frame_generation)) {
     NVSDK_NGX_FeatureDiscoveryInfo discovery = setup.discovery;
     discovery.FeatureID = NVSDK_NGX_Feature_FrameGeneration;
     count = 0;
@@ -732,7 +730,7 @@ std::unique_ptr<VulkanUpscaler> CreateVulkanDlssUpscaler(const VulkanDevice* dev
 }
 
 std::unique_ptr<VulkanFrameGenerator> CreateVulkanDlssFrameGenerator(const VulkanDevice* device) {
-  if (!REXCVAR_GET(present_dlssg_experimental)) {
+  if (!REXCVAR_GET(present_dlss_frame_generation)) {
     return nullptr;
   }
   return std::make_unique<VulkanDlssFrameGenerator>(device);

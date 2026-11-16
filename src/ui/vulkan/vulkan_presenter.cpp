@@ -100,7 +100,7 @@ REXCVAR_DEFINE_STRING(present_upscaler_view, "upscale", "UI/Presenter",
 REXCVAR_DEFINE_STRING(present_frame_generation, "off", "UI/Presenter",
                       "Show a generated frame between each two real ones: off, fsr3 (AMD FSR "
                       "3.1 frame generation, needs the game's depth and camera motion), dlss "
-                      "(untested, present_dlssg_experimental) or lsfg (not runnable yet). "
+                      "(NVIDIA DLSS frame generation, RTX 40 and newer) or lsfg (not runnable yet). "
                       "The swapchain is remade when it is turned on. SDR only")
     .allowed({"off", "fsr3", "dlss", "lsfg"})
     .lifecycle(rex::cvar::Lifecycle::kHotReload);

@@ -77,7 +77,7 @@ class VulkanFrameGenerator {
 // FSR 3.1 frame generation through the FidelityFX API (the same runtime as
 // the FSR upscalers), or null when the build has no FidelityFX API.
 std::unique_ptr<VulkanFrameGenerator> CreateVulkanFfxFrameGenerator(const VulkanDevice* device);
-// UP-4.3, untested: null unless present_dlssg_experimental is set.
+// UP-4.3: null when present_dlss_frame_generation is off.
 std::unique_ptr<VulkanFrameGenerator> CreateVulkanDlssFrameGenerator(const VulkanDevice* device);
 // UP-5.2: finds the player's Lossless.dll; unavailable until its shaders are
 // translated. Null unless present_lsfg_dll or present_lsfg_experimental is set.

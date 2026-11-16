@@ -15,7 +15,7 @@
 # instead of downloading.
 #
 # Sets REXGLUE_DLSS_INCLUDE_DIR and REXGLUE_DLSS_LIBRARY when available, and
-# REXGLUE_DLSS_RUNTIME_DIR (nvngx_dlss.dll and LICENSE.txt) with
+# REXGLUE_DLSS_RUNTIME_DIR (nvngx_dlss.dll, nvngx_dlssg.dll and LICENSE.txt) with
 # REXGLUE_DLSS_VERSION when the runtime is too.
 
 # Renamed from REXGLUE_DLSS (off by default) so build folders configured
@@ -48,6 +48,8 @@ set(_rexglue_dlss_files
     "lib/Windows_x86_64/x64/nvsdk_ngx_d.lib|bc43df9ec032004fde681d3e3afd01cde239e03a0125b822e88674c84287f99c")
 set(_rexglue_dlss_runtime_files
     "lib/Windows_x86_64/rel/nvngx_dlss.dll|d00b5b0ab29c3ca101b70c3a5ecb3a01b7ef33766a3383a28a18623083e6123e"
+    # DLSS frame generation (UP-4.3).
+    "lib/Windows_x86_64/rel/nvngx_dlssg.dll|8d59d49b36410dd6b62fef2503a5871d347415bd85d943fa0848563a95dd50c7"
     "LICENSE.txt|d4216e39ebef5f9b50a6712ebb37beeb5379862a67733a9999c651f21592aaf0")
 
 if(REXGLUE_DLSS_SDK_DIR)
@@ -124,6 +126,7 @@ _rexglue_dlss_fetch(_rexglue_dlss_ok ${_rexglue_dlss_runtime_files})
 if(_rexglue_dlss_ok)
     set(_rexglue_dlss_runtime "${CMAKE_BINARY_DIR}/nvidia-dlss-runtime")
     file(COPY "${_rexglue_dlss_dir}/lib/Windows_x86_64/rel/nvngx_dlss.dll"
+              "${_rexglue_dlss_dir}/lib/Windows_x86_64/rel/nvngx_dlssg.dll"
               "${_rexglue_dlss_dir}/LICENSE.txt"
          DESTINATION "${_rexglue_dlss_runtime}")
     set(REXGLUE_DLSS_RUNTIME_DIR "${_rexglue_dlss_runtime}" CACHE INTERNAL "")
