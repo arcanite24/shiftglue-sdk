@@ -76,6 +76,7 @@ REXCVAR_DEFINE_INT32(vulkan_log_pipeline_waits_ms, 0, "GPU/Vulkan",
     .range(0, 5000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
+REXCVAR_DECLARE(bool, fh1_occlusion_grid);
 #if defined(REXGLUE_ENABLE_CS_PROBES)
 REXCVAR_DECLARE(bool, gpu_async_fence_probe);
 REXCVAR_DECLARE(bool, gpu_async_fence_completion);
@@ -4094,7 +4095,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                                                 hudless_wanted || ambient_occlusion);
     hud_snapshot_view =
         fh1_native_executor_->TakeHudSnapshot(guest_output_width, guest_output_height);
-    fh1_native_executor_->SetCameraTrackingEnabled(camera_wanted || ambient_occlusion);
+    fh1_native_executor_->SetCameraTrackingEnabled(camera_wanted || ambient_occlusion ||
+                                                   REXCVAR_GET(fh1_occlusion_grid));
     // UP-1.7: once the object slot image is the guest output's size (made
     // between frames, IssueSwap) and initialised by a camera pass.
     const bool object_motion_wanted =

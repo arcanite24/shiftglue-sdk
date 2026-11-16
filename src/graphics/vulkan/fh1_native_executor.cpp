@@ -26,6 +26,7 @@
 #include <rex/memory.h>
 #include <rex/perf/counter.h>
 #include <rex/thread.h>
+#include <rex/system/fh1_occlusion_grid.h>
 #include <rex/system/thread_state.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -637,6 +638,7 @@ void Fh1NativeExecutor::Shutdown() {
   surfaces_.clear();
   DestroyHudSnapshot();
   DestroyCamera();
+  DestroyOcclusion();
   for (auto& [key, pipeline] : transfer_pipelines_) dfn.vkDestroyPipeline(device, pipeline, nullptr);
   transfer_pipelines_.clear();
   specialized_transfer_pipelines_ = 0;
@@ -3353,20 +3355,30 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
       untile_height_ ? uint32_t(std::max(0, -int32_t(regs.Get<reg::PA_SC_WINDOW_OFFSET>()
                                                          .window_y_offset)))
                      : 0u;
-  if (untile_height_ && !untile_band) EndUntiledTiling();
+  // Untiled, the scene is whole at its first resolve, before the last
+  // band is copied down over it (FR-3b: by the HUD the copy read zeros).
   // UP-1.3: each predicated tile's resolve ends a band of the scene depth
   // (the window offset moves its screen rows to the top of EDRAM).
-  if (!untile_height_ && camera_tracking_enabled_ && camera_scene_depth_valid_) {
+  // Untiled, the scene is whole at its first tile's resolve, before the
+  // last band is copied down over it (FR-3b: by the HUD the copy read
+  // zeros).
+  if (camera_tracking_enabled_ && camera_scene_depth_valid_ && (!untile_height_ || !untile_band)) {
     const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
     const auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
     const uint32_t msaa = uint32_t(surface_info.msaa_samples);
     if (MakeDepthKey(depth_info.depth_base, Fh1PitchTiles(surface_info.surface_pitch, msaa),
                      msaa, depth_info.depth_format)
             .Pack() == camera_scene_depth_) {
-      SnapshotCameraDepth(uint32_t(
-          std::max(0, -int32_t(regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset))));
+      if (untile_height_) {
+        SnapshotCameraDepth(0);
+        ReduceOcclusionDepth();
+      } else {
+        SnapshotCameraDepth(uint32_t(
+            std::max(0, -int32_t(regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset))));
+      }
     }
   }
+  if (untile_height_ && !untile_band) EndUntiledTiling();
   CopyPlan plan;
   if (!PlanCopy(plan)) {
     if (plan.empty) {
@@ -3712,6 +3724,7 @@ void Fh1NativeExecutor::OnSwap(uint64_t frame) {
   FinishCameraFrame();
   AdvanceJitter();
   if (!initialized_) return;
+  UpdateOcclusionGrid();
   ApplyCompletedDeferredReadbacks();
   ReleaseRetiredImages(false);
   UpdateCoarseShading();
@@ -3872,6 +3885,14 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
       "stats={{{}}}",
       frame, draws_, resolves_, surfaces_.size(), counters_.FormatSkips(),
       counters_.FormatStats());
+  {
+    uint64_t tested = 0, culled = 0;
+    rex::system::TakeFh1OcclusionCounts(tested, culled);
+    if (tested) {
+      REXGPU_INFO("FH1 occlusion culling: tested={} culled={} ({:.1f} %)", tested, culled,
+                  100.0 * double(culled) / double(tested));
+    }
+  }
   if (gpu_frames_) {
     const double tick_ns = command_processor_.GetVulkanDevice()->properties().timestampPeriod;
     const double scale = tick_ns / 1e6 / double(gpu_frames_);

@@ -469,6 +469,7 @@ void Fh1NativeExecutor::FinishCameraFrame() {
     REXGPU_INFO("FH1 camera: depth = {:.6g} + {:.6g} / view z", camera.depth_a, camera.depth_b);
   }
   camera_ready_ = camera;
+  camera_world_wvp_ = current;
   camera_ready_valid_ = true;
   camera_previous_objects_ = std::move(objects);
   if (!camera.cut) {
@@ -570,7 +571,11 @@ void Fh1NativeExecutor::SnapshotCameraDepth(uint32_t band_row) {
   // frame's first band, to the bottom of the lowest band seen, so frames
   // with a taller band than it has are dropped until the next.
   const uint32_t width = surface->width * scale_;
-  const uint32_t height = std::min(surface->height, surface->image_height) * scale_;
+  // Untiled, the image holds every screen row.
+  const uint32_t height =
+      std::min(untile_height_ ? std::max(surface->height, untile_height_) : surface->height,
+               surface->image_height) *
+      scale_;
   const uint32_t dest_row = band_row * scale_;
   camera_depth_wanted_height_ = std::max(camera_depth_wanted_height_, dest_row + height);
   if (camera_depth_rows_ &&

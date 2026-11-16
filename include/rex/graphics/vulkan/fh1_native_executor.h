@@ -619,6 +619,44 @@ class Fh1NativeExecutor {
   std::array<VkPipeline, 2> camera_depth_pipelines_ = {};
   VkDescriptorPool camera_depth_descriptor_pool_ = VK_NULL_HANDLE;
   std::array<VkDescriptorSet, 4> camera_depth_sets_ = {};
+  // The world group's matrix of the frame camera_ready_ describes.
+  std::array<float, 16> camera_world_wvp_ = {};
+
+  // FR-3b occlusion grid (fh1_occlusion.cpp): the swapped frame's camera
+  // depth reduced to tiles of the farthest depth, read back a few frames
+  // late and published to the title (rex/system/fh1_occlusion_grid.h).
+  struct OcclusionPending {
+    uint32_t slot;
+    uint64_t submission;
+    uint64_t frame;
+    std::array<float, 16> wvp;
+    float depth_a;
+    float depth_b;
+    uint32_t columns;
+    uint32_t rows;
+  };
+  // Untiled, at the scene's first resolve: reduce its depth into a slot.
+  void ReduceOcclusionDepth();
+  void UpdateOcclusionGrid();
+  bool EnsureOcclusionPipeline();
+  void DestroyOcclusion();
+  bool occlusion_failed_ = false;
+  VkDescriptorSetLayout occlusion_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout occlusion_pipeline_layout_ = VK_NULL_HANDLE;
+  // Single-sampled and multisampled sources.
+  std::array<VkPipeline, 2> occlusion_pipelines_ = {};
+  VkDescriptorPool occlusion_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, 4> occlusion_sets_ = {};
+  VkBuffer occlusion_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory occlusion_memory_ = VK_NULL_HANDLE;
+  const float* occlusion_mapped_ = nullptr;
+  std::deque<OcclusionPending> occlusion_pending_;
+  uint32_t occlusion_next_slot_ = 0;
+  bool occlusion_published_ = false;
+  // This frame's reduction, waiting for the frame's camera at the swap.
+  OcclusionPending occlusion_reduced_ = {};
+  bool occlusion_reduced_valid_ = false;
+  uint64_t occlusion_published_frame_ = 0;
 
   // Descriptor set layouts (set 0): source images (bindings 16 and 17) with
   // the storage buffer (binding 32) for compute, the source images for

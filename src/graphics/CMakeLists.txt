@@ -65,6 +65,7 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/fh1_native_executor.cpp
     vulkan/fh1_inspector.cpp
     vulkan/fh1_camera.cpp
+    vulkan/fh1_occlusion.cpp
     vulkan/command_processor.cpp
     vulkan/vulkan_draw_program.cpp
     vulkan/scene_post.cpp

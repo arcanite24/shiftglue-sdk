@@ -46,6 +46,7 @@ set(REXSYSTEM_SOURCES
     map_parser.cpp
     module.cpp
     function_dispatcher.cpp
+    fh1_occlusion_grid.cpp
     gpu_plugin_loader.cpp
     thread.cpp
     thread_state.cpp
