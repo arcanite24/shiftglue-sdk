@@ -76,14 +76,15 @@ void Fh1FrameCensus::ObserveOrderedSwap(uint64_t frame, uint64_t output_frame) {
   fmt::memory_buffer line;
   auto out = std::back_inserter(line);
   fmt::format_to(out,
-      "{{\"schema\":\"pinyon-shift.fh1-frame-order.v2\",\"backend\":\"vulkan\","
+      "{{\"schema\":\"pinyon-shift.fh1-frame-order.v3\",\"backend\":\"vulkan\","
       "\"identity\":\"process-local-pipeline-cache-entry\",\"frame\":{},"
       "\"output_frame\":{},\"overflow\":{},\"draws\":[", frame, output_frame, state.overflow);
   bool first = true;
   for (const auto& draw : state.draws) {
-    fmt::format_to(out, "{}[{},\"{:X}\",\"{:X}\",\"{:X}\",{},{}]", first ? "" : ",", draw.pass,
-                   draw.pipeline, draw.inputs.textures, draw.inputs.vertices,
-                   draw.inputs.index_base, draw.inputs.blend);
+    fmt::format_to(out, "{}[{},\"{:X}\",\"{:X}\",\"{:X}\",{},{},{},\"{:X}\"]", first ? "" : ",",
+                   draw.pass, draw.pipeline, draw.inputs.textures, draw.inputs.vertices,
+                   draw.inputs.index_base, draw.inputs.blend, draw.inputs.list,
+                   draw.inputs.dynamic_state);
     first = false;
   }
   fmt::format_to(out, "]}}\n");

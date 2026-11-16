@@ -48,6 +48,11 @@ class Fh1FrameCensus {
     uint64_t vertices = 0;
     uint32_t index_base = 0;
     uint32_t blend = 0;
+    // The innermost indirect buffer the draw came from, and a hash of the
+    // dynamic state a merged draw would also have to share (viewport,
+    // scissors, window offset, depth bias, stencil reference, face mode).
+    uint32_t list = 0;
+    uint64_t dynamic_state = 0;
   };
   static void ObserveOrderedDraw(uint64_t frame, uint64_t pass, const void* pipeline,
                                  const OrderedDrawInputs& inputs);

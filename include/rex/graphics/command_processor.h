@@ -552,6 +552,10 @@ class CommandProcessor {
   }
   // gpu_trace_bins_vblank: the indirect buffer nesting depth.
   uint32_t trace_ib_depth_ = 0;
+  // Decoder: the innermost indirect buffer being executed. Recorder: the one
+  // the draw being issued came from (DrawRecord::list_ptr).
+  uint32_t trace_ib_ptr_ = 0;
+  uint32_t draw_list_ptr_ = 0;
  protected:
   // Forgets the shader cache's shaders (before the backend destroys them).
   void D3dShaderCacheReset();
@@ -617,6 +621,9 @@ class CommandProcessor {
     uint32_t dma_size;
     IndexBufferInfo index_buffer_info;
     const char* opcode_name;
+    // The innermost indirect buffer the draw packet was in (decoder side),
+    // for censuses that group draws by command buffer.
+    uint32_t list_ptr = 0;
   };
   static constexpr uint32_t kRecordDraw = 3;
   // PD-1.2: an IM_LOAD as data (type, guest address, dword count, microcode

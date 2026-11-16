@@ -1934,8 +1934,14 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   ++trace_ib_depth_;
   struct DepthGuard {
     uint32_t& depth;
-    ~DepthGuard() { --depth; }
-  } depth_guard{trace_ib_depth_};
+    uint32_t& ptr;
+    uint32_t saved_ptr;
+    ~DepthGuard() {
+      --depth;
+      ptr = saved_ptr;
+    }
+  } depth_guard{trace_ib_depth_, trace_ib_ptr_, trace_ib_ptr_};
+  trace_ib_ptr_ = ptr;
   // DL-0.1 D3D source census (one flag check while it is off).
   d3d_census_decoder::IbBegin(ptr, count, trace_ib_depth_);
   d3d_skip_visible_ =
@@ -3428,6 +3434,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
     record.dma_size = fused_dma_size;
     record.index_buffer_info = index_buffer_info;
     record.opcode_name = opcode_name;
+    record.list_ptr = trace_ib_ptr_;
     if (!record_split_) {
       ExecuteDrawRecord(record);
     } else {
@@ -3453,6 +3460,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 }
 
 void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
+  draw_list_ptr_ = record.list_ptr;
   if (record.fused_registers) {
     // Per-draw registers outside the state epoch and hash, with no write side
     // effect: stored as WriteRegister would.

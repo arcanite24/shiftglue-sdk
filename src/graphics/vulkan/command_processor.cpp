@@ -7465,6 +7465,14 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     }
     inputs.index_base = index_buffer_info ? index_buffer_info->guest_base : 0;
     inputs.blend = regs.values[XE_GPU_REG_RB_BLENDCONTROL0];
+    inputs.list = draw_list_ptr_;
+    inputs.dynamic_state = 0xCBF29CE484222325ull;
+    mix(inputs.dynamic_state, &regs.values[XE_GPU_REG_PA_CL_VPORT_XSCALE], 6);
+    mix(inputs.dynamic_state, &regs.values[XE_GPU_REG_PA_SC_WINDOW_OFFSET], 3);
+    mix(inputs.dynamic_state, &regs.values[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_TL], 2);
+    mix(inputs.dynamic_state, &regs.values[XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE], 4);
+    mix(inputs.dynamic_state, &regs.values[XE_GPU_REG_RB_STENCILREFMASK], 1);
+    mix(inputs.dynamic_state, &regs.values[XE_GPU_REG_PA_SU_SC_MODE_CNTL], 1);
     d3d12::Fh1FrameCensus::ObserveOrderedDraw(observation_frame_sequence_,
                                               ordered_census_pass_, pipeline_handle, inputs);
   }
