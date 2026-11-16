@@ -40,6 +40,11 @@ set(_rexglue_dlss_files
     "include/nvsdk_ngx_params.h|943bc8cc5cdae03b6303016fbad3183636f2335ae27a2d18776798c3b4efabbc"
     "include/nvsdk_ngx_vk.h|2d364ce7132881eb669e9498fd570d74cba563b1fbebc82c235f8e1ad2dd8b6d"
     "include/nvsdk_ngx_helpers_vk.h|c192bff72138f12f770db48e12c1d8f712dfc81ea0e8e055ebb27d8dd1b31623"
+    # DLSS frame generation (UP-4.3).
+    "include/nvsdk_ngx.h|dc38e7467cf415379c9d12ae1b6e4a494c453ed92720fb53e92aecb523e7b848"
+    "include/nvsdk_ngx_defs_dlssg.h|c29765ab9e0125f9d724ae9811cc2abe03738d17486ec8eee80d78a1504549e1"
+    "include/nvsdk_ngx_params_dlssg.h|c24fa5aa68ffa2808c828b75cfa32843f1606f80a145f84055ac450d7e6c74ad"
+    "include/nvsdk_ngx_helpers_dlssg_vk.h|b371d90b9f4372b9a415e68a0afbdc2f31b7b552e219a9637d848749bc965316"
     "lib/Windows_x86_64/x64/nvsdk_ngx_d.lib|bc43df9ec032004fde681d3e3afd01cde239e03a0125b822e88674c84287f99c")
 set(_rexglue_dlss_runtime_files
     "lib/Windows_x86_64/rel/nvngx_dlss.dll|d00b5b0ab29c3ca101b70c3a5ecb3a01b7ef33766a3383a28a18623083e6123e"

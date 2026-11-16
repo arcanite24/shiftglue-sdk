@@ -77,6 +77,8 @@ class VulkanFrameGenerator {
 // FSR 3.1 frame generation through the FidelityFX API (the same runtime as
 // the FSR upscalers), or null when the build has no FidelityFX API.
 std::unique_ptr<VulkanFrameGenerator> CreateVulkanFfxFrameGenerator(const VulkanDevice* device);
+// UP-4.3, untested: null unless present_dlssg_experimental is set.
+std::unique_ptr<VulkanFrameGenerator> CreateVulkanDlssFrameGenerator(const VulkanDevice* device);
 
 }  // namespace vulkan
 }  // namespace ui
