@@ -910,9 +910,13 @@ struct ReplayProbeIb {
   uint64_t exit_bin_select = 0, exit_bin_mask = 0;
   Shader* exit_vertex_shader = nullptr;
   Shader* exit_pixel_shader = nullptr;
-  // Split decoding (mode 3): the record entries the buffer appended.
+  // Split decoding (mode 3): the record entries the buffer appended, and the
+  // decoder's last shader load of each type at the buffer's end.
   std::vector<uint32_t> words;
   bool words_ok = false;
+  bool exit_shader_valid[2] = {};
+  uint64_t exit_shader_hash[2] = {};
+  uint32_t exit_shader_dwords[2] = {};
 };
 struct ReplayProbeCapture {
   bool skippable = true;
@@ -1133,7 +1137,8 @@ void CommandProcessor::PacketWriteRegister(uint32_t index, uint32_t value) {
   } else if (index == XE_GPU_REG_SCRATCH_UMSK || index == XE_GPU_REG_SCRATCH_ADDR) {
     FlushPendingScratchWrites();
   }
-  if (elide_unchanged_registers_ && index < RegisterFile::kRegisterCount &&
+  if (elide_unchanged_registers_ && !replay_probe.capturing &&
+      index < RegisterFile::kRegisterCount &&
       decode_register_file_->values[index] == value && !RegisterWriteAlwaysMatters(index)) {
     // The recorder's register file already holds this value.
     return;
@@ -1207,7 +1212,7 @@ void CommandProcessor::PacketWriteRegistersFromMem(uint32_t start_index, const u
     }
     return;
   }
-  if (elide_unchanged_registers_) {
+  if (elide_unchanged_registers_ && !replay_probe.capturing) {
     // Record only the sub-runs that change a register (or whose write always
     // matters); the rest would leave the recorder's register file as it is.
     uint32_t* shadow = decode_register_file_->values + start_index;
@@ -1268,7 +1273,7 @@ void CommandProcessor::RecordRegisterRun(uint32_t start_index, const uint32_t* b
   // gap holding the registers' current values (rewriting a float constant
   // with its own value only stores it again).
   constexpr uint32_t kConstantRunMergeGap = 16;
-  if (REXCVAR_GET(gpu_record_merge_constant_runs) &&
+  if (REXCVAR_GET(gpu_record_merge_constant_runs) && !replay_probe.capturing &&
       start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
       start_index + num_registers - 1 <= XE_GPU_REG_SHADER_CONSTANT_511_W &&
       last_constant_run_batch_ == record_batch_.get() &&
@@ -2086,8 +2091,11 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
       }
       bin_select_ = probe_ib->exit_bin_select;
       bin_mask_ = probe_ib->exit_bin_mask;
-      decode_last_shader_load_[0].valid = false;
-      decode_last_shader_load_[1].valid = false;
+      for (int type = 0; type < 2; ++type) {
+        decode_last_shader_load_[type].valid = probe_ib->exit_shader_valid[type];
+        decode_last_shader_load_[type].hash = probe_ib->exit_shader_hash[type];
+        decode_last_shader_load_[type].dword_count = probe_ib->exit_shader_dwords[type];
+      }
       replay_probe.replayed_draws += probe_ib->drawn_draws;
       // Batches publish as decoding would (every 32 draws or 64 Ki words).
       record_batch_draws_ += probe_ib->drawn_draws;
@@ -2144,6 +2152,9 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
         // The capture starts on an entry boundary and no run merges across it.
         FlushPendingScratchWrites();
         last_constant_run_batch_ = nullptr;
+        // Its loads are all recorded, so its exit load state is its own.
+        decode_last_shader_load_[0].valid = false;
+        decode_last_shader_load_[1].valid = false;
         replay_probe.levels[probe_level].word_offset = record_batch_->words.size();
       }
     }
@@ -2228,6 +2239,11 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
                              words.end());
         ib.words.swap(capture.words);
         ib.words_ok = capture.words_ok;
+        for (int type = 0; type < 2; ++type) {
+          ib.exit_shader_valid[type] = decode_last_shader_load_[type].valid;
+          ib.exit_shader_hash[type] = decode_last_shader_load_[type].hash;
+          ib.exit_shader_dwords[type] = decode_last_shader_load_[type].dword_count;
+        }
         uint32_t draws = 0;
         for (size_t i = 0; i < ib.words.size();) {
           switch (ib.words[i]) {
@@ -4092,7 +4108,8 @@ void CommandProcessor::LoadGuestShader(xenos::ShaderType shader_type, uint32_t a
     decode_shader_loads_.store(decode_shader_loads_.load(std::memory_order_relaxed) + 1,
                                std::memory_order_relaxed);
     LastShaderLoad& last = decode_last_shader_load_[shader_type == xenos::ShaderType::kPixel];
-    if (last.valid && last.hash == ucode_hash && last.dword_count == size_dwords) {
+    if (last.valid && last.hash == ucode_hash && last.dword_count == size_dwords &&
+        !replay_probe.capturing) {
       // The recorder would look up the same shader and set it again.
       decode_shader_loads_skipped_.store(
           decode_shader_loads_skipped_.load(std::memory_order_relaxed) + 1,
