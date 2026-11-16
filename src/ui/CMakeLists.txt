@@ -41,6 +41,7 @@ set(REXUI_VULKAN_SOURCES
     vulkan/ui_samplers.cpp
     vulkan/vulkan_dlss_upscaler.cpp
     vulkan/vulkan_ffx_upscaler.cpp
+    vulkan/vulkan_lsfg_frame_generator.cpp
     vulkan/vulkan_device.cpp
     vulkan/vulkan_immediate_drawer.cpp
     vulkan/vulkan_instance.cpp

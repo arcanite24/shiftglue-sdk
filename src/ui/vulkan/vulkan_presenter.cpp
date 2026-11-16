@@ -4193,6 +4193,7 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
           CreateVulkanDlssFrameGenerator(vulkan_device_)) {
     frame_generators_.push_back(std::move(generator));
   }
+  frame_generators_.push_back(CreateVulkanLsfgFrameGenerator(vulkan_device_));
   for (const std::unique_ptr<VulkanFrameGenerator>& generator : frame_generators_) {
     const FrameGeneratorInfo& info = generator->info();
     if (info.available) {
