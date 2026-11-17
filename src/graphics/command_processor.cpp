@@ -2884,7 +2884,8 @@ bool CommandProcessor::PredicatedOut(uint32_t packet, uint32_t opcode) const {
                           (bin_mask_ & ~uint64_t(3)) &&
                           (bin_mask_ == (uint64_t(3) << rex::tzcnt(uint32_t(bin_mask_)))) &&
                           !(rex::tzcnt(uint32_t(bin_mask_)) & 1);
-  const uint64_t select = untile_select_all_ && TilingPassOfSelect() == 0 && !tile_state
+  const uint64_t select = untile_select_all_ && TilingPassOfSelect() == 0 && !tile_state &&
+                                  UntileSurface(*register_file_)
                               ? ~uint64_t(0)
                               : bin_select_;
   const bool any_pass = (select & bin_mask_) != 0;
@@ -3678,7 +3679,8 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
             "FH1 debug draw {} mode={} prim={} indices={} vs={:016X} ps={:016X} color0={:08X} "
             "surface={:08X} mask={:08X} blend0={:08X} depth={:08X} vte={:08X} "
             "window_scissor={:08X}/{:08X} copy_dest={:08X} copy_info={:08X} copy_ctrl={:08X} "
-            "stencil={:08X}/{:08X} colorcontrol={:08X} depth_info={:08X}{}",
+            "stencil={:08X}/{:08X} colorcontrol={:08X} depth_info={:08X} window_offset={:08X} "
+            "screen_scissor={:08X}/{:08X} pass={} bins={:X}/{:X}{}",
             draw_index, regs[XE_GPU_REG_RB_MODECONTROL] & 7, uint32_t(vgt_draw_initiator.prim_type),
             uint32_t(vgt_draw_initiator.num_indices),
             active_vertex_shader_ ? active_vertex_shader_->ucode_data_hash() : 0,
@@ -3690,7 +3692,9 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
             regs[XE_GPU_REG_RB_COPY_DEST_BASE], regs[XE_GPU_REG_RB_COPY_DEST_INFO],
             regs[XE_GPU_REG_RB_COPY_CONTROL], regs[XE_GPU_REG_RB_STENCILREFMASK],
             regs[XE_GPU_REG_RB_STENCILREFMASK_BF], regs[XE_GPU_REG_RB_COLORCONTROL],
-            regs[XE_GPU_REG_RB_DEPTH_INFO], textures);
+            regs[XE_GPU_REG_RB_DEPTH_INFO], regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET],
+            regs[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_TL], regs[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR],
+            TilingPassOfSelect(), bin_mask_, bin_select_, textures);
       }
       static const auto null_fetch = [] {
         uint32_t draw = UINT32_MAX, fetch = 0;

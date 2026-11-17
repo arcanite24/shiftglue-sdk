@@ -49,6 +49,8 @@ class VulkanTextureCache;
 struct Fh1VulkanExecutorConfig {
   // fh1_untile_predicated_tiling: the screen height in guest pixels, or 0.
   uint32_t untile_height = 0;
+  // fh1_untile_msaa_mask: the guest MSAA modes whose tilings are untiled.
+  uint32_t untile_msaa_mask = 7;
   bool msaa_2x_supported = true;
   bool gamma_as_unorm16 = false;
   bool depth_float24_round = false;
@@ -530,6 +532,12 @@ class Fh1NativeExecutor {
   // fh1_untile_predicated_tiling: the screen height the images hold, and the
   // last later-tile band resolved from each surface since the tiling began.
   uint32_t untile_height_ = 0;
+  // Untiled now: the target surface's MSAA mode is in fh1_untile_msaa_mask.
+  bool UntileSurface() const {
+    return untile_height_ &&
+           ((config_.untile_msaa_mask >>
+             uint32_t(register_file_.Get<reg::RB_SURFACE_INFO>().msaa_samples)) & 1);
+  }
   std::unordered_map<uint32_t, uint32_t> untile_bands_;
   bool initialized_ = false;
   // present_hdr's snapshot of the scene before the HUD: the scene target's

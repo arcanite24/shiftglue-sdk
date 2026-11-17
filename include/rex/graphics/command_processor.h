@@ -540,6 +540,13 @@ class CommandProcessor {
   // predicated packets run as if every tile's bins were selected.
   bool untile_tiling_ = false;
   bool untile_select_all_ = false;
+  // fh1_untile_msaa_mask: the guest MSAA modes (bit per xenos::MsaaSamples)
+  // whose tilings are untiled; a tiling on another surface keeps its tiles.
+  uint32_t untile_msaa_mask_ = 7;
+  bool UntileSurface(const RegisterFile& regs) const {
+    return untile_tiling_ &&
+           ((untile_msaa_mask_ >> uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples)) & 1);
+  }
   // Draws the backend skipped for a later untile pass (gpu_replay_floor_probe
   // counts drawn draws as the decoded ones minus these).
   uint64_t untile_skipped_draws_ = 0;

@@ -278,7 +278,7 @@ uint32_t Fh1NativeExecutor::CurrentDepthKey() const {
 }
 
 int32_t Fh1NativeExecutor::ObjectRowOffset() const {
-  if (untile_height_) return 0;
+  if (UntileSurface()) return 0;
   return std::max(0, -int32_t(register_file_.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset)) *
          int32_t(scale_);
 }

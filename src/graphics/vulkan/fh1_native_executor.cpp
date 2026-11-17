@@ -2208,7 +2208,7 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1DrawInfo& draw) {
       depth_control.zfunc != xenos::CompareFunction::kAlways &&
       depth_control.zfunc != xenos::CompareFunction::kNever;
   const auto window = register_file_.Get<reg::PA_SC_WINDOW_OFFSET>();
-  const bool untile_shifted = untile_height_ &&
+  const bool untile_shifted = UntileSurface() &&
       (window.window_x_offset || window.window_y_offset);
   if (enabled && !single_sample_msaa_ && !two_sample_msaa_ && !untile_shifted &&
       !draw.memexport && !draw.occlusion_query_active && !reads_depth &&
@@ -3372,7 +3372,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
   // Untiled tiling: a later tile's band is at its screen rows of the
   // surfaces, past the EDRAM rows its window offset maps it to.
   const uint32_t untile_band =
-      untile_height_ ? uint32_t(std::max(0, -int32_t(regs.Get<reg::PA_SC_WINDOW_OFFSET>()
+      UntileSurface() ? uint32_t(std::max(0, -int32_t(regs.Get<reg::PA_SC_WINDOW_OFFSET>()
                                                          .window_y_offset)))
                      : 0u;
   // UP-1.3: each predicated tile's resolve ends a band of the scene depth
@@ -3380,14 +3380,14 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
   // Untiled, the scene is whole at its first tile's resolve, before the
   // last band is copied down over it: the FR-3b occlusion grid reduces it
   // there (the camera copy still waits for the HUD).
-  if (camera_tracking_enabled_ && camera_scene_depth_valid_ && (!untile_height_ || !untile_band)) {
+  if (camera_tracking_enabled_ && camera_scene_depth_valid_ && (!UntileSurface() || !untile_band)) {
     const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
     const auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
     const uint32_t msaa = uint32_t(surface_info.msaa_samples);
     if (MakeDepthKey(depth_info.depth_base, Fh1PitchTiles(surface_info.surface_pitch, msaa),
                      msaa, depth_info.depth_format)
             .Pack() == camera_scene_depth_) {
-      if (untile_height_) {
+      if (UntileSurface()) {
         ReduceOcclusionDepth();
       } else {
         SnapshotCameraDepth(uint32_t(
@@ -3662,7 +3662,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     const auto window = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
     const bool shared = REXCVAR_GET(fh1_shared_depth_alias) &&
         !single_sample_msaa_ && !two_sample_msaa_ &&
-        (!untile_height_ || (!window.window_x_offset && !window.window_y_offset)) && key.is_depth &&
+        (!UntileSurface() || (!window.window_x_offset && !window.window_y_offset)) && key.is_depth &&
         key.base_tiles == 0 && key.pitch_tiles == 16 &&
         key.msaa == uint32_t(xenos::MsaaSamples::k4X) &&
         key.format == uint32_t(xenos::DepthRenderTargetFormat::kD24FS8);

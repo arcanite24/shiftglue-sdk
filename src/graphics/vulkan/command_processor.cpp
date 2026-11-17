@@ -106,6 +106,11 @@ REXCVAR_DEFINE_BOOL(fh1_untile_early_skip, true, "GPU",
                     "IssueDraw instead of after its shaders, primitives, samplers and textures "
                     "were set up (NN-2.1)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(fh1_untile_msaa_mask, 7, "GPU",
+                     "fh1_untile_predicated_tiling: the guest MSAA modes whose tilings are "
+                     "untiled (bit 0 1X, bit 1 2X, bit 2 4X); a tiling on another surface keeps "
+                     "its tiles (FM3's menus tile at 4X and are cut untiled)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(fh1_untile_height, 720, "GPU",
                      "The screen height in guest pixels the untiled first tile renders "
                      "(fh1_untile_predicated_tiling)")
@@ -2640,6 +2645,8 @@ void VulkanCommandProcessor::CreateNativeExecutor() {
     native_config.render_targets = render_target_cache_.get();
     native_config.untile_height =
         REXCVAR_GET(fh1_untile_predicated_tiling) ? uint32_t(REXCVAR_GET(fh1_untile_height)) : 0;
+    native_config.untile_msaa_mask = uint32_t(REXCVAR_GET(fh1_untile_msaa_mask)) & 7;
+    untile_msaa_mask_ = native_config.untile_msaa_mask;
     if (!fh1_native_executor_->Initialize(native_config)) {
       REXGPU_WARN("FH1 native executor unavailable; using the render target cache");
       fh1_native_executor_.reset();
@@ -6151,6 +6158,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   // setup between here and there only fed the skipped draw.
   if (untile_tiling_ && REXCVAR_GET(fh1_untile_early_skip) &&
       regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset && TilingPassOfSelect() != 0 &&
+      UntileSurface(regs) &&
       !(REXCVAR_GET(fh1_debug_untile) & 2)) {
     fh1_native_executor_->CountEvent("untile_skipped_draw");
     PERF_counter_inc(kFh1UntileSkippedDraws);
@@ -6859,7 +6867,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         TraceTiling("draw", regs, bin_select(), bin_mask(), trace_swaps_);
       }
       const auto window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
-      if (untile_tiling_) {
+      if (UntileSurface(regs)) {
         if (window_offset.window_y_offset && TilingPassOfSelect() != 0 &&
             !(REXCVAR_GET(fh1_debug_untile) & 2)) {
           // The first tile drew these objects over the whole height.
@@ -9719,7 +9727,8 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
   // first tile's draws cover the whole screen height.
   int32_t untile_rows = 0;
   bool untile_first_tile = false;
-  if (untile_tiling_) {
+  const bool untile_surface = UntileSurface(regs);
+  if (untile_surface) {
     untile_rows = -pa_sc_window_offset.window_y_offset;
     untile_first_tile = untile_select_all_ && TilingPassOfSelect() == 0;
     viewport.x -= float(pa_sc_window_offset.window_x_offset * int32_t(draw_resolution_scale_x));
@@ -9744,7 +9753,7 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
   scissor.offset[1] *= draw_resolution_scale_y;
   scissor.extent[0] *= draw_resolution_scale_x;
   scissor.extent[1] *= draw_resolution_scale_y;
-  if (untile_tiling_) {
+  if (untile_surface) {
     scissor.offset[0] = uint32_t(int32_t(scissor.offset[0]) -
                                  pa_sc_window_offset.window_x_offset *
                                      int32_t(draw_resolution_scale_x));
