@@ -120,7 +120,9 @@ namespace rex::cvar {
 //=============================================================================
 
 std::vector<std::string> Init(int argc, char** argv);
-void LoadConfig(const std::filesystem::path& config_path);
+// Returns the parse error, or an empty string. A file that does not parse
+// applies none of its values.
+std::string LoadConfig(const std::filesystem::path& config_path);
 void ApplyEnvironment();
 void FinalizeInit();
 bool IsFinalized();

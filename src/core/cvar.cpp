@@ -753,10 +753,10 @@ std::vector<std::string> Init(int argc, char** argv) {
   return positional;
 }
 
-void LoadConfig(const std::filesystem::path& config_path) {
+std::string LoadConfig(const std::filesystem::path& config_path) {
   if (!std::filesystem::exists(config_path)) {
     REXLOG_DEBUG("Config file not found: {}", rex::path_to_utf8(config_path));
-    return;
+    return {};
   }
 
   // Read through the path: path::string() is in the ANSI code page on
@@ -767,7 +767,7 @@ void LoadConfig(const std::filesystem::path& config_path) {
     std::ifstream file(config_path, std::ios::binary);
     if (!file) {
       REXLOG_ERROR("Failed to open config {}", name);
-      return;
+      return "cannot be opened";
     }
     const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
     auto config = toml::parse(text, name);
@@ -775,7 +775,10 @@ void LoadConfig(const std::filesystem::path& config_path) {
     REXLOG_DEBUG("Loaded config from {}", name);
   } catch (const toml::parse_error& err) {
     REXLOG_ERROR("Failed to parse config {}: {}", name, err.what());
+    const auto& where = err.source().begin;
+    return fmt::format("line {}, column {}: {}", where.line, where.column, err.description());
   }
+  return {};
 }
 
 void ApplyEnvironment() {

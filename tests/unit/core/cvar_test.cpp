@@ -190,7 +190,22 @@ TEST_CASE("cvar TOML config loading", "[cvar]") {
 
   SECTION("Nonexistent config is handled gracefully") {
     auto missing = temp_dir / "nonexistent.toml";
-    rex::cvar::LoadConfig(missing);
+    CHECK(rex::cvar::LoadConfig(missing).empty());
+  }
+
+  SECTION("A config that does not parse reports where and applies nothing") {
+    std::ofstream file(config_path);
+    file << "test_int32_flag = 999\n";
+    file << "test_string_flag = off\n";
+    file.close();
+
+    REXCVAR_SET(test_int32_flag, 0);
+    const std::string error = rex::cvar::LoadConfig(config_path);
+
+    CHECK(error.find("line 2") != std::string::npos);
+    CHECK(REXCVAR_GET(test_int32_flag) == 0);
+
+    std::filesystem::remove(config_path);
   }
 }
 

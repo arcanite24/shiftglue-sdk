@@ -168,8 +168,9 @@ bool ReXApp::SetupEnvironment() {
   resolved_defaults_ = std::move(path_config);
 
   // Load config FIRST so log cvars have final values
+  std::string config_error;
   if (std::filesystem::exists(config_path_))
-    rex::cvar::LoadConfig(config_path_);
+    config_error = rex::cvar::LoadConfig(config_path_);
 
   // Late-phase logging
   std::string log_file_cvar = REXCVAR_GET(log_file);
@@ -193,8 +194,14 @@ bool ReXApp::SetupEnvironment() {
 
   OnPostInitLogging();
 
-  if (std::filesystem::exists(config_path_))
+  // The parse ran before logging: a file that does not parse applied none
+  // of its values, and nothing said so.
+  if (!config_error.empty()) {
+    REXLOG_ERROR("Config {} does not parse ({}); every setting in it is ignored",
+                 rex::path_to_utf8(config_path_), config_error);
+  } else if (std::filesystem::exists(config_path_)) {
     REXLOG_DEBUG("Loaded config: {}", rex::path_to_utf8(config_path_.filename()));
+  }
 
   REXLOG_DEBUG("{} starting", GetName());
   if (!game_data_root_.empty()) {
