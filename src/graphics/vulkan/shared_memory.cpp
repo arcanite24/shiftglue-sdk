@@ -261,6 +261,8 @@ void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_
 
 bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
                                                           uint32_t length_allocations) {
+  rex::perf::ScopedCounterNs census(rex::perf::CounterId::kGpuMemoryAllocationNs,
+                                    rex::perf::CounterId::kGpuMemoryAllocations);
   if (!length_allocations) {
     return true;
   }

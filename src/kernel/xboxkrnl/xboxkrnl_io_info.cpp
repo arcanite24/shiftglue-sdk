@@ -15,6 +15,7 @@
 #include <rex/filesystem/device.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
+#include <rex/perf/counter.h>
 #include <rex/session_probe.h>
 #include <rex/memory.h>
 #include <rex/hook.h>
@@ -107,6 +108,8 @@ uint32_t GetQueryFileInfoMinimumLength(uint32_t info_class) {
 
 u32 NtQueryInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block_ptr,
                                  mapped_void info_ptr, u32 info_length, u32 info_class) {
+  rex::perf::ScopedCounterNs query_census(rex::perf::CounterId::kFileQueryInfoNs,
+                                          rex::perf::CounterId::kFileQueryInfos);
   const bool trace = session_probe::ExternalEnabled();
   if (trace) { session_probe::Scalar(session_probe::Kind::kIoReadRequest, 1, (uint64_t(file_handle) << 32) | info_class); session_probe::Scalar(session_probe::Kind::kIoReadRequest, info_ptr.guest_address(), info_length); }
   auto live = [&]() -> u32 {

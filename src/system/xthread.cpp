@@ -1343,6 +1343,7 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
       (uint64_t(alertable) << 32) | processor_mode, interval);
   int64_t timeout_ticks = interval;
   uint32_t timeout_ms;
+  PERF_counter_inc(kGuestDelays);
   if (timeout_ticks > 0) {
     // Absolute time, based on January 1, 1601.
     // TODO(benvanik): convert time to relative time.
@@ -1351,6 +1352,7 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
   } else if (timeout_ticks < 0) {
     // Relative time.
     timeout_ms = uint32_t(-timeout_ticks / 10000);  // Ticks -> MS
+    if (-timeout_ticks % 10000) PERF_counter_inc(kGuestDelaysTruncated);
   } else {
     timeout_ms = 0;
   }

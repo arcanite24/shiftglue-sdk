@@ -286,6 +286,32 @@ constexpr const char* kCounterNames[] = {
     "gpu_bindless_overflows",
     "d3d_program_mark_drops",
     "d3d_program_mark_reclaims",
+    "file_opens",
+    "file_open_misses",
+    "file_open_ns",
+    "file_reads",
+    "file_read_bytes",
+    "file_read_ns",
+    "file_scatter_reads",
+    "file_scatter_segments",
+    "file_scatter_bytes",
+    "file_query_infos",
+    "file_query_info_ns",
+    "xam_deferred_completions",
+    "xam_deferred_sleep_ns",
+    "occlusion_query_ends",
+    "occlusion_query_await_ns",
+    "gpu_memory_allocations",
+    "gpu_memory_allocation_ns",
+    "texture_loads",
+    "texture_load_cpu_ns",
+    "guest_delays",
+    "guest_delays_truncated",
+    "file_opens_async",
+    "file_reads_async",
+    "xam_ui_sleep_ns",
+    "title_lzx_calls",
+    "title_lzx_ns",
 };
 static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
 
@@ -440,6 +466,32 @@ constexpr bool kIsGauge[] = {
     false,  // kGpuBindlessOverflows
     false,  // kD3dProgramMarkDrops
     false,  // kD3dProgramMarkReclaims
+    false,  // kFileOpens
+    false,  // kFileOpenMisses
+    false,  // kFileOpenNs
+    false,  // kFileReads
+    false,  // kFileReadBytes
+    false,  // kFileReadNs
+    false,  // kFileScatterReads
+    false,  // kFileScatterSegments
+    false,  // kFileScatterBytes
+    false,  // kFileQueryInfos
+    false,  // kFileQueryInfoNs
+    false,  // kXamDeferredCompletions
+    false,  // kXamDeferredSleepNs
+    false,  // kOcclusionQueryEnds
+    false,  // kOcclusionQueryAwaitNs
+    false,  // kGpuMemoryAllocations
+    false,  // kGpuMemoryAllocationNs
+    false,  // kTextureLoads
+    false,  // kTextureLoadCpuNs
+    false,  // kGuestDelays
+    false,  // kGuestDelaysTruncated
+    false,  // kFileOpensAsync
+    false,  // kFileReadsAsync
+    false,  // kXamUiSleepNs
+    false,  // kTitleLzxCalls
+    false,  // kTitleLzxNs
 };
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 

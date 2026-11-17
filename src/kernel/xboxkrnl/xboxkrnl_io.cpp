@@ -20,6 +20,7 @@
 #include <rex/logging.h>
 #include <rex/session_probe.h>
 #include <rex/memory.h>
+#include <rex/perf/counter.h>
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/system/info/file.h>
@@ -169,6 +170,8 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
     return X_STATUS_INVALID_PARAMETER;
   }
   assert_not_null(handle_out);
+  rex::perf::ScopedCounterNs open_census(rex::perf::CounterId::kFileOpenNs,
+                                         rex::perf::CounterId::kFileOpens);
 
   auto object_name = REX_KERNEL_MEMORY()->TranslateVirtual<X_ANSI_STRING*>(object_attrs->name_ptr);
 
@@ -213,6 +216,7 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
     bool synchronous = (create_options & CreateOptions::FILE_SYNCHRONOUS_IO_ALERT) ||
                        (create_options & CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT);
     file = object_ref<XFile>(new XFile(REX_KERNEL_STATE(), vfs_file, synchronous));
+    if (!synchronous) PERF_counter_inc(kFileOpensAsync);
 
     // Handle ref is incremented, so return that.
     handle = file->handle();
@@ -238,6 +242,7 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
         static_cast<uint32_t>(result), static_cast<uint32_t>(file_action), handle);
   }
   if (XFAILED(result)) {
+    PERF_counter_inc(kFileOpenMisses);
     REXKRNL_IMPORT_FAIL("NtCreateFile", "path='{}' -> {:#x}", target_path, result);
   } else {
     REXKRNL_IMPORT_RESULT("NtCreateFile", "{:#x} handle={:#x}", result, handle);
@@ -282,9 +287,13 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
   if (XSUCCEEDED(result)) {
     if (true || file->is_synchronous()) {
       // Synchronous.
+      rex::perf::ScopedCounterNs read_census(rex::perf::CounterId::kFileReadNs,
+                                             rex::perf::CounterId::kFileReads);
+      if (!file->is_synchronous()) PERF_counter_inc(kFileReadsAsync);
       result = file->Read(buffer.guest_address(), buffer_length,
                           byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
                           &bytes_read, apc_context.guest_address());
+      PERF_counter_add(kFileReadBytes, bytes_read);
       if (io_status_block) {
         io_status_block->status = result;
         io_status_block->information = bytes_read;
@@ -394,9 +403,12 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
     if (true || file->is_synchronous()) {
       // Synchronous.
       uint32_t bytes_read = 0;
+      rex::perf::ScopedCounterNs read_census(rex::perf::CounterId::kFileReadNs,
+                                             rex::perf::CounterId::kFileScatterReads);
       result = file->ReadScatter(segment_array.guest_address(), length,
                                  byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
                                  &bytes_read, apc_context.guest_address());
+      PERF_counter_add(kFileScatterBytes, bytes_read);
       if (io_status_block) {
         io_status_block->status = result;
         io_status_block->information = bytes_read;

@@ -10,6 +10,7 @@
  */
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -261,6 +262,38 @@ enum class CounterId : uint16_t {
   kGpuBindlessOverflows,
   kD3dProgramMarkDrops,
   kD3dProgramMarkReclaims,
+  // Console-era loading census (docs/CONSOLE_ERA_RESEARCH.md CE-0.4): guest file
+  // opens (and misses), reads, scatter reads, file queries, deferred XAM
+  // completions and their sleep, occlusion-query ends and their queue wait,
+  // device memory allocations, texture loads and their CPU time, guest delays
+  // (and those the millisecond rounding shortened).
+  kFileOpens,
+  kFileOpenMisses,
+  kFileOpenNs,
+  kFileReads,
+  kFileReadBytes,
+  kFileReadNs,
+  kFileScatterReads,
+  kFileScatterSegments,
+  kFileScatterBytes,
+  kFileQueryInfos,
+  kFileQueryInfoNs,
+  kXamDeferredCompletions,
+  kXamDeferredSleepNs,
+  kOcclusionQueryEnds,
+  kOcclusionQueryAwaitNs,
+  kGpuMemoryAllocations,
+  kGpuMemoryAllocationNs,
+  kTextureLoads,
+  kTextureLoadCpuNs,
+  kGuestDelays,
+  kGuestDelaysTruncated,
+  kFileOpensAsync,
+  kFileReadsAsync,
+  kXamUiSleepNs,
+  // The title's LZX archive decompression (Pinyon Shift's native decoder).
+  kTitleLzxCalls,
+  kTitleLzxNs,
 
   kCount  // sentinel -- must be last
 };
@@ -370,6 +403,27 @@ class Profiler {
     return false;
 #endif
   }
+};
+
+// Adds the nanoseconds a scope took to `time` and, when given, one to `count`
+// (the CE-0.4 load census).
+class ScopedCounterNs {
+ public:
+  explicit ScopedCounterNs(CounterId time, CounterId count = CounterId::kCount)
+      : time_(time), count_(count), begin_(std::chrono::steady_clock::now()) {}
+  ~ScopedCounterNs() {
+    IncrementCounter(time_, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - begin_)
+                                .count());
+    if (count_ != CounterId::kCount) IncrementCounter(count_);
+  }
+  ScopedCounterNs(const ScopedCounterNs&) = delete;
+  ScopedCounterNs& operator=(const ScopedCounterNs&) = delete;
+
+ private:
+  CounterId time_;
+  CounterId count_;
+  std::chrono::steady_clock::time_point begin_;
 };
 
 }  // namespace rex::perf

@@ -15,6 +15,8 @@
 #include <string>
 
 #include <fmt/format.h>
+#include <rex/cvar.h>
+#include <rex/perf/counter.h>
 #include <rex/assert.h>
 #include <rex/filesystem.h>
 #include <rex/image_info.h>
@@ -66,8 +68,13 @@ std::filesystem::path ModuleLibraryPath(const std::string& name) {
 }  // namespace
 
 
-// 25 ms, as xenia-canary 8d2d80dfde: the 100 ms wait only lengthened boot.
-constexpr uint32_t kDeferredOverlappedDelayMillis = 25;
+// 25 ms, as xenia-canary 8d2d80dfde: the 100 ms wait only lengthened boot. The
+// console's XAM reports "pending" and finishes later; the wait only imitates
+// that latency. Pinyon Shift's CE-1 measured no load-time gain from 0.
+REXCVAR_DEFINE_UINT32(xam_deferred_completion_ms, 25, "Kernel",
+                      "Milliseconds a deferred XAM completion (content create and open, "
+                      "overlapped enumeration) waits before it completes")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // This is a global object initialized with the XboxkrnlModule.
 // It references the current kernel state object that all kernel methods should
@@ -1257,9 +1264,13 @@ void KernelState::CompleteOverlappedDeferredEx(
         if (pre_callback) {
           pre_callback();
         }
-        REXSYS_DEBUG("Deferred overlapped {:08X}: sleeping {}ms", overlapped_ptr,
-                     kDeferredOverlappedDelayMillis);
-        rex::thread::Sleep(std::chrono::milliseconds(kDeferredOverlappedDelayMillis));
+        const uint32_t delay_ms = REXCVAR_GET(xam_deferred_completion_ms);
+        REXSYS_DEBUG("Deferred overlapped {:08X}: sleeping {}ms", overlapped_ptr, delay_ms);
+        {
+          rex::perf::ScopedCounterNs census(rex::perf::CounterId::kXamDeferredSleepNs,
+                                            rex::perf::CounterId::kXamDeferredCompletions);
+          if (delay_ms) rex::thread::Sleep(std::chrono::milliseconds(delay_ms));
+        }
         uint32_t extended_error, length;
         REXSYS_DEBUG("Deferred overlapped {:08X}: running completion", overlapped_ptr);
         auto result = completion_callback(extended_error, length);

@@ -8263,11 +8263,15 @@ bool VulkanCommandProcessor::EndGuestOcclusionQuery(uint32_t sample_count_addres
                                            sizeof(uint64_t) * host_index, sizeof(uint64_t),
                                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
 
-  if (!EndSubmission(false)) {
-    return false;
-  }
-  if (!AwaitAllQueueOperationsCompletion()) {
-    return false;
+  PERF_counter_inc(kOcclusionQueryEnds);
+  {
+    rex::perf::ScopedCounterNs census(rex::perf::CounterId::kOcclusionQueryAwaitNs);
+    if (!EndSubmission(false)) {
+      return false;
+    }
+    if (!AwaitAllQueueOperationsCompletion()) {
+      return false;
+    }
   }
 
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();

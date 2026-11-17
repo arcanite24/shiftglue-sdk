@@ -9,7 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/perf/counter.h>
 #include <rex/runtime.h>
 #include <rex/string.h>
 #include <rex/system/flags.h>
@@ -29,6 +31,13 @@ REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
+
+// The wait after a system dialog closes, before XN_SYS_UI reports it gone
+// (100 ms as in Xenia). Pinyon Shift's CE-1 measured no load-time gain from 0.
+REXCVAR_DEFINE_UINT32(xam_ui_close_delay_ms, 100, "Kernel",
+                      "Milliseconds between a system dialog closing and the title being told "
+                      "the system UI is gone")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex {
 namespace kernel {
@@ -93,7 +102,10 @@ X_RESULT xeXamDispatchProvider(std::function<void(std::function<void(uint32_t)>)
     return X_ERROR_SUCCESS;
   };
   auto post = []() {
-    rex::thread::Sleep(std::chrono::milliseconds(100));
+    if (const uint32_t delay_ms = REXCVAR_GET(xam_ui_close_delay_ms)) {
+      rex::perf::ScopedCounterNs census(rex::perf::CounterId::kXamUiSleepNs);
+      rex::thread::Sleep(std::chrono::milliseconds(delay_ms));
+    }
     REX_KERNEL_STATE()->BroadcastNotification(0x9, false);
   };
   if (!overlapped) {
@@ -151,7 +163,10 @@ X_RESULT xeXamDispatchDialog(T* dialog, std::function<X_RESULT(T*)> close_callba
     return result;
   };
   auto post = []() {
-    rex::thread::Sleep(std::chrono::milliseconds(100));
+    if (const uint32_t delay_ms = REXCVAR_GET(xam_ui_close_delay_ms)) {
+      rex::perf::ScopedCounterNs census(rex::perf::CounterId::kXamUiSleepNs);
+      rex::thread::Sleep(std::chrono::milliseconds(delay_ms));
+    }
     // Broadcast XN_SYS_UI = false
     REX_KERNEL_STATE()->BroadcastNotification(0x9, false);
   };
@@ -193,7 +208,10 @@ X_RESULT xeXamDispatchDialogEx(T* dialog,
     return result;
   };
   auto post = []() {
-    rex::thread::Sleep(std::chrono::milliseconds(100));
+    if (const uint32_t delay_ms = REXCVAR_GET(xam_ui_close_delay_ms)) {
+      rex::perf::ScopedCounterNs census(rex::perf::CounterId::kXamUiSleepNs);
+      rex::thread::Sleep(std::chrono::milliseconds(delay_ms));
+    }
     // Broadcast XN_SYS_UI = false
     REX_KERNEL_STATE()->BroadcastNotification(0x9, false);
   };
@@ -217,7 +235,10 @@ X_RESULT xeXamDispatchHeadless(std::function<X_RESULT()> run_callback, uint32_t 
     REX_KERNEL_STATE()->BroadcastNotification(0x9, true);
   };
   auto post = []() {
-    rex::thread::Sleep(std::chrono::milliseconds(100));
+    if (const uint32_t delay_ms = REXCVAR_GET(xam_ui_close_delay_ms)) {
+      rex::perf::ScopedCounterNs census(rex::perf::CounterId::kXamUiSleepNs);
+      rex::thread::Sleep(std::chrono::milliseconds(delay_ms));
+    }
     REXKRNL_DEBUG("xeXamDispatchHeadless: Broadcasting XN_SYS_UI = false");
     // Broadcast XN_SYS_UI = false
     REX_KERNEL_STATE()->BroadcastNotification(0x9, false);
@@ -240,7 +261,10 @@ X_RESULT xeXamDispatchHeadlessEx(std::function<X_RESULT(uint32_t&, uint32_t&)> r
     REX_KERNEL_STATE()->BroadcastNotification(0x9, true);
   };
   auto post = []() {
-    rex::thread::Sleep(std::chrono::milliseconds(100));
+    if (const uint32_t delay_ms = REXCVAR_GET(xam_ui_close_delay_ms)) {
+      rex::perf::ScopedCounterNs census(rex::perf::CounterId::kXamUiSleepNs);
+      rex::thread::Sleep(std::chrono::milliseconds(delay_ms));
+    }
     // Broadcast XN_SYS_UI = false
     REX_KERNEL_STATE()->BroadcastNotification(0x9, false);
   };

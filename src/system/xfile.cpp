@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/perf/counter.h>
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -243,6 +244,7 @@ X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length, ui
     }
 
     uint32_t bytes_read = 0;
+    PERF_counter_inc(kFileScatterSegments);
     result = ReadInternal(
         read_buffer, read_length,
         byte_offset

@@ -584,8 +584,13 @@ VkResult VulkanTextureCache::CreateTextureImage(const VkImageCreateInfo& image_c
       dfn.vkDestroyImage(device, pool_image, nullptr);
     }
   }
-  const VkResult result = vmaCreateImage(vma_allocator_, &image_create_info,
-                                         &allocation_create_info, &image, &allocation, nullptr);
+  VkResult result;
+  {
+    rex::perf::ScopedCounterNs census(rex::perf::CounterId::kGpuMemoryAllocationNs,
+                                      rex::perf::CounterId::kGpuMemoryAllocations);
+    result = vmaCreateImage(vma_allocator_, &image_create_info, &allocation_create_info, &image,
+                            &allocation, nullptr);
+  }
   if (result == VK_SUCCESS) {
     command_processor_.GetVulkanDevice()->ReportImageCompression(image, image_create_info,
                                                                  "texture");
@@ -2186,6 +2191,8 @@ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unsca
 
 bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                                bool load_mips) {
+  rex::perf::ScopedCounterNs census(rex::perf::CounterId::kTextureLoadCpuNs,
+                                    rex::perf::CounterId::kTextureLoads);
   // GPU time of the load for fh1_native_gpu_profile, split by resolve-sourced
   // reloads and other loads.
   Fh1NativeExecutor* const gpu_profile_executor = command_processor_.GetFh1NativeExecutor();
