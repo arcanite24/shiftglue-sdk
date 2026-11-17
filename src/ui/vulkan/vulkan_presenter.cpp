@@ -28,6 +28,8 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/platform.h>
+#include <rex/thread.h>
+#include <rex/ui/flags.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -4482,6 +4484,22 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   VkResult present_result;
   if (frame_generated) {
     // The generated frame first, the real one half a real frame later.
+    const float half_ms = std::clamp(frame_generation_.interval_ms * 0.5f, 0.0f, 25.0f);
+    const double refresh_hz = REXCVAR_GET(video_mode_refresh_rate);
+    const double refresh_ms = refresh_hz > 1.0 ? 1000.0 / refresh_hz : 0.0;
+    const double refreshes =
+        paint_context_.swapchain_is_fifo && refresh_ms > 0.0 ? std::floor(half_ms / refresh_ms + 0.5) : 0.0;
+    // Under FIFO, below the refresh rate (30 real frames at 120 Hz), the pair
+    // queued back to back reached a G-SYNC LG C5 unevenly: LSFG about 8 then
+    // 24 ms apart, DLSS and FSR 3 at only about 30 images a second. Both
+    // images come from the paint's one submit, so wait for it, then queue the
+    // real frame a whole number of refreshes after the generated one: 97 % of
+    // DLSS's on-screen intervals in 13-21 ms, FSR 3 and LSFG alike, real
+    // frames still every 33.3 ms. At or above the refresh, as before.
+    if (refreshes >= 1.0) {
+      paint_context_.submission_tracker.AwaitSubmissionCompletion(
+          paint_context_.submission_tracker.GetCurrentSubmission() - 1);
+    }
     const auto generated_time = std::chrono::steady_clock::now();
     present_result = present_image(generated_image_index, generated_present_semaphore);
     if (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR) {
@@ -4489,9 +4507,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       NoteFrameGenerationPresent(true);
       if (!paint_context_.swapchain_is_fifo) {
         // Without FIFO nothing spaces the two presents: wait here.
-        const float half_ms = std::clamp(frame_generation_.interval_ms * 0.5f, 0.0f, 25.0f);
         std::this_thread::sleep_until(
             generated_time + std::chrono::microseconds(int64_t(half_ms * 1000.0f)));
+      } else if (refreshes >= 1.0) {
+        // A precise wait: a late wake moves the real frame a refresh later.
+        rex::thread::SleepUntil(
+            generated_time + std::chrono::microseconds(int64_t(refreshes * refresh_ms * 1000.0)),
+            std::chrono::microseconds(300));
       }
       frame_generation_.gap_ms_sum += std::chrono::duration<double, std::milli>(
                                           std::chrono::steady_clock::now() - generated_time)
