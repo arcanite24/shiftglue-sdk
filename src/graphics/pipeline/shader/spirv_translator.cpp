@@ -29,10 +29,21 @@
 #include <rex/platform.h>
 #include <rex/string/buffer.h>
 
+// The defaults below measured on Android's Adreno also apply to Linux on ARM
+// handhelds (ArmadaOS on the Odin 2 Portal: Mesa Turnip, Adreno 740). There
+// the five together took a free-roam drive from 20.4 to 16.4 ms of GPU a frame
+// (median, same spot, one run each), from 99.8 % of frames over 17.5 ms to
+// 0.1 %. Desktop GPUs measured no gain from bindless or the texel buffer.
+#if REX_PLATFORM_ANDROID || (REX_PLATFORM_GNU_LINUX && defined(REX_ARCH_ARM64))
+#define REX_MOBILE_GPU_DEFAULTS 1
+#else
+#define REX_MOBILE_GPU_DEFAULTS 0
+#endif
+
 // On Android: Adreno has no pushed pixel textures (see the command processor),
 // so each change allocated and wrote a set; on the Odin 2 Portal bindless takes
 // the recorder's CPU from 9.25 and 9.05 to 7.67 and 7.81 ms a frame (two pairs).
-REXCVAR_DEFINE_BOOL(vulkan_bindless_textures, REX_PLATFORM_ANDROID, "GPU/Vulkan",
+REXCVAR_DEFINE_BOOL(vulkan_bindless_textures, REX_MOBILE_GPU_DEFAULTS, "GPU/Vulkan",
                     "Bind textures and samplers from one long-lived descriptor set indexed by "
                     "per-draw indices instead of per-draw descriptor sets and pushes, on devices "
                     "with Vulkan 1.2 descriptor indexing (RECORDER_PER_DRAW_BACKLOG PD-4)")
@@ -42,7 +53,7 @@ REXCVAR_DEFINE_BOOL(vulkan_bindless_textures, REX_PLATFORM_ANDROID, "GPU/Vulkan"
 // minimums). Without it the Odin 2 Portal's frame-600 replay falls from 14.19
 // to 13.87 ms, and that frame, free roam, a race, photo mode and the title
 // replay byte-identical.
-REXCVAR_DEFINE_BOOL(spirv_ieee_vertex_math, REX_PLATFORM_ANDROID, "GPU",
+REXCVAR_DEFINE_BOOL(spirv_ieee_vertex_math, REX_MOBILE_GPU_DEFAULTS, "GPU",
                     "Vulkan: vertex shaders multiply as IEEE floats, without the Direct3D 9 "
                     "rule that 0 * anything = 0 (a compare and a select per product). "
                     "Products stay unfused, so positions match between passes; a 0 * Inf "
@@ -56,7 +67,7 @@ REXCVAR_DEFINE_BOOL(spirv_ieee_vertex_math, REX_PLATFORM_ANDROID, "GPU",
 // rule, against 10.0 ms with plain products. On macOS: an M4 Pro free-roam
 // drive's median frame falls from 10.9 to 8.6 ms (two runs each), brightness
 // and the image unchanged against Windows.
-REXCVAR_DEFINE_BOOL(spirv_fast_pixel_math, REX_PLATFORM_ANDROID || REX_PLATFORM_MAC, "GPU",
+REXCVAR_DEFINE_BOOL(spirv_fast_pixel_math, REX_MOBILE_GPU_DEFAULTS || REX_PLATFORM_MAC, "GPU",
                     "Vulkan: in pixel shaders, apply the Direct3D 9 multiply rule (0 * anything "
                     "= 0) only to products that come out NaN, and let the driver fuse "
                     "multiply-adds. Less pixel shader work at high scales; a NaN operand times "
@@ -66,7 +77,7 @@ REXCVAR_DEFINE_BOOL(spirv_fast_pixel_math, REX_PLATFORM_ANDROID || REX_PLATFORM_
 // On Android: the Odin 2 Portal's 1x drive frame falls about 3 ms (6 %) when
 // the texture sign switches fold away. On macOS the M4 Pro drive's median
 // frame falls from 10.9 to 9.8 ms.
-REXCVAR_DEFINE_BOOL(spirv_specialize_texture_signs, REX_PLATFORM_ANDROID || REX_PLATFORM_MAC, "GPU",
+REXCVAR_DEFINE_BOOL(spirv_specialize_texture_signs, REX_MOBILE_GPU_DEFAULTS || REX_PLATFORM_MAC, "GPU",
                     "Vulkan: make each texture fetch's signedness (unsigned, signed, biased, "
                     "gamma) a specialization constant set from the bound textures when the "
                     "pipeline is created, so drivers fold the per-fetch switch away; pipelines "
@@ -105,7 +116,7 @@ REXCVAR_DEFINE_BOOL(spirv_implicit_lod_2d, false, "GPU",
 // vertex shader, 252 and 51 with one texel buffer). The Odin 2 Portal's
 // frame-600 replay: 16.65 to 15.01 ms at 1x, 20.48 to 18.9 at 4x, the image
 // bit-identical.
-REXCVAR_DEFINE_BOOL(vulkan_shared_memory_texel_buffer, REX_PLATFORM_ANDROID, "GPU/Vulkan",
+REXCVAR_DEFINE_BOOL(vulkan_shared_memory_texel_buffer, REX_MOBILE_GPU_DEFAULTS, "GPU/Vulkan",
                     "Read shared memory (vertex fetches) through one R32_UINT uniform texel "
                     "buffer over all 512 MB on devices whose storage buffer range is smaller, "
                     "instead of a switch over several storage buffer bindings")
