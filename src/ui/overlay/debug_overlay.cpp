@@ -139,8 +139,11 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
 
     const int64_t source_frames =
         rex::perf::GetTotalCounter(rex::perf::CounterId::kSourceFrameCount);
+    // The presenter's counter holds real frames only: add the generated
+    // presents so this line shows what reaches the display, as Shown does.
     const int64_t presents =
-        rex::perf::GetTotalCounter(rex::perf::CounterId::kPresentCount);
+        rex::perf::GetTotalCounter(rex::perf::CounterId::kPresentCount) +
+        int64_t(present.generated_presents);
     const int64_t simulation_time_ns =
         rex::perf::GetTotalCounter(rex::perf::CounterId::kSimulationTimeNs);
     if (!rate_sample_tick_) {
@@ -166,7 +169,12 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
     const double source_frame_ms = source_fps_ > 0.0 ? 1000.0 / source_fps_ : 0.0;
     const double present_frame_ms = present_fps_ > 0.0 ? 1000.0 / present_fps_ : 0.0;
     ImGui::Text("Render:  %6.1f FPS  %6.2f ms", source_fps_, source_frame_ms);
-    ImGui::Text("Present: %6.1f FPS  %6.2f ms", present_fps_, present_frame_ms);
+    if (present.frame_generation.empty()) {
+      ImGui::Text("Present: %6.1f FPS  %6.2f ms", present_fps_, present_frame_ms);
+    } else {
+      ImGui::Text("Present: %6.1f FPS  %6.2f ms (generated included)", present_fps_,
+                  present_frame_ms);
+    }
     ImGui::Text("Title speed: %5.1f%%", title_speed_ * 100.0);
     ImGui::Text("Dropped: %" PRId64 "  Duplicates: %" PRId64,
                 rex::perf::GetTotalCounter(rex::perf::CounterId::kDroppedPresentCount),
