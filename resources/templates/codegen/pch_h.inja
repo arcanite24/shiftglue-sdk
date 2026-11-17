@@ -221,11 +221,23 @@ extern "C" uint32_t rex_physical_host_offset_e0;
 // full barrier, lwsync orders everything but a store before a later load,
 // eieio orders stores (device and memory), and isync after a reservation
 // loop makes it an acquire.
+//
+// REX_PPC_COMPILER_BARRIERS keeps the compiler from moving memory accesses
+// across a guest barrier on x86-64, at no instruction cost. Guest loads and
+// stores are volatile, so they keep their order among themselves anyway; the
+// barriers also order the host's non-volatile accesses (the PPC context,
+// kernel-shared state) for builds that drop MSVC volatile semantics
+// (-fno-ms-volatile), under which a volatile access no longer acts as one.
 #if REX_ARCH_ARM64
 #define REX_PPC_SYNC() __atomic_thread_fence(__ATOMIC_SEQ_CST)
 #define REX_PPC_LWSYNC() __atomic_thread_fence(__ATOMIC_ACQ_REL)
 #define REX_PPC_EIEIO() __atomic_thread_fence(__ATOMIC_SEQ_CST)
 #define REX_PPC_ISYNC() __atomic_thread_fence(__ATOMIC_ACQUIRE)
+#elif defined(REX_PPC_COMPILER_BARRIERS)
+#define REX_PPC_SYNC() __atomic_signal_fence(__ATOMIC_SEQ_CST)
+#define REX_PPC_LWSYNC() __atomic_signal_fence(__ATOMIC_SEQ_CST)
+#define REX_PPC_EIEIO() __atomic_signal_fence(__ATOMIC_SEQ_CST)
+#define REX_PPC_ISYNC() __atomic_signal_fence(__ATOMIC_SEQ_CST)
 #else
 #define REX_PPC_SYNC() ((void)0)
 #define REX_PPC_LWSYNC() ((void)0)
