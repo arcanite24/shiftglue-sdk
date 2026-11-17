@@ -177,6 +177,10 @@ REXCVAR_DEFINE_STRING(fh1_skip_pixel_shaders, "", "GPU",
 REXCVAR_DEFINE_BOOL(fh1_debug_alpha_to_mask_off, false, "GPU",
                     "Diagnostic: ignore guest alpha to coverage (draw such draws opaque)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(fh1_skip_pixel_shaders_keep_every, 0, "GPU",
+                     "With fh1_skip_pixel_shaders: still draw every this many matching draws "
+                     "(2 keeps half of a layered detail effect); 0 skips them all")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_skip_draws_without_effect, true, "GPU",
                     "Skip FH1 draws that write no surface, outside occlusion queries and "
                     "without memory export (FH1 native executor, Vulkan)")
@@ -6915,7 +6919,12 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       }
       if (!skip_pixel_shaders.empty() && pixel_shader && !fh1_draw.memexport &&
           !fh1_draw.occlusion_query_active &&
-          skip_pixel_shaders.count(pixel_shader->ucode_data_hash())) {
+          skip_pixel_shaders.count(pixel_shader->ucode_data_hash()) &&
+          [] {
+            static uint32_t matching_draws = 0;
+            const int32_t keep_every = REXCVAR_GET(fh1_skip_pixel_shaders_keep_every);
+            return keep_every <= 1 || (matching_draws++ % uint32_t(keep_every)) != 0;
+          }()) {
         // The skipped draw's render state, once per shader, to judge what
         // it was (alpha test, depth write, blending).
         static std::unordered_set<uint64_t> skip_pixel_shaders_logged;
