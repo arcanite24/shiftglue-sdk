@@ -32,6 +32,8 @@ bld/
 [Oo]bj/
 [Oo]ut/
 [Ll]og/
+# LSFG's vendored DXBC sources keep headers in a log/ folder.
+!thirdparty/lsfg/dxbc/src/util/log/
 [Ll]ogs/
 
 # Build results on 'Bin' directories
