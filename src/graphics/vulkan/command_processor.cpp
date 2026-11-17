@@ -174,6 +174,9 @@ REXCVAR_DEFINE_STRING(fh1_skip_pixel_shaders, "", "GPU",
                       "they export memory or count occlusion samples (FH1 native executor, "
                       "Vulkan). For low-end presets: drops a detail layer, not the scene")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(fh1_debug_alpha_to_mask_off, false, "GPU",
+                    "Diagnostic: ignore guest alpha to coverage (draw such draws opaque)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_skip_draws_without_effect, true, "GPU",
                     "Skip FH1 draws that write no surface, outside occlusion queries and "
                     "without memory export (FH1 native executor, Vulkan)")
@@ -6096,6 +6099,11 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
   const RegisterFile& regs = *register_file_;
+  // fh1_debug_alpha_to_mask_off: draw alpha-to-coverage draws opaque, to
+  // measure what the coverage emulation (a kill in the shader) costs.
+  if (REXCVAR_GET(fh1_debug_alpha_to_mask_off)) {
+    register_file_->values[XE_GPU_REG_RB_COLORCONTROL] &= ~(UINT32_C(1) << 4);
+  }
   const uint64_t memo_state = StateMemoKey();
   (void)index_buffer_info;
   const bool unchanged_inputs = REXCVAR_GET(gpu_draw_unchanged_inputs);
