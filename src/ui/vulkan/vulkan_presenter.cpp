@@ -1433,7 +1433,8 @@ bool VulkanPresenter::RecordFrameGeneration(
     if (lock.owns_lock() && presented_capture_written_ &&
         presented_capture_buffer_ != VK_NULL_HANDLE &&
         presented_capture_buffer_extent_.width == extent.width &&
-        presented_capture_buffer_extent_.height == extent.height) {
+        presented_capture_buffer_extent_.height == extent.height &&
+        presented_capture_buffer_pixel_size_ == 4) {
       VkBufferMemoryBarrier buffer_barrier = {};
       buffer_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
       buffer_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1601,6 +1602,35 @@ bool VulkanPresenter::CapturePresentedOutput(RawImage& image_out) {
   image.stride = extent.width * 4;
   image.data.resize(size_t(image.stride) * extent.height);
   bool converted = true;
+  // scRGB (1.0 is 80 nits): the paper white back to SDR white, sRGB-encoded,
+  // highlights above it clipped.
+  auto half_to_float = [](uint16_t h) {
+    const uint32_t sign = uint32_t(h & 0x8000u) << 16;
+    uint32_t exponent = (h >> 10) & 0x1Fu;
+    uint32_t mantissa = h & 0x3FFu;
+    uint32_t bits;
+    if (exponent == 0) {
+      if (mantissa == 0) {
+        bits = sign;
+      } else {
+        exponent = 113;
+        while (!(mantissa & 0x400u)) {
+          mantissa <<= 1;
+          --exponent;
+        }
+        bits = sign | (exponent << 23) | ((mantissa & 0x3FFu) << 13);
+      }
+    } else if (exponent == 31) {
+      bits = sign | 0x7F800000u | (mantissa << 13);
+    } else {
+      bits = sign | ((exponent + 112) << 23) | (mantissa << 13);
+    }
+    float value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+  };
+  const float paper_white_inv =
+      float(80.0 / std::max(REXCVAR_GET(present_hdr_paper_white_nits), 1.0));
   const uint32_t* source = static_cast<const uint32_t*>(mapping);
   uint32_t* dest = reinterpret_cast<uint32_t*>(image.data.data());
   const size_t pixel_count = size_t(extent.width) * extent.height;
@@ -1621,6 +1651,22 @@ bool VulkanPresenter::CapturePresentedOutput(RawImage& image_out) {
         dest[i] = Packed10bpcRGBTo8bpcBytes(source[i]);
       }
       break;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: {
+      const uint16_t* halves = static_cast<const uint16_t*>(mapping);
+      for (size_t i = 0; i < pixel_count; ++i) {
+        uint32_t packed = 0xFF000000u;
+        for (uint32_t c = 0; c < 3; ++c) {
+          const float linear =
+              std::clamp(half_to_float(halves[i * 4 + c]) * paper_white_inv, 0.0f, 1.0f);
+          const float encoded = linear <= 0.0031308f
+                                    ? linear * 12.92f
+                                    : 1.055f * std::pow(linear, 1.0f / 2.4f) - 0.055f;
+          packed |= uint32_t(encoded * 255.0f + 0.5f) << (c * 8);
+        }
+        dest[i] = packed;
+      }
+      break;
+    }
     default:
       converted = false;
       break;
@@ -2177,6 +2223,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   // into the SDR stand-ins, and the last pass samples them.
   const bool hdr = paint_context_.swapchain_hdr;
   const VkFormat render_pass_format = hdr ? PaintContext::kHdrStandInFormat : new_swapchain_format;
+  paint_context_.swapchain_image_format = new_swapchain_format;
   if (paint_context_.swapchain_render_pass_format != render_pass_format ||
       paint_context_.swapchain_render_pass_hdr != hdr) {
     util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device,
@@ -3149,6 +3196,79 @@ bool VulkanPresenter::GuestOutputImage::CreateImage(VkImage& image, VkDeviceMemo
   }
 
   return true;
+}
+
+void VulkanPresenter::RecordPresentedCapture(VkCommandBuffer command_buffer,
+                                             uint32_t swapchain_image_index, VkFormat format,
+                                             VkExtent2D extent, uint64_t submission_index) {
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const uint32_t pixel_size = format == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 4;
+  std::unique_lock<std::mutex> lock(presented_capture_mutex_, std::try_to_lock);
+  if (lock.owns_lock()) {
+    const VkDevice device = vulkan_device_->device();
+    if (presented_capture_buffer_extent_.width != extent.width ||
+        presented_capture_buffer_extent_.height != extent.height ||
+        presented_capture_buffer_pixel_size_ < pixel_size) {
+      if (presented_capture_buffer_ != VK_NULL_HANDLE) {
+        paint_context_.submission_tracker.AwaitSubmissionCompletion(
+            presented_capture_submission_);
+        util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, presented_capture_buffer_);
+        util::DestroyAndNullHandle(dfn.vkFreeMemory, device, presented_capture_memory_);
+      }
+      presented_capture_buffer_extent_ = {};
+      presented_capture_buffer_pixel_size_ = 0;
+      presented_capture_written_ = false;
+      if (util::CreateDedicatedAllocationBuffer(
+              vulkan_device_, VkDeviceSize(extent.width) * extent.height * pixel_size,
+              VK_BUFFER_USAGE_TRANSFER_DST_BIT, util::MemoryPurpose::kReadback,
+              presented_capture_buffer_, presented_capture_memory_)) {
+        presented_capture_buffer_extent_ = extent;
+        presented_capture_buffer_pixel_size_ = pixel_size;
+      }
+    }
+    if (presented_capture_buffer_ != VK_NULL_HANDLE) {
+      VkImageMemoryBarrier image_barrier = {};
+      image_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+      image_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+      image_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      image_barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+      image_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      image_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      image_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      image_barrier.image = paint_context_.swapchain_images[swapchain_image_index];
+      image_barrier.subresourceRange = util::InitializeSubresourceRange();
+      dfn.vkCmdPipelineBarrier(command_buffer,
+                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                               &image_barrier);
+      VkBufferImageCopy copy = {};
+      copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      copy.imageSubresource.layerCount = 1;
+      copy.imageExtent = {extent.width, extent.height, 1};
+      dfn.vkCmdCopyImageToBuffer(command_buffer, image_barrier.image,
+                                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, presented_capture_buffer_,
+                                 1, &copy);
+      VkBufferMemoryBarrier buffer_barrier = {};
+      buffer_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+      buffer_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      buffer_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+      buffer_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      buffer_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      buffer_barrier.buffer = presented_capture_buffer_;
+      buffer_barrier.size = VK_WHOLE_SIZE;
+      image_barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      image_barrier.dstAccessMask = 0;
+      image_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      image_barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+      dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                               0, 0, nullptr, 1, &buffer_barrier, 1, &image_barrier);
+      presented_capture_extent_ = extent;
+      presented_capture_format_ = format;
+      presented_capture_submission_ = submission_index;
+      presented_capture_written_ = true;
+    }
+  }
 }
 
 void VulkanPresenter::RecordHdrOutput(VkCommandBuffer command_buffer,
@@ -4189,74 +4309,20 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 
   // CapturePresentedOutput: keep a copy of each finished SDR image.
   if (!paint_context_.swapchain_hdr && swapchain_capturable.load(std::memory_order_relaxed)) {
-    std::unique_lock<std::mutex> lock(presented_capture_mutex_, std::try_to_lock);
-    if (lock.owns_lock()) {
-      const VkDevice device = vulkan_device_->device();
-      const VkExtent2D extent = paint_context_.swapchain_extent;
-      if (presented_capture_buffer_extent_.width != extent.width ||
-          presented_capture_buffer_extent_.height != extent.height) {
-        if (presented_capture_buffer_ != VK_NULL_HANDLE) {
-          paint_context_.submission_tracker.AwaitSubmissionCompletion(
-              presented_capture_submission_);
-          util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, presented_capture_buffer_);
-          util::DestroyAndNullHandle(dfn.vkFreeMemory, device, presented_capture_memory_);
-        }
-        presented_capture_buffer_extent_ = {};
-        presented_capture_written_ = false;
-        if (util::CreateDedicatedAllocationBuffer(
-                vulkan_device_, VkDeviceSize(extent.width) * extent.height * 4,
-                VK_BUFFER_USAGE_TRANSFER_DST_BIT, util::MemoryPurpose::kReadback,
-                presented_capture_buffer_, presented_capture_memory_)) {
-          presented_capture_buffer_extent_ = extent;
-        }
-      }
-      if (presented_capture_buffer_ != VK_NULL_HANDLE) {
-        VkImageMemoryBarrier image_barrier = {};
-        image_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        image_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        image_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        image_barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        image_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        image_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        image_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        image_barrier.image = paint_context_.swapchain_images[swapchain_image_index];
-        image_barrier.subresourceRange = util::InitializeSubresourceRange();
-        dfn.vkCmdPipelineBarrier(draw_command_buffer,
-                                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                                 &image_barrier);
-        VkBufferImageCopy copy = {};
-        copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        copy.imageSubresource.layerCount = 1;
-        copy.imageExtent = {extent.width, extent.height, 1};
-        dfn.vkCmdCopyImageToBuffer(draw_command_buffer, image_barrier.image,
-                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, presented_capture_buffer_,
-                                   1, &copy);
-        VkBufferMemoryBarrier buffer_barrier = {};
-        buffer_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        buffer_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        buffer_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-        buffer_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        buffer_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        buffer_barrier.buffer = presented_capture_buffer_;
-        buffer_barrier.size = VK_WHOLE_SIZE;
-        image_barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        image_barrier.dstAccessMask = 0;
-        image_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        image_barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        dfn.vkCmdPipelineBarrier(draw_command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                                 0, 0, nullptr, 1, &buffer_barrier, 1, &image_barrier);
-        presented_capture_extent_ = extent;
-        presented_capture_format_ = paint_context_.swapchain_render_pass_format;
-        presented_capture_submission_ = current_paint_submission_index;
-        presented_capture_written_ = true;
-      }
-    }
+    RecordPresentedCapture(draw_command_buffer, swapchain_image_index,
+                           paint_context_.swapchain_render_pass_format,
+                           paint_context_.swapchain_extent, current_paint_submission_index);
   }
 
   if (paint_context_.swapchain_hdr) {
     RecordHdrOutput(draw_command_buffer, swapchain_image_index, hdr_test_pattern);
+    // And of each finished HDR image, after the HDR pass.
+    if (swapchain_capturable.load(std::memory_order_relaxed)) {
+      RecordPresentedCapture(draw_command_buffer, swapchain_image_index,
+                             paint_context_.swapchain_image_format,
+                             HdrSwapchainImageExtent(paint_context_.swapchain_extent),
+                             current_paint_submission_index);
+    }
   }
 
   uint32_t generated_image_index = UINT32_MAX;
@@ -4279,6 +4345,14 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                             current_paint_submission_index, generated_image_index);
   if (frame_generated && paint_context_.swapchain_hdr) {
     RecordHdrOutput(draw_command_buffer, generated_image_index, hdr_test_pattern);
+    // Debug: the generated HDR image replaces the real one in the capture.
+    if (REXCVAR_GET(present_frame_generation_capture) != 0 &&
+        swapchain_capturable.load(std::memory_order_relaxed)) {
+      RecordPresentedCapture(draw_command_buffer, generated_image_index,
+                             paint_context_.swapchain_image_format,
+                             HdrSwapchainImageExtent(paint_context_.swapchain_extent),
+                             current_paint_submission_index);
+    }
   }
 
   dfn.vkEndCommandBuffer(draw_command_buffer);

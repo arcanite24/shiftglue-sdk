@@ -553,6 +553,8 @@ class VulkanPresenter final : public Presenter {
     // after copies outside the pass.
     VkRenderPass swapchain_load_render_pass = VK_NULL_HANDLE;
     VkFormat swapchain_render_pass_format = VK_FORMAT_UNDEFINED;
+    // The swapchain images' own format (scRGB or HDR10 with present_hdr).
+    VkFormat swapchain_image_format = VK_FORMAT_UNDEFINED;
     bool swapchain_render_pass_clear_load_op = false;
     // Whether swapchain_render_pass ends in an HDR stand-in to be sampled.
     bool swapchain_render_pass_hdr = false;
@@ -683,6 +685,10 @@ class VulkanPresenter final : public Presenter {
   // it.
   void RecordHdrOutput(VkCommandBuffer command_buffer, uint32_t swapchain_image_index,
                        uint32_t hdr_test_pattern);
+  // CapturePresentedOutput: copies a finished swapchain image (in the
+  // present layout, left there) into the readback buffer.
+  void RecordPresentedCapture(VkCommandBuffer command_buffer, uint32_t swapchain_image_index,
+                              VkFormat format, VkExtent2D extent, uint64_t submission_index);
   void ReleaseFrameGenerationImages();
   // The compute pipeline of frame_generation_compose.cs.glsl and its sets,
   // created on first use.
@@ -859,6 +865,7 @@ class VulkanPresenter final : public Presenter {
   VkBuffer presented_capture_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory presented_capture_memory_ = VK_NULL_HANDLE;
   VkExtent2D presented_capture_buffer_extent_ = {};
+  uint32_t presented_capture_buffer_pixel_size_ = 0;
   VkExtent2D presented_capture_extent_ = {};
   VkFormat presented_capture_format_ = VK_FORMAT_UNDEFINED;
   uint64_t presented_capture_submission_ = 0;
