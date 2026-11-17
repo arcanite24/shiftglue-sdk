@@ -547,6 +547,37 @@ class CommandProcessor {
     return untile_tiling_ &&
            ((untile_msaa_mask_ >> uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples)) & 1);
   }
+  // Untiled: the later tile (1 and up) whose two bins a packet's bin mask
+  // names alone, or 0. Such packets set that tile's window offset, scissors
+  // and resolve destination; FM3's 4X menus also draw a depth-only reset
+  // per tile this way, at window offset 0 in the tile's own EDRAM rows.
+  uint32_t UntileTileOfMask() const {
+    const uint64_t mask = bin_mask_;
+    if ((mask & 0xFFFFFFFFu) != mask || !(mask & ~uint64_t(3))) return 0;
+    const uint32_t shift = rex::tzcnt(uint32_t(mask));
+    if ((shift & 1) || mask != (uint64_t(3) << shift)) return 0;
+    return shift / 2;
+  }
+  // Untiled: the screen rows each later tile starts at, from the window
+  // offset of its own pass (0 until that pass has drawn). The first tile
+  // runs a later tile's own draws there; that tile's pass then drops them.
+  static constexpr uint32_t kUntileMaxTiles = 16;
+  std::atomic<int32_t> untile_tile_rows_[kUntileMaxTiles] = {};
+  int32_t UntileTileRows(uint32_t tile) const {
+    return tile && tile < kUntileMaxTiles ? untile_tile_rows_[tile].load(std::memory_order_relaxed)
+                                          : 0;
+  }
+  // Untiled: a later tile's pass draws nothing the first tile hasn't drawn
+  // already, its objects over the whole height and its own draws in its
+  // rows; any other draw in it (window offset 0) still runs.
+  bool UntileLaterTileDraw(const RegisterFile& regs) const {
+    const int32_t pass = TilingPassOfSelect();
+    if (!pass) return false;
+    if (regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset) return true;
+    if (pass < 0) return false;
+    const uint32_t tile = UntileTileOfMask();
+    return tile && UntileTileRows(tile);
+  }
   // Draws the backend skipped for a later untile pass (gpu_replay_floor_probe
   // counts drawn draws as the decoded ones minus these).
   uint64_t untile_skipped_draws_ = 0;

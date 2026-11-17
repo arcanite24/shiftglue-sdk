@@ -2880,10 +2880,11 @@ bool CommandProcessor::PredicatedOut(uint32_t packet, uint32_t opcode) const {
   // Untiled, the first tile also runs the later tiles' objects; the packets
   // predicated on a whole later tile set that tile's window offset,
   // scissors and resolve destination, and stay with their tile.
-  const bool tile_state = (bin_mask_ & 0xFFFFFFFFu) == bin_mask_ &&
-                          (bin_mask_ & ~uint64_t(3)) &&
-                          (bin_mask_ == (uint64_t(3) << rex::tzcnt(uint32_t(bin_mask_)))) &&
-                          !(rex::tzcnt(uint32_t(bin_mask_)) & 1);
+  // A later tile's own draw runs in the first tile too, moved to the
+  // tile's screen rows once its pass has shown where they are.
+  const uint32_t tile = UntileTileOfMask();
+  const bool tile_state = tile && !((opcode == PM4_DRAW_INDX || opcode == PM4_DRAW_INDX_2) &&
+                                    UntileTileRows(tile));
   const uint64_t select = untile_select_all_ && TilingPassOfSelect() == 0 && !tile_state &&
                                   UntileSurface(*register_file_)
                               ? ~uint64_t(0)

@@ -6156,10 +6156,15 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   // A later tile's draw under fh1_untile_predicated_tiling is dropped further
   // down anyway (the first tile drew its objects over the whole height); the
   // setup between here and there only fed the skipped draw.
-  if (untile_tiling_ && REXCVAR_GET(fh1_untile_early_skip) &&
-      regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset && TilingPassOfSelect() != 0 &&
-      UntileSurface(regs) &&
-      !(REXCVAR_GET(fh1_debug_untile) & 2)) {
+  if (untile_tiling_ && TilingPassOfSelect() > 0 &&
+      uint32_t(TilingPassOfSelect()) < kUntileMaxTiles && UntileSurface(regs)) {
+    // Where this later tile's rows start on screen, for its own draws the
+    // first tile runs (UntileTileOfMask).
+    const int32_t rows = -regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset;
+    if (rows > 0) untile_tile_rows_[TilingPassOfSelect()].store(rows, std::memory_order_relaxed);
+  }
+  if (untile_tiling_ && REXCVAR_GET(fh1_untile_early_skip) && UntileSurface(regs) &&
+      UntileLaterTileDraw(regs) && !(REXCVAR_GET(fh1_debug_untile) & 2)) {
     fh1_native_executor_->CountEvent("untile_skipped_draw");
     PERF_counter_inc(kFh1UntileSkippedDraws);
     ++untile_skipped_draws_;
@@ -6868,8 +6873,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       }
       const auto window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
       if (UntileSurface(regs)) {
-        if (window_offset.window_y_offset && TilingPassOfSelect() != 0 &&
-            !(REXCVAR_GET(fh1_debug_untile) & 2)) {
+        if (UntileLaterTileDraw(regs) && !(REXCVAR_GET(fh1_debug_untile) & 2)) {
           // The first tile drew these objects over the whole height.
           fh1_native_executor_->CountEvent("untile_skipped_draw");
           PERF_counter_inc(kFh1UntileSkippedDraws);
@@ -9731,6 +9735,11 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
   if (untile_surface) {
     untile_rows = -pa_sc_window_offset.window_y_offset;
     untile_first_tile = untile_select_all_ && TilingPassOfSelect() == 0;
+    // A later tile's own draw, run by the first tile in that tile's rows.
+    if (untile_first_tile && UntileTileOfMask()) {
+      untile_rows += UntileTileRows(UntileTileOfMask());
+      untile_first_tile = false;
+    }
     viewport.x -= float(pa_sc_window_offset.window_x_offset * int32_t(draw_resolution_scale_x));
     viewport.y += float(untile_rows * int32_t(draw_resolution_scale_y));
   }
