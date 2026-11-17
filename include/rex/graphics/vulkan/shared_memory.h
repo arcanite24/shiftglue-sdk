@@ -66,6 +66,8 @@ class VulkanSharedMemory : public SharedMemory {
   uint32_t buffer_memory_type_;
   // Single for non-sparse, every allocation so far for sparse.
   std::vector<VkDeviceMemory> buffer_memory_;
+  // The buffer's persistent mapping with vulkan_shared_memory_host_direct.
+  uint8_t* host_mapping_ = nullptr;
 
   Usage last_usage_;
   std::pair<uint32_t, uint32_t> last_written_range_;

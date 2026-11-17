@@ -34,6 +34,14 @@ REXCVAR_DEFINE_UINT32(vulkan_sparse_shared_memory_turnip, 1, "GPU/Vulkan",
                       "(checked with Turnip gen8-v37, NN-6.1), 2 on every Adreno")
     .range(0, 2)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(vulkan_shared_memory_host_direct, false, "GPU/Vulkan",
+                    "Keep shared memory in device-local, host-visible memory (resizable BAR "
+                    "or an integrated GPU) and write guest uploads into it from the CPU, "
+                    "instead of copying them on the GPU. A copy ends the open rendering, "
+                    "so mid-frame uploads cost a render pass each. Uploads are no longer "
+                    "snapshots: a draw already recorded in the same submission sees the "
+                    "new data. Falls back to the usual buffer when no such memory fits.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::vulkan {
 
@@ -93,7 +101,59 @@ bool VulkanSharedMemory::Initialize() {
   if (sparse_broken && REXCVAR_GET(vulkan_sparse_shared_memory)) {
     REXGPU_INFO("Shared memory: not using sparse residency on Turnip");
   }
-  if (REXCVAR_GET(vulkan_sparse_shared_memory) && !sparse_broken &&
+  // Shared memory the CPU writes directly (vulkan_shared_memory_host_direct).
+  if (REXCVAR_GET(vulkan_shared_memory_host_direct)) {
+    VkBufferCreateInfo direct_create_info = buffer_create_info;
+    direct_create_info.flags = 0;
+    const ui::vulkan::VulkanDevice::MemoryTypes& types = vulkan_device->memory_types();
+    if (dfn.vkCreateBuffer(device, &direct_create_info, nullptr, &buffer_) == VK_SUCCESS) {
+      VkMemoryRequirements requirements;
+      dfn.vkGetBufferMemoryRequirements(device, buffer_, &requirements);
+      uint32_t candidates = requirements.memoryTypeBits & types.device_local &
+                            types.host_visible & types.host_coherent;
+      uint32_t type_index;
+      while (!host_mapping_ && rex::bit_scan_forward(candidates, &type_index)) {
+        candidates &= ~(uint32_t(1) << type_index);
+        VkMemoryAllocateInfo allocate_info = {};
+        allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocate_info.allocationSize = requirements.size;
+        allocate_info.memoryTypeIndex = type_index;
+        VkMemoryDedicatedAllocateInfo dedicated = {};
+        if (vulkan_device->extensions().ext_1_1_KHR_dedicated_allocation) {
+          dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+          dedicated.buffer = buffer_;
+          allocate_info.pNext = &dedicated;
+        }
+        VkDeviceMemory memory;
+        if (dfn.vkAllocateMemory(device, &allocate_info, nullptr, &memory) != VK_SUCCESS) {
+          continue;
+        }
+        void* mapping = nullptr;
+        if (dfn.vkBindBufferMemory(device, buffer_, memory, 0) != VK_SUCCESS ||
+            dfn.vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &mapping) != VK_SUCCESS) {
+          dfn.vkFreeMemory(device, memory, nullptr);
+          break;  // The buffer may be bound already: give it up.
+        }
+        buffer_memory_type_ = type_index;
+        buffer_memory_.push_back(memory);
+        host_mapping_ = static_cast<uint8_t*>(mapping);
+      }
+      if (!host_mapping_) {
+        dfn.vkDestroyBuffer(device, buffer_, nullptr);
+        buffer_ = VK_NULL_HANDLE;
+        REXGPU_WARN(
+            "Shared memory: no device-local, host-visible memory fits the {} MB buffer "
+            "(resizable BAR off?); uploading through the GPU instead",
+            kBufferSize >> 20);
+      } else {
+        REXGPU_INFO("Shared memory: {} MB in host-visible device memory (type {}), "
+                    "uploads written by the CPU",
+                    kBufferSize >> 20, buffer_memory_type_);
+      }
+    }
+  }
+
+  if (!host_mapping_ && REXCVAR_GET(vulkan_sparse_shared_memory) && !sparse_broken &&
       vulkan_device->properties().sparseResidencyBuffer) {
     if (dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &buffer_) == VK_SUCCESS) {
       VkMemoryRequirements buffer_memory_requirements;
@@ -208,6 +268,10 @@ void VulkanSharedMemory::Shutdown(bool from_destructor) {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
+  if (host_mapping_ && !buffer_memory_.empty()) {
+    dfn.vkUnmapMemory(device, buffer_memory_.front());
+    host_mapping_ = nullptr;
+  }
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, buffer_);
   for (VkDeviceMemory memory : buffer_memory_) {
     dfn.vkFreeMemory(device, memory, nullptr);
@@ -323,6 +387,18 @@ bool VulkanSharedMemory::UploadRanges(
         PERF_counter_inc(kGpuUploadSplitsVertex);
         break;
     }
+  }
+  // Host-visible shared memory: write the pages in place. Host writes made
+  // before the submission are visible to it, so no copy or barrier, and the
+  // open rendering stays open.
+  if (host_mapping_) {
+    for (const std::pair<uint32_t, uint32_t>& upload_range : upload_page_ranges) {
+      const uint32_t offset = upload_range.first << page_size_log2();
+      const uint32_t length = upload_range.second << page_size_log2();
+      MakeRangeValid(offset, length, false);
+      std::memcpy(host_mapping_ + offset, memory().TranslatePhysical(offset), length);
+    }
+    return true;
   }
   // upload_page_ranges are sorted, use them to determine the range for the
   // ordering barrier.

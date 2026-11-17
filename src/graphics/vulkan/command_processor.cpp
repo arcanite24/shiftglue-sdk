@@ -8521,6 +8521,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   }
 
   if (is_opening_frame) {
+    if (shared_memory_) {
+      shared_memory_->BeginUploadFrame();
+    }
     // Update the completed frame index, also obtaining the actual completed
     // frame number (since the CPU may be actually less than 3 frames behind)
     // before reclaiming resources tracked with the frame number.

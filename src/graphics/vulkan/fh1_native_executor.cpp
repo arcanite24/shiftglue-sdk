@@ -3986,6 +3986,19 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
   if (!top.empty()) {
     REXGPU_INFO("FH1 native executor (Vulkan) renderings ended by other work, per frame: {}", top);
   }
+  // Cumulative shared-memory uploads by kind (as the D3D12 executor logs):
+  // requests that uploaded, page ranges, bytes, and bytes uploaded again
+  // within the same frame.
+  using Kind = SharedMemory::UploadKind;
+  const auto stats = [this](Kind kind) {
+    const SharedMemory::UploadStats& s = config_.memory->upload_stats(kind);
+    return fmt::format("{}/{}/{:.1f}MB (repeat {:.1f}MB)", s.requests, s.ranges,
+                       double(s.bytes) / 1048576.0, double(s.repeat_bytes) / 1048576.0);
+  };
+  REXGPU_INFO("Shared memory uploads since start: vertex {} index {} texture {} memexport {} "
+              "other {}",
+              stats(Kind::kVertex), stats(Kind::kIndex), stats(Kind::kTexture),
+              stats(Kind::kMemexport), stats(Kind::kOther));
 }
 
 uint32_t Fh1NativeExecutor::GpuBegin() {
