@@ -160,6 +160,12 @@ REXCVAR_DEFINE_BOOL(fh1_coarse_shading_alpha_test, false, "GPU",
                     "fh1_coarse_shading also shades alpha-tested and killing draws (foliage) "
                     "per block; alpha to coverage stays per pixel")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(fh1_skip_pixel_shaders, "", "GPU",
+                      "Quality for speed: skip the draws using these guest pixel shaders, as "
+                      "comma-separated hex hashes (as in the GPU profile's P entries), unless "
+                      "they export memory or count occlusion samples (FH1 native executor, "
+                      "Vulkan). For low-end presets: drops a detail layer, not the scene")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_skip_draws_without_effect, true, "GPU",
                     "Skip FH1 draws that write no surface, outside occlusion queries and "
                     "without memory export (FH1 native executor, Vulkan)")
@@ -6842,6 +6848,33 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       fh1_native_executor_->CountDrawSkippedWithoutEffect();
       fh1_native_executor_->NativeDrawIssued(fh1_draw);
       return true;
+    }
+    // fh1_skip_pixel_shaders: parsed again only when the string changes.
+    {
+      static std::string skip_pixel_shaders_text;
+      static std::unordered_set<uint64_t> skip_pixel_shaders;
+      const std::string& text = REXCVAR_GET(fh1_skip_pixel_shaders);
+      if (text != skip_pixel_shaders_text) {
+        skip_pixel_shaders_text = text;
+        skip_pixel_shaders.clear();
+        size_t start = 0;
+        while (start < text.size()) {
+          size_t end = text.find(',', start);
+          if (end == std::string::npos) end = text.size();
+          const std::string item = text.substr(start, end - start);
+          char* parsed_end = nullptr;
+          const uint64_t hash = std::strtoull(item.c_str(), &parsed_end, 16);
+          if (parsed_end != item.c_str()) skip_pixel_shaders.insert(hash);
+          start = end + 1;
+        }
+      }
+      if (!skip_pixel_shaders.empty() && pixel_shader && !fh1_draw.memexport &&
+          !fh1_draw.occlusion_query_active &&
+          skip_pixel_shaders.count(pixel_shader->ucode_data_hash())) {
+        fh1_native_executor_->CountEvent("draw_skipped_pixel_shader");
+        fh1_native_executor_->NativeDrawIssued(fh1_draw);
+        return true;
+      }
     }
   } else if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                            normalized_color_mask, *vertex_shader)) {
