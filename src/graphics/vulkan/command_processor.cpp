@@ -160,6 +160,14 @@ REXCVAR_DEFINE_BOOL(fh1_coarse_shading_alpha_test, false, "GPU",
                     "fh1_coarse_shading also shades alpha-tested and killing draws (foliage) "
                     "per block; alpha to coverage stays per pixel")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(fh1_capture_output_frame, 0, "GPU",
+                     "Write the guest output (before presenter scaling) as PPM to "
+                     "fh1_capture_output_path after this many swaps; 0 is off. Works without "
+                     "a visible window, as when benchmarking over SSH")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(fh1_capture_output_path, "", "GPU",
+                      "File for fh1_capture_output_frame (the parent directory must exist)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_STRING(fh1_skip_pixel_shaders, "", "GPU",
                       "Quality for speed: skip the draws using these guest pixel shaders, as "
                       "comma-separated hex hashes (as in the GPU profile's P entries), unless "
@@ -3843,6 +3851,35 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   DrawCostFrame();
   DrawProgramFrame();
   IssueSwapImpl(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  // fh1_capture_output_frame: the guest output as PPM, once.
+  {
+    static uint64_t swaps = 0;
+    const int32_t capture_frame = REXCVAR_GET(fh1_capture_output_frame);
+    if (capture_frame > 0 && ++swaps == uint64_t(capture_frame)) {
+      const auto& path = REXCVAR_GET(fh1_capture_output_path);
+      Fh1AwaitAllQueueOperations();
+      ui::RawImage image;
+      ui::Presenter* presenter = graphics_system_ ? graphics_system_->presenter() : nullptr;
+      bool captured = !path.empty() && presenter && presenter->CaptureGuestOutput(image) &&
+                      image.width && image.height && image.stride >= size_t(image.width) * 4;
+      if (captured) {
+        std::ofstream output(rex::to_path(path), std::ios::binary | std::ios::trunc);
+        output << "P6\n" << image.width << " " << image.height << "\n255\n";
+        for (uint32_t y = 0; output && y < image.height; ++y) {
+          const uint8_t* row = image.data.data() + size_t(y) * image.stride;
+          for (uint32_t x = 0; x < image.width; ++x) {
+            output.write(reinterpret_cast<const char*>(row + size_t(x) * 4), 3);
+          }
+        }
+        captured = bool(output);
+      }
+      if (captured) {
+        REXGPU_INFO("Guest output after swap {} written to {}", capture_frame, path);
+      } else {
+        REXGPU_ERROR("Cannot capture the guest output to {}", path);
+      }
+    }
+  }
   // Settings that rebuild host objects apply between frames.
   if (object_slot_wanted_width_ &&
       (object_slot_wanted_width_ != object_slot_image_width_ ||
@@ -6871,6 +6908,20 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       if (!skip_pixel_shaders.empty() && pixel_shader && !fh1_draw.memexport &&
           !fh1_draw.occlusion_query_active &&
           skip_pixel_shaders.count(pixel_shader->ucode_data_hash())) {
+        // The skipped draw's render state, once per shader, to judge what
+        // it was (alpha test, depth write, blending).
+        static std::unordered_set<uint64_t> skip_pixel_shaders_logged;
+        if (skip_pixel_shaders_logged.insert(pixel_shader->ucode_data_hash()).second) {
+          const auto color_control = regs.Get<reg::RB_COLORCONTROL>();
+          const auto depth_control = regs.Get<reg::RB_DEPTHCONTROL>();
+          REXGPU_INFO(
+              "fh1_skip_pixel_shaders: {:016X} first skipped draw: alpha test {} func {} "
+              "alpha to mask {}, depth test {} write {} func {}, blend0 {:08X}",
+              pixel_shader->ucode_data_hash(), uint32_t(color_control.alpha_test_enable),
+              uint32_t(color_control.alpha_func), uint32_t(color_control.alpha_to_mask_enable),
+              uint32_t(depth_control.z_enable), uint32_t(depth_control.z_write_enable),
+              uint32_t(depth_control.zfunc), regs.values[XE_GPU_REG_RB_BLENDCONTROL0]);
+        }
         fh1_native_executor_->CountEvent("draw_skipped_pixel_shader");
         fh1_native_executor_->NativeDrawIssued(fh1_draw);
         return true;
