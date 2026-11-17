@@ -48,6 +48,11 @@ REXCVAR_DEFINE_STRING(present_ffx_runtime, "", "UI/Presenter",
                       "upscalers/fidelityfx/<version> next to the executable, newest first "
                       "(and the package's libraries on Android)");
 
+REXCVAR_DEFINE_BOOL(present_ffx_frame_generation_debug, false, "UI/Presenter",
+                    "Debug: FSR 3 frame generation draws its debug view (its inputs and "
+                    "what it made of them) into the generated frames")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex {
 namespace ui {
 namespace vulkan {
@@ -679,6 +684,9 @@ class VulkanFfxFrameGenerator final : public VulkanFrameGenerator {
     configure.frameGenerationEnabled = true;
     configure.allowAsyncWorkloads = false;
     configure.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
+    if (REXCVAR_GET(present_ffx_frame_generation_debug)) {
+      configure.flags |= FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW;
+    }
     configure.generationRect = {inputs.generation_x, inputs.generation_y,
                                 int32_t(inputs.generation_width),
                                 int32_t(inputs.generation_height)};

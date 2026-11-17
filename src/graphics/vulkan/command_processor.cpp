@@ -4078,6 +4078,9 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
   const bool hudless_wanted = presenter->WantsHudlessGuestOutput();
   // UP-1.3: and the depth and camera motion.
   const bool camera_wanted = presenter->WantsGuestOutputCamera();
+  // UP-4: frame generation reads the HUD's coverage from the guest output's
+  // alpha, as present_hdr does.
+  const bool hud_mask_wanted = presenter->WantsGuestOutputHudMask();
   VkImageView camera_depth_view = VK_NULL_HANDLE;
   Fh1NativeExecutor::Camera camera = {};
   const bool scene_fxaa =
@@ -4091,8 +4094,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
   VkImageView ao_depth_view = VK_NULL_HANDLE;
   if (fh1_native_executor_) {
     hdr_active = ui::vulkan::GetHdrOutputState().active;
-    fh1_native_executor_->SetHudSnapshotEnabled(hdr_active || scene_fxaa || scene_lut ||
-                                                hudless_wanted || ambient_occlusion);
+    fh1_native_executor_->SetHudSnapshotEnabled(hdr_active || hud_mask_wanted || scene_fxaa ||
+                                                scene_lut || hudless_wanted || ambient_occlusion);
     hud_snapshot_view =
         fh1_native_executor_->TakeHudSnapshot(guest_output_width, guest_output_height);
     fh1_native_executor_->SetCameraTrackingEnabled(camera_wanted || ambient_occlusion ||
@@ -4123,8 +4126,9 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, display_width, display_height,
        frontbuffer_format, swap_texture_view, swap_post_effect, swap_source_needs_rb_swap,
-       hud_snapshot_view, hdr_active, scene_fxaa, scene_lut, hudless_wanted, camera_depth_view,
-       ao_depth_view, camera](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+       hud_snapshot_view, hdr_active, hud_mask_wanted, scene_fxaa, scene_lut, hudless_wanted,
+       camera_depth_view, ao_depth_view,
+       camera](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         // In case the swap command is the only one in the frame.
         if (!BeginSubmission(true)) {
           return false;
@@ -4559,7 +4563,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             }
           }
 
-          if (hdr_active && hud_snapshot_view != VK_NULL_HANDLE && EnsureSwapHudMask()) {
+          if ((hdr_active || hud_mask_wanted) && hud_snapshot_view != VK_NULL_HANDLE &&
+              EnsureSwapHudMask()) {
             PushImageMemoryBarrier(vulkan_context.image(), guest_output_subresource_range,
                                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,

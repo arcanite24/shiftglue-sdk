@@ -44,10 +44,18 @@ class DebugOverlayDialog : public ImGuiDialog {
 
  private:
   FrameStatsProvider stats_provider_;
-#ifdef REXGLUE_ENABLE_PERF_COUNTERS
   static constexpr size_t kFrameHistorySize = 120;
   std::array<float, kFrameHistorySize> frame_time_history_{};
   size_t frame_history_idx_ = 0;
+  // The presenter's totals at the last rate sample, and the rates.
+  uint64_t rate_tick_ = 0;
+  uint64_t rate_real_ = 0;
+  uint64_t rate_generated_ = 0;
+  uint64_t rate_failed_ = 0;
+  double real_fps_ = 0.0;
+  double generated_fps_ = 0.0;
+  double failed_per_second_ = 0.0;
+#ifdef REXGLUE_ENABLE_PERF_COUNTERS
   uint64_t rate_sample_tick_ = 0;
   int64_t rate_source_frames_ = 0;
   int64_t rate_presents_ = 0;

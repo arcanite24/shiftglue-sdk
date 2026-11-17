@@ -190,9 +190,13 @@ class VulkanPresenter final : public Presenter {
   bool WantsGuestOutputCamera() const override {
     return guest_output_camera_wanted_.load(std::memory_order_relaxed);
   }
+  bool WantsGuestOutputHudMask() const override {
+    return guest_output_hud_mask_wanted_.load(std::memory_order_relaxed);
+  }
   bool IsFrameGenerating() const override {
     return frame_generating_.load(std::memory_order_relaxed);
   }
+  PresentStats GetPresentStatsFromUIThread() const override;
   uint32_t GuestOutputJitterPhases() const override {
     return guest_output_jitter_phases_.load(std::memory_order_relaxed);
   }
@@ -544,6 +548,10 @@ class VulkanPresenter final : public Presenter {
 
     // May be reused between connections if the format stays the same.
     VkRenderPass swapchain_render_pass = VK_NULL_HANDLE;
+    // UP-4: compatible with swapchain_render_pass, but loads the image from
+    // and leaves it in that pass's final layout, to draw over a painted image
+    // after copies outside the pass.
+    VkRenderPass swapchain_load_render_pass = VK_NULL_HANDLE;
     VkFormat swapchain_render_pass_format = VK_FORMAT_UNDEFINED;
     bool swapchain_render_pass_clear_load_op = false;
     // Whether swapchain_render_pass ends in an HDR stand-in to be sampled.
@@ -631,17 +639,57 @@ class VulkanPresenter final : public Presenter {
                                 const GuestOutputImage* camera_source = nullptr,
                                 const UpscalerCamera* camera = nullptr);
 
-  // UP-4: after the paint of a new guest frame, copies the finished image,
-  // generates the frame between the previous one and it, and copies that
-  // into a second swapchain image (generated_image_index_out). False when
-  // nothing was recorded: frame generation off, unusable or skipped.
+  // UP-4: the provider that present_frame_generation names, if usable on
+  // this swapchain, or null.
+  VulkanFrameGenerator* GetFrameGenerator() const;
+  // UP-4: the image painting draws into for a swapchain image (the
+  // swapchain image, or its HDR stand-in), and the layout
+  // swapchain_render_pass leaves it in.
+  VkImage GetPaintTargetImage(uint32_t swapchain_image_index) const;
+  VkImageLayout GetPaintTargetLayout() const;
+  // UP-4: creates the frame generation images at the swapchain size (and
+  // drops the provider's history when they change). False if they could not
+  // be made.
+  bool EnsureFrameGenerationImages(VulkanFrameGenerator* generator);
+  // UP-4: copies the painted frame, before the host UI and, where the game's
+  // HUD is deferred, before the HUD, as the provider's input. The HUD is then
+  // drawn back over the painted frame (hud_source: the guest output with the
+  // HUD and its HUD-less copy, null for none).
+  struct FrameGenerationHud {
+    VkImageView frame_view = VK_NULL_HANDLE;
+    VkImageView hudless_view = VK_NULL_HANDLE;
+    int32_t rect_x = 0;
+    int32_t rect_y = 0;
+    uint32_t rect_width = 0;
+    uint32_t rect_height = 0;
+    float source_uv_scale[2] = {1.0f, 1.0f};
+  };
+  void RecordFrameGenerationInput(VkCommandBuffer command_buffer, uint32_t swapchain_image_index,
+                                  const FrameGenerationHud* hud, uint64_t submission_index);
+  // UP-4: after the paint of a new guest frame (input copied by
+  // RecordFrameGenerationInput), generates the frame between the previous
+  // one and it, puts the real frame's HUD and host UI over it, and copies it
+  // into the paint target of a second swapchain image
+  // (generated_image_index_out). False when nothing was recorded: frame
+  // generation off, unusable or skipped.
   bool RecordFrameGeneration(VkCommandBuffer command_buffer, VkSemaphore acquire_semaphore,
                              uint32_t swapchain_image_index,
                              const GuestOutputImage* guest_output_image,
                              uint64_t guest_output_refresh_serial,
                              const UpscalerCamera* camera, uint32_t render_width,
-                             uint32_t render_height, uint32_t& generated_image_index_out);
+                             uint32_t render_height, uint64_t submission_index,
+                             uint32_t& generated_image_index_out);
+  // present_hdr: the last pass, from the stand-in of a swapchain image into
+  // it.
+  void RecordHdrOutput(VkCommandBuffer command_buffer, uint32_t swapchain_image_index,
+                       uint32_t hdr_test_pattern);
   void ReleaseFrameGenerationImages();
+  // The compute pipeline of frame_generation_compose.cs.glsl and its sets,
+  // created on first use.
+  bool EnsureFrameGenerationCompose();
+  void DispatchFrameGenerationCompose(VkCommandBuffer command_buffer, VkDescriptorSet set,
+                                      VkImageView frame_view, VkImageView hudless_view,
+                                      VkImageView target_view, const uint32_t constants[10]);
   // Counts each present for the frame generation log line, and writes the
   // line every 5 seconds while the swapchain was made for frame generation.
   void NoteFrameGenerationPresent(bool generated);
@@ -715,10 +763,21 @@ class VulkanPresenter final : public Presenter {
   };
   struct FrameGenerationState {
     VulkanFrameGenerator* generator = nullptr;
-    // The finished real frame and the generated one, at the swapchain size.
+    // At the swapchain size: the provider's input (the painted frame before
+    // the HUD and the host UI), its output, and the finished real frame.
     FrameGenerationImage color;
     FrameGenerationImage output;
+    FrameGenerationImage final;
+    // present_frame_generation_capture 2: the previous finished real frame,
+    // and the 2x2 picture the capture shows.
+    FrameGenerationImage previous;
+    FrameGenerationImage debug;
+    bool previous_valid = false;
     VkExtent2D extent = {};
+    // RecordFrameGenerationInput copied this paint's input.
+    bool input_recorded = false;
+    // Whether the HUD went into the input.
+    bool input_hudless = false;
     uint64_t last_image_submission = 0;
     uint64_t frame_id = 0;
     uint64_t refresh_serial = 0;
@@ -744,8 +803,30 @@ class VulkanPresenter final : public Presenter {
     uint64_t last_present_us = 0;
     uint64_t last_log_us = 0;
     bool logged_unusable = false;
+    // Never reset, for the F3 overlay.
+    uint64_t total_real_presents = 0;
+    uint64_t total_generated_presents = 0;
+    uint64_t total_failed = 0;
+    std::string waiting;
+    uint32_t render_width = 0;
+    uint32_t render_height = 0;
   };
   FrameGenerationState frame_generation_;
+  // UP-4: frame_generation_compose.cs.glsl, in the layout of the upscale HUD
+  // composite, with two sets per paint submission.
+  VkPipeline frame_generation_compose_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool frame_generation_compose_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, 2 * PaintContext::kSubmissionCount> frame_generation_compose_sets_ =
+      {};
+  bool frame_generation_compose_failed_ = false;
+  // UP-4: hdr_ui_mask.ps.glsl in an SDR swapchain_render_pass, and the pass
+  // it was made for.
+  VkPipeline frame_generation_mask_pipeline_ = VK_NULL_HANDLE;
+  VkRenderPass frame_generation_mask_render_pass_ = VK_NULL_HANDLE;
+  uint64_t frame_generation_mask_last_submission_ = 0;
+  // UP-4: whether the last paint wanted the guest output's alpha to be the
+  // HUD's coverage.
+  std::atomic<bool> guest_output_hud_mask_wanted_ = false;
   // UP-1.2: whether the last paint fed a temporal upscaler the guest output
   // directly, so the refresher should write the HUD-less copy.
   std::atomic<bool> hudless_guest_output_wanted_ = false;

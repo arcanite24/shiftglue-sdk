@@ -54,6 +54,7 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   // SetPresenter may be called from the destructor.
   void SetPresenter(Presenter* new_presenter);
+  Presenter* presenter() const { return presenter_; }
   void SetImmediateDrawer(ImmediateDrawer* new_immediate_drawer);
   void SetPresenterAndImmediateDrawer(Presenter* new_presenter,
                                       ImmediateDrawer* new_immediate_drawer) {

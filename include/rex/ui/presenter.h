@@ -21,6 +21,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <string>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -402,9 +403,39 @@ class Presenter {
   // Whether painting would use the game's depth and camera motion with the
   // guest output (a temporal upscaler, UP-1.3 and UP-1.4).
   virtual bool WantsGuestOutputCamera() const { return false; }
+  // UP-4: whether painting wants the guest output's alpha to be the game's
+  // HUD coverage (as present_hdr does), to keep the HUD out of generated
+  // frames. Read by the refresher at any time.
+  virtual bool WantsGuestOutputHudMask() const { return false; }
   // UP-4.2: whether painting shows a generated frame after each real one,
   // so the game should render at no more than half the display's refresh.
   virtual bool IsFrameGenerating() const { return false; }
+  // What the presenter has shown, for the F3 overlay: running totals that
+  // the reader turns into rates, and the current setup.
+  struct PresentStats {
+    // Real frames presented, and generated frames presented between them.
+    uint64_t real_presents = 0;
+    uint64_t generated_presents = 0;
+    // Frames the provider was asked for but did not make.
+    uint64_t generation_failures = 0;
+    // The frame generation provider in use ("" when off) and its name.
+    std::string frame_generation;
+    std::string frame_generation_name;
+    // What frame generation waits for when it makes nothing ("" when it
+    // runs): a menu without a scene, a restart, an unavailable provider.
+    std::string frame_generation_waiting;
+    // The size the game renders at (the temporal upscaler's input) and the
+    // swapchain's.
+    uint32_t render_width = 0;
+    uint32_t render_height = 0;
+    uint32_t output_width = 0;
+    uint32_t output_height = 0;
+    // The temporal upscaler's name ("" for a spatial effect).
+    std::string upscaler;
+    bool hdr = false;
+    bool vsync = false;
+  };
+  virtual PresentStats GetPresentStatsFromUIThread() const { return {}; }
   // UP-1.5: the length of the jitter sequence the game should render with
   // (0: no jitter), for the temporal upscaler's ratio.
   virtual uint32_t GuestOutputJitterPhases() const { return 0; }
