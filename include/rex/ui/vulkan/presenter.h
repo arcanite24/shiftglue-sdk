@@ -210,6 +210,10 @@ class VulkanPresenter final : public Presenter {
   uint32_t GuestOutputJitterPhases() const override {
     return guest_output_jitter_phases_.load(std::memory_order_relaxed);
   }
+  // Once the paint shaders exist (they never change after).
+  bool SupportsGsr() const override {
+    return guest_output_paint_fs_[size_t(GuestOutputPaintEffect::kGsr)] != VK_NULL_HANDLE;
+  }
   // The formats of the guest output's camera images.
   static constexpr VkFormat kGuestOutputDepthFormat = VK_FORMAT_R32_SFLOAT;
   static constexpr VkFormat kGuestOutputMotionFormat = VK_FORMAT_R16G16_SFLOAT;
@@ -365,6 +369,7 @@ class VulkanPresenter final : public Presenter {
     kGuestOutputPaintPipelineLayoutIndexFsrEasu,
     kGuestOutputPaintPipelineLayoutIndexFsrRcas,
 #endif
+    kGuestOutputPaintPipelineLayoutIndexGsr,
     // present_hdr's last pass (HdrOutputConstants).
     kGuestOutputPaintPipelineLayoutIndexHdr,
 
@@ -390,6 +395,8 @@ class VulkanPresenter final : public Presenter {
       case GuestOutputPaintEffect::kFsrRcasDither:
         return kGuestOutputPaintPipelineLayoutIndexFsrRcas;
 #endif
+      case GuestOutputPaintEffect::kGsr:
+        return kGuestOutputPaintPipelineLayoutIndexGsr;
       default:
         assert_unhandled_case(effect);
         return kGuestOutputPaintPipelineLayoutCount;

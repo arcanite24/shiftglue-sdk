@@ -232,6 +232,9 @@ class Presenter {
       // NVIDIA DLSS Super Resolution through NGX (FSR 1 without it).
       kDlss,
 #endif
+      // Snapdragon Game Super Resolution 1 (one spatial pass) where the
+      // presenter has it (SupportsGsr), bilinear elsewhere.
+      kGsr,
     };
 
 #if defined(REX_HAS_FIDELITYFX_SDK)
@@ -447,6 +450,9 @@ class Presenter {
   // UP-1.5: the length of the jitter sequence the game should render with
   // (0: no jitter), for the temporal upscaler's ratio.
   virtual uint32_t GuestOutputJitterPhases() const { return 0; }
+  // Whether present_effect gsr can draw Snapdragon GSR 1 (otherwise it is
+  // bilinear).
+  virtual bool SupportsGsr() const { return false; }
   const GuestOutputPaintConfig& GetGuestOutputPaintConfigFromUIThread() const {
     return guest_output_paint_config_;
   }
@@ -537,6 +543,7 @@ class Presenter {
     kFsrRcas,
     kFsrRcasDither,
 #endif
+    kGsr,
 
     kCount,
   };
@@ -580,8 +587,8 @@ class Presenter {
   static constexpr size_t kMaxGuestOutputPaintEffects =
       GuestOutputPaintConfig::kFsrMaxUpscalingPassesMax + 2;
 #else
-  // Bilinear-only path: at most 1 effect.
-  static constexpr size_t kMaxGuestOutputPaintEffects = 1;
+  // GSR, then a bilinear stretch where its output is clamped.
+  static constexpr size_t kMaxGuestOutputPaintEffects = 2;
 #endif
 
   struct GuestOutputPaintFlow {
@@ -646,6 +653,28 @@ class Presenter {
       const std::pair<uint32_t, uint32_t>& output_size = flow.effect_output_sizes[effect_index];
       output_size_inv[0] = 1.0f / float(output_size.first);
       output_size_inv[1] = 1.0f / float(output_size.second);
+    }
+  };
+
+  // guest_output_gsr.ps.glsl's GsrConstants: the bilinear ones and GSR's
+  // ViewportInfo (the input's texel size and size).
+  struct GsrConstants {
+    int32_t output_offset[2];
+    float output_size_inv[2];
+    float input_size_inv[2];
+    float input_size[2];
+
+    void Initialize(const GuestOutputPaintFlow& flow, size_t effect_index) {
+      flow.GetEffectOutputOffset(effect_index, output_offset[0], output_offset[1]);
+      const std::pair<uint32_t, uint32_t>& output_size = flow.effect_output_sizes[effect_index];
+      output_size_inv[0] = 1.0f / float(output_size.first);
+      output_size_inv[1] = 1.0f / float(output_size.second);
+      uint32_t input_width, input_height;
+      flow.GetEffectInputSize(effect_index, input_width, input_height);
+      input_size[0] = float(input_width);
+      input_size[1] = float(input_height);
+      input_size_inv[0] = 1.0f / input_size[0];
+      input_size_inv[1] = 1.0f / input_size[1];
     }
   };
 

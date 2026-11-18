@@ -38,7 +38,7 @@ float GetUpscalerModeRatio(UpscalerMode mode);
 const char* GetUpscalerModeName(UpscalerMode mode);
 
 struct UpscalerInfo {
-  // Stable name for cvars and settings ("bilinear", "cas", "fsr", "fsr2",
+  // Stable name for cvars and settings ("bilinear", "cas", "fsr", "gsr", "fsr2",
   // "fsr3"); present_effect takes it.
   std::string id;
   // Shown to players.

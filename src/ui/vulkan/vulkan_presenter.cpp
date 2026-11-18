@@ -276,6 +276,7 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/guest_output_triangle_strip_rect_vs.h"
 // glslangValidator -V, from ../shaders/*.glsl.
 #include "../shaders/vulkan_spirv/frame_generation_compose_cs.h"
+#include "../shaders/vulkan_spirv/guest_output_gsr_ps.h"
 #include "../shaders/vulkan_spirv/hdr_output_ps.h"
 #include "../shaders/vulkan_spirv/hdr_ui_mask_ps.h"
 #include "../shaders/vulkan_spirv/upscale_debug_view_cs.h"
@@ -602,6 +603,15 @@ std::vector<UpscalerInfo> VulkanPresenter::GetFrameGenerators() const {
 
 std::vector<UpscalerInfo> VulkanPresenter::GetUpscalers() const {
   std::vector<UpscalerInfo> infos = GetSpatialUpscalerInfos();
+  UpscalerInfo& gsr = infos.emplace_back();
+  gsr.id = "gsr";
+  gsr.name = "Snapdragon Game Super Resolution 1";
+  gsr.version = "1.0";
+  gsr.kind = UpscalerKind::kSpatial;
+  gsr.available = SupportsGsr();
+  if (!gsr.available) {
+    gsr.unavailable_reason = "Its shader did not load";
+  }
   for (const std::unique_ptr<VulkanUpscaler>& upscaler : upscalers_) {
     infos.push_back(upscaler->info());
   }
@@ -4554,6 +4564,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
             FsrEasuConstants fsr_easu;
             FsrRcasConstants fsr_rcas;
 #endif
+            GsrConstants gsr;
           } effect_constants;
           switch (guest_output_paint_pipeline_layout_index) {
             case kGuestOutputPaintPipelineLayoutIndexBilinear: {
@@ -4580,6 +4591,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
               effect_constants.fsr_rcas.Initialize(guest_output_flow, i, guest_output_paint_config);
             } break;
 #endif
+            case kGuestOutputPaintPipelineLayoutIndexGsr: {
+              effect_constants_size = sizeof(effect_constants.gsr);
+              effect_constants.gsr.Initialize(guest_output_flow, i);
+            } break;
             default:
               break;
           }
@@ -5146,6 +5161,9 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
         guest_output_paint_push_constant_range_ffx.size = sizeof(FsrRcasConstants);
         break;
 #endif
+      case kGuestOutputPaintPipelineLayoutIndexGsr:
+        guest_output_paint_push_constant_range_ffx.size = sizeof(GsrConstants);
+        break;
       case kGuestOutputPaintPipelineLayoutIndexHdr:
         guest_output_paint_push_constant_range_ffx.size = sizeof(HdrOutputConstants);
         break;
@@ -5222,12 +5240,22 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
         shader_module_create_info.pCode = shaders::guest_output_ffx_fsr_rcas_dither_ps;
         break;
 #endif
+      case GuestOutputPaintEffect::kGsr:
+        shader_module_create_info.codeSize = sizeof(shaders::guest_output_gsr_ps);
+        shader_module_create_info.pCode = shaders::guest_output_gsr_ps;
+        break;
       default:
         // Not supported by this implementation.
         continue;
     }
     if (dfn.vkCreateShaderModule(device, &shader_module_create_info, nullptr,
                                  &guest_output_paint_fs_[i]) != VK_SUCCESS) {
+      // GSR is optional: without it present_effect gsr is bilinear.
+      if (GuestOutputPaintEffect(i) == GuestOutputPaintEffect::kGsr) {
+        REXLOG_WARN("VulkanPresenter: Failed to create the Snapdragon GSR shader module");
+        guest_output_paint_fs_[i] = VK_NULL_HANDLE;
+        continue;
+      }
       REXLOG_ERROR(
           "VulkanPresenter: Failed to create the guest output painting shader "
           "module for effect {}",
@@ -5309,6 +5337,12 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
     VkPipeline guest_output_paint_intermediate_pipeline = CreateGuestOutputPaintPipeline(
         GuestOutputPaintEffect(i), guest_output_intermediate_render_pass_);
     if (guest_output_paint_intermediate_pipeline == VK_NULL_HANDLE) {
+      // Without its module SupportsGsr is false and gsr is bilinear.
+      if (GuestOutputPaintEffect(i) == GuestOutputPaintEffect::kGsr) {
+        REXLOG_WARN("VulkanPresenter: Failed to create the Snapdragon GSR pipeline");
+        util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device, guest_output_paint_fs_[i]);
+        continue;
+      }
       return false;
     }
     paint_context_.guest_output_paint_pipelines[i].intermediate_pipeline =

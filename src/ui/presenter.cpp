@@ -59,9 +59,10 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
                       "Guest output effect: bilinear, cas (sharpen, and resample when "
                       "downscaling), fsr (FSR 1 upscale with RCAS sharpening), fsr2 and fsr3 "
-                      "(temporal FSR through the FidelityFX runtime), dlss (DLSS through NGX); "
-                      "FSR 1 when the temporal upscaler is unavailable")
-    .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3", "dlss"});
+                      "(temporal FSR through the FidelityFX runtime), dlss (DLSS through NGX), "
+                      "gsr (Snapdragon GSR 1 upscale, Vulkan); FSR 1 when the temporal upscaler "
+                      "is unavailable")
+    .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3", "dlss", "gsr"});
 
 REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
                       rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessDefault,
@@ -85,8 +86,9 @@ REXCVAR_DEFINE_STRING(
     "Temporal FSR quality mode: auto, nativeaa, quality, balanced, performance, ultra_performance")
     .allowed({"auto", "nativeaa", "quality", "balanced", "performance", "ultra_performance"});
 #else
-REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter", "Guest output effect: bilinear")
-    .allowed({"bilinear"});
+REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
+                      "Guest output effect: bilinear, gsr (Snapdragon GSR 1 upscale, Vulkan)")
+    .allowed({"bilinear", "gsr"});
 #endif
 
 REXCVAR_DEFINE_BOOL(present_dither, false, "UI/Presenter",
@@ -119,6 +121,9 @@ GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name
     return GuestOutputPaintConfig::Effect::kDlss;
   }
 #endif
+  if (lowered == "gsr") {
+    return GuestOutputPaintConfig::Effect::kGsr;
+  }
   return GuestOutputPaintConfig::Effect::kBilinear;
 }
 
@@ -1139,6 +1144,22 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
     }
   }
 #endif  // defined(REX_HAS_FIDELITYFX_SDK)
+
+  // Snapdragon GSR 1: one pass to the output size where it scales up; the
+  // bilinear stretch below takes a downscale, and what clamping leaves.
+  if (config.GetEffect() == GuestOutputPaintConfig::Effect::kGsr && SupportsGsr()) {
+    const std::pair<uint32_t, uint32_t> gsr_input_size =
+        flow.effect_count
+            ? flow.effect_output_sizes[flow.effect_count - 1]
+            : std::make_pair(properties.frontbuffer_width, properties.frontbuffer_height);
+    if (gsr_input_size.first < output_width_clamped ||
+        gsr_input_size.second < output_height_clamped) {
+      assert_true(flow.effect_count < flow.effects.size());
+      flow.effect_output_sizes[flow.effect_count] =
+          std::make_pair(output_width_clamped, output_height_clamped);
+      flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kGsr;
+    }
+  }
 
   std::pair<uint32_t, uint32_t>* last_pre_bilinear_effect_size =
       flow.effect_count ? &flow.effect_output_sizes[flow.effect_count - 1] : nullptr;
