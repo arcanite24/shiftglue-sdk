@@ -9,10 +9,68 @@
 
 namespace rex::graphics::vulkan {
 
+// The exact identity: shader_<guest>_<modification>_<XXH3 of the translated
+// SPIR-V>.spv. The translated hash changes with the resolution scale, the
+// platform and any translator change.
 std::string VulkanShaderOverrideFilename(uint64_t guest, uint64_t modification,
                                          std::span<const uint8_t> original);
 
-// First valid exact-identity file wins. Bad files never reach the driver.
+// The names a replacement may also use, tried in this order after every
+// root's exact name: shader_<guest>_<modification>.spv, then
+// shader_<guest>.spv. One such file stands in for every translation of that
+// guest shader whose interface it fits (SpirvInterfaceFits).
+std::vector<std::string> VulkanShaderOverrideGuestFilenames(uint64_t guest, uint64_t modification);
+
+// What a module's main entry point binds, reads and writes: enough to tell
+// whether a replacement can take a translation's place in the translation's
+// pipeline layout and between its pipeline's stages.
+struct SpirvInterface {
+  // SPIR-V ExecutionModel of main (0 vertex, 4 fragment, ...).
+  uint32_t execution_model = ~0u;
+  struct Resource {
+    uint32_t set = 0;
+    uint32_t binding = 0;
+    // "ubo", "ssbo", "sampler", or the image type ("image f32 2D arr0 ms0
+    // sampled1"), "sampled " before it for a combined image and sampler.
+    std::string kind;
+    // Array elements: 0 when not an array, ~0u for a runtime array.
+    uint32_t count = 0;
+    // A buffer block's size in bytes (its last member's end).
+    uint32_t bytes = 0;
+  };
+  std::vector<Resource> resources;
+  struct Variable {
+    uint32_t location = ~0u;
+    uint32_t component = 0;
+    // "f32x4", "u32", "f32x4[16]", ...
+    std::string type;
+  };
+  std::vector<Variable> inputs;
+  std::vector<Variable> outputs;
+  // SPIR-V BuiltIn values, from variables and from blocks' members.
+  std::vector<uint32_t> builtin_inputs;
+  std::vector<uint32_t> builtin_outputs;
+  uint32_t push_constant_bytes = 0;
+};
+
+bool ReflectSpirvInterface(std::span<const uint32_t> words, SpirvInterface& out,
+                           std::string& error);
+
+// Whether a replacement with interface `replacement` can stand in for a
+// translation with interface `translation`: the same stage; every resource it
+// declares is one of the translation's (same set, binding and kind, no more
+// array elements or block bytes), so the translation's layout serves it; no
+// more push constants; only inputs the translation has; exactly the
+// translation's outputs (and, before the fragment stage, at least its
+// built-in outputs). On false, `why` says what differs.
+bool SpirvInterfaceFits(const SpirvInterface& replacement, const SpirvInterface& translation,
+                        std::string& why);
+
+// The first valid file among every root's exact name, then the guest names
+// (VulkanShaderOverrideGuestFilenames) root by root. A file is valid when it
+// is SPIR-V that validates for Vulkan 1.2, has a main of the translation's
+// stage and fits the translation's interface. Bad files are reported through
+// `warn` and never reach the driver.
 std::vector<uint8_t> LoadVulkanShaderOverride(const std::vector<std::filesystem::path>& roots,
                                               uint64_t guest, uint64_t modification,
                                               std::span<const uint8_t> original,

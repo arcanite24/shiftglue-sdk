@@ -149,8 +149,11 @@ REXCVAR_DEFINE_STRING(vulkan_shader_override_dir, "", "GPU/Vulkan",
                       "new overrides)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(vulkan_shader_override_dirs, "", "GPU/Vulkan",
-                      "Semicolon-separated shader replacement directories, first valid exact "
-                      "identity wins, ahead of vulkan_shader_override_dir and built-in edits")
+                      "Semicolon-separated shader replacement directories, ahead of "
+                      "vulkan_shader_override_dir and built-in edits. The first valid exact "
+                      "identity wins, then shader_<guest hash>_<modification>.spv, then "
+                      "shader_<guest hash>.spv, each accepted only when its bindings, inputs "
+                      "and outputs fit the translation's")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
@@ -4930,6 +4933,42 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   }
   VkResult create_result = dfn.vkCreateGraphicsPipelines(device, vk_pipeline_cache_, 1,
                                                          &pipeline_create_info, nullptr, &pipeline);
+  if (create_result != VK_SUCCESS) {
+    // A replacement (vulkan_shader_override_dirs) the driver took as a
+    // module but not in this pipeline: this pipeline uses the translation
+    // instead, through modules of its own so the shared ones stay as they
+    // are for the creation threads.
+    std::vector<VkShaderModule> restored_modules;
+    for (uint32_t i = 0; i < shader_stage_count; ++i) {
+      for (const VulkanShader::VulkanTranslation* translation :
+           {creation_arguments.vertex_shader, creation_arguments.pixel_shader}) {
+        if (!translation || translation->replaced_binary().empty() ||
+            shader_stages[i].module != translation->shader_module()) {
+          continue;
+        }
+        const std::vector<uint8_t>& original = translation->replaced_binary();
+        VkShaderModule module = ui::vulkan::util::CreateShaderModule(
+            vulkan_device, reinterpret_cast<const uint32_t*>(original.data()), original.size());
+        if (module == VK_NULL_HANDLE) {
+          continue;
+        }
+        REXGPU_WARN("Vulkan shader override for {:016X}/{:016X} failed in a pipeline (result={}); "
+                    "that pipeline uses the translation",
+                    translation->shader().ucode_data_hash(), translation->modification(),
+                    int32_t(create_result));
+        shader_stages[i].module = module;
+        restored_modules.push_back(module);
+        break;
+      }
+    }
+    if (!restored_modules.empty()) {
+      create_result = dfn.vkCreateGraphicsPipelines(device, vk_pipeline_cache_, 1,
+                                                    &pipeline_create_info, nullptr, &pipeline);
+      for (VkShaderModule module : restored_modules) {
+        dfn.vkDestroyShaderModule(device, module, nullptr);
+      }
+    }
+  }
   if (log_statistics && create_result == VK_SUCCESS) {
     LogPipelineStatistics(pipeline, creation_arguments);
   }
