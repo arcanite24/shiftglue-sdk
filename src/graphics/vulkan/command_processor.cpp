@@ -58,6 +58,7 @@
 #include <rex/types.h>
 #include <rex/memory/utils.h>
 #include <rex/ui/flags.h>
+#include <rex/ui/upscaler.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -791,6 +792,22 @@ bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
     return false;
   }
   return true;
+}
+
+// texture_mip_lod_bias and, under a temporal upscaler that renders below its
+// output size, log2(render width / output width): the mip a texture would get
+// at the output size, the base of FSR's and DLSS's mip bias (their further -1
+// is left to texture_mip_lod_bias). In eighths, so a resized window does not
+// rebuild the samplers for a sliver.
+double TextureMipLodBias() {
+  double bias = REXCVAR_GET(texture_mip_lod_bias);
+  if (REXCVAR_GET(texture_mip_lod_bias_upscaler) && ui::IsTemporalUpscalerActive()) {
+    const float scale = ui::GetTemporalUpscalerRenderScale();
+    if (scale > 0.0f && scale < 1.0f) {
+      bias += std::round(std::log2(double(scale)) * 8.0) / 8.0;
+    }
+  }
+  return std::clamp(bias, -3.0, 3.0);
 }
 
 }  // namespace
@@ -2585,7 +2602,7 @@ bool VulkanCommandProcessor::CreateScaledComponents(uint32_t draw_resolution_sca
     return false;
   }
   // A new texture cache has no samplers yet.
-  sampler_mip_lod_bias_ = REXCVAR_GET(texture_mip_lod_bias);
+  sampler_mip_lod_bias_ = TextureMipLodBias();
   built_texture_max_size_ = REXCVAR_GET(vulkan_texture_max_size);
 
   CreateNativeExecutor();
@@ -2907,7 +2924,7 @@ void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
 }
 
 void VulkanCommandProcessor::RecreateSamplersIfMipLodBiasChanged() {
-  const double mip_lod_bias = REXCVAR_GET(texture_mip_lod_bias);
+  const double mip_lod_bias = TextureMipLodBias();
   if (mip_lod_bias == sampler_mip_lod_bias_ || device_lost_ || frame_open_) {
     return;
   }

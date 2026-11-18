@@ -64,7 +64,10 @@ std::vector<UpscalerInfo> GetSpatialUpscalerInfos();
 // provider (UP-1.6): games turn off effects that fight its history, such as
 // motion blur and depth of field. Any thread.
 bool IsTemporalUpscalerActive();
-void SetTemporalUpscalerActive(bool active);
+// render_scale: the provider's render width over its output width (1 for a
+// 1:1 pass such as DLAA, and when none is active).
+void SetTemporalUpscalerActive(bool active, float render_scale = 1.0f);
+float GetTemporalUpscalerRenderScale();
 
 // Per-frame description of a temporal upscale, for every graphics API.
 // The game camera of a frame, for a temporal upscaler's depth and motion.

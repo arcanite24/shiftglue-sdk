@@ -123,6 +123,12 @@ REXCVAR_DEFINE_DOUBLE(texture_mip_lod_bias, 0.0, "GPU",
     .range(-3.0, 3.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(texture_mip_lod_bias_upscaler, true, "GPU",
+                    "Vulkan: under a temporal upscaler (FSR 2 and 3, DLSS), also add "
+                    "log2(render width / output width) to the texture LOD bias, so textures "
+                    "keep the detail of the output size")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 // Both backends switch the scale between frames (up to 4x, square scales).
 REXCVAR_DEFINE_INT32(draw_resolution_scale_x, 1, "GPU", "Draw resolution scale X (1 = no scaling)")
     .range(1, 8)

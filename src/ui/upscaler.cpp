@@ -43,14 +43,20 @@ const char* GetUpscalerModeName(UpscalerMode mode) {
 
 namespace {
 std::atomic<bool> temporal_upscaler_active = false;
+std::atomic<float> temporal_upscaler_render_scale = 1.0f;
 }  // namespace
 
 bool IsTemporalUpscalerActive() {
   return temporal_upscaler_active.load(std::memory_order_relaxed);
 }
 
-void SetTemporalUpscalerActive(bool active) {
+void SetTemporalUpscalerActive(bool active, float render_scale) {
+  temporal_upscaler_render_scale.store(active ? render_scale : 1.0f, std::memory_order_relaxed);
   temporal_upscaler_active.store(active, std::memory_order_relaxed);
+}
+
+float GetTemporalUpscalerRenderScale() {
+  return temporal_upscaler_render_scale.load(std::memory_order_relaxed);
 }
 
 std::vector<UpscalerInfo> GetSpatialUpscalerInfos() {

@@ -4214,7 +4214,16 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           }
         }
         guest_output_jitter_phases_.store(jitter_phases, std::memory_order_relaxed);
-        SetTemporalUpscalerActive(temporal_reads_guest_output);
+        float temporal_render_scale = 1.0f;
+        if (temporal_reads_guest_output) {
+          uint32_t render_width = 0, render_height = 0;
+          guest_output_flow.GetEffectInputSize(0, render_width, render_height);
+          const uint32_t output_width = guest_output_flow.effect_output_sizes[0].first;
+          if (render_width && output_width) {
+            temporal_render_scale = float(render_width) / float(output_width);
+          }
+        }
+        SetTemporalUpscalerActive(temporal_reads_guest_output, temporal_render_scale);
         for (size_t i = 0; i < guest_output_flow.effect_count; ++i) {
           bool is_final_effect = i + 1 >= guest_output_flow.effect_count;
           GuestOutputPaintEffect effect = guest_output_flow.effects[i];

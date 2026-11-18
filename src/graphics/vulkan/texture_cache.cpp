@@ -1399,7 +1399,7 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
     sampler_create_info.mipLodBias =
         parameters.no_lod_bias
             ? 0.0f
-            : std::clamp(float(REXCVAR_GET(texture_mip_lod_bias)), -max_bias, max_bias);
+            : std::clamp(float(command_processor_.sampler_mip_lod_bias()), -max_bias, max_bias);
   }
   if (parameters.aniso_filter != xenos::AnisoFilter::kDisabled) {
     sampler_create_info.anisotropyEnable = VK_TRUE;

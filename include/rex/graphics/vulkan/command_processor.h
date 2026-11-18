@@ -149,6 +149,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking) override;
 
+  // The texture LOD bias the texture cache's samplers are created with:
+  // texture_mip_lod_bias and the upscaler's share, changed only between
+  // frames (RecreateSamplersIfMipLodBiasChanged).
+  double sampler_mip_lod_bias() const { return sampler_mip_lod_bias_; }
+
   // Fixed for the processor's lifetime; cached, since draws ask for it many
   // times and provider() is virtual.
   ui::vulkan::VulkanDevice* GetVulkanDevice() const {
@@ -375,8 +380,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   // resolution scale cvars name another square scale from 1x to 4x, so the
   // scale changes without a restart (NP-4.7).
   void SwitchDrawResolutionScaleIfRequested();
-  // Between frames, destroys the samplers when texture_mip_lod_bias differs
-  // from the bias they were created with, so they are created again with it.
+  // Between frames, destroys the samplers when the texture LOD bias
+  // (texture_mip_lod_bias, plus the temporal upscaler's share with
+  // texture_mip_lod_bias_upscaler) differs from the bias they were created
+  // with, so they are created again with it.
   void RecreateSamplersIfMipLodBiasChanged();
   // Forgets the samplers and texture descriptors draws reuse. The GPU must be
   // done with every submission and none may be open.
@@ -1109,7 +1116,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // A requested scale that cannot be switched to, so the request is reported
   // once.
   uint32_t declined_draw_resolution_scale_ = 0;
-  // texture_mip_lod_bias when the texture cache's samplers were last dropped.
+  // The texture LOD bias when the texture cache's samplers were last dropped.
   double sampler_mip_lod_bias_ = 0.0;
   // fh1_msaa_single_sample, fh1_msaa_2x and vulkan_texture_max_size when the
   // scaled components were last created; a change rebuilds them between
