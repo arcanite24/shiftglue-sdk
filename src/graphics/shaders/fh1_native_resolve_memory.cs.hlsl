@@ -29,7 +29,8 @@ FH1_PUSH_CONSTANTS cbuffer Fh1NativeResolveMemoryConstants FH1_CONSTANTS_REGISTE
                             // same place 30 (fh1_native_edram.hlsli)
   uint fh1_sample_select;   // sanitized xenos::CopySampleSelect
   // pack 0:2 (0: 8_8_8_8, 1: 2_10_10_10, 2: 32_FLOAT, 3: 16_16_16_16_FLOAT,
-  // 4: raw 32-bit word, 5: 16_16_16_16 unorm, 6: 8 unorm), endian 3:5,
+  // 4: raw 32-bit word, 5: 16_16_16_16 unorm, 6: 8 unorm, 7: 16_16 from a
+  // 16_16 target, its snorm words), endian 3:5,
   // swap red/blue 6, float24 rounding 7,
   // exp bias 8:15 (signed), bytes per texel log2 16:17, gamma targets hold
   // linear values 18, 16_16[_16_16] hosts keep the full range as snorm / 32 19,
@@ -264,7 +265,8 @@ void main(uint3 thread : SV_DispatchThreadID) {
       LayoutIs64bpp(FH1_RESOLVE_LAYOUT) == 0u &&
       ((pack == 0u && (format == FORMAT_8_8_8_8 || format == FORMAT_8_8_8_8_GAMMA)) ||
        (pack == 1u && (format == FORMAT_2_10_10_10 ||
-                       format == FORMAT_2_10_10_10_AS_10_10_10_10)))) {
+                       format == FORMAT_2_10_10_10_AS_10_10_10_10)) ||
+       (pack == 7u && format == FORMAT_16_16))) {
     StoreWord(address, host_pixel, EndianSwap32(LoadOwnerWord(pixel, first_sample, 0u), endian));
     return;
   }
@@ -286,6 +288,12 @@ void main(uint3 thread : SV_DispatchThreadID) {
     StoreWord(address, host_pixel, EndianSwap32(EncodeColor(color, FORMAT_2_10_10_10), endian));
   } else if (pack == 2u) {
     StoreWord(address, host_pixel, EndianSwap32(asuint(color.r), endian));
+  } else if (pack == 7u) {
+    // The samples' average back in the target's snorm encoding (the texture's
+    // fetch constant says how it reads them).
+    int2 q = int2(round(clamp(color.rg / fh1_fixed16_scale, -1.0f, 1.0f) * 32767.0f));
+    StoreWord(address, host_pixel,
+              EndianSwap32((uint(q.x) & 0xFFFFu) | (uint(q.y) << 16u), endian));
   } else if (pack == 6u) {
     // R8 texels share words. Atomics preserve both neighbouring texels and
     // bytes outside a partial resolve, including when threads run concurrently.

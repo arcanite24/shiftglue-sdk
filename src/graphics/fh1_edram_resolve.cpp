@@ -133,6 +133,10 @@ bool Fh1PlanResolve(const RegisterFile& regs, const memory::Memory& memory,
         pack = 3;
         bpb_log2 = 3;
         break;
+      // FM3 resolves a 16_16 target into a 16_16 texture.
+      case xenos::TextureFormat::k_16_16:
+        if (plan.color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16) pack = 7;
+        break;
       // Depth of field resolves its 16_16_16_16_FLOAT target into one (#425).
       case xenos::TextureFormat::k_16_16_16_16:
         pack = 5;
