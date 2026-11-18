@@ -76,6 +76,14 @@ REXCVAR_DEFINE_UINT32(
     "FH1 source-render FPS limit (0 follows the host display; up to 1000 for an "
     "effectively unlocked rate)")
     .range(0, 1000);
+REXCVAR_DEFINE_BOOL(low_latency_frame_cap, false, "GPU",
+                    "Hold the game a little under the display's refresh (refresh - "
+                    "refresh^2/3600: 116 at 120 Hz, 58 real frames with frame generation), as "
+                    "NVIDIA Reflex does on G-SYNC, so frames do not queue behind v-sync: on a "
+                    "120 Hz VRR display, input to screen fell from about 40 ms to 10 ms. For "
+                    "G-SYNC and FreeSync displays; a fixed-refresh display repeats a frame now "
+                    "and then")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(gpu_log_register_reads, false, "GPU",
                     "Log the first guest read of each GPU register (a census of what the "
                     "title polls, for deciding which reads need emulation)");
@@ -267,11 +275,20 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             continue;
           }
           uint32_t current_render_fps_limit = REXCVAR_GET(pinyon_shift_fh1_render_fps_limit);
+          // Issue #1094: the display's rate, or a little under it for low
+          // latency (frames at exactly the refresh fill the swapchain queue).
+          double display_rate = REXCVAR_GET(video_mode_refresh_rate);
+          if (REXCVAR_GET(low_latency_frame_cap) && display_rate > 1.0) {
+            display_rate -= display_rate * display_rate / 3600.0;
+            const uint32_t cap = uint32_t(display_rate);
+            if (cap && (!current_render_fps_limit || current_render_fps_limit > cap)) {
+              current_render_fps_limit = cap;
+            }
+          }
           // UP-4.2: with a generated frame after each real one, the game
           // renders at no more than half the refresh, so both are shown.
           if (presenter_ && presenter_->IsFrameGenerating()) {
-            const uint32_t half_refresh =
-                uint32_t(REXCVAR_GET(video_mode_refresh_rate) * 0.5 + 0.5);
+            const uint32_t half_refresh = uint32_t(display_rate * 0.5 + 0.5);
             if (half_refresh &&
                 (!current_render_fps_limit || current_render_fps_limit > half_refresh)) {
               current_render_fps_limit = half_refresh;

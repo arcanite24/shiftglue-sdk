@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -302,6 +303,10 @@ class VulkanPresenter final : public Presenter {
     uint64_t version = UINT64_MAX;
     // Which refresh wrote the image last (guest_output_refresh_serial_).
     uint64_t refresh_serial = 0;
+    // When that refresh was submitted, and when the title had last read
+    // its controller by then (rex/latency.h), for the latency measurement.
+    uint64_t refresh_us = 0;
+    uint64_t input_us = 0;
     // Whether that refresh also wrote the HUD-less copy, and the camera
     // images with this camera.
     bool hudless_valid = false;
@@ -820,6 +825,41 @@ class VulkanPresenter final : public Presenter {
     uint32_t render_height = 0;
   };
   FrameGenerationState frame_generation_;
+  // Issue #1094: input to display, per real frame, in segments. The shown
+  // time is when vkWaitForPresentKHR returned for the frame, which runs at
+  // the next present: an upper bound, late by up to a frame.
+  struct LatencyFrame {
+    uint64_t present_id = 0;
+    uint64_t input_us = 0;
+    uint64_t refresh_us = 0;
+    uint64_t paint_us = 0;
+    uint64_t queued_us = 0;
+  };
+  struct LatencyState {
+    uint64_t measured_serial = 0;
+    // Real frames queued and not yet seen on screen, oldest first (FIFO
+    // keeps two or three in flight).
+    std::array<LatencyFrame, 8> pending = {};
+    size_t pending_first = 0;
+    size_t pending_count = 0;
+    // Sums over the current window, in microseconds.
+    uint64_t frames = 0;
+    uint64_t shown_frames = 0;
+    double input_to_refresh = 0.0;
+    double refresh_to_paint = 0.0;
+    double paint_to_queued = 0.0;
+    double queued_to_shown = 0.0;
+    double total_max = 0.0;
+    uint64_t window_start_us = 0;
+    uint64_t window_generated = 0;
+    // The last window's means, for the F3 overlay (0: none yet).
+    std::atomic<float> input_to_queued_ms{0.0f};
+    std::atomic<float> input_to_shown_ms{0.0f};
+  };
+  LatencyState latency_;
+  // Polls the queued real frames (timeout 0) and adds those now shown.
+  void PollLatencyShown();
+  void CloseLatencyWindow();
   // UP-4: frame_generation_compose.cs.glsl, in the layout of the upscale HUD
   // composite, with two sets per paint submission.
   VkPipeline frame_generation_compose_pipeline_ = VK_NULL_HANDLE;

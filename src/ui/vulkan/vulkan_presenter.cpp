@@ -25,6 +25,7 @@
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/latency.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/platform.h>
@@ -106,6 +107,11 @@ REXCVAR_DEFINE_STRING(present_frame_generation, "off", "UI/Presenter",
                       "frame generation from the player's Lossless.dll). The swapchain is remade "
                       "when it is turned on")
     .allowed({"off", "fsr3", "dlss", "lsfg"})
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(present_latency_log, false, "UI/Presenter",
+                    "Debug: log the time from the title's controller read to its frame on "
+                    "screen, in segments, every 5 seconds")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(present_frame_generation_log, false, "UI/Presenter",
@@ -1537,8 +1543,70 @@ void VulkanPresenter::NoteFrameGenerationPresent(bool generated) {
   }
 }
 
+void VulkanPresenter::PollLatencyShown() {
+  LatencyState& state = latency_;
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  while (state.pending_count) {
+    LatencyFrame& frame = state.pending[state.pending_first];
+    if (frame.present_id > paint_context_.swapchain_last_present_id) {
+      // From a swapchain since remade.
+      state.pending_count = 0;
+      break;
+    }
+    if (dfn.vkWaitForPresentKHR(vulkan_device_->device(), paint_context_.swapchain,
+                                frame.present_id, 0) != VK_SUCCESS) {
+      break;
+    }
+    // Shown by now: an upper bound, late by up to the time between paints.
+    const uint64_t now_us = rex::latency::NowUs();
+    ++state.shown_frames;
+    state.queued_to_shown += double(now_us - frame.queued_us);
+    state.total_max = std::max(state.total_max, double(now_us - frame.input_us));
+    state.pending_first = (state.pending_first + 1) % state.pending.size();
+    --state.pending_count;
+  }
+}
+
+void VulkanPresenter::CloseLatencyWindow() {
+  LatencyState& state = latency_;
+  const uint64_t now_us = rex::latency::NowUs();
+  if (!state.window_start_us) {
+    state.window_start_us = now_us;
+    return;
+  }
+  if (now_us - state.window_start_us < 5000000 || !state.frames) {
+    return;
+  }
+  const double frames = double(state.frames);
+  const double to_refresh = state.input_to_refresh / frames / 1000.0;
+  const double to_paint = state.refresh_to_paint / frames / 1000.0;
+  const double to_queued = state.paint_to_queued / frames / 1000.0;
+  const double to_shown =
+      state.shown_frames ? state.queued_to_shown / double(state.shown_frames) / 1000.0 : 0.0;
+  const double queued_total = to_refresh + to_paint + to_queued;
+  state.input_to_queued_ms.store(float(queued_total), std::memory_order_relaxed);
+  state.input_to_shown_ms.store(state.shown_frames ? float(queued_total + to_shown) : 0.0f,
+                                std::memory_order_relaxed);
+  if (REXCVAR_GET(present_latency_log)) {
+    REXLOG_INFO(
+        "Latency ({} real frames, {} generated, frame generation {}): input to guest refresh {:.1f} ms, to "
+        "paint {:.1f}, to queued {:.1f}, to shown (at most) {:.1f}; total {:.1f} ms queued, "
+        "{:.1f} shown, worst {:.1f}",
+        state.frames, frame_generation_.total_generated_presents - state.window_generated,
+        REXCVAR_GET(present_frame_generation), to_refresh, to_paint, to_queued,
+        to_shown, queued_total, queued_total + to_shown, state.total_max / 1000.0);
+  }
+  state.frames = state.shown_frames = 0;
+  state.input_to_refresh = state.refresh_to_paint = state.paint_to_queued = 0.0;
+  state.queued_to_shown = state.total_max = 0.0;
+  state.window_start_us = now_us;
+  state.window_generated = frame_generation_.total_generated_presents;
+}
+
 Presenter::PresentStats VulkanPresenter::GetPresentStatsFromUIThread() const {
   PresentStats stats;
+  stats.latency_queued_ms = latency_.input_to_queued_ms.load(std::memory_order_relaxed);
+  stats.latency_shown_ms = latency_.input_to_shown_ms.load(std::memory_order_relaxed);
   const FrameGenerationState& state = frame_generation_;
   stats.real_presents = state.total_real_presents;
   stats.generated_presents = state.total_generated_presents;
@@ -2486,6 +2554,8 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
 void VulkanPresenter::GuestOutputRefreshSubmitted(uint32_t mailbox_index) {
   GuestOutputImageInstance& image_instance = guest_output_images_[mailbox_index];
   image_instance.refresh_serial = ++guest_output_refresh_serial_;
+  image_instance.refresh_us = rex::latency::NowUs();
+  image_instance.input_us = rex::latency::last_input_sample_us.load(std::memory_order_relaxed);
   // Even if the refresher has returned false, it still might have submitted
   // some commands referencing the image. It's better to put an excessive
   // signal and wait slightly longer, for nothing important, while shutting down
@@ -3483,6 +3553,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   GuestOutputPaintConfig guest_output_paint_config;
   std::shared_ptr<GuestOutputImage> guest_output_image;
   uint64_t guest_output_refresh_serial = 0;
+  uint64_t guest_output_refresh_us = 0;
+  uint64_t guest_output_input_us = 0;
   bool guest_output_hudless = false;
   bool guest_output_camera_valid = false;
   UpscalerCamera guest_output_camera;
@@ -3494,6 +3566,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       assert_true(guest_output_images_[guest_output_mailbox_index].ever_successfully_refreshed);
       guest_output_image = guest_output_images_[guest_output_mailbox_index].image;
       guest_output_refresh_serial = guest_output_images_[guest_output_mailbox_index].refresh_serial;
+      guest_output_refresh_us = guest_output_images_[guest_output_mailbox_index].refresh_us;
+      guest_output_input_us = guest_output_images_[guest_output_mailbox_index].input_us;
       guest_output_hudless = guest_output_images_[guest_output_mailbox_index].hudless_valid;
       guest_output_camera_valid = guest_output_images_[guest_output_mailbox_index].camera_valid;
       guest_output_camera = guest_output_images_[guest_output_mailbox_index].camera;
@@ -3503,6 +3577,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     // the new reference or is exclusively owned by main target painting (and
     // multiple threads can't paint the main target at the same time).
   }
+  const uint64_t latency_paint_start_us = rex::latency::NowUs();
 
   // UP-4: the size of the guest frame, once it is painted this time.
   uint32_t frame_generation_render_width = 0;
@@ -4451,6 +4526,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     }
   }
 
+  uint64_t last_present_id = 0;
+  uint64_t last_present_queued_us = 0;
+  // A new real frame (not a repaint of the same guest output) is measured.
+  const bool measure_latency = guest_output_refresh_serial &&
+                               guest_output_refresh_serial != latency_.measured_serial &&
+                               guest_output_input_us && guest_output_input_us <= guest_output_refresh_us;
+  const uint64_t paint_us = measure_latency ? latency_paint_start_us : 0;
   auto present_image = [&](uint32_t image_index, VkSemaphore wait_semaphore) {
     VkPresentInfoKHR present_info;
     present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -4465,8 +4547,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     VkPresentIdKHR present_id_info = {VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
     uint64_t present_id = 0;
     const VulkanDevice::Properties& device_properties = vulkan_device_->properties();
-    if (device_properties.presentId && device_properties.presentWait &&
-        REXCVAR_GET(vulkan_present_wait)) {
+    // IDs go on every present where present wait exists, for the latency
+    // measurement (and VK_NV_low_latency2); only vulkan_present_wait waits.
+    const bool present_ids = device_properties.presentId && device_properties.presentWait;
+    if (present_ids) {
+      PollLatencyShown();
       present_id = ++paint_context_.swapchain_last_present_id;
       present_id_info.swapchainCount = 1;
       present_id_info.pPresentIds = &present_id;
@@ -4478,12 +4563,17 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
       result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
     }
-    if (present_id > 1 && (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)) {
+    last_present_id = present_id;
+    last_present_queued_us = rex::latency::NowUs();
+    if (present_id > 1 && REXCVAR_GET(vulkan_present_wait) &&
+        (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)) {
       // At most one present in flight: the previous one must have reached the
       // display before the next frame is painted. With frame generation this
       // also spaces the two presents of a paint by a refresh under FIFO.
-      dfn.vkWaitForPresentKHR(vulkan_device_->device(), paint_context_.swapchain, present_id - 1,
-                              UINT64_C(50000000));
+      if (dfn.vkWaitForPresentKHR(vulkan_device_->device(), paint_context_.swapchain,
+                                  present_id - 1, UINT64_C(50000000)) == VK_SUCCESS) {
+        PollLatencyShown();
+      }
     }
     return result;
   };
@@ -4530,6 +4620,30 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     present_result = present_image(swapchain_image_index, present_semaphore);
   }
   if (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR) {
+    if (measure_latency) {
+      latency_.measured_serial = guest_output_refresh_serial;
+      LatencyState& state = latency_;
+      if (state.pending_count == state.pending.size()) {
+        state.pending_first = (state.pending_first + 1) % state.pending.size();
+        --state.pending_count;
+      }
+      LatencyFrame& frame =
+          state.pending[(state.pending_first + state.pending_count++) % state.pending.size()];
+      frame.present_id = last_present_id;
+      frame.input_us = guest_output_input_us;
+      frame.refresh_us = guest_output_refresh_us;
+      frame.paint_us = std::max(paint_us, guest_output_refresh_us);
+      // When the real frame was queued, before any wait for an earlier one.
+      frame.queued_us = last_present_queued_us ? last_present_queued_us : rex::latency::NowUs();
+      ++state.frames;
+      state.input_to_refresh += double(frame.refresh_us - frame.input_us);
+      state.refresh_to_paint += double(frame.paint_us - frame.refresh_us);
+      state.paint_to_queued += double(frame.queued_us - frame.paint_us);
+      if (!frame.present_id) {
+        state.pending_count = 0;  // nothing to poll without present ids
+      }
+      CloseLatencyWindow();
+    }
     ++frame_generation_.total_real_presents;
     if (paint_context_.swapchain_frame_generation) {
       NoteFrameGenerationPresent(false);

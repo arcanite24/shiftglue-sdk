@@ -434,6 +434,11 @@ class Presenter {
     std::string upscaler;
     bool hdr = false;
     bool vsync = false;
+    // Issue #1094: the mean time from the title's controller read to its
+    // real frame queued for display, and to it shown (an upper bound), over
+    // the last 5 seconds; 0 when not measured.
+    float latency_queued_ms = 0.0f;
+    float latency_shown_ms = 0.0f;
   };
   virtual PresentStats GetPresentStatsFromUIThread() const { return {}; }
   // UP-1.5: the length of the jitter sequence the game should render with

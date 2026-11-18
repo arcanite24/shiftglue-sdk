@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include <rex/latency.h>
 #include <rex/dbg.h>
 #include <rex/input/device_assignment.h>
 #include <rex/input/flags.h>
@@ -297,6 +298,7 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
                       [&] { return GetKeystrokeImpl(user_index, flags, out_keystroke); });
 }
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+  rex::latency::NoteInputSample();
   return SessionInput(session_probe::Kind::kInputResult, session_probe::Kind::kInputState,
                       user_index, out_state, [&] { return GetMergedState(user_index, false, out_state); });
 }

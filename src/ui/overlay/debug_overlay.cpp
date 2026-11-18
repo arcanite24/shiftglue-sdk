@@ -125,6 +125,11 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
         ImGui::Text("Output %ux%u", present.output_width, present.output_height);
       }
       ImGui::Text("%s, V-sync %s", present.hdr ? "HDR" : "SDR", present.vsync ? "on" : "off");
+      if (present.latency_shown_ms > 0.0f) {
+        ImGui::Text("Input lag %5.1f ms (to shown, at most)", present.latency_shown_ms);
+      } else if (present.latency_queued_ms > 0.0f) {
+        ImGui::Text("Input lag %5.1f ms (to queued)", present.latency_queued_ms);
+      }
     }
 
     // Shown frame time, real frames and generated ones together.
