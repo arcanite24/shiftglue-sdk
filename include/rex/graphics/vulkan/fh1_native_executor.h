@@ -468,6 +468,7 @@ class Fh1NativeExecutor {
   bool IsReadbackResolveSize(uint32_t width, uint32_t height);
   std::string readback_sizes_text_;
   std::vector<uint64_t> readback_sizes_;
+  std::unordered_map<uint32_t, uint64_t> readback_size_frames_;
   void QueueResolveReadback(uint32_t address, uint32_t length);
   // Small resolves the CPU reads every frame (the auto exposure's luminance,
   // #548): copied into a ring and written to guest memory once their
