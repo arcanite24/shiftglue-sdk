@@ -190,6 +190,11 @@ REXCVAR_DEFINE_BOOL(fh1_skip_draws_without_effect, true, "GPU",
                     "Skip FH1 draws that write no surface, outside occlusion queries and "
                     "without memory export (FH1 native executor, Vulkan)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(vulkan_device_local_uniform_memory, false, "GPU/Vulkan",
+                    "Put the per-draw uniform (constant) upload pages in host-visible "
+                    "device-local memory (Resizable BAR) when the GPU has it, so draws read "
+                    "their constants from VRAM rather than over PCIe")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_cached_uniform_memory, true, "GPU/Vulkan",
                     "Put the per-draw uniform (constant) upload pages in host-cached memory "
                     "rather than write-combined memory")
@@ -1459,6 +1464,7 @@ bool VulkanCommandProcessor::SetupContext() {
       rex::align(std::max(ui::GraphicsUploadBufferPool::kDefaultPageSize, size_t(16384)),
                  size_t(device_properties.minUniformBufferOffsetAlignment)),
       REXCVAR_GET(vulkan_cached_uniform_memory));
+  uniform_buffer_pool_->SetPreferDeviceLocal(REXCVAR_GET(vulkan_device_local_uniform_memory));
 
   // Descriptor set layouts that don't depend on the setup of other subsystems.
   VkShaderStageFlags guest_shader_stages =

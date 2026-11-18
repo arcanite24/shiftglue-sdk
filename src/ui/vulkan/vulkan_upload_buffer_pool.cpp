@@ -25,6 +25,21 @@ namespace vulkan {
 // or flush range must be clamped to the actual allocation size as a special
 // case, but it's still unlikely that the allocation won't be aligned to it), so
 // try not to waste that padding.
+uint32_t VulkanUploadBufferPool::ChooseMemoryType(uint32_t supported_types) const {
+  const VulkanDevice::MemoryTypes& types = vulkan_device_->memory_types();
+  if (prefer_device_local_) {
+    // Write-combined device-local first (the BAR window), then any
+    // host-visible device-local type.
+    const uint32_t device_local = supported_types & types.host_visible & types.device_local;
+    uint32_t memory_type;
+    if (rex::bit_scan_forward(device_local & ~types.host_cached, &memory_type) ||
+        rex::bit_scan_forward(device_local, &memory_type)) {
+      return memory_type;
+    }
+  }
+  return util::ChooseHostMemoryType(types, supported_types, prefer_cached_);
+}
+
 VulkanUploadBufferPool::VulkanUploadBufferPool(const VulkanDevice* const vulkan_device,
                                                const VkBufferUsageFlags usage,
                                                const size_t page_size, const bool prefer_cached)
@@ -89,8 +104,7 @@ GraphicsUploadBufferPool::Page* VulkanUploadBufferPool::CreatePageImplementation
   if (memory_type_ == kMemoryTypeUnknown) {
     VkMemoryRequirements memory_requirements;
     dfn.vkGetBufferMemoryRequirements(device, buffer, &memory_requirements);
-    memory_type_ = util::ChooseHostMemoryType(vulkan_device_->memory_types(),
-                                              memory_requirements.memoryTypeBits, prefer_cached_);
+    memory_type_ = ChooseMemoryType(memory_requirements.memoryTypeBits);
     if (memory_type_ == UINT32_MAX) {
       REXLOG_ERROR(
           "No host-visible memory types can store an Vulkan upload buffer with "
@@ -117,8 +131,7 @@ GraphicsUploadBufferPool::Page* VulkanUploadBufferPool::CreatePageImplementation
           VK_SUCCESS) {
         VkMemoryRequirements memory_requirements_expanded;
         dfn.vkGetBufferMemoryRequirements(device, buffer_expanded, &memory_requirements_expanded);
-        uint32_t memory_type_expanded = util::ChooseHostMemoryType(
-            vulkan_device_->memory_types(), memory_requirements.memoryTypeBits, prefer_cached_);
+        uint32_t memory_type_expanded = ChooseMemoryType(memory_requirements.memoryTypeBits);
         if (memory_requirements_expanded.size <= allocation_size_ &&
             memory_type_expanded != UINT32_MAX) {
           page_size_ = size_t(allocation_size_);

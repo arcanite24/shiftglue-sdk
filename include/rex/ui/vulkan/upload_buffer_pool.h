@@ -25,6 +25,12 @@ class VulkanUploadBufferPool : public GraphicsUploadBufferPool {
   VulkanUploadBufferPool(const VulkanDevice* vulkan_device, VkBufferUsageFlags usage,
                          size_t page_size = kDefaultPageSize, bool prefer_cached = false);
 
+  // Before the first request: pages go to host-visible device-local memory
+  // (Resizable BAR, or any memory on a UMA GPU) where the device has it, so
+  // the GPU reads them from VRAM. Writes must stay sequential and never be
+  // read back by the CPU.
+  void SetPreferDeviceLocal(bool prefer) { prefer_device_local_ = prefer; }
+
   uint8_t* Request(uint64_t submission_index, size_t size, size_t alignment, VkBuffer& buffer_out,
                    VkDeviceSize& offset_out);
   uint8_t* RequestPartial(uint64_t submission_index, size_t size, size_t alignment,
@@ -57,6 +63,8 @@ class VulkanUploadBufferPool : public GraphicsUploadBufferPool {
 
   VkBufferUsageFlags usage_;
   bool prefer_cached_;
+  bool prefer_device_local_ = false;
+  uint32_t ChooseMemoryType(uint32_t supported_types) const;
 };
 
 }  // namespace vulkan
