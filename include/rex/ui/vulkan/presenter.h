@@ -794,6 +794,8 @@ class VulkanPresenter final : public Presenter {
     // Counts since the last log line.
     uint64_t generated = 0;
     uint64_t skipped_no_camera = 0;
+    // Dispatches that dropped the provider's history (camera cut or restart).
+    uint64_t resets = 0;
     uint64_t skipped_no_image = 0;
     uint64_t skipped_repeat = 0;
     uint64_t skipped_no_size = 0;

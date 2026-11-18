@@ -1278,6 +1278,7 @@ bool VulkanPresenter::RecordFrameGeneration(
     frame.jitter_x = camera->jitter_x;
     frame.jitter_y = camera->jitter_y;
   }
+  if (frame.reset) ++state.resets;
   inputs.frame_id = ++state.frame_id;
   // The painted guest output, clipped to the swapchain.
   inputs.generation_width = extent.width;
@@ -1516,17 +1517,18 @@ void VulkanPresenter::NoteFrameGenerationPresent(bool generated) {
   REXLOG_INFO(
       "VulkanPresenter: frame generation {} ({}): {:.1f} presents/s ({} generated), interval "
       "mean {:.2f} max {:.2f} ms, <12: {}, 12-22: {}, 22-40: {}, >40: {}; dispatched {} "
-      "(failed {}), skipped: repeat {}, no camera {}, no size {}, no image {}; real every "
-      "{:.2f} ms, generated-to-real gap {:.2f} ms",
+      "(failed {}, reset {}), skipped: repeat {}, no camera {}, no size {}, no image {}; real "
+      "every {:.2f} ms, generated-to-real gap {:.2f} ms",
       REXCVAR_GET(present_frame_generation),
       state.generator ? state.generator->info().version : std::string("-"),
       double(state.presents) / seconds, state.presents_generated,
       state.presents ? state.present_ms_sum / double(state.presents) : 0.0, state.present_ms_max,
       state.present_buckets[0], state.present_buckets[1], state.present_buckets[2],
-      state.present_buckets[3], state.generated, state.failed, state.skipped_repeat,
+      state.present_buckets[3], state.generated, state.failed, state.resets, state.skipped_repeat,
       state.skipped_no_camera, state.skipped_no_size, state.skipped_no_image, state.interval_ms,
       state.presents_generated ? state.gap_ms_sum / double(state.presents_generated) : 0.0);
   state.generated = state.failed = state.skipped_no_camera = state.skipped_no_image = 0;
+  state.resets = 0;
   state.skipped_repeat = state.skipped_no_size = 0;
   state.presents = state.presents_generated = 0;
   state.present_ms_sum = state.present_ms_max = state.gap_ms_sum = 0.0;
@@ -2962,7 +2964,11 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   // by name) and otherwise only paces the guest GPU: with it on, the two
   // modes that tear are left out, so the swapchain is mailbox or FIFO, as
   // Direct3D 12 presents without its tearing flag. Unregistered counts as on.
-  const bool vsync = rex::cvar::GetFlagByName("vsync") != "false";
+  // Frame generation always presents in FIFO (G-SYNC and FreeSync still
+  // follow it): with vsync off, immediate presents were spaced only by a CPU
+  // sleep from the submit, not by when either image was done, and the pair
+  // reached the display unevenly (issue #1094: "felt off" next to vsync on).
+  const bool vsync = rex::cvar::GetFlagByName("vsync") != "false" || frame_generation;
   if (!vsync && REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
       std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
           present_modes.cend()) {

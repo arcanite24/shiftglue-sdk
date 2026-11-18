@@ -6,8 +6,9 @@
  * the player sets, or the Lossless Scaling folder in their Steam libraries),
  * reads its DXBC shaders in memory, translates them to SPIR-V with DXVK's
  * compiler and runs lsfg-vk's LSFG 3.1 passes on the presenter's device, in
- * its command buffer (thirdparty/lsfg). Nothing is looked for unless
- * present_lsfg_dll or present_lsfg_experimental is set.
+ * its command buffer (thirdparty/lsfg). It is offered whenever the player
+ * has the DLL: present_lsfg_dll, or else a Lossless Scaling install in one
+ * of their Steam libraries.
  */
 
 #include <rex/ui/vulkan/frame_generator.h>
@@ -35,12 +36,12 @@
 #endif
 
 REXCVAR_DEFINE_STRING(present_lsfg_dll, "", "UI/Presenter",
-                      "Path to the player's own Lossless.dll for LSFG frame generation")
+                      "Path to the player's own Lossless.dll for LSFG frame generation (empty: "
+                      "the Lossless Scaling install in the Steam library folders)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(present_lsfg_experimental, false, "UI/Presenter",
-                    "Look for Lossless.dll in the Steam library folders when "
-                    "present_lsfg_dll is empty")
+                    "No longer used: LSFG is offered whenever Lossless.dll is found")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(present_lsfg_performance, false, "UI/Presenter",
@@ -300,9 +301,6 @@ class VulkanLsfgFrameGenerator final : public VulkanFrameGenerator {
 }  // namespace
 
 std::unique_ptr<VulkanFrameGenerator> CreateVulkanLsfgFrameGenerator(const VulkanDevice* device) {
-  if (REXCVAR_GET(present_lsfg_dll).empty() && !REXCVAR_GET(present_lsfg_experimental)) {
-    return nullptr;
-  }
   return std::make_unique<VulkanLsfgFrameGenerator>(device);
 }
 

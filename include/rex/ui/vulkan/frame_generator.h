@@ -80,7 +80,7 @@ std::unique_ptr<VulkanFrameGenerator> CreateVulkanFfxFrameGenerator(const Vulkan
 // UP-4.3: null when present_dlss_frame_generation is off.
 std::unique_ptr<VulkanFrameGenerator> CreateVulkanDlssFrameGenerator(const VulkanDevice* device);
 // UP-5.2: LSFG 3.1 from the player's own Lossless.dll, its shaders translated
-// at run time. Null unless present_lsfg_dll or present_lsfg_experimental is set.
+// at run time. Unavailable (with a reason) when no Lossless.dll is found.
 std::unique_ptr<VulkanFrameGenerator> CreateVulkanLsfgFrameGenerator(const VulkanDevice* device);
 
 }  // namespace vulkan
