@@ -458,6 +458,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     // #106, for HDR10 output (present_hdr).
     XE_UI_VULKAN_STRUCT_EXTENSION(EXT_hdr_metadata)
+    // #506, NVIDIA Reflex (present_reflex): needs present ids and the 1.2
+    // timeline semaphores its sleep signals.
+    if (get_physical_device_properties2_supported &&
+        properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+      XE_UI_VULKAN_STRUCT_EXTENSION(NV_low_latency2)
+    }
   }
 
   bool ext_1_2_KHR_sampler_mirror_clamp_to_edge = false;
@@ -1103,6 +1109,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (device->extensions_.ext_KHR_present_id) {
     XE_UI_VULKAN_FEATURE_2(features_KHR_present_id, presentId)
   }
+  if (device->extensions_.ext_NV_low_latency2) {
+    XE_UI_VULKAN_FEATURE_2(features_1_2, timelineSemaphore);
+  }
   if (device->extensions_.ext_KHR_present_wait) {
     XE_UI_VULKAN_FEATURE_2(features_KHR_present_wait, presentWait)
   }
@@ -1198,6 +1207,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
   if (device->extensions_.ext_EXT_hdr_metadata) {
 #include <rex/ui/vulkan/functions/device_ext_hdr_metadata.inc>
+  }
+  if (device->extensions_.ext_NV_low_latency2) {
+#include <rex/ui/vulkan/functions/device_nv_low_latency2.inc>
   }
   if (device->extensions_.ext_KHR_fragment_shading_rate) {
 #include <rex/ui/vulkan/functions/device_khr_fragment_shading_rate.inc>

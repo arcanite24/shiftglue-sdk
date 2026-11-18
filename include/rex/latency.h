@@ -20,7 +20,26 @@ inline uint64_t NowUs() {
 // The steady clock (NowUs) at the title's latest XInputGetState.
 inline std::atomic<uint64_t> last_input_sample_us{0};
 
+// NVIDIA Reflex (VK_NV_low_latency2): the presenter installs a hook that
+// sleeps at the start of a guest frame and marks its stages. A guest frame
+// starts at the first controller read after a VdSwap and ends at the next
+// VdSwap.
+enum class FrameEvent : uint32_t {
+  kInputSample,  // XInputGetState, before the state is read
+  kSwap,         // VdSwap
+};
+using FrameHook = void (*)(FrameEvent event);
+inline std::atomic<FrameHook> frame_hook{nullptr};
+
+inline void NoteFrameEvent(FrameEvent event) {
+  if (FrameHook hook = frame_hook.load(std::memory_order_acquire)) {
+    hook(event);
+  }
+}
+
+// Before the title reads its controller: Reflex may sleep here first.
 inline void NoteInputSample() {
+  NoteFrameEvent(FrameEvent::kInputSample);
   last_input_sample_us.store(NowUs(), std::memory_order_relaxed);
 }
 

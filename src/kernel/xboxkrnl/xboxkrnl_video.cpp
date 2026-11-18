@@ -24,6 +24,7 @@
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/rtl.h>
 #include <rex/kernel/xboxkrnl/video.h>
+#include <rex/latency.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
 #include <rex/types.h>
@@ -452,6 +453,8 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   assert(texture_format_ptr);
   assert(width);
   assert(height);
+  // Reflex: the guest frame's CPU work ends here.
+  rex::latency::NoteFrameEvent(rex::latency::FrameEvent::kSwap);
 
   namespace xenos = rex::graphics::xenos;
 

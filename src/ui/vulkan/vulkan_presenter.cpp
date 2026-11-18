@@ -113,6 +113,14 @@ REXCVAR_DEFINE_BOOL(present_latency_log, false, "UI/Presenter",
                     "Debug: log the time from the title's controller read to its frame on "
                     "screen, in segments, every 5 seconds")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(present_reflex, false, "UI/Presenter",
+                    "NVIDIA Reflex (VK_NV_low_latency2): the title waits before reading the "
+                    "controller until the driver says a frame should start, so it is not "
+                    "queued behind earlier ones. NVIDIA GPUs only")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(present_reflex_boost, false, "UI/Presenter",
+                    "With present_reflex: keep the GPU clocks up (Reflex Boost)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(present_frame_generation_multiplier, 2, "UI/Presenter",
                      "Frames shown per real one while generating: 2, or 3 and 4 with a "
@@ -345,6 +353,10 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
 }
 
 VulkanPresenter::~VulkanPresenter() {
+  if (reflex_presenter_.load(std::memory_order_acquire) == this) {
+    rex::latency::frame_hook.store(nullptr, std::memory_order_release);
+    reflex_presenter_.store(nullptr, std::memory_order_release);
+  }
   // Retirement drains drawing and presentation before releasing their objects.
   paint_context_.DestroySwapchainAndVulkanSurface();
 
@@ -373,6 +385,7 @@ VulkanPresenter::~VulkanPresenter() {
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
 
+  util::DestroyAndNullHandle(dfn.vkDestroySemaphore, device, reflex_.semaphore);
   util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, frame_generation_compose_pipeline_);
   util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device, frame_generation_compose_pool_);
   util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, frame_generation_mask_pipeline_);
@@ -1699,11 +1712,166 @@ void VulkanPresenter::CloseLatencyWindow() {
         REXCVAR_GET(present_frame_generation), to_refresh, to_paint, to_queued,
         to_shown, queued_total, queued_total + to_shown, state.total_max / 1000.0);
   }
+  ReflexReport();
   state.frames = state.shown_frames = 0;
   state.input_to_refresh = state.refresh_to_paint = state.paint_to_queued = 0.0;
   state.queued_to_shown = state.total_max = 0.0;
   state.window_start_us = now_us;
   state.window_generated = frame_generation_.total_generated_presents;
+}
+
+std::atomic<VulkanPresenter*> VulkanPresenter::reflex_presenter_{nullptr};
+
+void VulkanPresenter::ReflexFrameHook(rex::latency::FrameEvent event) {
+  if (VulkanPresenter* presenter = reflex_presenter_.load(std::memory_order_acquire)) {
+    presenter->ReflexFrameEvent(event);
+  }
+}
+
+void VulkanPresenter::ReflexFrameEvent(rex::latency::FrameEvent event) {
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  ReflexState& state = reflex_;
+  if (event == rex::latency::FrameEvent::kSwap) {
+    // The CPU part of the frame ends; its refresh comes later on the GPU
+    // thread, which takes the frame ID from here in order.
+    uint64_t frame_id = 0;
+    if (state.in_frame.exchange(false, std::memory_order_acq_rel)) {
+      frame_id = state.frame_id.load(std::memory_order_relaxed);
+      ReflexMark(VK_LATENCY_MARKER_SIMULATION_END_NV, frame_id);
+      ReflexMark(VK_LATENCY_MARKER_RENDERSUBMIT_START_NV, frame_id);
+    }
+    // Every swap, Reflex on or not, so the refreshes stay paired with theirs
+    // when it is turned on.
+    std::lock_guard<std::mutex> lock(state.swapped_mutex);
+    if (state.swapped_count == state.swapped.size()) {
+      state.swapped_first = (state.swapped_first + 1) % state.swapped.size();
+      --state.swapped_count;
+    }
+    state.swapped[(state.swapped_first + state.swapped_count++) % state.swapped.size()] = frame_id;
+    return;
+  }
+  // The first controller read after a swap starts a frame: sleep until the
+  // driver says it should start, then mark it.
+  if (state.in_frame.load(std::memory_order_acquire)) {
+    return;
+  }
+  uint64_t wait_value = 0;
+  {
+    std::lock_guard<std::mutex> lock(paint_context_.reflex_mutex);
+    const VkSwapchainKHR swapchain = paint_context_.reflex_swapchain;
+    if (swapchain == VK_NULL_HANDLE || state.in_frame.exchange(true, std::memory_order_acq_rel)) {
+      return;
+    }
+    VkLatencySleepInfoNV sleep_info = {VK_STRUCTURE_TYPE_LATENCY_SLEEP_INFO_NV};
+    sleep_info.signalSemaphore = state.semaphore;
+    sleep_info.value = state.semaphore_value + 1;
+    if (dfn.vkLatencySleepNV(device, swapchain, &sleep_info) == VK_SUCCESS) {
+      wait_value = ++state.semaphore_value;
+    }
+  }
+  if (wait_value) {
+    // Not under the lock: a resize must not wait for the sleep.
+    const uint64_t start_us = rex::latency::NowUs();
+    VkSemaphoreWaitInfo wait_info = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+    wait_info.semaphoreCount = 1;
+    wait_info.pSemaphores = &state.semaphore;
+    wait_info.pValues = &wait_value;
+    dfn.vkWaitSemaphores(device, &wait_info, UINT64_C(50000000));
+    state.sleep_us.fetch_add(rex::latency::NowUs() - start_us, std::memory_order_relaxed);
+    state.sleeps.fetch_add(1, std::memory_order_relaxed);
+  }
+  const uint64_t frame_id = state.frame_id.fetch_add(1, std::memory_order_acq_rel) + 1;
+  ReflexMark(VK_LATENCY_MARKER_SIMULATION_START_NV, frame_id);
+  ReflexMark(VK_LATENCY_MARKER_INPUT_SAMPLE_NV, frame_id);
+}
+
+void VulkanPresenter::ReflexMark(VkLatencyMarkerNV marker, uint64_t frame_id) {
+  if (!frame_id) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(paint_context_.reflex_mutex);
+  if (paint_context_.reflex_swapchain == VK_NULL_HANDLE) {
+    return;
+  }
+  VkSetLatencyMarkerInfoNV marker_info = {VK_STRUCTURE_TYPE_SET_LATENCY_MARKER_INFO_NV};
+  marker_info.presentID = frame_id * kReflexPresentIdStride;
+  marker_info.marker = marker;
+  vulkan_device_->functions().vkSetLatencyMarkerNV(vulkan_device_->device(),
+                                                   paint_context_.reflex_swapchain, &marker_info);
+}
+
+void VulkanPresenter::ReflexUpdate() {
+  if (reflex_.semaphore == VK_NULL_HANDLE) {
+    return;
+  }
+  const VkSwapchainKHR swapchain = paint_context_.swapchain;
+  const bool boost = REXCVAR_GET(present_reflex_boost);
+  const VkSwapchainKHR wanted = REXCVAR_GET(present_reflex) ? swapchain : VK_NULL_HANDLE;
+  if (wanted == paint_context_.reflex_swapchain && (wanted == VK_NULL_HANDLE || boost == reflex_.boost)) {
+    return;
+  }
+  if (swapchain == VK_NULL_HANDLE) {
+    return;
+  }
+  VkLatencySleepModeInfoNV mode = {VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV};
+  mode.lowLatencyMode = wanted != VK_NULL_HANDLE;
+  mode.lowLatencyBoost = wanted != VK_NULL_HANDLE && boost;
+  mode.minimumIntervalUs = 0;
+  const VkResult result = vulkan_device_->functions().vkSetLatencySleepModeNV(
+      vulkan_device_->device(), swapchain, &mode);
+  {
+    std::lock_guard<std::mutex> lock(paint_context_.reflex_mutex);
+    paint_context_.reflex_swapchain = result == VK_SUCCESS ? wanted : VK_NULL_HANDLE;
+  }
+  reflex_.boost = boost;
+  if (result != VK_SUCCESS || !reflex_.logged || !wanted) {
+    REXLOG_INFO("VulkanPresenter: NVIDIA Reflex {}{} (result {})",
+                wanted ? "on" : "off", wanted && boost ? " with boost" : "", int32_t(result));
+    reflex_.logged = true;
+  }
+}
+
+void VulkanPresenter::ReflexReport() {
+  const uint64_t sleeps = reflex_.sleeps.exchange(0, std::memory_order_relaxed);
+  const uint64_t sleep_us = reflex_.sleep_us.exchange(0, std::memory_order_relaxed);
+  if (!REXCVAR_GET(present_latency_log) || paint_context_.reflex_swapchain == VK_NULL_HANDLE) {
+    return;
+  }
+  std::array<VkLatencyTimingsFrameReportNV, 64> timings;
+  for (VkLatencyTimingsFrameReportNV& timing : timings) {
+    timing = {VK_STRUCTURE_TYPE_LATENCY_TIMINGS_FRAME_REPORT_NV};
+  }
+  VkGetLatencyMarkerInfoNV marker_info = {VK_STRUCTURE_TYPE_GET_LATENCY_MARKER_INFO_NV};
+  marker_info.timingCount = uint32_t(timings.size());
+  marker_info.pTimings = timings.data();
+  {
+    std::lock_guard<std::mutex> lock(paint_context_.reflex_mutex);
+    vulkan_device_->functions().vkGetLatencyTimingsNV(
+        vulkan_device_->device(), paint_context_.reflex_swapchain, &marker_info);
+  }
+  uint32_t reports = 0;
+  double input_to_gpu_end = 0.0, simulation = 0.0, submit_to_gpu_end = 0.0, gpu = 0.0;
+  double input_to_present = 0.0;
+  for (uint32_t i = 0; i < std::min(marker_info.timingCount, uint32_t(timings.size())); ++i) {
+    const VkLatencyTimingsFrameReportNV& t = timings[i];
+    if (!t.inputSampleTimeUs || !t.gpuRenderEndTimeUs || t.gpuRenderEndTimeUs < t.inputSampleTimeUs ||
+        t.simEndTimeUs < t.simStartTimeUs || t.presentEndTimeUs < t.inputSampleTimeUs) {
+      continue;
+    }
+    ++reports;
+    input_to_gpu_end += double(t.gpuRenderEndTimeUs - t.inputSampleTimeUs);
+    simulation += double(t.simEndTimeUs - t.simStartTimeUs);
+    submit_to_gpu_end += double(t.gpuRenderEndTimeUs - t.renderSubmitStartTimeUs);
+    gpu += double(t.gpuRenderEndTimeUs - t.gpuRenderStartTimeUs);
+    input_to_present += double(t.presentEndTimeUs - t.inputSampleTimeUs);
+  }
+  const double n = reports ? double(reports) * 1000.0 : 1.0;
+  REXLOG_INFO(
+      "Reflex ({} of {} driver reports): input to GPU done {:.1f} ms, to present {:.1f}; "
+      "simulation {:.1f}, submit to GPU done {:.1f}, GPU {:.1f}; slept {} times, {:.1f} ms each",
+      reports, marker_info.timingCount, input_to_gpu_end / n, input_to_present / n, simulation / n,
+      submit_to_gpu_end / n, gpu / n, sleeps, sleeps ? double(sleep_us) / double(sleeps) / 1000.0 : 0.0);
 }
 
 Presenter::PresentStats VulkanPresenter::GetPresentStatsFromUIThread() const {
@@ -2661,6 +2829,19 @@ void VulkanPresenter::GuestOutputRefreshSubmitted(uint32_t mailbox_index) {
   image_instance.refresh_serial = ++guest_output_refresh_serial_;
   image_instance.refresh_us = rex::latency::NowUs();
   image_instance.input_us = rex::latency::last_input_sample_us.load(std::memory_order_relaxed);
+  // Reflex: the oldest swap not refreshed yet is this one.
+  image_instance.reflex_frame = 0;
+  {
+    std::lock_guard<std::mutex> lock(reflex_.swapped_mutex);
+    if (reflex_.swapped_count) {
+      image_instance.reflex_frame = reflex_.swapped[reflex_.swapped_first];
+      reflex_.swapped_first = (reflex_.swapped_first + 1) % reflex_.swapped.size();
+      --reflex_.swapped_count;
+    }
+  }
+  if (image_instance.reflex_frame) {
+    ReflexMark(VK_LATENCY_MARKER_RENDERSUBMIT_END_NV, image_instance.reflex_frame);
+  }
   // Even if the refresher has returned false, it still might have submitted
   // some commands referencing the image. It's better to put an excessive
   // signal and wait slightly longer, for nothing important, while shutting down
@@ -2689,6 +2870,12 @@ namespace {
 std::atomic<bool> hdr_output_offered = false;
 std::atomic<bool> hdr_output_active = false;
 }  // namespace
+
+namespace {
+std::atomic<bool> reflex_available = false;
+}  // namespace
+
+bool ReflexAvailable() { return reflex_available.load(std::memory_order_relaxed); }
 
 HdrOutputState GetHdrOutputState() {
   return {hdr_output_offered.load(std::memory_order_relaxed),
@@ -3173,6 +3360,14 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   }
   swapchain_create_info.clipped = VK_TRUE;
   swapchain_create_info.oldSwapchain = old_swapchain;
+  // Reflex: latency mode is allowed on every swapchain when offered, so
+  // present_reflex turns its sleep mode on and off without a new one.
+  VkSwapchainLatencyCreateInfoNV latency_create_info = {
+      VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV};
+  if (vulkan_device->extensions().ext_NV_low_latency2 && vulkan_device->properties().presentId) {
+    latency_create_info.latencyModeEnable = VK_TRUE;
+    swapchain_create_info.pNext = &latency_create_info;
+  }
   VkSwapchainKHR swapchain;
   if (dfn.vkCreateSwapchainKHR(device, &swapchain_create_info, nullptr, &swapchain) != VK_SUCCESS) {
     REXLOG_ERROR("VulkanPresenter: Failed to create a swapchain");
@@ -3197,6 +3392,11 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
 }
 
 VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
+  {
+    // The guest threads stop sleeping and marking on it first.
+    std::lock_guard<std::mutex> lock(reflex_mutex);
+    reflex_swapchain = VK_NULL_HANDLE;
+  }
   if (swapchain != VK_NULL_HANDLE) {
     REXLOG_INFO("VulkanPresenter: Retiring swapchain: waiting for drawing");
     const bool drawing_complete = submission_tracker.AwaitAllSubmissionsCompletion();
@@ -3663,6 +3863,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   uint64_t guest_output_refresh_serial = 0;
   uint64_t guest_output_refresh_us = 0;
   uint64_t guest_output_input_us = 0;
+  uint64_t guest_output_reflex_frame = 0;
   bool guest_output_hudless = false;
   bool guest_output_camera_valid = false;
   UpscalerCamera guest_output_camera;
@@ -3676,6 +3877,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       guest_output_refresh_serial = guest_output_images_[guest_output_mailbox_index].refresh_serial;
       guest_output_refresh_us = guest_output_images_[guest_output_mailbox_index].refresh_us;
       guest_output_input_us = guest_output_images_[guest_output_mailbox_index].input_us;
+      guest_output_reflex_frame = guest_output_images_[guest_output_mailbox_index].reflex_frame;
       guest_output_hudless = guest_output_images_[guest_output_mailbox_index].hudless_valid;
       guest_output_camera_valid = guest_output_images_[guest_output_mailbox_index].camera_valid;
       guest_output_camera = guest_output_images_[guest_output_mailbox_index].camera;
@@ -4656,7 +4858,17 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                                guest_output_refresh_serial != latency_.measured_serial &&
                                guest_output_input_us && guest_output_input_us <= guest_output_refresh_us;
   const uint64_t paint_us = measure_latency ? latency_paint_start_us : 0;
-  auto present_image = [&](uint32_t image_index, VkSemaphore wait_semaphore) {
+  ReflexUpdate();
+  const bool reflex = paint_context_.reflex_swapchain != VK_NULL_HANDLE;
+  // Reflex: the real image of guest frame F is presented with ID
+  // F * kReflexPresentIdStride, which its markers carry, and generated ones
+  // just before it. IDs must grow, so a repaint of the same frame (or one
+  // overtaken by the UI's own paints) takes the next free ID unmarked.
+  const uint64_t reflex_present_id =
+      reflex ? guest_output_reflex_frame * kReflexPresentIdStride : 0;
+  // `wanted_id`: the ID to give when free (0: the next one).
+  auto present_image = [&](uint32_t image_index, VkSemaphore wait_semaphore,
+                           uint64_t wanted_id) {
     VkPresentInfoKHR present_info;
     present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     present_info.pNext = nullptr;
@@ -4672,13 +4884,23 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     const VulkanDevice::Properties& device_properties = vulkan_device_->properties();
     // IDs go on every present where present wait exists, for the latency
     // measurement (and VK_NV_low_latency2); only vulkan_present_wait waits.
-    const bool present_ids = device_properties.presentId && device_properties.presentWait;
+    const bool present_wait = device_properties.presentId && device_properties.presentWait;
+    const bool present_ids = present_wait || reflex;
+    const uint64_t previous_present_id = paint_context_.swapchain_last_present_id;
+    bool reflex_marked = false;
     if (present_ids) {
-      PollLatencyShown();
-      present_id = ++paint_context_.swapchain_last_present_id;
+      if (present_wait) {
+        PollLatencyShown();
+      }
+      present_id = std::max(wanted_id, previous_present_id + 1);
+      paint_context_.swapchain_last_present_id = present_id;
       present_id_info.swapchainCount = 1;
       present_id_info.pPresentIds = &present_id;
       present_info.pNext = &present_id_info;
+      reflex_marked = reflex && wanted_id && present_id == reflex_present_id;
+    }
+    if (reflex_marked) {
+      ReflexMark(VK_LATENCY_MARKER_PRESENT_START_NV, guest_output_reflex_frame);
     }
     VkResult result;
     {
@@ -4686,15 +4908,18 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
       result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
     }
+    if (reflex_marked) {
+      ReflexMark(VK_LATENCY_MARKER_PRESENT_END_NV, guest_output_reflex_frame);
+    }
     last_present_id = present_id;
     last_present_queued_us = rex::latency::NowUs();
-    if (present_id > 1 && REXCVAR_GET(vulkan_present_wait) &&
+    if (present_wait && previous_present_id && REXCVAR_GET(vulkan_present_wait) &&
         (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)) {
       // At most one present in flight: the previous one must have reached the
       // display before the next frame is painted. With frame generation this
       // also spaces the two presents of a paint by a refresh under FIFO.
       if (dfn.vkWaitForPresentKHR(vulkan_device_->device(), paint_context_.swapchain,
-                                  present_id - 1, UINT64_C(50000000)) == VK_SUCCESS) {
+                                  previous_present_id, UINT64_C(50000000)) == VK_SUCCESS) {
         PollLatencyShown();
       }
     }
@@ -4742,10 +4967,12 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         frame_generation_.gap_ms_sum +=
             std::chrono::duration<double, std::milli>(previous_time - first_time).count() /
             double(generated_count);
-        present_result = present_image(swapchain_image_index, present_semaphore);
+        present_result = present_image(swapchain_image_index, present_semaphore, reflex_present_id);
         break;
       }
-      present_result = present_image(generated_image_indices[k], generated_present_semaphores[k]);
+      present_result = present_image(
+          generated_image_indices[k], generated_present_semaphores[k],
+          reflex_present_id ? reflex_present_id - generated_count + k : 0);
       if (present_result != VK_SUCCESS && present_result != VK_SUBOPTIMAL_KHR) {
         break;
       }
@@ -4753,7 +4980,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       NoteFrameGenerationPresent(true);
     }
   } else {
-    present_result = present_image(swapchain_image_index, present_semaphore);
+    present_result = present_image(swapchain_image_index, present_semaphore, reflex_present_id);
   }
   if (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR) {
     if (measure_latency) {
@@ -5144,6 +5371,23 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
     } else {
       REXLOG_INFO("VulkanPresenter: upscaler {} unavailable: {}", info.id,
                   info.unavailable_reason);
+    }
+  }
+
+  // Reflex: one presenter takes the title's frame events.
+  if (vulkan_device_->extensions().ext_NV_low_latency2 && vulkan_device_->properties().presentId) {
+    VkSemaphoreTypeCreateInfo semaphore_type = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    semaphore_type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    semaphore_type.initialValue = 0;
+    VkSemaphoreCreateInfo semaphore_info = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    semaphore_info.pNext = &semaphore_type;
+    VulkanPresenter* expected = nullptr;
+    if (vulkan_device_->functions().vkCreateSemaphore(vulkan_device_->device(), &semaphore_info,
+                                                     nullptr, &reflex_.semaphore) == VK_SUCCESS &&
+        reflex_presenter_.compare_exchange_strong(expected, this)) {
+      rex::latency::frame_hook.store(&ReflexFrameHook, std::memory_order_release);
+      reflex_available.store(true, std::memory_order_relaxed);
+      REXLOG_INFO("VulkanPresenter: NVIDIA Reflex (VK_NV_low_latency2) available");
     }
   }
 

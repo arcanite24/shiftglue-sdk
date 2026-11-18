@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/latency.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/surface.h>
 #include <rex/ui/vulkan/device.h>
@@ -69,6 +70,9 @@ struct HdrOutputState {
   bool active = false;
 };
 HdrOutputState GetHdrOutputState();
+// The presenter offers NVIDIA Reflex (present_reflex), for menus. A function,
+// not an inline variable, so the title's module reads the runtime's value.
+bool ReflexAvailable();
 
 class VulkanPresenter final : public Presenter {
  public:
@@ -312,6 +316,9 @@ class VulkanPresenter final : public Presenter {
     // its controller by then (rex/latency.h), for the latency measurement.
     uint64_t refresh_us = 0;
     uint64_t input_us = 0;
+    // Reflex: the guest frame (ReflexState::frame_id) this refresh shows, 0
+    // for none.
+    uint64_t reflex_frame = 0;
     // Whether that refresh also wrote the HUD-less copy, and the camera
     // images with this camera.
     bool hudless_valid = false;
@@ -591,6 +598,11 @@ class VulkanPresenter final : public Presenter {
     // vulkan_present_wait: the last present ID given on `swapchain`, 0 for
     // none yet.
     uint64_t swapchain_last_present_id = 0;
+    // NVIDIA Reflex: `swapchain` while its latency sleep mode is on, for the
+    // guest threads that sleep and mark (rex/latency.h). Null before the
+    // swapchain is retired or destroyed, under reflex_mutex.
+    std::mutex reflex_mutex;
+    VkSwapchainKHR reflex_swapchain = VK_NULL_HANDLE;
     VkExtent2D swapchain_extent = {};
     bool swapchain_is_fifo = false;
     // UP-4: the images can be copied to and from (present_frame_generation
@@ -842,6 +854,39 @@ class VulkanPresenter final : public Presenter {
     uint32_t render_height = 0;
   };
   FrameGenerationState frame_generation_;
+  // NVIDIA Reflex (VK_NV_low_latency2, present_reflex): the title's thread
+  // sleeps before its controller read until the driver says the frame should
+  // start, and each guest frame's stages are marked with the present ID its
+  // real image will have (frame_id * kReflexPresentIdStride).
+  static constexpr uint64_t kReflexPresentIdStride = 16;
+  struct ReflexState {
+    VkSemaphore semaphore = VK_NULL_HANDLE;  // timeline
+    uint64_t semaphore_value = 0;            // under reflex_mutex
+    // Applied to paint_context_.swapchain (paint thread).
+    bool sleep_mode = false;
+    bool boost = false;
+    bool logged = false;
+    std::atomic<bool> in_frame{false};
+    std::atomic<uint64_t> frame_id{0};
+    // Frame IDs at each VdSwap (0 when no frame was marked), taken by the
+    // guest output refreshes, which come later on the GPU thread.
+    std::mutex swapped_mutex;
+    std::array<uint64_t, 16> swapped = {};
+    size_t swapped_first = 0;
+    size_t swapped_count = 0;
+    // Over the latency window.
+    std::atomic<uint64_t> sleeps{0};
+    std::atomic<uint64_t> sleep_us{0};
+  };
+  ReflexState reflex_;
+  static std::atomic<VulkanPresenter*> reflex_presenter_;
+  static void ReflexFrameHook(rex::latency::FrameEvent event);
+  void ReflexFrameEvent(rex::latency::FrameEvent event);
+  // Marks a stage of a guest frame when Reflex is on.
+  void ReflexMark(VkLatencyMarkerNV marker, uint64_t frame_id);
+  // Paint thread: applies present_reflex to paint_context_.swapchain.
+  void ReflexUpdate();
+  void ReflexReport();
   // Issue #1094: input to display, per real frame, in segments. The shown
   // time is when vkWaitForPresentKHR returned for the frame, which runs at
   // the next present: an upper bound, late by up to a frame.
