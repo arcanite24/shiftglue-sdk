@@ -311,25 +311,45 @@ X_RESULT InputSystem::GetHostPadState(uint32_t user_index, X_INPUT_STATE* out_st
 namespace {
 // Host shortcuts on controllers: a chord held together runs a bind once, and
 // the title does not see the chord's buttons until all are released.
+//
+// One controller can reach a user through several devices (SDL and XInput
+// both report it, or Steam adds a virtual pad), polled a moment apart. With
+// one held flag per user, the device that had not seen the press yet cleared
+// it and the next poll fired the bind again: L3+R3 opened and closed the
+// overlay several times per press. The chord now fires when the first
+// device completes it and re-arms only once every device has let it go.
 struct PadChord {
   const char* bind;
-  bool held[4] = {};
+  std::vector<DeviceId> holding[4];
 };
 PadChord g_pad_chord_debug_overlay = {"bind_debug_overlay"};
 PadChord g_pad_chord_game_menu = {"bind_game_menu"};
 
-void ApplyPadChord(PadChord& chord, const std::string& text, uint32_t user_index,
+// Devices no longer mapped to the user (unplugged) stop holding the chord.
+void PrunePadChord(PadChord& chord, uint32_t user_index, const std::vector<DeviceId>& ids) {
+  if (user_index >= 4) return;
+  auto& holding = chord.holding[user_index];
+  std::erase_if(holding, [&](DeviceId id) {
+    return std::find(ids.begin(), ids.end(), id) == ids.end();
+  });
+}
+
+void ApplyPadChord(PadChord& chord, const std::string& text, uint32_t user_index, DeviceId device,
                    X_INPUT_GAMEPAD& pad) {
   const uint16_t buttons = PadChordButtons(text);
   if (!buttons || user_index >= 4) return;
-  bool& held = chord.held[user_index];
+  auto& holding = chord.holding[user_index];
+  const auto it = std::find(holding.begin(), holding.end(), device);
+  bool held = it != holding.end();
   if ((pad.buttons & buttons) == buttons) {
-    if (!held) {
+    if (holding.empty()) {
       REXLOG_INFO("Controller chord {} on pad {}: {}", text, user_index, chord.bind);
       rex::ui::TriggerBind(chord.bind);
     }
+    if (!held) holding.push_back(device);
     held = true;
   } else if (!(pad.buttons & buttons)) {
+    if (held) holding.erase(it);
     held = false;
   }
   if (held) pad.buttons = uint16_t(pad.buttons & ~buttons);
@@ -348,6 +368,11 @@ X_RESULT InputSystem::GetMergedState(uint32_t user_index, bool host_pads_only,
   std::vector<DeviceId> ids;
   assignment_->DevicesForUser(user_index, ids);
 
+  if (!host_pads_only) {
+    PrunePadChord(g_pad_chord_debug_overlay, user_index, ids);
+    PrunePadChord(g_pad_chord_game_menu, user_index, ids);
+  }
+
   X_INPUT_STATE merged = {};
   bool any = false;
   for (DeviceId id : ids) {
@@ -364,8 +389,8 @@ X_RESULT InputSystem::GetMergedState(uint32_t user_index, bool host_pads_only,
     // layout so a remap can never lock the player out of the remap screen.
     if (!host_pads_only && !driver->is_keyboard_and_mouse()) {
       ApplyPadChord(g_pad_chord_debug_overlay, REXCVAR_GET(pad_chord_debug_overlay), user_index,
-                    state.gamepad);
-      ApplyPadChord(g_pad_chord_game_menu, REXCVAR_GET(pad_chord_game_menu), user_index,
+                    id, state.gamepad);
+      ApplyPadChord(g_pad_chord_game_menu, REXCVAR_GET(pad_chord_game_menu), user_index, id,
                     state.gamepad);
       ApplyPadRemap(state.gamepad);
     }
