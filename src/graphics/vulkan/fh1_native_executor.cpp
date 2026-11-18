@@ -3292,8 +3292,8 @@ bool Fh1NativeExecutor::IsReadbackEnclosed(uint32_t image_base, uint32_t image_w
                   image_width, image_height);
     }
     it->last_frame = frame_;
+    if (it->recurring) return false;
   }
-  if (it != readback_enclosings_.end() && it->recurring) return false;
   Count("resolve_readback_enclosing");
   return true;
 }
