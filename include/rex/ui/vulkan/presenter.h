@@ -771,6 +771,10 @@ class VulkanPresenter final : public Presenter {
   // Advanced by every guest output refresh (refresher thread; the consumer
   // reads the copy in GuestOutputImageInstance).
   uint64_t guest_output_refresh_serial_ = 0;
+  // Mean time between guest output refreshes (the title's frame rate), for
+  // the pacing of generated frames. Written by the refresher.
+  uint64_t guest_output_last_refresh_us_ = 0;
+  std::atomic<float> guest_output_refresh_interval_ms_{0.0f};
 
   // Temporal upscaler providers (rex/ui/vulkan/upscaler.h) and the state of
   // the last temporal dispatch, used by painting only.

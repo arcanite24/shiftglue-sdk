@@ -1201,6 +1201,16 @@ bool VulkanPresenter::RecordFrameGeneration(
     state.interval_ms =
         state.interval_ms > 0.0f ? state.interval_ms * 0.9f + delta_ms * 0.1f : delta_ms;
   }
+  // The generated frames are spaced by the title's frame rate, taken where
+  // it refreshes the output. Between paints it included this paint's own
+  // spacing: one late frame at LSFG 4x lengthened the spacing, the paint,
+  // and so the next interval, until it held at 11 real frames a second and
+  // 130 ms of lag where 2x ran at 58 (2026-11-18).
+  if (const float guest_interval_ms =
+          guest_output_refresh_interval_ms_.load(std::memory_order_relaxed);
+      guest_interval_ms > 0.0f) {
+    state.interval_ms = guest_interval_ms;
+  }
   state.last_real_us = now_us;
   const bool needs_camera =
       generator->info().uses_depth || generator->info().uses_motion_vectors;
@@ -2828,6 +2838,15 @@ void VulkanPresenter::GuestOutputRefreshSubmitted(uint32_t mailbox_index) {
   GuestOutputImageInstance& image_instance = guest_output_images_[mailbox_index];
   image_instance.refresh_serial = ++guest_output_refresh_serial_;
   image_instance.refresh_us = rex::latency::NowUs();
+  if (guest_output_last_refresh_us_) {
+    const float delta_ms = std::clamp(
+        float(image_instance.refresh_us - guest_output_last_refresh_us_) / 1000.0f, 1.0f, 100.0f);
+    const float interval_ms = guest_output_refresh_interval_ms_.load(std::memory_order_relaxed);
+    guest_output_refresh_interval_ms_.store(
+        interval_ms > 0.0f ? interval_ms * 0.9f + delta_ms * 0.1f : delta_ms,
+        std::memory_order_relaxed);
+  }
+  guest_output_last_refresh_us_ = image_instance.refresh_us;
   image_instance.input_us = rex::latency::last_input_sample_us.load(std::memory_order_relaxed);
   // Reflex: the oldest swap not refreshed yet is this one.
   image_instance.reflex_frame = 0;
