@@ -1,6 +1,7 @@
 [submodule "thirdparty/libmspack"]
 	path = thirdparty/libmspack
 	url = https://github.com/kyz/libmspack.git
+	ignore = dirty
 [submodule "thirdparty/glslang"]
 	path = thirdparty/glslang
 	url = https://github.com/KhronosGroup/glslang.git
