@@ -585,11 +585,11 @@ class Fh1NativeExecutor {
   uint32_t current_object_slot_ = 0;
   std::vector<std::array<float, 16>> object_reprojections_;
   std::unordered_map<uint64_t, uint32_t> object_slot_by_matrix_;
-  // Draws of each mesh so far this frame, and each draw's matrix by mesh
-  // and order this frame and the last.
+  // Draws of each mesh so far this frame, and the matrices of each mesh's
+  // draws this frame and the last, in draw order.
   std::unordered_map<uint64_t, uint32_t> object_occurrences_;
-  std::unordered_map<uint64_t, std::array<float, 16>> object_current_wvp_;
-  std::unordered_map<uint64_t, std::array<float, 16>> object_previous_wvp_;
+  std::unordered_map<uint64_t, std::vector<std::array<float, 16>>> object_current_wvp_;
+  std::unordered_map<uint64_t, std::vector<std::array<float, 16>>> object_previous_wvp_;
   std::vector<std::array<float, 16>> object_reprojections_ready_;
   uint32_t AssignObjectSlot(uint64_t object, const std::array<float, 16>& wvp);
   // The first register of the draw's world-view-projection (c128 the

@@ -157,15 +157,21 @@ void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
     // UP-1.7: a car, with its own matrix in c0-c3. Jittered with the scene
     // (it draws to its own colour target, so GetSceneJitter's colour check
     // left cars unjittered and aliased before).
-    if (SceneObjectMatrixRegister(*draw.vertex_shader) != kObjectFirstRegister) return;
+    std::array<float, 16> wvp;
+    std::memcpy(wvp.data(),
+                &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X + kObjectFirstRegister * 4],
+                sizeof(wvp));
+    const bool taken = SceneObjectMatrixRegister(*draw.vertex_shader) == kObjectFirstRegister;
+    if (!taken) return;
     draw_is_scene_car_ = true;
     if (object_motion_enabled_) {
-      std::array<float, 16> wvp;
-      std::memcpy(wvp.data(),
-                  &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X +
-                                         kObjectFirstRegister * 4],
-                  sizeof(wvp));
-      current_object_slot_ = AssignObjectSlot(DrawObjectKey(draw), wvp);
+      // By the shader alone: FH2's car meshes come from vertex buffers that
+      // move between frames, so the shader-and-buffer key never met last
+      // frame's and the player's car kept the world's motion (slot 0), a
+      // ghost under frame generation. A car's parts share its matrix, and
+      // nearest-origin pairing tells the cars apart.
+      current_object_slot_ =
+          AssignObjectSlot(draw.vertex_shader->ucode_data_hash() ^ 0x43415253ull, wvp);
     }
     return;
   }
@@ -197,18 +203,49 @@ uint64_t Fh1NativeExecutor::DrawObjectKey(const Fh1DrawInfo& draw) const {
 }
 
 uint32_t Fh1NativeExecutor::AssignObjectSlot(uint64_t object, const std::array<float, 16>& wvp) {
-  // One mesh drawn several times a frame (a car's four wheels, or each
-  // predicated tile's band) is told apart by its order among the draws of
-  // that mesh, which a frame repeats.
-  const uint64_t key = object ^ (uint64_t(object_occurrences_[object]++) + 1) *
-                                    0xC2B2AE3D27D4EB4Full;
-  object_current_wvp_.emplace(key, wvp);
+  // One mesh drawn several times a frame (a car's four wheels, each
+  // predicated tile's band, every tree or bench of a kind) is paired with
+  // last frame's draw of that mesh whose origin was nearest on the screen.
+  // Pairing by draw order alone matched one tree with another as props came
+  // into view and left it: far trees and benches got a neighbour's motion,
+  // and frame generation ghosted and flickered on them.
+  const uint32_t order = object_occurrences_[object]++;
+  object_current_wvp_[object].push_back(wvp);
   uint32_t slot = 0;
   // Objects new this frame keep the camera's motion (slot 0).
-  auto previous = object_previous_wvp_.find(key);
+  const std::array<float, 16>* previous = nullptr;
+  if (auto draws = object_previous_wvp_.find(object); draws != object_previous_wvp_.end()) {
+    // The origin's screen position: the matrix's last column.
+    auto origin = [](const std::array<float, 16>& m, double& x, double& y, double& w) {
+      w = m[15];
+      if (!(w > 1e-4)) return false;
+      x = m[3] / w;
+      y = m[7] / w;
+      return true;
+    };
+    double x, y, w;
+    if (origin(wvp, x, y, w)) {
+      // Within a tenth of the screen in one frame, at a similar distance.
+      double best = 0.1;
+      for (const std::array<float, 16>& candidate : draws->second) {
+        double cx, cy, cw;
+        if (!origin(candidate, cx, cy, cw)) continue;
+        const double distance = std::max(std::abs(cx - x), std::abs(cy - y)) * 0.5 +
+                                std::abs(cw - w) / std::max(cw, w);
+        if (distance < best) {
+          best = distance;
+          previous = &candidate;
+        }
+      }
+      if (!previous) Count("object_unpaired");
+    } else if (order < draws->second.size()) {
+      // An origin behind the camera (a large piece around it): by order.
+      previous = &draws->second[order];
+    }
+  }
   Matrix current_inverse;
-  if (previous != object_previous_wvp_.end() && Invert(ToMatrix(wvp), current_inverse)) {
-    const Matrix reprojection = Multiply(ToMatrix(previous->second), current_inverse);
+  if (previous && Invert(ToMatrix(wvp), current_inverse)) {
+    const Matrix reprojection = Multiply(ToMatrix(*previous), current_inverse);
     std::array<float, 16> matrix;
     for (size_t i = 0; i < 16; ++i) matrix[i] = float(reprojection[i]);
     // Objects that move with the world (most props and the world's own
@@ -420,6 +457,13 @@ void Fh1NativeExecutor::FinishCameraFrame() {
       camera.depth_a = float(b < 0.0 ? 1.0 - a : a);
       camera.depth_b = float(std::abs(b));
       camera.depth_matrix_flipped = b < 0.0;
+      // A reversed matrix's z row is nearly orthogonal to its w row, so the
+      // planes above come out wrong (far 0); take them from the depth
+      // instead: 1 at the near plane, 0 at the far one.
+      if (b > 0.0 && a < 1.0) {
+        camera.near_plane = float(b / (1.0 - a));
+        camera.far_plane = a < 0.0 ? float(-b / a) : 0.0f;
+      }
     }
   }
 
@@ -444,18 +488,52 @@ void Fh1NativeExecutor::FinishCameraFrame() {
         Invert(ToMatrix(current), current_inverse)) {
       const Matrix candidate = Multiply(ToMatrix(previous->first), current_inverse);
       // A jump of the view between frames is a cut even when the world
-      // carries over.
+      // carries over. Measured as how far points on the screen move, at
+      // depths from 3 m to 300 m: the matrix's own entries are no measure,
+      // since FH2's reversed matrix makes its z column grow with speed (a
+      // car at 100 km/h read as a cut every frame, and frame generation lost
+      // its history on almost every frame).
       double change = 0.0;
-      for (int r = 0; r < 2; ++r) {
-        for (int c = 0; c < 4; ++c) {
-          change = std::max(change, std::abs(candidate[r * 4 + c] - (r == c ? 1.0 : 0.0)));
+      if (camera.depth_b > 0.0f) {
+        size_t points = 0;
+        for (const double view_z : {3.0, 30.0, 300.0}) {
+          const double stored = camera.depth_a + camera.depth_b / view_z;
+          const double z = camera.depth_matrix_flipped ? 1.0 - stored : stored;
+          for (const double y : {-0.6, 0.0, 0.6}) {
+            for (const double x : {-0.6, 0.0, 0.6}) {
+              const double in[4] = {x, y, z, 1.0};
+              double out[4] = {};
+              for (int r = 0; r < 4; ++r) {
+                for (int c = 0; c < 4; ++c) out[r] += candidate[r * 4 + c] * in[c];
+              }
+              // Behind the previous camera: a point the car has just passed.
+              if (!(out[3] > 1e-6)) continue;
+              ++points;
+              change = std::max(change, std::max(std::abs(out[0] / out[3] - x),
+                                                 std::abs(out[1] / out[3] - y)));
+            }
+          }
+        }
+        // Half the screen's height in one frame, or no point in front.
+        change = points ? change * 0.5 : 1.0;
+      } else {
+        for (int r = 0; r < 2; ++r) {
+          for (int c = 0; c < 4; ++c) {
+            change = std::max(change, std::abs(candidate[r * 4 + c] - (r == c ? 1.0 : 0.0)));
+          }
         }
       }
       if (change < 0.25) {
         reprojection = candidate;
         camera.cut = false;
+      } else {
+        Count("camera_cut_jump");
       }
+    } else {
+      Count("camera_cut_unmatched");
     }
+  } else {
+    Count("camera_cut_new_world");
   }
   for (size_t i = 0; i < 16; ++i) camera.reprojection[i] = float(reprojection[i]);
   if (camera.cut) Count("camera_cut");

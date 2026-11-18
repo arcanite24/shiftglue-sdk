@@ -3684,6 +3684,15 @@ layout(set = 0, binding = 3, r32ui) readonly uniform uimage2D object_slots;
 layout(set = 0, binding = 4, std430) readonly buffer ObjectReprojections {
   layout(row_major) mat4 object_reprojections[];
 };
+// Whether an object slot's depth (the fragment's, at the pixel centre) is
+// the surface the scene depth holds (sample 0 of a multisampled surface). On
+// a slope the two differ by the depth's change over a fraction of a pixel,
+// which near the camera is far above a fixed 1/65536: FH2's road and its
+// player's car failed it and lost their own motion. Within 1 % of the
+// reversed depth (1 % of the distance) or 1/65536.
+bool SameSurface(float slot_z, float stored_z) {
+  return abs(slot_z - stored_z) < max(1.0 / 65536.0, 0.01 * max(slot_z, stored_z));
+}
 void main() {
   ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
   if (any(greaterThanEqual(uvec2(pixel), c.size))) {
@@ -3692,12 +3701,14 @@ void main() {
   // FH1 draws the scene turned 180 degrees in clip space (the post pass
   // turns it back), so the scene depth of a screen pixel is at the opposite
   // one, and its clip x and y are the screen's negated.
-  // Its depth is reversed (1 near) by the viewport, not the matrix: the
-  // matrix's clip z is the usual D3D depth, 1 minus the stored one, which is
-  // also what the providers take.
+  // Both titles store the depth reversed (1 near), and the providers take
+  // 1 minus it (0 near). FH1 reverses it in the viewport, so its matrix's
+  // clip z is that 1 minus the stored one; FH2's matrix is reversed itself
+  // (bit 17), so its clip z is the stored depth, as in ambient occlusion.
   ivec2 scene_pixel = ivec2(c.size) - 1 - pixel;
   float stored_z = texelFetch(source_depth, scene_pixel, 0).r;
   float z = 1.0 - stored_z;
+  float matrix_z = ((c.object_count >> 17u) & 1u) != 0u ? stored_z : z;
   // UP-1.7: the nearest scene object drawn at the pixel, if it is what the
   // depth holds (not something drawn over it without a slot), moves with
   // its own reprojection.
@@ -3706,8 +3717,7 @@ void main() {
   if (((c.object_count >> 16u) & 1u) != 0u) {
     uint key = all(lessThan(scene_pixel, imageSize(object_slots)))
                    ? imageLoad(object_slots, scene_pixel).r : 0u;
-    bool match = abs(float(key >> 8u) * (c.object_depth_scale / 16777215.0) - stored_z) <
-                 (1.0 / 65536.0);
+    bool match = SameSurface(float(key >> 8u) * (c.object_depth_scale / 16777215.0), stored_z);
     imageStore(depth, pixel, vec4(z, 0.0, 0.0, 0.0));
     imageStore(motion, pixel,
                vec4(key != 0u ? vec2(float(key & 0xFFu) / 255.0 * 0.2, match ? 0.1 : -0.1)
@@ -3719,14 +3729,13 @@ void main() {
     uint key = imageLoad(object_slots, scene_pixel).r;
     uint slot = key & 0xFFu;
     if (slot != 0u && slot < object_count &&
-        abs(float(key >> 8u) * (c.object_depth_scale / 16777215.0) - stored_z) <
-            (1.0 / 65536.0)) {
+        SameSurface(float(key >> 8u) * (c.object_depth_scale / 16777215.0), stored_z)) {
       reprojection = object_reprojections[slot];
     }
   }
   vec2 uv = (vec2(pixel) + 0.5) * c.size_inv;
   vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-  vec4 previous = reprojection * vec4(-ndc, z, 1.0);
+  vec4 previous = reprojection * vec4(-ndc, matrix_z, 1.0);
   vec2 motion_uv = vec2(0.0);
   if (previous.w > 1.0e-6) {
     vec2 previous_ndc = -previous.xy / previous.w;
@@ -4789,7 +4798,9 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             camera_constants.size_inv[0] = 1.0f / float(guest_output_width);
             camera_constants.size_inv[1] = 1.0f / float(guest_output_height);
             camera_constants.object_count =
-                object_count | uint32_t(REXCVAR_GET(present_upscaler_object_debug)) << 16;
+                object_count |
+                uint32_t(REXCVAR_GET(present_upscaler_object_debug) != 0) << 16 |
+                uint32_t(!camera.depth_matrix_flipped && camera.depth_b > 0.0f) << 17;
             if ((frame_current_ % 600) == 0) {
               REXGPU_INFO("Object motion: {} slots, {} slot draws, {} without the variant",
                           object_count, object_slot_draws_, object_slot_fallback_draws_);
