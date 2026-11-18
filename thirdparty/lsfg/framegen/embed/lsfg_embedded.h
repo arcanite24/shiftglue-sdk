@@ -30,6 +30,8 @@ struct EmbeddedSettings {
   bool performance = false;
   // The motion search resolution as a share of the frame, 0.25 to 1.
   float flow_scale = 1.0f;
+  // Frames generated between two real ones (1 to 3: 2x to 4x).
+  uint32_t generation_count = 1;
 };
 
 // SPIR-V for a shader name ("mipmaps", "p_alpha[0]", ...), empty if missing.
@@ -47,13 +49,14 @@ class Embedded {
   virtual bool Resize(uint32_t width, uint32_t height, std::string* error) = 0;
 
   // Records: present_color (SHADER_READ_ONLY_OPTIMAL, left that way, with
-  // TRANSFER_SRC usage) into the history, the passes, and the frame halfway
-  // to the previous one into output (GENERAL, left GENERAL and visible to
-  // compute shaders). Returns false when nothing was written to output: the
-  // first frames after Resize, or when generate is false (a cut), which still
-  // records the history so the next frame can generate.
-  virtual bool Record(VkCommandBuffer command_buffer, VkImage present_color, VkImage output,
-                      bool generate) = 0;
+  // TRANSFER_SRC usage) into the history, the passes, and the generated
+  // frames between the previous one and it, in order, into outputs (one per
+  // generation_count; GENERAL, left GENERAL and visible to compute
+  // shaders). Returns false when nothing was written: the first frames after
+  // Resize, or when generate is false (a cut), which still records the
+  // history so the next frame can generate.
+  virtual bool Record(VkCommandBuffer command_buffer, VkImage present_color,
+                      const VkImage* outputs, bool generate) = 0;
 };
 
 }  // namespace lsfg

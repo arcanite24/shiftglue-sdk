@@ -114,6 +114,13 @@ REXCVAR_DEFINE_BOOL(present_latency_log, false, "UI/Presenter",
                     "screen, in segments, every 5 seconds")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(present_frame_generation_multiplier, 2, "UI/Presenter",
+                     "Frames shown per real one while generating: 2, or 3 and 4 with a "
+                     "provider that makes several (LSFG); the game renders at the refresh "
+                     "divided by it")
+    .range(2, 4)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(present_frame_generation_log, false, "UI/Presenter",
                     "Debug: log present spacing and frame generation counts every 5 seconds")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -278,8 +285,10 @@ VulkanPresenter::PaintContext::Submission::~Submission() {
   if (acquire_semaphore_ != VK_NULL_HANDLE) {
     dfn.vkDestroySemaphore(device, acquire_semaphore_, nullptr);
   }
-  if (frame_generation_acquire_semaphore_ != VK_NULL_HANDLE) {
-    dfn.vkDestroySemaphore(device, frame_generation_acquire_semaphore_, nullptr);
+  for (VkSemaphore semaphore : frame_generation_acquire_semaphores_) {
+    if (semaphore != VK_NULL_HANDLE) {
+      dfn.vkDestroySemaphore(device, semaphore, nullptr);
+    }
   }
 }
 
@@ -291,10 +300,15 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
   semaphore_create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
   semaphore_create_info.pNext = nullptr;
   semaphore_create_info.flags = 0;
-  if (dfn.vkCreateSemaphore(device, &semaphore_create_info, nullptr, &acquire_semaphore_) !=
-          VK_SUCCESS ||
-      dfn.vkCreateSemaphore(device, &semaphore_create_info, nullptr,
-                            &frame_generation_acquire_semaphore_) != VK_SUCCESS) {
+  bool semaphores_created =
+      dfn.vkCreateSemaphore(device, &semaphore_create_info, nullptr, &acquire_semaphore_) ==
+      VK_SUCCESS;
+  for (VkSemaphore& semaphore : frame_generation_acquire_semaphores_) {
+    semaphores_created = semaphores_created &&
+                         dfn.vkCreateSemaphore(device, &semaphore_create_info, nullptr,
+                                               &semaphore) == VK_SUCCESS;
+  }
+  if (!semaphores_created) {
     REXLOG_ERROR(
         "VulkanPresenter: Failed to create a swapchain image acquisition "
         "semaphore");
@@ -761,8 +775,9 @@ void VulkanPresenter::ReleaseFrameGenerationImages() {
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
   for (FrameGenerationImage* image :
-       {&frame_generation_.color, &frame_generation_.output, &frame_generation_.final,
-        &frame_generation_.previous, &frame_generation_.debug}) {
+       {&frame_generation_.color, &frame_generation_.output, &frame_generation_.extra_outputs[0],
+        &frame_generation_.extra_outputs[1], &frame_generation_.final, &frame_generation_.previous,
+        &frame_generation_.debug}) {
     util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, image->view);
     util::DestroyAndNullHandle(dfn.vkDestroyImage, device, image->image);
     util::DestroyAndNullHandle(dfn.vkFreeMemory, device, image->memory);
@@ -814,6 +829,18 @@ static_assert(sizeof(FrameGenerationComposeConstants) == sizeof(uint32_t) * 10);
 
 }  // namespace
 
+uint32_t VulkanPresenter::WantedFrameGenerationMultiplier() const {
+  const std::string& id = REXCVAR_GET(present_frame_generation);
+  uint32_t multiplier = uint32_t(std::clamp(REXCVAR_GET(present_frame_generation_multiplier), 2,
+                                            int32_t(kMaxGeneratedFrames + 1)));
+  for (const std::unique_ptr<VulkanFrameGenerator>& candidate : frame_generators_) {
+    if (candidate->info().id == id) {
+      multiplier = std::min(multiplier, candidate->info().max_generated + 1);
+    }
+  }
+  return multiplier;
+}
+
 VulkanFrameGenerator* VulkanPresenter::GetFrameGenerator() const {
   if (!paint_context_.swapchain_frame_generation) {
     return nullptr;
@@ -848,7 +875,11 @@ bool VulkanPresenter::EnsureFrameGenerationImages(VulkanFrameGenerator* generato
   const bool debug = REXCVAR_GET(present_frame_generation_capture) == 2;
   const bool rebuild = state.generator != generator || state.extent.width != extent.width ||
                        state.extent.height != extent.height || state.color.image == VK_NULL_HANDLE;
-  if (!rebuild && (!debug || state.debug.image != VK_NULL_HANDLE)) {
+  bool extras_ready = true;
+  for (uint32_t i = 0; i + 1 < state.generated_count; ++i) {
+    extras_ready = extras_ready && state.extra_outputs[i].image != VK_NULL_HANDLE;
+  }
+  if (!rebuild && extras_ready && (!debug || state.debug.image != VK_NULL_HANDLE)) {
     return true;
   }
   paint_context_.submission_tracker.AwaitSubmissionCompletion(state.last_image_submission);
@@ -890,6 +921,9 @@ bool VulkanPresenter::EnsureFrameGenerationImages(VulkanFrameGenerator* generato
     return dfn.vkCreateImageView(device, &view_info, nullptr, &image.view) == VK_SUCCESS;
   };
   bool created = create(state.color) && create(state.output) && create(state.final);
+  for (uint32_t i = 0; created && i + 1 < state.generated_count; ++i) {
+    created = create(state.extra_outputs[i]);
+  }
   if (created && debug) {
     created = create(state.previous) && create(state.debug);
     state.previous_valid = false;
@@ -1054,7 +1088,8 @@ void VulkanPresenter::RecordFrameGenerationInput(VkCommandBuffer command_buffer,
     constants.mode = 0;
     DispatchFrameGenerationCompose(
         command_buffer,
-        frame_generation_compose_sets_[(submission_index % PaintContext::kSubmissionCount) * 2],
+        frame_generation_compose_sets_[(submission_index % PaintContext::kSubmissionCount) *
+                                       kComposeSetsPerSubmission],
         hud->frame_view, hud->hudless_view, state.output.view,
         reinterpret_cast<const uint32_t*>(&constants));
     const VkImageMemoryBarrier barriers[2] = {
@@ -1096,11 +1131,14 @@ void VulkanPresenter::RecordFrameGenerationInput(VkCommandBuffer command_buffer,
 }
 
 bool VulkanPresenter::RecordFrameGeneration(
-    VkCommandBuffer command_buffer, VkSemaphore acquire_semaphore, uint32_t swapchain_image_index,
+    VkCommandBuffer command_buffer, const VkSemaphore* acquire_semaphores,
+    uint32_t swapchain_image_index,
     const GuestOutputImage* guest_output_image, uint64_t guest_output_refresh_serial,
     const UpscalerCamera* camera, uint32_t render_width, uint32_t render_height,
-    uint64_t submission_index, uint32_t& generated_image_index_out) {
+    uint64_t submission_index, uint32_t* generated_image_indices_out,
+    uint32_t& generated_count_out) {
   FrameGenerationState& state = frame_generation_;
+  generated_count_out = 0;
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
   // Only good for this paint.
@@ -1164,6 +1202,22 @@ bool VulkanPresenter::RecordFrameGeneration(
     state.waiting = "no scene";
     return false;
   }
+  // Generated frames per real one: the multiplier less one, as far as the
+  // provider and the swapchain's images go.
+  const uint32_t wanted_count = std::clamp<uint32_t>(
+      std::min(uint32_t(std::max(REXCVAR_GET(present_frame_generation_multiplier), 2)),
+               std::max(paint_context_.swapchain_frame_generation_multiplier, 2u)) -
+          1,
+      1, std::min(generator->info().max_generated, kMaxGeneratedFrames));
+  if (wanted_count != state.generated_count || state.generator != generator) {
+    if (wanted_count != state.generated_count && state.generator == generator) {
+      paint_context_.submission_tracker.AwaitSubmissionCompletion(state.last_image_submission);
+      generator->Release();
+    }
+    generator->SetGeneratedCount(wanted_count);
+    state.generated_count = wanted_count;
+    state.reset = true;
+  }
   if (!EnsureFrameGenerationImages(generator)) {
     state.reset = true;
     state.waiting = "no memory for its images";
@@ -1180,20 +1234,32 @@ bool VulkanPresenter::RecordFrameGeneration(
     return false;
   }
 
-  // The second image, for the generated frame.
-  uint32_t generated_index = 0;
-  const VkResult acquired =
-      dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_C(10000000),
-                                acquire_semaphore, VK_NULL_HANDLE, &generated_index);
-  if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) {
-    ++state.skipped_no_image;
-    state.reset = true;
-    state.waiting = "no swapchain image";
-    return false;
+  // An image for each generated frame. One that cannot be had leaves the
+  // later frames out (the acquired images must all be presented).
+  uint32_t count = state.generated_count;
+  std::array<uint32_t, kMaxGeneratedFrames> generated_indices = {};
+  std::array<VkImage, kMaxGeneratedFrames> generated_targets = {};
+  for (uint32_t k = 0; k < count; ++k) {
+    const VkResult acquired =
+        dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_C(10000000),
+                                  acquire_semaphores[k], VK_NULL_HANDLE, &generated_indices[k]);
+    if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) {
+      if (!k) {
+        ++state.skipped_no_image;
+        state.reset = true;
+        state.waiting = "no swapchain image";
+        return false;
+      }
+      count = k;
+      break;
+    }
+    generated_targets[k] = GetPaintTargetImage(generated_indices[k]);
   }
+  auto output_image = [&state](uint32_t k) -> FrameGenerationImage& {
+    return k ? state.extra_outputs[k - 1] : state.output;
+  };
 
   const VkImage real_target = GetPaintTargetImage(swapchain_image_index);
-  const VkImage generated_target = GetPaintTargetImage(generated_index);
   const VkImageLayout target_layout = GetPaintTargetLayout();
   VkImageBlit blit = {};
   blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -1250,6 +1316,17 @@ bool VulkanPresenter::RecordFrameGeneration(
                                  VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                              0, 0, nullptr, 0, nullptr, input_recorded ? 3 : 4, barriers);
   }
+  if (state.generated_count > 1) {
+    std::array<VkImageMemoryBarrier, kMaxGeneratedFrames - 1> extra_barriers;
+    for (uint32_t k = 1; k < state.generated_count; ++k) {
+      extra_barriers[k - 1] = FrameGenerationBarrier(
+          output_image(k).image, kFrameGenerationAnyAccess, VK_ACCESS_SHADER_WRITE_BIT,
+          VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    }
+    dfn.vkCmdPipelineBarrier(command_buffer, kFrameGenerationAnyStage,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+                             state.generated_count - 1, extra_barriers.data());
+  }
 
   constexpr VkImageUsageFlags kCameraUsage =
       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
@@ -1258,6 +1335,12 @@ bool VulkanPresenter::RecordFrameGeneration(
                           extent.width,      extent.height,    kFrameGenerationImageUsage};
   inputs.output = {state.output.image, state.output.view, VK_FORMAT_R8G8B8A8_UNORM,
                    extent.width,       extent.height,     kFrameGenerationImageUsage};
+  inputs.output_count = state.generated_count;
+  for (uint32_t k = 1; k < state.generated_count; ++k) {
+    inputs.extra_outputs[k - 1] = {output_image(k).image, output_image(k).view,
+                                   VK_FORMAT_R8G8B8A8_UNORM, extent.width, extent.height,
+                                   kFrameGenerationImageUsage};
+  }
   UpscalerFrame& frame = inputs.frame;
   frame.render_width = render_width;
   frame.render_height = render_height;
@@ -1344,51 +1427,64 @@ bool VulkanPresenter::RecordFrameGeneration(
   // Only where painting recorded the input before the UI: the alpha is the
   // coverage then, not the opaque alpha of the effects.
   if (generated && input_recorded && EnsureFrameGenerationCompose()) {
-    const VkImageMemoryBarrier to_compose = FrameGenerationBarrier(
-        state.output.image, VK_ACCESS_SHADER_WRITE_BIT,
-        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,
-        VK_IMAGE_LAYOUT_GENERAL);
+    std::array<VkImageMemoryBarrier, kMaxGeneratedFrames> to_compose;
+    for (uint32_t k = 0; k < count; ++k) {
+      to_compose[k] = FrameGenerationBarrier(
+          output_image(k).image, VK_ACCESS_SHADER_WRITE_BIT,
+          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,
+          VK_IMAGE_LAYOUT_GENERAL);
+    }
     dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                             &to_compose);
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, count,
+                             to_compose.data());
     FrameGenerationComposeConstants constants = {};
     constants.output_size[0] = extent.width;
     constants.output_size[1] = extent.height;
     constants.mode = 1;
     // Above rounding noise in an 8-bit alpha.
     constants.threshold = 1.5f / 255.0f;
-    DispatchFrameGenerationCompose(
-        command_buffer,
-        frame_generation_compose_sets_[(submission_index % PaintContext::kSubmissionCount) * 2 +
-                                       1],
-        state.final.view, state.final.view, state.output.view,
-        reinterpret_cast<const uint32_t*>(&constants));
+    for (uint32_t k = 0; k < count; ++k) {
+      DispatchFrameGenerationCompose(
+          command_buffer,
+          frame_generation_compose_sets_[(submission_index % PaintContext::kSubmissionCount) *
+                                             kComposeSetsPerSubmission +
+                                         1 + k],
+          state.final.view, state.final.view, output_image(k).view,
+          reinterpret_cast<const uint32_t*>(&constants));
+    }
   }
 
-  // The generated frame, or the real one again if the provider recorded
-  // nothing, into the second image: it was acquired and must be presented.
-  const VkImage source = generated ? state.output.image : state.final.image;
+  // Each generated frame, or the real one again if the provider recorded
+  // nothing, into its image: they were acquired and must be presented.
   {
-    const VkImageMemoryBarrier barriers[2] = {
-        generated ? FrameGenerationBarrier(state.output.image, VK_ACCESS_SHADER_WRITE_BIT,
-                                           VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
-                                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
-                  : FrameGenerationBarrier(state.final.image, VK_ACCESS_SHADER_READ_BIT,
-                                           VK_ACCESS_TRANSFER_READ_BIT,
-                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
-        FrameGenerationBarrier(generated_target, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
-                               VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
-    };
+    std::array<VkImageMemoryBarrier, 2 * kMaxGeneratedFrames> barriers;
+    uint32_t barrier_count = 0;
+    for (uint32_t k = 0; k < count; ++k) {
+      if (generated) {
+        barriers[barrier_count++] = FrameGenerationBarrier(
+            output_image(k).image, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+      } else if (!k) {
+        barriers[barrier_count++] = FrameGenerationBarrier(
+            state.final.image, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+      }
+      barriers[barrier_count++] =
+          FrameGenerationBarrier(generated_targets[k], 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    }
     dfn.vkCmdPipelineBarrier(command_buffer,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
                                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2,
-                             barriers);
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                             barrier_count, barriers.data());
   }
-  dfn.vkCmdBlitImage(command_buffer, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                     generated_target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-                     VK_FILTER_NEAREST);
+  for (uint32_t k = 0; k < count; ++k) {
+    const VkImage source = generated ? output_image(k).image : state.final.image;
+    dfn.vkCmdBlitImage(command_buffer, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       generated_targets[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                       VK_FILTER_NEAREST);
+  }
   if (debug_grid) {
     // The rest of the grid, then the finished real frame kept for the next.
     const VkImageMemoryBarrier to_read = FrameGenerationBarrier(
@@ -1471,14 +1567,17 @@ bool VulkanPresenter::RecordFrameGeneration(
     }
   }
   {
-    const VkImageMemoryBarrier to_present = FrameGenerationBarrier(
-        generated_target, VK_ACCESS_TRANSFER_WRITE_BIT,
-        paint_context_.swapchain_hdr ? VK_ACCESS_SHADER_READ_BIT : VkAccessFlags(0),
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, target_layout);
+    std::array<VkImageMemoryBarrier, kMaxGeneratedFrames> to_present;
+    for (uint32_t k = 0; k < count; ++k) {
+      to_present[k] = FrameGenerationBarrier(
+          generated_targets[k], VK_ACCESS_TRANSFER_WRITE_BIT,
+          paint_context_.swapchain_hdr ? VK_ACCESS_SHADER_READ_BIT : VkAccessFlags(0),
+          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, target_layout);
+    }
     dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
                              paint_context_.swapchain_hdr ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
                                                           : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                             0, 0, nullptr, 0, nullptr, 1, &to_present);
+                             0, 0, nullptr, 0, nullptr, count, to_present.data());
   }
   state.last_image_submission = submission_index;
   frame_generating_.store(generated, std::memory_order_relaxed);
@@ -1492,7 +1591,11 @@ bool VulkanPresenter::RecordFrameGeneration(
     state.reset = true;
     state.waiting = "warming up";
   }
-  generated_image_index_out = generated_index;
+  frame_generation_multiplier_.store(generated ? count + 1 : 2, std::memory_order_relaxed);
+  for (uint32_t k = 0; k < count; ++k) {
+    generated_image_indices_out[k] = generated_indices[k];
+  }
+  generated_count_out = count;
   return true;
 }
 
@@ -2115,9 +2218,10 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         old_swapchain, paint_context_.present_queue_family, new_swapchain_format,
         paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo,
         paint_context_.swapchain_hdr, surface_unusable,
-        paint_context_.swapchain_frame_generation);
+        paint_context_.swapchain_frame_generation, WantedFrameGenerationMultiplier());
     paint_context_.swapchain_frame_generation_requested =
         REXCVAR_GET(present_frame_generation) != "off";
+    paint_context_.swapchain_frame_generation_multiplier = WantedFrameGenerationMultiplier();
     // Destroy the old swapchain that may be retired now.
     if (old_swapchain != VK_NULL_HANDLE) {
       dfn.vkDestroySwapchainKHR(device, old_swapchain, nullptr);
@@ -2226,9 +2330,10 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         VK_NULL_HANDLE, paint_context_.present_queue_family, new_swapchain_format,
         paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo,
         paint_context_.swapchain_hdr, surface_unusable,
-        paint_context_.swapchain_frame_generation);
+        paint_context_.swapchain_frame_generation, WantedFrameGenerationMultiplier());
     paint_context_.swapchain_frame_generation_requested =
         REXCVAR_GET(present_frame_generation) != "off";
+    paint_context_.swapchain_frame_generation_multiplier = WantedFrameGenerationMultiplier();
     if (paint_context_.swapchain == VK_NULL_HANDLE) {
       // Failed to create the swapchain for the new Vulkan surface - destroy the
       // Vulkan surface.
@@ -2594,7 +2699,8 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
     VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out, VkFormat& image_format_out,
     VkExtent2D& image_extent_out, bool& is_fifo_out, bool& hdr_out,
-    bool& ui_surface_unusable_out, bool& frame_generation_out) {
+    bool& ui_surface_unusable_out, bool& frame_generation_out,
+    uint32_t frame_generation_multiplier) {
   ui_surface_unusable_out = false;
   hdr_out = false;
   frame_generation_out = false;
@@ -2930,7 +3036,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   swapchain_create_info.pNext = nullptr;
   swapchain_create_info.flags = 0;
   swapchain_create_info.surface = surface;
-  // UP-4: the real and the generated image of a paint are held together,
+  // UP-4: the real and the generated images of a paint are held together,
   // and the compositor may hold two more (gamescope does).
   const VkImageUsageFlags frame_generation_usage =
       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -2939,7 +3045,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
       (surface_capabilities.supportedUsageFlags & frame_generation_usage) ==
           frame_generation_usage;
   swapchain_create_info.minImageCount =
-      std::max(kSubmissionCount + (frame_generation ? 2u : 0u),
+      std::max(kSubmissionCount + (frame_generation ? frame_generation_multiplier : 0u),
                surface_capabilities.minImageCount);
   if (surface_capabilities.maxImageCount) {
     swapchain_create_info.minImageCount =
@@ -3439,7 +3545,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   // UP-4: frame generation turned on needs swapchain images it can copy and
   // one more of them; made once (a surface without them stays without).
   if (REXCVAR_GET(present_frame_generation) != "off" &&
-      !paint_context_.swapchain_frame_generation_requested) {
+      (!paint_context_.swapchain_frame_generation_requested ||
+       paint_context_.swapchain_frame_generation_multiplier <
+           WantedFrameGenerationMultiplier())) {
     return PaintResult::kNotPresentedConnectionOutdated;
   }
   // Begin the submission in place of the one not currently potentially used on
@@ -4408,7 +4516,12 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     }
   }
 
-  uint32_t generated_image_index = UINT32_MAX;
+  std::array<uint32_t, kMaxGeneratedFrames> generated_image_indices = {};
+  uint32_t generated_count = 0;
+  std::array<VkSemaphore, kMaxGeneratedFrames> generated_acquire_semaphores;
+  for (uint32_t k = 0; k < kMaxGeneratedFrames; ++k) {
+    generated_acquire_semaphores[k] = paint_submission.frame_generation_acquire_semaphore(k);
+  }
   if (frame_generation_render_width) {
     frame_generation_.render_width = frame_generation_render_width;
     frame_generation_.render_height = frame_generation_render_height;
@@ -4419,14 +4532,18 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   }
   const bool frame_generated =
       frame_generation_render_width &&
-      RecordFrameGeneration(draw_command_buffer,
-                            paint_submission.frame_generation_acquire_semaphore(),
+      RecordFrameGeneration(draw_command_buffer, generated_acquire_semaphores.data(),
                             swapchain_image_index, guest_output_image.get(),
                             guest_output_refresh_serial,
                             guest_output_camera_valid ? &guest_output_camera : nullptr,
                             frame_generation_render_width, frame_generation_render_height,
-                            current_paint_submission_index, generated_image_index);
+                            current_paint_submission_index, generated_image_indices.data(),
+                            generated_count);
   if (frame_generated && paint_context_.swapchain_hdr) {
+    for (uint32_t k = 1; k < generated_count; ++k) {
+      RecordHdrOutput(draw_command_buffer, generated_image_indices[k], hdr_test_pattern);
+    }
+    const uint32_t generated_image_index = generated_image_indices[0];
     RecordHdrOutput(draw_command_buffer, generated_image_index, hdr_test_pattern);
     // Debug: the generated HDR image replaces the real one in the capture.
     if (REXCVAR_GET(present_frame_generation_capture) != 0 &&
@@ -4461,26 +4578,32 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   command_buffers[command_buffer_count++] = draw_command_buffer;
   VkSemaphore present_semaphore =
       paint_context_.swapchain_framebuffers[swapchain_image_index].present_semaphore;
-  // UP-4: a generated frame's image is acquired and presented on its own.
-  const VkSemaphore wait_semaphores[2] = {acquire_semaphore,
-                                          paint_submission.frame_generation_acquire_semaphore()};
-  const VkPipelineStageFlags wait_stages[2] = {acquire_semaphore_wait_stage,
-                                               VK_PIPELINE_STAGE_TRANSFER_BIT};
-  const VkSemaphore generated_present_semaphore =
-      frame_generated
-          ? paint_context_.swapchain_framebuffers[generated_image_index].present_semaphore
-          : VK_NULL_HANDLE;
-  const VkSemaphore signal_semaphores[2] = {present_semaphore, generated_present_semaphore};
+  // UP-4: each generated frame's image is acquired and presented on its own.
+  std::array<VkSemaphore, 1 + kMaxGeneratedFrames> wait_semaphores = {acquire_semaphore};
+  std::array<VkPipelineStageFlags, 1 + kMaxGeneratedFrames> wait_stages = {
+      acquire_semaphore_wait_stage};
+  std::array<VkSemaphore, 1 + kMaxGeneratedFrames> signal_semaphores = {present_semaphore};
+  std::array<VkSemaphore, kMaxGeneratedFrames> generated_present_semaphores = {};
+  if (!frame_generated) {
+    generated_count = 0;
+  }
+  for (uint32_t k = 0; k < generated_count; ++k) {
+    wait_semaphores[1 + k] = generated_acquire_semaphores[k];
+    wait_stages[1 + k] = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    generated_present_semaphores[k] =
+        paint_context_.swapchain_framebuffers[generated_image_indices[k]].present_semaphore;
+    signal_semaphores[1 + k] = generated_present_semaphores[k];
+  }
   VkSubmitInfo submit_info;
   submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   submit_info.pNext = nullptr;
-  submit_info.waitSemaphoreCount = frame_generated ? 2 : 1;
-  submit_info.pWaitSemaphores = wait_semaphores;
-  submit_info.pWaitDstStageMask = wait_stages;
+  submit_info.waitSemaphoreCount = 1 + generated_count;
+  submit_info.pWaitSemaphores = wait_semaphores.data();
+  submit_info.pWaitDstStageMask = wait_stages.data();
   submit_info.commandBufferCount = command_buffer_count;
   submit_info.pCommandBuffers = command_buffers;
-  submit_info.signalSemaphoreCount = frame_generated ? 2 : 1;
-  submit_info.pSignalSemaphores = signal_semaphores;
+  submit_info.signalSemaphoreCount = 1 + generated_count;
+  submit_info.pSignalSemaphores = signal_semaphores.data();
   {
     VulkanSubmissionTracker::FenceAcquisition fence_acqusition(
         paint_context_.submission_tracker.AcquireFenceToAdvanceSubmission());
@@ -4579,42 +4702,55 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   };
   VkResult present_result;
   if (frame_generated) {
-    // The generated frame first, the real one half a real frame later.
-    const float half_ms = std::clamp(frame_generation_.interval_ms * 0.5f, 0.0f, 25.0f);
+    // The generated frames first, the real one last, each a share of a real
+    // frame after the one before (half of it at 2x).
+    const float step_ms = std::clamp(
+        frame_generation_.interval_ms / float(generated_count + 1), 0.0f, 25.0f);
     const double refresh_hz = REXCVAR_GET(video_mode_refresh_rate);
     const double refresh_ms = refresh_hz > 1.0 ? 1000.0 / refresh_hz : 0.0;
     const double refreshes =
-        paint_context_.swapchain_is_fifo && refresh_ms > 0.0 ? std::floor(half_ms / refresh_ms + 0.5) : 0.0;
+        paint_context_.swapchain_is_fifo && refresh_ms > 0.0 ? std::floor(step_ms / refresh_ms + 0.5) : 0.0;
     // Under FIFO, below the refresh rate (30 real frames at 120 Hz), the pair
     // queued back to back reached a G-SYNC LG C5 unevenly: LSFG about 8 then
-    // 24 ms apart, DLSS and FSR 3 at only about 30 images a second. Both
-    // images come from the paint's one submit, so wait for it, then queue the
-    // real frame a whole number of refreshes after the generated one: 97 % of
-    // DLSS's on-screen intervals in 13-21 ms, FSR 3 and LSFG alike, real
-    // frames still every 33.3 ms. At or above the refresh, as before.
+    // 24 ms apart, DLSS and FSR 3 at only about 30 images a second. All the
+    // images come from the paint's one submit, so wait for it, then queue
+    // each a whole number of refreshes after the one before: 97 % of DLSS's
+    // on-screen intervals in 13-21 ms, FSR 3 and LSFG alike, real frames
+    // still every 33.3 ms. At or above the refresh, as before.
     if (refreshes >= 1.0) {
       paint_context_.submission_tracker.AwaitSubmissionCompletion(
           paint_context_.submission_tracker.GetCurrentSubmission() - 1);
     }
-    const auto generated_time = std::chrono::steady_clock::now();
-    present_result = present_image(generated_image_index, generated_present_semaphore);
-    if (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR) {
+    const auto first_time = std::chrono::steady_clock::now();
+    auto previous_time = first_time;
+    for (uint32_t k = 0; k <= generated_count; ++k) {
+      if (k) {
+        if (!paint_context_.swapchain_is_fifo) {
+          // Without FIFO nothing spaces the presents: wait here.
+          std::this_thread::sleep_until(
+              previous_time + std::chrono::microseconds(int64_t(step_ms * 1000.0f)));
+        } else if (refreshes >= 1.0) {
+          // A precise wait: a late wake moves the next frame a refresh later.
+          rex::thread::SleepUntil(
+              previous_time +
+                  std::chrono::microseconds(int64_t(refreshes * refresh_ms * 1000.0)),
+              std::chrono::microseconds(300));
+        }
+        previous_time = std::chrono::steady_clock::now();
+      }
+      if (k == generated_count) {
+        frame_generation_.gap_ms_sum +=
+            std::chrono::duration<double, std::milli>(previous_time - first_time).count() /
+            double(generated_count);
+        present_result = present_image(swapchain_image_index, present_semaphore);
+        break;
+      }
+      present_result = present_image(generated_image_indices[k], generated_present_semaphores[k]);
+      if (present_result != VK_SUCCESS && present_result != VK_SUBOPTIMAL_KHR) {
+        break;
+      }
       ++frame_generation_.total_generated_presents;
       NoteFrameGenerationPresent(true);
-      if (!paint_context_.swapchain_is_fifo) {
-        // Without FIFO nothing spaces the two presents: wait here.
-        std::this_thread::sleep_until(
-            generated_time + std::chrono::microseconds(int64_t(half_ms * 1000.0f)));
-      } else if (refreshes >= 1.0) {
-        // A precise wait: a late wake moves the real frame a refresh later.
-        rex::thread::SleepUntil(
-            generated_time + std::chrono::microseconds(int64_t(refreshes * refresh_ms * 1000.0)),
-            std::chrono::microseconds(300));
-      }
-      frame_generation_.gap_ms_sum += std::chrono::duration<double, std::milli>(
-                                          std::chrono::steady_clock::now() - generated_time)
-                                          .count();
-      present_result = present_image(swapchain_image_index, present_semaphore);
     }
   } else {
     present_result = present_image(swapchain_image_index, present_semaphore);

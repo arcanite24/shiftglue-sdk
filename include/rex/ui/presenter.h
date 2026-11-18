@@ -410,6 +410,9 @@ class Presenter {
   // UP-4.2: whether painting shows a generated frame after each real one,
   // so the game should render at no more than half the display's refresh.
   virtual bool IsFrameGenerating() const { return false; }
+  // Frames shown per real one while generating (2, or 3-4 with a provider
+  // that makes several), so the game renders at the refresh divided by it.
+  virtual uint32_t FrameGenerationMultiplier() const { return 2; }
   // What the presenter has shown, for the F3 overlay: running totals that
   // the reader turns into rates, and the current setup.
   struct PresentStats {

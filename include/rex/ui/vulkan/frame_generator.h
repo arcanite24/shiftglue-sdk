@@ -8,6 +8,7 @@
  * counters) sees the generated frames.
  */
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -32,6 +33,8 @@ struct FrameGeneratorInfo {
   // Inputs the provider reads besides the two finished frames.
   bool uses_depth = false;
   bool uses_motion_vectors = false;
+  // Generated frames it can make between two real ones (3 for 4x).
+  uint32_t max_generated = 1;
 };
 
 // present_color is the finished frame at the display size, in
@@ -43,6 +46,10 @@ struct VulkanFrameGeneratorInputs {
   VulkanUpscalerImage depth;
   VulkanUpscalerImage motion_vectors;
   VulkanUpscalerImage output;
+  // With SetGeneratedCount above 1: the later generated frames, in order
+  // (output is the first, nearest the previous real frame).
+  std::array<VulkanUpscalerImage, 2> extra_outputs = {};
+  uint32_t output_count = 1;
   // Render size, motion vector scale, camera, jitter, the time since the
   // previous real frame, and reset (a cut, a resize, a skipped frame).
   UpscalerFrame frame;
@@ -72,6 +79,9 @@ class VulkanFrameGenerator {
                         const VulkanFrameGeneratorInputs& inputs) = 0;
   // Frees what Prepare made (the GPU must be done with it).
   virtual void Release() = 0;
+  // Generated frames per Dispatch, up to info().max_generated; set while
+  // released (before the next Prepare).
+  virtual void SetGeneratedCount(uint32_t count) { (void)count; }
 };
 
 // FSR 3.1 frame generation through the FidelityFX API (the same runtime as

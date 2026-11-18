@@ -14,6 +14,7 @@
 #include <rex/ui/vulkan/frame_generator.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -174,6 +175,7 @@ class VulkanLsfgFrameGenerator final : public VulkanFrameGenerator {
     info_.id = "lsfg";
     info_.name = "Lossless Scaling frame generation";
     info_.version = "3.1";
+    info_.max_generated = 3;
     const fs::path dll = FindLosslessDll();
     if (dll.empty()) {
       info_.unavailable_reason = "no Lossless.dll found";
@@ -226,6 +228,7 @@ class VulkanLsfgFrameGenerator final : public VulkanFrameGenerator {
       lsfg::EmbeddedSettings settings;
       settings.performance = REXCVAR_GET(present_lsfg_performance);
       settings.flow_scale = float(REXCVAR_GET(present_lsfg_flow_scale));
+      settings.generation_count = generated_count_;
       // Translated as the passes ask for them; the pipelines are kept.
       lsfg::ShaderSource source = [this](const std::string& name) {
         const auto it = resources_.find(lsfg::ShaderResourceId(name));
@@ -271,14 +274,22 @@ class VulkanLsfgFrameGenerator final : public VulkanFrameGenerator {
     // reset, so only a reset that follows a generated frame is a cut: the
     // warm-up frames would otherwise keep it set for good.
     const bool cut = inputs.frame.reset && last_generated_;
+    std::array<VkImage, 3> outputs = {inputs.output.image};
+    for (uint32_t k = 1; k < generated_count_; ++k) {
+      outputs[k] = inputs.extra_outputs[k - 1].image;
+    }
     last_generated_ = embedded_->Record(command_buffer, inputs.present_color.image,
-                                        inputs.output.image, !cut);
+                                        outputs.data(), !cut);
     return last_generated_;
 #else
     (void)command_buffer;
     (void)inputs;
     return false;
 #endif
+  }
+
+  void SetGeneratedCount(uint32_t count) override {
+    generated_count_ = std::clamp(count, 1u, 3u);
   }
 
   void Release() override {
@@ -291,6 +302,7 @@ class VulkanLsfgFrameGenerator final : public VulkanFrameGenerator {
  private:
   const VulkanDevice* device_;
   FrameGeneratorInfo info_;
+  uint32_t generated_count_ = 1;
 #if REX_HAS_LSFG
   std::map<uint32_t, std::vector<uint8_t>> resources_;
   std::unique_ptr<lsfg::Embedded> embedded_;

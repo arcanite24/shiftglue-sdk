@@ -285,10 +285,13 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
               current_render_fps_limit = cap;
             }
           }
-          // UP-4.2: with a generated frame after each real one, the game
-          // renders at no more than half the refresh, so both are shown.
+          // UP-4.2: with generated frames after each real one, the game
+          // renders at no more than the refresh divided by the frames shown
+          // per real one (half at 2x), so all are shown.
           if (presenter_ && presenter_->IsFrameGenerating()) {
-            const uint32_t half_refresh = uint32_t(display_rate * 0.5 + 0.5);
+            const uint32_t half_refresh = uint32_t(
+                display_rate / double(std::max(presenter_->FrameGenerationMultiplier(), 2u)) +
+                0.5);
             if (half_refresh &&
                 (!current_render_fps_limit || current_render_fps_limit > half_refresh)) {
               current_render_fps_limit = half_refresh;

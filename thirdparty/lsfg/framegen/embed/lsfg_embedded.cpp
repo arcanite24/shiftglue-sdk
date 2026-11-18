@@ -73,8 +73,8 @@ class Chain {
                          VK_FORMAT_R8G8B8A8_UNORM);
   }
 
-  bool Record(VkCommandBuffer command_buffer, VkImage present_color, VkImage output,
-              bool generate) {
+  bool Record(VkCommandBuffer command_buffer, VkImage present_color, const VkImage* outputs,
+              bool generate, uint32_t generation_count) {
     const LSFG::Core::CommandBuffer buffer(command_buffer);
     // inImg_0 is the newest frame when the index is even.
     LSFG::Core::Image& next = (frame_ % 2 == 0) ? in_0_ : in_1_;
@@ -130,17 +130,19 @@ class Chain {
     beta_.Dispatch(buffer, frame_);
 
     const bool write = generate && frame_ + 1 >= kWarmupFrames;
-    if (write) {
-      // Its second: the flow and the frame halfway between (one pass).
+    for (uint32_t pass = 0; write && pass < generation_count; ++pass) {
+      // Its later ones, one per generated frame: the flow and the frame at
+      // (pass + 1) / (generation_count + 1) between the two real ones.
       for (size_t i = 0; i < 7; i++) {
-        gamma_.at(i).Dispatch(buffer, frame_, 0);
+        gamma_.at(i).Dispatch(buffer, frame_, pass);
         if (i >= 4) {
-          delta_.at(i - 4).Dispatch(buffer, frame_, 0);
+          delta_.at(i - 4).Dispatch(buffer, frame_, pass);
         }
       }
-      generate_.Dispatch(buffer, frame_, 0);
+      generate_.Dispatch(buffer, frame_, pass);
+      const VkImage output = outputs[pass];
 
-      LSFG::Core::Image& generated = generate_.getOutImages().at(0);
+      LSFG::Core::Image& generated = generate_.getOutImages().at(pass);
       VkImageMemoryBarrier barrier = {};
       barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
       barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -226,13 +228,14 @@ class EmbeddedImpl final : public Embedded {
     return true;
   }
 
-  bool Record(VkCommandBuffer command_buffer, VkImage present_color, VkImage output,
+  bool Record(VkCommandBuffer command_buffer, VkImage present_color, const VkImage* outputs,
               bool generate) override {
+    const uint32_t count = uint32_t(vk_.generationCount);
     if (chain_p_) {
-      return chain_p_->Record(command_buffer, present_color, output, generate);
+      return chain_p_->Record(command_buffer, present_color, outputs, generate, count);
     }
     if (chain_) {
-      return chain_->Record(command_buffer, present_color, output, generate);
+      return chain_->Record(command_buffer, present_color, outputs, generate, count);
     }
     return false;
   }
@@ -266,7 +269,7 @@ std::unique_ptr<Embedded> Embedded::Create(const EmbeddedDevice& device, ShaderS
     LSFG::Vulkan vk{
         .device = LSFG::Core::Device(device.device, device.physical_device, device.queue_family,
                                      VK_NULL_HANDLE),
-        .generationCount = 1,
+        .generationCount = std::clamp<uint64_t>(settings.generation_count, 1, 3),
         // lsfg-vk passes the inverse of the player's flow scale.
         .flowScale = 1.0f / flow_scale,
         .isHdr = false,
