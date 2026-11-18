@@ -464,6 +464,10 @@ class Fh1NativeExecutor {
   // Surfaces with pending clears.
   uint32_t pending_clear_surfaces_ = 0;
   bool IsOneOffResolve(uint32_t address, uint32_t length);
+  // fh1_readback_resolve_sizes, parsed when it changes.
+  bool IsReadbackResolveSize(uint32_t width, uint32_t height);
+  std::string readback_sizes_text_;
+  std::vector<uint64_t> readback_sizes_;
   void QueueResolveReadback(uint32_t address, uint32_t length);
   // Small resolves the CPU reads every frame (the auto exposure's luminance,
   // #548): copied into a ring and written to guest memory once their

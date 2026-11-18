@@ -131,6 +131,11 @@ REXCVAR_DEFINE_BOOL(fh1_readback_small_float_resolves, true, "GPU",
                     "Read completed 32_FLOAT resolves of 4 KB or less back to guest RAM for "
                     "the title's CPU auto exposure")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(fh1_readback_resolve_sizes, "", "GPU",
+                      "Color resolves of these sizes, as <width>x<height>[,...], are read back "
+                      "to guest RAM before the next CPU-visible fence: images the title's CPU "
+                      "code reads right after rendering them (FM3's road strips, 32x512)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_debug_resolve_textures_only, false, "GPU",
                     "Diagnostics (renders wrong where guest memory is read): a resolve with a "
                     "current texture over its destination writes that texture only, not the "
@@ -3183,6 +3188,26 @@ void Fh1NativeExecutor::DumpResolveOutput(uint32_t address, uint32_t length) {
   dfn.vkFreeMemory(device, memory, nullptr);
 }
 
+bool Fh1NativeExecutor::IsReadbackResolveSize(uint32_t width, uint32_t height) {
+  const std::string sizes = REXCVAR_GET(fh1_readback_resolve_sizes);
+  if (sizes != readback_sizes_text_) {
+    readback_sizes_text_ = sizes;
+    readback_sizes_.clear();
+    size_t start = 0;
+    while (start < sizes.size()) {
+      size_t end = sizes.find(',', start);
+      if (end == std::string::npos) end = sizes.size();
+      uint32_t w = 0, h = 0;
+      if (std::sscanf(sizes.substr(start, end - start).c_str(), "%ux%u", &w, &h) == 2) {
+        readback_sizes_.push_back((uint64_t(w) << 32) | h);
+      }
+      start = end + 1;
+    }
+  }
+  const uint64_t size = (uint64_t(width) << 32) | height;
+  return std::find(readback_sizes_.begin(), readback_sizes_.end(), size) != readback_sizes_.end();
+}
+
 bool Fh1NativeExecutor::IsOneOffResolve(uint32_t address, uint32_t length) {
   // As the D3D12 executor: the first frames of each run of resolves to a new,
   // large range are read back (car thumbnails the game saves). So is a
@@ -3582,8 +3607,11 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     // also read at guest size, and stale there it pins the exposure at its
     // daytime limit, overexposing the screen until about noon (#444).
     constexpr uint32_t kUnscaledCopyMaxLength = 4096;
+    const bool listed = written_address && !plan.copying_depth &&
+                        IsReadbackResolveSize(uint32_t(plan.x1 - plan.x0),
+                                              uint32_t(plan.y1 - plan.y0));
     const bool one_off =
-        scale_ > 1 && written_address && IsOneOffResolve(extent_start, extent_length);
+        listed || (scale_ > 1 && written_address && IsOneOffResolve(extent_start, extent_length));
     bool unscaled_copy_complete = scale_ == 1 && complete;
     if (scale_ > 1 && written_address &&
         (one_off || extent_length <= kUnscaledCopyMaxLength)) {
@@ -3606,6 +3634,16 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
       }
       if (unscaled_complete && one_off) QueueResolveReadback(extent_start, extent_length);
       unscaled_copy_complete = complete && unscaled_complete;
+    } else if (listed && complete) {
+      // Unscaled, the resolve already wrote the guest layout.
+      QueueResolveReadback(extent_start, extent_length);
+    }
+    if (listed) {
+      static std::atomic<int> logged{0};
+      if (logged.fetch_add(1) < 64) {
+        REXGPU_INFO("FH1 resolve read back: {:08X}+{:X} {}x{}", extent_start, extent_length,
+                    plan.x1 - plan.x0, plan.y1 - plan.y0);
+      }
     }
     // GPU validity tracking preserves this resolve, but CPU exposure reads
     // still need its bytes in guest RAM (seen at lr 830A4880 on Apple silicon).
