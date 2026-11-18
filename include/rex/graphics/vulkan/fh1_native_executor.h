@@ -14,6 +14,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <rex/graphics/fh1_depth_overwrite.h>
@@ -469,6 +470,25 @@ class Fh1NativeExecutor {
   std::string readback_sizes_text_;
   std::vector<uint64_t> readback_sizes_;
   std::unordered_map<uint32_t, uint64_t> readback_size_frames_;
+  // fh1_readback_enclosing_sizes: a resolve of one of these sizes declares
+  // its range, and later resolves into a declared range (strips and regions
+  // resolved into tile positions inside the image) are read back with it.
+  // A range is dropped after fh1_readback_enclosing_frames without one; one
+  // declared again within fh1_readback_resolve_quiet_frames after the frames
+  // that build it is a render target, not read back.
+  bool IsReadbackEnclosed(uint32_t image_base, uint32_t image_width, uint32_t image_height,
+                          uint32_t extent_start, uint32_t extent_length);
+  struct ReadbackEnclosing {
+    uint32_t address;
+    uint32_t length;
+    uint64_t first_frame;
+    uint64_t last_frame;
+    bool recurring;
+  };
+  std::string readback_enclosing_text_;
+  std::vector<uint64_t> readback_enclosing_sizes_;
+  std::vector<ReadbackEnclosing> readback_enclosings_;
+  std::unordered_set<uint32_t> readback_enclosing_seen_;
   void QueueResolveReadback(uint32_t address, uint32_t length);
   // Small resolves the CPU reads every frame (the auto exposure's luminance,
   // #548): copied into a ring and written to guest memory once their

@@ -136,6 +136,17 @@ REXCVAR_DEFINE_STRING(fh1_readback_resolve_sizes, "", "GPU",
                       "to guest RAM before the next CPU-visible fence: images the title's CPU "
                       "code reads right after rendering them (FM3's road strips, 32x512)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(fh1_readback_enclosing_sizes, "", "GPU",
+                      "Color resolves of these sizes (<width>x<height>[,...]) are read back, "
+                      "and so are later resolves into their range: images the title builds "
+                      "from strips and regions resolved into tile positions inside them, then "
+                      "reads on the CPU (FM3's car liveries, 2048x2048 and 1024x1024)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(fh1_readback_enclosing_frames, 600, "GPU",
+                     "fh1_readback_enclosing_sizes: drop a declared range after this many "
+                     "frames without a resolve into it")
+    .range(1, 1000000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(fh1_readback_resolve_quiet_frames, 0, "GPU",
                      "fh1_readback_resolve_sizes: read a resolve back only if nothing was "
                      "resolved to its address in this many frames before (0: always). Each "
@@ -3215,6 +3226,78 @@ bool Fh1NativeExecutor::IsReadbackResolveSize(uint32_t width, uint32_t height) {
   return std::find(readback_sizes_.begin(), readback_sizes_.end(), size) != readback_sizes_.end();
 }
 
+bool Fh1NativeExecutor::IsReadbackEnclosed(uint32_t image_base, uint32_t image_width,
+                                           uint32_t image_height, uint32_t extent_start,
+                                           uint32_t extent_length) {
+  const std::string sizes = REXCVAR_GET(fh1_readback_enclosing_sizes);
+  if (sizes != readback_enclosing_text_) {
+    readback_enclosing_text_ = sizes;
+    readback_enclosing_sizes_.clear();
+    readback_enclosings_.clear();
+    size_t start = 0;
+    while (start < sizes.size()) {
+      size_t end = sizes.find(',', start);
+      if (end == std::string::npos) end = sizes.size();
+      uint32_t w = 0, h = 0;
+      if (std::sscanf(sizes.substr(start, end - start).c_str(), "%ux%u", &w, &h) == 2) {
+        readback_enclosing_sizes_.push_back((uint64_t(w) << 32) | h);
+      }
+      start = end + 1;
+    }
+  }
+  if (readback_enclosing_sizes_.empty() || !extent_length) return false;
+  if (image_width >= 1024 && image_height >= 1024 && readback_enclosing_seen_.size() < 16 &&
+      readback_enclosing_seen_.insert(image_base).second) {
+    REXGPU_INFO("FH1 large resolve destination: {:08X} {}x{}, extent {:08X}+{:X}", image_base,
+                image_width, image_height, extent_start, extent_length);
+  }
+  const uint64_t expiry = uint64_t(REXCVAR_GET(fh1_readback_enclosing_frames));
+  std::erase_if(readback_enclosings_, [&](const ReadbackEnclosing& e) {
+    return frame_ > e.last_frame + expiry;
+  });
+  const uint64_t extent_end = uint64_t(extent_start) + extent_length;
+  // A resolve into a declared image: read back unless that image is
+  // rendered again and again (a render target, not a built texture).
+  for (ReadbackEnclosing& e : readback_enclosings_) {
+    if (extent_start >= e.address && extent_end <= uint64_t(e.address) + e.length &&
+        e.address != image_base) {
+      e.last_frame = frame_;
+      if (e.recurring) return false;
+      Count("resolve_readback_enclosed");
+      return true;
+    }
+  }
+  const uint64_t size = (uint64_t(image_width) << 32) | image_height;
+  if (std::find(readback_enclosing_sizes_.begin(), readback_enclosing_sizes_.end(), size) ==
+      readback_enclosing_sizes_.end()) {
+    return false;
+  }
+  // The image's own resolve (its base, or its first strip): declares it.
+  const uint32_t length = uint32_t(std::max<uint64_t>(extent_end, image_base) - image_base);
+  auto it = std::find_if(readback_enclosings_.begin(), readback_enclosings_.end(),
+                         [&](const ReadbackEnclosing& e) { return e.address == image_base; });
+  if (it == readback_enclosings_.end()) {
+    if (readback_enclosings_.size() >= 16) readback_enclosings_.erase(readback_enclosings_.begin());
+    readback_enclosings_.push_back({image_base, length, frame_, frame_, false});
+    REXGPU_INFO("FH1 resolve read back with what is resolved into it: {:08X} {}x{}", image_base,
+                image_width, image_height);
+  } else {
+    it->length = std::max(it->length, length);
+    // Declared again after the frames that build it: rendered every frame.
+    const int32_t quiet = REXCVAR_GET(fh1_readback_resolve_quiet_frames);
+    if (!it->recurring && quiet > 0 && frame_ > it->first_frame + 8 &&
+        frame_ <= it->last_frame + uint64_t(quiet)) {
+      it->recurring = true;
+      REXGPU_INFO("FH1 resolve {:08X} {}x{} is rendered again: not read back", image_base,
+                  image_width, image_height);
+    }
+    it->last_frame = frame_;
+  }
+  if (it != readback_enclosings_.end() && it->recurring) return false;
+  Count("resolve_readback_enclosing");
+  return true;
+}
+
 bool Fh1NativeExecutor::IsOneOffResolve(uint32_t address, uint32_t length) {
   // As the D3D12 executor: the first frames of each run of resolves to a new,
   // large range are read back (car thumbnails the game saves). So is a
@@ -3631,6 +3714,13 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
         listed = false;
         Count("resolve_readback_recent");
       }
+    }
+    if (written_address && !plan.copying_depth &&
+        IsReadbackEnclosed(resolve_info.copy_dest_base,
+                           resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32 << 5,
+                           resolve_info.copy_dest_coordinate_info.height_aligned_div_32 << 5,
+                           extent_start, extent_length)) {
+      listed = true;
     }
     const bool one_off =
         listed || (scale_ > 1 && written_address && IsOneOffResolve(extent_start, extent_length));
