@@ -1,45 +1,104 @@
-> [!CAUTION]
-> This project is in early development. Expect things to not work quite right and there to be significant changes and breaking public API updates as development progresses. Contributions and feedback are welcome, but please be aware that the codebase is still evolving rapidly.
+<p align="center">
+  <img src=".github/shiftglue-banner.png" alt="ShiftGlue" width="800">
+</p>
 
-<h1 align="center">
-  <br>
-  <a href="https://github.com/rexglue/rexglue-sdk">
-    <img src="https://github.com/rexglue/rexglue-media/blob/main/ReX_Banner.png" alt="ReXGlue banner">
-  </a>
-  <br>
-  <br>
-  <a href="https://discord.gg/CNTxwSNZfT">
-    <img src="https://img.shields.io/badge/Discord-Join%20Server-5865F2?logo=discord&logoColor=white" alt="Discord">
-  </a>
-  <a href="https://github.com/rexglue/rexglue-sdk/stargazers">
-    <img src="https://img.shields.io/github/stars/rexglue/rexglue-sdk" alt="rexglue-sdk stargazers">
-  </a>
-</h1>
+<p align="center">
+  <a href="https://github.com/arcanite24/shiftglue-sdk/stargazers"><img src="https://img.shields.io/github/stars/arcanite24/shiftglue-sdk" alt="ShiftGlue stargazers"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/licence-BSD--3--Clause-informational" alt="BSD 3-Clause licence"></a>
+  <a href="https://github.com/rexglue/rexglue-sdk"><img src="https://img.shields.io/badge/fork%20of-ReXGlue-lightgrey" alt="Fork of ReXGlue"></a>
+</p>
 
-ReXGlue converts Xbox 360 PowerPC code into portable C++ that runs natively on modern platforms.
+ShiftGlue is a fork of [ReXGlue](https://github.com/rexglue/rexglue-sdk). Like ReXGlue, it converts
+Xbox 360 PowerPC code into portable C++ ahead of time and supplies the runtime the result runs on:
+kernel, graphics, audio and input. ShiftGlue is the framework under the Shift ports, and most of its
+changes came from making those games run well on desktops, handhelds, Macs and Android phones.
 
-ReXGlue is heavily rooted on the foundations of [Xenia](https://github.com/xenia-project), the Xbox 360 emulator. Rather than interpreting or JIT-compiling PPC instructions at runtime, ReXGlue takes a different path: it generates C++ source code ahead of time, an approach inspired by [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) and [rexdex's recompiler](https://github.com/rexdex/recompiler).
-
-Latest SDK builds and releases are published on [GitHub Releases](https://github.com/rexglue/rexglue-sdk/releases). Join the [Discord server](https://discord.gg/CNTxwSNZfT) for updates and share what you have created.
-
-## Builds
-
-| Channel | CI | Download |
+| Port | Game (Xbox 360) | ShiftGlue branch |
 | --- | --- | --- |
-| Release | [![win-amd64](https://github.com/rexglue/rexglue-sdk/actions/workflows/build-win-amd64.yaml/badge.svg)](https://github.com/rexglue/rexglue-sdk/actions/workflows/build-win-amd64.yaml) [![linux-amd64](https://github.com/rexglue/rexglue-sdk/actions/workflows/build-linux-amd64.yaml/badge.svg)](https://github.com/rexglue/rexglue-sdk/actions/workflows/build-linux-amd64.yaml) [![linux-arm64](https://github.com/rexglue/rexglue-sdk/actions/workflows/build-linux-aarch64.yaml/badge.svg)](https://github.com/rexglue/rexglue-sdk/actions/workflows/build-linux-aarch64.yaml) | [Latest stable](https://github.com/rexglue/rexglue-sdk/releases/latest) |
-| Nightly | [![nightly](https://github.com/rexglue/rexglue-sdk/actions/workflows/nightly.yaml/badge.svg)](https://github.com/rexglue/rexglue-sdk/actions/workflows/nightly.yaml) | [Latest pre-release](https://github.com/rexglue/rexglue-sdk/releases?q=prerelease%3Atrue) |
+| [Pinyon Shift](https://github.com/arcanite24/pinyon-shift) | Forza Horizon | `main` |
+| [Lavender Shift](https://github.com/arcanite24/lavender-shift) | Forza Horizon 2 | `main` |
+| [Cobalt Shift](https://github.com/arcanite24/cobalt-shift) | Forza Motorsport 3 | `cobalt` |
 
-## Quickstart
+> [!CAUTION]
+> ShiftGlue changes quickly and its API breaks without notice. It is not a ReXGlue release: for
+> ReXGlue's own builds, documentation and support, go to the upstream project.
 
-For quick start guide, full CLI reference, and config file options, see the [wiki](https://github.com/rexglue/rexglue-sdk/wiki).
+## What the fork adds
 
-# **Disclaimer**
-ReXGlue is not affiliated with nor endorsed by Microsoft or Xbox. It is an independent project created for educational and development purposes. All trademarks and copyrights belong to their respective owners. 
+- **Platforms.** An Android arm64 target (Vulkan, Adreno drivers loaded through adrenotools, Mali
+  workarounds, HDR10); fixes and tuning for Apple silicon Macs on MoltenVK, including guest memory on
+  16 KiB host pages; 2 MiB pages for game code on Linux and thread pinning for the Steam Deck.
+- **A Vulkan renderer for small GPUs.** An on-disk shader cache, ahead-of-time pipeline lists, opt-in
+  bindless textures, texture size caps, and render scale, MSAA and texture size that change without a
+  restart.
+- **Upscaling and frame generation.** DLSS and FSR 2/3 temporal upscaling fed with the title's depth,
+  motion vectors and a frame without the HUD; FSR 3.1, DLSS and LSFG 3.1 frame generation (LSFG loads
+  the player's own `Lossless.dll`).
+- **Display.** HDR output to an scRGB swapchain, ambient occlusion at present, texture replacement
+  packs, and HUD scaling with a safe zone.
+- **Input and audio.** DualSense triggers, lightbar and tilt steering; racing wheels driven by the
+  title's own force feedback; SDL controller mappings built from raw input; key bindings with
+  modifiers; the player's own music as the console's music player.
+- **Code generation.** Opt-in native regions compiled into one host function, checked against an independent
+  interpreter and a lockstep verifier; loads from read-only image data folded into literals; RTTI class
+  export (`classes.json`); more PowerPC instructions; ABI poison checks around guest calls.
+- **Diagnostics.** Session and frame replay, frame inspection snapshots, draw and lock censuses, and
+  GPU profiles broken down by pass.
 
-This project is not intended to promote piracy nor unauthorized use of copyrighted material. Any misuse of this software to endorse or enable this type of activity is strictly prohibited.
+Some of these paths are written for the Forza Horizon renderer; their settings and code are named
+`fh1`.
 
+## Using it
+
+ShiftGlue has no standalone releases. Each port pins a ShiftGlue commit as a git submodule and builds
+it with its own setup tool, which is the easiest way to get a working build.
+
+To build the SDK on its own, use the CMake presets:
+
+```sh
+cmake --preset win-amd64
+cmake --build --preset win-amd64-release
+```
+
+Presets exist for `win-amd64`, `win-arm64`, `linux-amd64`, `linux-arm64`, `mac-amd64` and
+`mac-arm64`. Android builds go through the NDK toolchain of the port that uses them. Build
+prerequisites, the codegen CLI and the config file are described on
+[ReXGlue's wiki](https://github.com/rexglue/rexglue-sdk/wiki). It is written for upstream and the fork
+has diverged since, so some details differ.
+
+## Reporting problems
+
+Issues are turned off on this repository. Report problems on the tracker of the port you are using,
+for example [Pinyon Shift's issues](https://github.com/arcanite24/pinyon-shift/issues). Pull requests
+are welcome here.
+
+## Upstream
+
+ShiftGlue's `main` does not mirror ReXGlue. Upstream changes arrive through merges, so the fork can
+trail ReXGlue's latest release. ReXGlue's [releases](https://github.com/rexglue/rexglue-sdk/releases),
+wiki and [Discord server](https://discord.gg/CNTxwSNZfT) belong to the upstream project.
+
+# Disclaimer
+
+ShiftGlue is not affiliated with or endorsed by Microsoft, Xbox, Playground Games, Turn 10 Studios or
+the ReXGlue project. It is an independent project created for educational and development purposes.
+All trademarks and copyrights belong to their respective owners.
+
+This project is not intended to promote piracy nor unauthorized use of copyrighted material. It
+contains no game code or data; the ports need the player's own copy of each game. Any misuse of this
+software to endorse or enable this type of activity is strictly prohibited.
+
+# Licence
+
+BSD 3-Clause, the same as ReXGlue; see [LICENSE](LICENSE). Portions are derived from the Xenia
+project.
 
 # Credits
+
+## ShiftGlue
+- [arcanite24](https://github.com/arcanite24) - Fork maintainer
+- [tycrowther](https://github.com/tycrowther), [rosscarlson](https://github.com/rosscarlson),
+  [XpartFS](https://github.com/XpartFS), [MoaazHF](https://github.com/MoaazHF) - Contributors
 
 ## ReXGlue
 - [Tom (crack)](https://github.com/tomcl7) - Project Founder

@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 420">
+  <title>ShiftGlue — Resin drop</title>
+  <defs>
+    <mask id="shiftglue-cutout" maskUnits="userSpaceOnUse" x="0" y="0" width="400" height="420" style="mask-type:luminance">
+      <path fill="#FFFFFF" d="M0,0 H400 V420 H0 Z"/>
+      <g id="cutout" fill="#000000">
+        <path d="M191.6,150.4 A25.2,25.2 0 1 1 208.4,150.4 L208.4,221.8 C208.4,238.6 247.6,244.2 247.6,277.8 C247.6,317 205.6,342.2 191.6,370.2 L170.4,434 L103.2,434 L158,345 C174.8,317 219.6,303 219.6,277.8 C219.6,255.4 191.6,247 191.6,221.8 Z"/>
+      </g>
+    </mask>
+  </defs>
+  <g id="silhouette" fill="#F2C45D" mask="url(#shiftglue-cutout)">
+    <path d="M200,16 C183,76 68,145 68,252 C68,337 123,395 200,404 C277,395 332,337 332,252 C332,145 217,76 200,16 Z"/>
+  </g>
+</svg>
