@@ -59,7 +59,7 @@ layout(push_constant) uniform AmbientOcclusionConstants {
   float fade_start;
   float fade_end;
   // 1: the history is this view's previous frame; 2: the matrix's depth is
-  // 1 minus the stored one (FH1).
+  // 1 minus the stored one (FH1); 4: ground-truth AO (GTAO) instead of SAO.
   uint flags;
   float rotation;
 } c;
@@ -133,6 +133,59 @@ layout(set = 0, binding = 1, rg16f) writeonly uniform image2D raw;
 
 const int kSamples = 12;
 const float kTurns = 7.0;
+const int kGtaoSlices = 2;
+const int kGtaoSteps = 6;
+
+// Ground-truth ambient occlusion (Jimenez et al., "Practical Realtime
+// Strategies for Accurate Indirect Occlusion", 2016): in each of a few
+// screen-space slices through the pixel, the highest horizon on either side
+// within the radius, then the cosine-weighted visible arc between the two
+// horizons, integrated in closed form around the normal projected into the
+// slice. Returns the visibility, 1 open.
+float GtaoVisibility(ivec2 p, vec3 position, vec3 normal, float radius, float radius_pixels,
+                     float noise) {
+  vec3 view = normalize(-position);
+  float jitter = fract(noise * 7.31 + 0.5);
+  float visibility = 0.0;
+  for (int s = 0; s < kGtaoSlices; ++s) {
+    float phi = (float(s) + noise) * 3.14159265 / float(kGtaoSlices);
+    vec2 direction = vec2(cos(phi), sin(phi));
+    // The slice's screen direction in view space (screen y runs down, view y up).
+    vec3 slice_direction = vec3(direction.x, -direction.y, 0.0);
+    vec3 axis = normalize(cross(slice_direction, view));
+    vec3 ortho = slice_direction - dot(slice_direction, view) * view;
+    vec3 projected = normal - axis * dot(normal, axis);
+    float projected_length = length(projected);
+    if (projected_length < 1e-4) {
+      visibility += 1.0;
+      continue;
+    }
+    float cos_n = clamp(dot(projected, view) / projected_length, -1.0, 1.0);
+    float n = (dot(projected, ortho) < 0.0 ? -1.0 : 1.0) * acos(cos_n);
+    float horizon_cos[2] = float[2](-1.0, -1.0);
+    for (int side = 0; side < 2; ++side) {
+      vec2 step_direction = side == 0 ? -direction : direction;
+      for (int i = 0; i < kGtaoSteps; ++i) {
+        float t = (float(i) + jitter) / float(kGtaoSteps);
+        vec2 offset = step_direction * max(1.0, t * radius_pixels);
+        vec3 v = ViewPosition(p + ivec2(round(offset))) - position;
+        float distance = length(v);
+        if (distance < 1e-4) continue;
+        float h = dot(v / distance, view);
+        // Fade towards the open horizon past the radius.
+        float falloff = clamp((distance - radius) / (0.5 * radius), 0.0, 1.0);
+        horizon_cos[side] = max(horizon_cos[side], mix(h, -1.0, falloff));
+      }
+    }
+    float h0 = n + max(-acos(horizon_cos[0]) - n, -1.57079633);
+    float h1 = n + min(acos(horizon_cos[1]) - n, 1.57079633);
+    float sin_n = sin(n);
+    float arc = 0.25 * (-cos(2.0 * h0 - n) + cos_n + 2.0 * h0 * sin_n) +
+                0.25 * (-cos(2.0 * h1 - n) + cos_n + 2.0 * h1 * sin_n);
+    visibility += projected_length * arc;
+  }
+  return clamp(visibility / float(kGtaoSlices), 0.0, 1.0);
+}
 
 void main() {
   ivec2 ao_pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -175,6 +228,9 @@ void main() {
                                        3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
     float noise =
         fract((kBayer[(ao_pixel.y & 3) * 4 + (ao_pixel.x & 3)] + 0.5) / 16.0 + c.rotation);
+    if ((c.flags & 4u) != 0u) {
+      occlusion = 1.0 - GtaoVisibility(p, position, normal, radius, radius_pixels, noise);
+    } else {
     float radius2 = radius * radius;
     float bias = 0.02 + 0.002 * position.z;
     float sum = 0.0;
@@ -188,6 +244,7 @@ void main() {
       sum += f * f * f * max((dot(v, normal) - bias) / (vv + 0.01), 0.0);
     }
     occlusion = min(1.0, sum * 5.0 / (radius2 * radius2 * radius2 * float(kSamples)));
+    }
   }
   occlusion *= 1.0 - smoothstep(c.fade_start, c.fade_end, position.z);
   imageStore(raw, ao_pixel, vec4(1.0 - occlusion, position.z, 0.0, 0.0));
@@ -236,19 +293,19 @@ constexpr double kRotationStep = 0.61803399;
 
 }  // namespace
 
-bool VulkanCommandProcessor::EnsureSwapAmbientOcclusion(uint32_t full_width,
-                                                        uint32_t full_height) {
+bool VulkanCommandProcessor::EnsureSwapAmbientOcclusion(uint32_t full_width, uint32_t full_height) {
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   if (swap_ao_pipeline_ == VK_NULL_HANDLE) {
-    if (swap_ao_failed_) return false;
+    if (swap_ao_failed_)
+      return false;
     swap_ao_failed_ = true;
     VkDescriptorSetLayoutBinding bindings[4] = {};
     for (uint32_t i = 0; i < 4; ++i) {
       bindings[i].binding = i;
-      bindings[i].descriptorType = (i == 1 || i == 2) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-                                                      : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+      bindings[i].descriptorType =
+          (i == 1 || i == 2) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
       bindings[i].descriptorCount = 1;
       bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
@@ -256,8 +313,8 @@ bool VulkanCommandProcessor::EnsureSwapAmbientOcclusion(uint32_t full_width,
     set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     set_layout_info.bindingCount = 4;
     set_layout_info.pBindings = bindings;
-    if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
-                                        &swap_ao_set_layout_) != VK_SUCCESS) {
+    if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr, &swap_ao_set_layout_) !=
+        VK_SUCCESS) {
       REXGPU_WARN("Failed to create the ambient occlusion descriptor set layout");
       return false;
     }
@@ -301,19 +358,17 @@ bool VulkanCommandProcessor::EnsureSwapAmbientOcclusion(uint32_t full_width,
       return false;
     }
     for (VkPipeline* pipeline : {&swap_ao_pipeline_, &swap_ao_temporal_pipeline_}) {
-      const std::string source = std::string(kAmbientOcclusionCommon) +
-                                 (pipeline == &swap_ao_pipeline_ ? kAmbientOcclusionEstimate
-                                                                 : kAmbientOcclusionTemporal);
+      const std::string source =
+          std::string(kAmbientOcclusionCommon) +
+          (pipeline == &swap_ao_pipeline_ ? kAmbientOcclusionEstimate : kAmbientOcclusionTemporal);
       std::vector<uint32_t> spirv;
       std::string compile_error;
-      if (!CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, source.c_str(), spirv,
-                              compile_error)) {
+      if (!CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, source.c_str(), spirv, compile_error)) {
         REXGPU_WARN("Failed to compile the ambient occlusion shader: {}", compile_error);
         return false;
       }
       *pipeline = ui::vulkan::util::CreateComputePipeline(
-          vulkan_device, swap_ao_pipeline_layout_, spirv.data(),
-          sizeof(uint32_t) * spirv.size());
+          vulkan_device, swap_ao_pipeline_layout_, spirv.data(), sizeof(uint32_t) * spirv.size());
       if (*pipeline == VK_NULL_HANDLE) {
         REXGPU_WARN("Failed to create the ambient occlusion pipeline");
         return false;
@@ -371,9 +426,10 @@ bool VulkanCommandProcessor::EnsureSwapAmbientOcclusion(uint32_t full_width,
   return true;
 }
 
-void VulkanCommandProcessor::DispatchSwapAmbientOcclusion(
-    VkImageView camera_depth, const Fh1NativeExecutor::Camera& camera, uint32_t full_width,
-    uint32_t full_height, uint32_t frame_index) {
+void VulkanCommandProcessor::DispatchSwapAmbientOcclusion(VkImageView camera_depth,
+                                                          const Fh1NativeExecutor::Camera& camera,
+                                                          uint32_t full_width, uint32_t full_height,
+                                                          uint32_t frame_index) {
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -382,8 +438,8 @@ void VulkanCommandProcessor::DispatchSwapAmbientOcclusion(
   // ran this pass for the same view.
   const uint32_t current = swap_ao_current_ ^ 1;
   const uint32_t previous = swap_ao_current_;
-  const bool history = swap_ao_history_valid_ && swap_ao_last_frame_ + 1 == frame_current_ &&
-                       !camera.cut;
+  const bool history =
+      swap_ao_history_valid_ && swap_ao_last_frame_ + 1 == frame_current_ && !camera.cut;
   PushImageMemoryBarrier(swap_ao_images_[current], range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
                          VK_ACCESS_SHADER_WRITE_BIT, swap_ao_layouts_[current],
@@ -392,13 +448,11 @@ void VulkanCommandProcessor::DispatchSwapAmbientOcclusion(
   // second.
   PushImageMemoryBarrier(swap_ao_raw_image_, range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
-                         VK_ACCESS_SHADER_WRITE_BIT, swap_ao_raw_layout_,
-                         VK_IMAGE_LAYOUT_GENERAL);
+                         VK_ACCESS_SHADER_WRITE_BIT, swap_ao_raw_layout_, VK_IMAGE_LAYOUT_GENERAL);
   swap_ao_raw_layout_ = VK_IMAGE_LAYOUT_GENERAL;
   if (swap_ao_layouts_[previous] != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
     // Never written (the first frame): bound but not read.
-    PushImageMemoryBarrier(swap_ao_images_[previous], range,
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    PushImageMemoryBarrier(swap_ao_images_[previous], range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_READ_BIT,
                            swap_ao_layouts_[previous], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     swap_ao_layouts_[previous] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -418,14 +472,13 @@ void VulkanCommandProcessor::DispatchSwapAmbientOcclusion(
     writes[i].dstSet = set;
     writes[i].dstBinding = i;
     writes[i].descriptorCount = 1;
-    writes[i].descriptorType = (i == 1 || i == 2) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-                                                  : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[i].descriptorType =
+        (i == 1 || i == 2) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     writes[i].pImageInfo = &infos[i];
   }
   dfn.vkUpdateDescriptorSets(device, 4, writes, 0, nullptr);
-  deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
-                                                   swap_ao_pipeline_layout_, 0, 1, &set, 0,
-                                                   nullptr);
+  deferred_command_buffer_.CmdVkBindDescriptorSets(
+      VK_PIPELINE_BIND_POINT_COMPUTE, swap_ao_pipeline_layout_, 0, 1, &set, 0, nullptr);
   const float tan_half_y = std::tan(camera.fov_y * 0.5f);
   const float radius = float(REXCVAR_GET(swap_ambient_occlusion_radius));
   struct {
@@ -451,14 +504,13 @@ void VulkanCommandProcessor::DispatchSwapAmbientOcclusion(
                  radius,
                  radius * 80.0f,
                  radius * 200.0f,
-                 (history ? 1u : 0u) | (camera.depth_matrix_flipped ? 2u : 0u),
+                 (history ? 1u : 0u) | (camera.depth_matrix_flipped ? 2u : 0u) |
+                     (REXCVAR_GET(swap_ambient_occlusion_gtao) ? 4u : 0u),
                  float(std::fmod(double(frame_current_) * kRotationStep, 1.0))};
-  std::copy(std::begin(camera.reprojection), std::end(camera.reprojection),
-            constants.reprojection);
+  std::copy(std::begin(camera.reprojection), std::end(camera.reprojection), constants.reprojection);
   static_assert(sizeof(constants) == sizeof(float) * 16 + sizeof(uint32_t) * 13);
-  deferred_command_buffer_.CmdVkPushConstants(swap_ao_pipeline_layout_,
-                                              VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants),
-                                              &constants);
+  deferred_command_buffer_.CmdVkPushConstants(swap_ao_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                                              0, sizeof(constants), &constants);
   BindExternalComputePipeline(swap_ao_pipeline_);
   deferred_command_buffer_.CmdVkDispatch((swap_ao_width_ + 7) / 8, (swap_ao_height_ + 7) / 8, 1);
   PushImageMemoryBarrier(swap_ao_raw_image_, range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -486,9 +538,12 @@ void VulkanCommandProcessor::DestroySwapAmbientOcclusionImages() {
     VkImageView& view = i < 2 ? swap_ao_views_[i] : swap_ao_raw_view_;
     VkImage& image = i < 2 ? swap_ao_images_[i] : swap_ao_raw_image_;
     VkDeviceMemory& memory = i < 2 ? swap_ao_memory_[i] : swap_ao_raw_memory_;
-    if (view != VK_NULL_HANDLE) destroy_image_views_.emplace_back(submission, view);
-    if (image != VK_NULL_HANDLE) destroy_images_.emplace_back(submission, image);
-    if (memory != VK_NULL_HANDLE) destroy_memory_.emplace_back(submission, memory);
+    if (view != VK_NULL_HANDLE)
+      destroy_image_views_.emplace_back(submission, view);
+    if (image != VK_NULL_HANDLE)
+      destroy_images_.emplace_back(submission, image);
+    if (memory != VK_NULL_HANDLE)
+      destroy_memory_.emplace_back(submission, memory);
     view = VK_NULL_HANDLE;
     image = VK_NULL_HANDLE;
     memory = VK_NULL_HANDLE;
@@ -506,8 +561,7 @@ void VulkanCommandProcessor::DestroySwapAmbientOcclusion() {
   const VkDevice device = vulkan_device->device();
   DestroySwapAmbientOcclusionImages();
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_ao_pipeline_);
-  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
-                                         swap_ao_temporal_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_ao_temporal_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
                                          swap_ao_pipeline_layout_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,

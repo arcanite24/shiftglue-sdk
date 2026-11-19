@@ -62,6 +62,11 @@ REXCVAR_DEFINE_INT32(swap_ambient_occlusion_strength, 70, "GPU",
 REXCVAR_DEFINE_BOOL(swap_ambient_occlusion_debug, false, "GPU",
                     "Vulkan: show only the ambient occlusion term, white for none")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(swap_ambient_occlusion_gtao, false, "GPU",
+                    "Vulkan: estimate the ambient occlusion with ground-truth AO (horizons in two "
+                    "screen-space slices, cosine-weighted) instead of scalable ambient obscurance "
+                    "(issue #5 SR-22)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(swap_ambient_occlusion_radius, 1.0, "GPU",
                       "Vulkan: ambient occlusion radius in the title's world units (metres in "
                       "FH1 and FH2)")

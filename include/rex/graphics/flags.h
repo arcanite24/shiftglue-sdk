@@ -70,6 +70,7 @@ REXCVAR_DECLARE(bool, swap_ambient_occlusion);
 REXCVAR_DECLARE(int32_t, swap_ambient_occlusion_strength);
 REXCVAR_DECLARE(double, swap_ambient_occlusion_radius);
 REXCVAR_DECLARE(bool, swap_ambient_occlusion_debug);
+REXCVAR_DECLARE(bool, swap_ambient_occlusion_gtao);
 
 // Guest shader translation cvars (dxbc_switch, dxbc_source_map,
 // use_fuzzy_alpha_epsilon, draw_resolution_scaled_texture_offsets) are
