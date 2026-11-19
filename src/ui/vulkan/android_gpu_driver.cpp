@@ -11,6 +11,7 @@
 #include <rex/ui/vulkan/android_gpu_driver.h>
 
 #include <dlfcn.h>
+#include <pthread.h>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -229,12 +230,26 @@ std::string MakeDriverSonamesUnique(const std::filesystem::path& folder,
 
 std::string g_loaded_driver;
 
+// SDL attaches a thread to the JVM on its first JNI call with no name, and
+// ART then renames it "Thread-N". The presenter's first paint runs on the GPU
+// command decoder, so "GPU Commands" became "Thread-9" (POCO F7 Pro, 0.9.1)
+// and android_thread_cores, which matches names, no longer found it. The
+// thread keeps its own name.
+JNIEnv* AndroidJniEnvKeepingThreadName() {
+  char name[16] = {};
+  const bool named = pthread_getname_np(pthread_self(), name, sizeof(name)) == 0 && name[0];
+  auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+  if (named)
+    pthread_setname_np(pthread_self(), name);
+  return env;
+}
+
 }  // namespace
 
 const std::string& LoadedAndroidGpuDriver() { return g_loaded_driver; }
 
 bool CallAndroidActivityMethod(const char* method) {
-  auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+  auto* env = AndroidJniEnvKeepingThreadName();
   auto activity = static_cast<jobject>(SDL_GetAndroidActivity());
   if (!env || !activity) return false;
   jclass activity_class = env->GetObjectClass(activity);
@@ -256,7 +271,7 @@ const AndroidDisplayHdr& GetAndroidDisplayHdr() {
     if (const char* diagnostics = std::getenv("REX_ANDROID_DISPLAY_DIAGNOSTICS")) {
       REXLOG_INFO("Android display environment (launch snapshot): {}", diagnostics);
     }
-    auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+    auto* env = AndroidJniEnvKeepingThreadName();
     auto activity = static_cast<jobject>(SDL_GetAndroidActivity());
     if (!env || !activity) return result;
     // activity.getDisplay().getHdrCapabilities() (API 30).

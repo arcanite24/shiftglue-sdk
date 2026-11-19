@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -39,6 +40,11 @@
 #include <rex/ui/flags.h>
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
+
+#if REX_PLATFORM_ANDROID
+#include <android/choreographer.h>
+#include <android/looper.h>
+#endif
 
 REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
     .allowed({"none", "fxaa", "fxaa_extreme"});
@@ -95,6 +101,13 @@ REXCVAR_DEFINE_BOOL(gpu_log_register_reads, false, "GPU",
 REXCVAR_DEFINE_BOOL(pinyon_shift_fh1_vblank_deadline_wait, true, "Pinyon Shift",
                     "Deliver FH1 guest vblanks from deadlines instead of 1 ms polling")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#if REX_PLATFORM_ANDROID
+REXCVAR_DEFINE_BOOL(android_vblank_display_lock, true, "Pinyon Shift",
+                    "Deliver guest vblanks on the display's own vsyncs (Choreographer) when the "
+                    "guest rate is a whole multiple of the display's refresh period, instead of "
+                    "the host clock, so frames keep one place against the display's vsync")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+#endif
 
 namespace {
 
@@ -122,6 +135,88 @@ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
   }
   return rex::graphics::CommandProcessor::SwapPostEffect::kNone;
 }
+
+#if REX_PLATFORM_ANDROID
+// The display's vsyncs, from a Choreographer on a looper thread of its own.
+// A panel's real refresh is not the nominal one (SurfaceFlinger predicts
+// 16.659 ms for a POCO F7 Pro's 60 Hz mode), so guest vblanks from the host
+// clock at exactly 60 Hz drifted against it: at 30 fps the time a frame
+// waited in the queue climbed from 17 to 33 ms over 25-35 s, then a frame
+// was shown twice and it started again. The period is SurfaceFlinger's own
+// estimate, from the spacing of the next two frame timelines.
+class DisplayVsync {
+ public:
+  ~DisplayVsync() { Stop(); }
+
+  void Start() {
+    if (running_.exchange(true))
+      return;
+    thread_ = std::thread([this] { Run(); });
+  }
+
+  void Stop() {
+    if (!running_.exchange(false))
+      return;
+    if (ALooper* looper = looper_.load())
+      ALooper_wake(looper);
+    if (thread_.joinable())
+      thread_.join();
+  }
+
+  // The latest vsync (CLOCK_MONOTONIC ns, as steady_clock) and the period,
+  // or false when none arrived in the last four periods.
+  bool Get(int64_t now_ns, int64_t& vsync_ns, int64_t& period_ns) const {
+    vsync_ns = vsync_ns_.load(std::memory_order_acquire);
+    period_ns = period_ns_.load(std::memory_order_acquire);
+    return vsync_ns && period_ns && now_ns - vsync_ns < 4 * period_ns;
+  }
+
+ private:
+  void Run() {
+    ALooper* looper = ALooper_prepare(0);
+    ALooper_acquire(looper);
+    looper_.store(looper);
+    AChoreographer* choreographer = AChoreographer_getInstance();
+    if (choreographer) {
+      AChoreographer_postVsyncCallback(choreographer, OnVsync, this);
+      while (running_.load())
+        ALooper_pollOnce(-1, nullptr, nullptr, nullptr);
+    } else {
+      REXGPU_WARN("Display vsync: no Choreographer; guest vblanks stay on the host clock");
+    }
+    looper_.store(nullptr);
+    ALooper_release(looper);
+  }
+
+  static void OnVsync(const AChoreographerFrameCallbackData* data, void* context) {
+    auto* self = static_cast<DisplayVsync*>(context);
+    if (AChoreographerFrameCallbackData_getFrameTimelinesLength(data) >= 2) {
+      const int64_t period =
+          AChoreographerFrameCallbackData_getFrameTimelineExpectedPresentationTimeNanos(data, 1) -
+          AChoreographerFrameCallbackData_getFrameTimelineExpectedPresentationTimeNanos(data, 0);
+      if (period >= 2'000'000 && period <= 50'000'000) {
+        self->period_ns_.store(period, std::memory_order_release);
+      }
+    }
+    self->vsync_ns_.store(AChoreographerFrameCallbackData_getFrameTimeNanos(data),
+                          std::memory_order_release);
+    if (self->running_.load()) {
+      AChoreographer_postVsyncCallback(AChoreographer_getInstance(), OnVsync, self);
+    }
+  }
+
+  std::thread thread_;
+  std::atomic<bool> running_{false};
+  std::atomic<ALooper*> looper_{nullptr};
+  std::atomic<int64_t> vsync_ns_{0};
+  std::atomic<int64_t> period_ns_{0};
+};
+
+DisplayVsync& GetDisplayVsync() {
+  static DisplayVsync display_vsync;
+  return display_vsync;
+}
+#endif
 
 // The present_* cvars BuildGuestOutputPaintConfigFromCVar reads.
 constexpr const char* kPresenterPaintCvars[] = {
@@ -273,9 +368,16 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         uint32_t render_fps_limit = UINT32_MAX;
         uint64_t interval_ticks = 1;
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+#if REX_PLATFORM_ANDROID
+        // The next locked vblank (steady_clock ns), 0 while on the host clock.
+        int64_t locked_next_ns = 0;
+#endif
         while (vsync_worker_running_) {
           if (chrono::Clock::guest_time_paused()) {
             // Guest time stands still in the background: no vblank is due.
+#if REX_PLATFORM_ANDROID
+            locked_next_ns = 0;
+#endif
             rex::thread::Sleep(std::chrono::milliseconds(20));
             continue;
           }
@@ -302,6 +404,67 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
               current_render_fps_limit = half_refresh;
             }
           }
+#if REX_PLATFORM_ANDROID
+          // Locked: each guest vblank on a display vsync, every k-th one where
+          // the guest period is k display periods (a 60 Hz guest: k = 1 at 60
+          // Hz, 2 at 120 Hz). Elsewhere (90 Hz, no vsyncs yet, a scaled guest
+          // clock) the host clock below.
+          if (REXCVAR_GET(android_vblank_display_lock) &&
+              chrono::Clock::guest_time_scalar() == 1.0) {
+            DisplayVsync& display = GetDisplayVsync();
+            display.Start();
+            const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count();
+            int64_t vsync_ns = 0, period_ns = 0;
+            if (display.Get(now_ns, vsync_ns, period_ns)) {
+              const double guest_period_ns =
+                  1e9 / Fh1GuestVblankHzForRenderLimit(current_render_fps_limit,
+                                                       REXCVAR_GET(video_mode_refresh_rate));
+              const double ratio = guest_period_ns / double(period_ns);
+              const int64_t k = std::llround(ratio);
+              if (k >= 1 && std::abs(ratio - double(k)) < 0.02 * double(k)) {
+                // The vsync grid nearest the planned time; a plan fallen more
+                // than a guest period behind (a stall) starts again from now.
+                const int64_t planned = locked_next_ns && locked_next_ns > now_ns - k * period_ns
+                                            ? locked_next_ns
+                                            : now_ns + period_ns / 2;
+                const int64_t n = std::llround(double(planned - vsync_ns) / double(period_ns));
+                const int64_t deadline_ns = vsync_ns + n * period_ns;
+                if (!locked_next_ns) {
+                  REXGPU_INFO("Guest vblanks locked to the display: every {} vsync(s) of {:.4f} ms",
+                              k, double(period_ns) / 1e6);
+                }
+                const auto deadline =
+                    std::chrono::steady_clock::time_point(std::chrono::nanoseconds(deadline_ns));
+                if (REXCVAR_GET(high_resolution_timer_waits)) {
+                  rex::thread::SleepUntil(deadline, std::chrono::microseconds(50));
+                } else {
+                  std::this_thread::sleep_until(deadline - std::chrono::microseconds(500));
+                  while (vsync_worker_running_ && std::chrono::steady_clock::now() < deadline) {
+                    std::this_thread::yield();
+                  }
+                }
+                if (!vsync_worker_running_)
+                  break;
+                MarkVblank();
+                locked_next_ns = deadline_ns + k * period_ns;
+                // The host-clock path resumes from here if the lock ends.
+                last_frame_time = chrono::Clock::QueryGuestTickCount();
+                continue;
+              }
+            }
+            if (locked_next_ns) {
+              REXGPU_INFO("Guest vblanks back on the host clock (display period {:.4f} ms)",
+                          double(period_ns) / 1e6);
+              locked_next_ns = 0;
+              last_frame_time = chrono::Clock::QueryGuestTickCount();
+            }
+          } else if (locked_next_ns) {
+            locked_next_ns = 0;
+            last_frame_time = chrono::Clock::QueryGuestTickCount();
+          }
+#endif
           if (current_render_fps_limit != render_fps_limit) {
             render_fps_limit = current_render_fps_limit;
             const double refresh_rate_hz = Fh1GuestVblankHzForRenderLimit(
@@ -348,6 +511,9 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             std::this_thread::yield();
           }
         }
+#if REX_PLATFORM_ANDROID
+        GetDisplayVsync().Stop();
+#endif
         return 0;
       }));
   // TODO: set_can_debugger_suspend not yet ported
