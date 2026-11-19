@@ -292,6 +292,13 @@ REXCVAR_DEFINE_BOOL(gpu_constant_census, false, "GPU/Vulkan",
                     "every 600 frames (RECORDER_REPLAY_BACKLOG RR-2.1); apart from the draw "
                     "cost model because its copies and compares inflate the uploads step")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+namespace rex::graphics::vulkan {
+namespace {
+// gpu_log_pixel_constants (defined below).
+void LogPixelConstants(const RegisterFile& regs, const VulkanShader& shader);
+}  // namespace
+}  // namespace rex::graphics::vulkan
+
 REXCVAR_DEFINE_BOOL(gpu_draw_cost_model, false, "GPU/Vulkan",
                     "Diagnostics (RR-0.1): time one draw in 16 step by step on the recorder, "
                     "and every draw and register run whole, and log the cost by draw band "
@@ -6941,6 +6948,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     fh1_draw.state_epoch = unchanged_inputs ? memo_state : state_epoch_;
     fh1_draw.state_is_hash = unchanged_inputs;
     MaybeRunMidframeHooks(pixel_shader);
+    if (pixel_shader) LogPixelConstants(*register_file_, *pixel_shader);
     fh1_native_executor_->MaybeSnapshotBeforeHud(fh1_draw);
     fh1_native_executor_->PrepareTargets(fh1_draw);
     if (!fh1_native_executor_->BindTargets(fh1_render_pass_key)) {
@@ -10666,7 +10674,6 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   }
   uint32_t float_constant_count_pixel = 0;
   if (pixel_shader != nullptr) {
-    LogPixelConstants(regs, *pixel_shader);
     const Shader::ConstantRegisterMap& float_constant_map_pixel =
         pixel_shader->constant_register_map();
     float_constant_count_pixel = float_constant_map_pixel.float_count;
