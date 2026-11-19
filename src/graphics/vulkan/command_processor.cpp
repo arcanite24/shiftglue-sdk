@@ -91,7 +91,21 @@ REXCVAR_DEFINE_BOOL(present_upscaler_object_motion, true, "GPU",
                     "not only the camera's");
 
 REXCVAR_DEFINE_INT32(present_upscaler_object_debug, 0, "GPU",
-                     "UP-1.7 debug: 1 shows the object slots in the motion view (red: slot, green: its depth is the pixel's)");
+                     "UP-1.7 debug: 1 shows the object slots in the motion view (red: slot, green: "
+                     "its depth is the pixel's); 2 shows the reactive mask (SR-23) in red");
+
+REXCVAR_DEFINE_STRING(present_upscaler_reactive_shaders, "", "GPU",
+                      "Issue #5 SR-23: guest pixel shader hashes (hex, comma separated) whose "
+                      "pixels a temporal upscaler gets as reactive (glass, effects drawn over "
+                      "the scene), so it trusts the current frame there over its history. "
+                      "Host render targets only; read at start")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_DOUBLE(present_upscaler_reactive_strength, 0.8, "GPU",
+                      "SR-23: the reactive mask's value on marked pixels (0 to 1)")
+    .range(0.0, 1.0);
+REXCVAR_DEFINE_BOOL(present_upscaler_reactive_depth_test, true, "GPU",
+                    "SR-23: a marked pixel is reactive only where the mark is in front of the "
+                    "scene depth (or on it), so glass behind an opaque surface is not");
 
 REXCVAR_DEFINE_BOOL(fh1_untile_predicated_tiling, REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "GPU",
                     "Render FH1's predicated tiling passes once: the first tile draws every "
@@ -1668,7 +1682,7 @@ bool VulkanCommandProcessor::SetupContext() {
     }
     REXGPU_INFO("Shared memory reads use one texel buffer");
   }
-  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[10];
+  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[12];
   shared_memory_and_edram_descriptor_set_layout_bindings[0].binding = 0;
   shared_memory_and_edram_descriptor_set_layout_bindings[0].descriptorType =
       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1718,6 +1732,12 @@ bool VulkanCommandProcessor::SetupContext() {
     object_slot_binding.descriptorCount = 1;
     object_slot_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     object_slot_binding.pImmutableSamplers = nullptr;
+    // SR-23: the reactive marks beside it.
+    VkDescriptorSetLayoutBinding& reactive_binding =
+        shared_memory_and_edram_descriptor_set_layout_bindings
+            [shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount++];
+    reactive_binding = object_slot_binding;
+    reactive_binding.binding = SpirvShaderTranslator::kReactiveImageBinding;
   }
   // SR-10: replacement pixel shaders' host inputs. Without the cvar the
   // layout is the same as before.
@@ -1785,7 +1805,7 @@ bool VulkanCommandProcessor::SetupContext() {
   }
   if (object_slot_set_binding_) {
     descriptor_pool_sizes[descriptor_pool_size_count].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    descriptor_pool_sizes[descriptor_pool_size_count++].descriptorCount = 1;
+    descriptor_pool_sizes[descriptor_pool_size_count++].descriptorCount = 2;
   }
   if (host_inputs_set_binding_) {
     descriptor_pool_sizes[descriptor_pool_size_count].type =
@@ -2751,7 +2771,7 @@ void VulkanCommandProcessor::WriteSharedMemoryAndEdramDescriptorSet() {
     shared_memory_descriptor_buffer_info.offset = shared_memory_binding_range * i;
     shared_memory_descriptor_buffer_info.range = shared_memory_binding_range;
   }
-  VkWriteDescriptorSet write_descriptor_sets[10];
+  VkWriteDescriptorSet write_descriptor_sets[12];
   uint32_t write_descriptor_set_count = 1;
   VkWriteDescriptorSet& write_descriptor_set_shared_memory = write_descriptor_sets[0];
   write_descriptor_set_shared_memory.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -2809,6 +2829,19 @@ void VulkanCommandProcessor::WriteSharedMemoryAndEdramDescriptorSet() {
     write_descriptor_set_object_slots.descriptorCount = 1;
     write_descriptor_set_object_slots.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     write_descriptor_set_object_slots.pImageInfo = &object_slot_image_info;
+  }
+  VkDescriptorImageInfo reactive_image_info = {VK_NULL_HANDLE, reactive_image_view_,
+                                               VK_IMAGE_LAYOUT_GENERAL};
+  if (object_slot_set_binding_ && reactive_image_view_ != VK_NULL_HANDLE) {
+    VkWriteDescriptorSet& write_descriptor_set_reactive =
+        write_descriptor_sets[write_descriptor_set_count++];
+    write_descriptor_set_reactive = {};
+    write_descriptor_set_reactive.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write_descriptor_set_reactive.dstSet = shared_memory_and_edram_descriptor_set_;
+    write_descriptor_set_reactive.dstBinding = SpirvShaderTranslator::kReactiveImageBinding;
+    write_descriptor_set_reactive.descriptorCount = 1;
+    write_descriptor_set_reactive.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    write_descriptor_set_reactive.pImageInfo = &reactive_image_info;
   }
   // SR-10 host inputs; every caller has nothing using set 0, so the
   // constants (the draw resolution scale) are rewritten here too.
@@ -3861,6 +3894,8 @@ layout(push_constant) uniform SwapCameraConstants {
   // slot depth (host) to the source depth's scale.
   uint object_count;
   float object_depth_scale;
+  // SR-23: the reactive mask's value on marked pixels.
+  float reactive_strength;
 } c;
 layout(set = 0, binding = 0) uniform texture2D source_depth;
 layout(set = 0, binding = 1, r32f) writeonly uniform image2D depth;
@@ -3869,6 +3904,9 @@ layout(set = 0, binding = 3, r32ui) readonly uniform uimage2D object_slots;
 layout(set = 0, binding = 4, std430) readonly buffer ObjectReprojections {
   layout(row_major) mat4 object_reprojections[];
 };
+// SR-23: the reactive marks the listed shaders wrote, and the mask.
+layout(set = 0, binding = 5, r32ui) readonly uniform uimage2D reactive_marks;
+layout(set = 0, binding = 6, r32f) writeonly uniform image2D reactive;
 // Whether an object slot's depth (the fragment's, at the pixel centre) is
 // the surface the scene depth holds (sample 0 of a multisampled surface). On
 // a slope the two differ by the depth's change over a fraction of a pixel,
@@ -3894,6 +3932,21 @@ void main() {
   float stored_z = texelFetch(source_depth, scene_pixel, 0).r;
   float z = 1.0 - stored_z;
   float matrix_z = ((c.object_count >> 17u) & 1u) != 0u ? stored_z : z;
+  // SR-23: reactive where a mark is the nearest surface (in front of the
+  // scene depth or on it), or anywhere marked without the depth test (bit
+  // 18).
+  uint mark = all(lessThan(scene_pixel, imageSize(reactive_marks)))
+                  ? imageLoad(reactive_marks, scene_pixel).r : 0u;
+  float mark_z = float(mark >> 8u) * (c.object_depth_scale / 16777215.0);
+  bool marked = mark != 0u && (((c.object_count >> 18u) & 1u) != 0u || mark_z >= stored_z ||
+                               SameSurface(mark_z, stored_z));
+  float reactive_value = marked ? c.reactive_strength : 0.0;
+  imageStore(reactive, pixel, vec4(reactive_value, 0.0, 0.0, 0.0));
+  if (((c.object_count >> 19u) & 1u) != 0u) {
+    imageStore(depth, pixel, vec4(z, 0.0, 0.0, 0.0));
+    imageStore(motion, pixel, vec4(marked ? 0.2 : 0.0, mark != 0u ? 0.05 : 0.0, 0.0, 0.0));
+    return;
+  }
   // UP-1.7: the nearest scene object drawn at the pixel, if it is what the
   // depth holds (not something drawn over it without a slot), moves with
   // its own reprojection.
@@ -3933,6 +3986,33 @@ void main() {
 
 }  // namespace
 
+namespace {
+
+// SR-23: present_upscaler_reactive_shaders, parsed once (it needs a restart).
+bool IsReactivePixelShader(uint64_t ucode_hash) {
+  static const std::vector<uint64_t> hashes = [] {
+    std::vector<uint64_t> parsed;
+    const std::string list = REXCVAR_GET(present_upscaler_reactive_shaders);
+    for (size_t start = 0; start < list.size();) {
+      const size_t end = std::min(list.find(',', start), list.size());
+      const std::string item = list.substr(start, end - start);
+      if (item.find_first_not_of(" ") != std::string::npos) {
+        parsed.push_back(std::strtoull(item.c_str(), nullptr, 16));
+      }
+      start = end + 1;
+    }
+    return parsed;
+  }();
+  return std::find(hashes.begin(), hashes.end(), ucode_hash) != hashes.end();
+}
+
+bool ReactiveShadersListed() {
+  static const bool listed = !REXCVAR_GET(present_upscaler_reactive_shaders).empty();
+  return listed;
+}
+
+}  // namespace
+
 bool VulkanCommandProcessor::EnsureSwapCamera() {
   if (swap_camera_pipeline_ != VK_NULL_HANDLE) return true;
   if (swap_camera_failed_) return false;
@@ -3940,8 +4020,8 @@ bool VulkanCommandProcessor::EnsureSwapCamera() {
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
-  VkDescriptorSetLayoutBinding bindings[5] = {};
-  for (uint32_t i = 0; i < 5; ++i) {
+  VkDescriptorSetLayoutBinding bindings[7] = {};
+  for (uint32_t i = 0; i < 7; ++i) {
     bindings[i].binding = i;
     bindings[i].descriptorType = i == 4 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
                                  : i    ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
@@ -3951,7 +4031,7 @@ bool VulkanCommandProcessor::EnsureSwapCamera() {
   }
   VkDescriptorSetLayoutCreateInfo set_layout_info = {};
   set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  set_layout_info.bindingCount = 5;
+  set_layout_info.bindingCount = 7;
   set_layout_info.pBindings = bindings;
   if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
                                       &swap_camera_set_layout_) != VK_SUCCESS) {
@@ -3959,7 +4039,7 @@ bool VulkanCommandProcessor::EnsureSwapCamera() {
     return false;
   }
   VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                             sizeof(float) * 16 + sizeof(uint32_t) * 6};
+                                             sizeof(float) * 16 + sizeof(uint32_t) * 7};
   VkPipelineLayoutCreateInfo pipeline_layout_info = {};
   pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
   pipeline_layout_info.setLayoutCount = 1;
@@ -3973,7 +4053,7 @@ bool VulkanCommandProcessor::EnsureSwapCamera() {
   }
   VkDescriptorPoolSize pool_sizes[3] = {
       {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxFramesInFlight},
-      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 * kMaxFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5 * kMaxFramesInFlight},
       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kMaxFramesInFlight},
   };
   VkDescriptorPoolCreateInfo pool_info = {};
@@ -4298,8 +4378,11 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
     // between frames, IssueSwap) and initialised by a camera pass.
     const bool object_motion_wanted =
         camera_wanted && object_slot_set_binding_ && REXCVAR_GET(present_upscaler_object_motion);
-    object_slot_wanted_width_ = object_motion_wanted ? guest_output_width : 0;
-    object_slot_wanted_height_ = object_motion_wanted ? guest_output_height : 0;
+    // SR-23: the reactive marks are made at the same size.
+    const bool reactive_wanted =
+        camera_wanted && object_slot_set_binding_ && ReactiveShadersListed();
+    object_slot_wanted_width_ = object_motion_wanted || reactive_wanted ? guest_output_width : 0;
+    object_slot_wanted_height_ = object_motion_wanted || reactive_wanted ? guest_output_height : 0;
     fh1_native_executor_->SetObjectMotionEnabled(
         object_motion_wanted && object_slot_image_initialized_ &&
         object_slot_image_width_ == guest_output_width &&
@@ -4964,7 +5047,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
           if (camera_depth_view != VK_NULL_HANDLE && EnsureSwapCamera() &&
               vulkan_context.EnsureCameraImages()) {
             const bool camera_written_before = vulkan_context.camera_ever_written_previously();
-            for (VkImage image : {vulkan_context.depth_image(), vulkan_context.motion_image()}) {
+            for (VkImage image : {vulkan_context.depth_image(), vulkan_context.motion_image(),
+                                  vulkan_context.reactive_image()}) {
               PushImageMemoryBarrier(
                   image, guest_output_subresource_range,
                   camera_written_before ? ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask
@@ -4981,20 +5065,20 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             const VkImageSubresourceRange object_slot_range =
                 ui::vulkan::util::InitializeSubresourceRange();
             const bool object_slots_readable = object_slot_image_initialized_;
-            if (object_slots_readable) {
-              PushImageMemoryBarrier(object_slot_image_, object_slot_range,
-                                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                     VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                                     VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
-                                     VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED,
-                                     VK_QUEUE_FAMILY_IGNORED, false);
-            } else {
-              PushImageMemoryBarrier(object_slot_image_, object_slot_range,
-                                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-                                     VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
-                                     VK_IMAGE_LAYOUT_GENERAL);
+            for (VkImage slot_image : {object_slot_image_, reactive_image_}) {
+              if (object_slots_readable) {
+                PushImageMemoryBarrier(
+                    slot_image, object_slot_range, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+              } else {
+                PushImageMemoryBarrier(
+                    slot_image, object_slot_range, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_ACCESS_SHADER_READ_BIT,
+                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+              }
             }
             SubmitBarriers(true);
             const std::vector<std::array<float, 16>>& object_table =
@@ -5011,16 +5095,19 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                   GetVulkanDevice(), swap_object_table_memories_[swap_frame_index],
                   swap_object_table_memory_types_[swap_frame_index]);
             }
-            VkDescriptorImageInfo camera_infos[4] = {
+            VkDescriptorImageInfo camera_infos[7] = {
                 {VK_NULL_HANDLE, camera_depth_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                 {VK_NULL_HANDLE, vulkan_context.depth_image_view(), VK_IMAGE_LAYOUT_GENERAL},
                 {VK_NULL_HANDLE, vulkan_context.motion_image_view(), VK_IMAGE_LAYOUT_GENERAL},
                 {VK_NULL_HANDLE, object_slot_image_view_, VK_IMAGE_LAYOUT_GENERAL},
+                {},
+                {VK_NULL_HANDLE, reactive_image_view_, VK_IMAGE_LAYOUT_GENERAL},
+                {VK_NULL_HANDLE, vulkan_context.reactive_image_view(), VK_IMAGE_LAYOUT_GENERAL},
             };
             const VkDescriptorBufferInfo object_table_info = {
                 swap_object_table_buffers_[swap_frame_index], 0, VK_WHOLE_SIZE};
-            VkWriteDescriptorSet camera_writes[5] = {};
-            for (uint32_t i = 0; i < 5; ++i) {
+            VkWriteDescriptorSet camera_writes[7] = {};
+            for (uint32_t i = 0; i < 7; ++i) {
               camera_writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
               camera_writes[i].dstSet = camera_set;
               camera_writes[i].dstBinding = i;
@@ -5034,7 +5121,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                 camera_writes[i].pImageInfo = &camera_infos[i];
               }
             }
-            dfn.vkUpdateDescriptorSets(device, 5, camera_writes, 0, nullptr);
+            dfn.vkUpdateDescriptorSets(device, 7, camera_writes, 0, nullptr);
             deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
                                                              swap_camera_pipeline_layout_, 0, 1,
                                                              &camera_set, 0, nullptr);
@@ -5044,6 +5131,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
               float size_inv[2];
               uint32_t object_count;
               float object_depth_scale;
+              float reactive_strength;
             } camera_constants;
             std::memcpy(camera_constants.reprojection, camera.reprojection,
                         sizeof(camera_constants.reprojection));
@@ -5052,13 +5140,25 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             camera_constants.size_inv[0] = 1.0f / float(guest_output_width);
             camera_constants.size_inv[1] = 1.0f / float(guest_output_height);
             camera_constants.object_count =
-                object_count |
-                uint32_t(REXCVAR_GET(present_upscaler_object_debug) != 0) << 16 |
-                uint32_t(!camera.depth_matrix_flipped && camera.depth_b > 0.0f) << 17;
+                object_count | uint32_t(REXCVAR_GET(present_upscaler_object_debug) == 1) << 16 |
+                uint32_t(!camera.depth_matrix_flipped && camera.depth_b > 0.0f) << 17 |
+                uint32_t(!REXCVAR_GET(present_upscaler_reactive_depth_test)) << 18 |
+                uint32_t(REXCVAR_GET(present_upscaler_object_debug) == 2) << 19;
+            // SR-23: the mask is given to the upscaler only with listed
+            // shaders, so without them it sees what it did before.
+            const bool reactive_listed = ReactiveShadersListed();
+            camera_constants.reactive_strength =
+                reactive_listed && object_slots_readable
+                    ? float(REXCVAR_GET(present_upscaler_reactive_strength))
+                    : 0.0f;
             if ((frame_current_ % 600) == 0) {
               REXGPU_INFO("Object motion: {} slots, {} slot draws, {} without the variant",
                           object_count, object_slot_draws_, object_slot_fallback_draws_);
+              if (reactive_listed) {
+                REXGPU_INFO("Reactive mask: {} marked draws", reactive_draws_);
+              }
             }
+            reactive_draws_ = 0;
             camera_constants.object_depth_scale = fh1_native_executor_->camera_depth_scale();
             object_slot_draws_ = 0;
             object_slot_fallback_draws_ = 0;
@@ -5069,27 +5169,28 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             BindExternalComputePipeline(swap_camera_pipeline_);
             deferred_command_buffer_.CmdVkDispatch((guest_output_width + 7) / 8,
                                                    (guest_output_height + 7) / 8, 1);
-            // Cleared for the next frame's scene.
-            PushImageMemoryBarrier(object_slot_image_, object_slot_range,
-                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT,
-                                   VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,
-                                   VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED,
-                                   VK_QUEUE_FAMILY_IGNORED, false);
+            // Cleared for the next frame's scene (and its reactive marks).
+            for (VkImage slot_image : {object_slot_image_, reactive_image_}) {
+              PushImageMemoryBarrier(
+                  slot_image, object_slot_range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                  VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                  VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+            }
             SubmitBarriers(true);
             const VkClearColorValue object_slot_clear = {};
-            deferred_command_buffer_.CmdVkClearColorImage(
-                object_slot_image_, VK_IMAGE_LAYOUT_GENERAL, &object_slot_clear, 1,
-                &object_slot_range);
-            PushImageMemoryBarrier(object_slot_image_, object_slot_range,
-                                   VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                   VK_ACCESS_TRANSFER_WRITE_BIT,
-                                   VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                                   VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-                                   VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+            for (VkImage slot_image : {object_slot_image_, reactive_image_}) {
+              deferred_command_buffer_.CmdVkClearColorImage(
+                  slot_image, VK_IMAGE_LAYOUT_GENERAL, &object_slot_clear, 1, &object_slot_range);
+              PushImageMemoryBarrier(
+                  slot_image, object_slot_range, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                  VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                  VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+            }
             object_slot_image_initialized_ = true;
-            for (VkImage image : {vulkan_context.depth_image(), vulkan_context.motion_image()}) {
+            for (VkImage image : {vulkan_context.depth_image(), vulkan_context.motion_image(),
+                                  vulkan_context.reactive_image()}) {
               PushImageMemoryBarrier(image, guest_output_subresource_range,
                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                      ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask,
@@ -5105,6 +5206,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             upscaler_camera.cut = camera.cut;
             upscaler_camera.jitter_x = camera.jitter_x;
             upscaler_camera.jitter_y = camera.jitter_y;
+            upscaler_camera.reactive = reactive_listed && object_slots_readable;
             vulkan_context.SetCameraWritten(upscaler_camera);
           }
 
@@ -6711,6 +6813,9 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
                                          : pixel_shader && fh1_native_executor_ &&
                                                fh1_native_executor_->IsSceneObjectDraw(*vertex_shader);
     object_slot_draws_ += uint32_t(object_slot && !i);
+    reactive_draws_ +=
+        uint32_t(!i && pixel_shader && object_slot_set_binding_ && ReactiveShadersListed() &&
+                 IsReactivePixelShader(pixel_shader->ucode_data_hash()));
     if (program_hit) {
       // NA-2.4: the recorded modifications and translations (ready when
       // recorded, and translations are never dropped).
@@ -6748,6 +6853,11 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
                          : SpirvShaderTranslator::Modification(0);
         if (object_slot) {
           pixel_shader_modification.pixel.object_slot_output = 1;
+        }
+        // SR-23: listed shaders mark their pixels reactive.
+        if (pixel_shader && object_slot_set_binding_ &&
+            IsReactivePixelShader(pixel_shader->ucode_data_hash())) {
+          pixel_shader_modification.pixel.reactive_output = 1;
         }
 
         // Translate the shaders now to obtain the sampler bindings.
@@ -9810,6 +9920,21 @@ bool VulkanCommandProcessor::CreateObjectSlotImage(uint32_t width, uint32_t heig
     DestroyObjectSlotImage();
     return false;
   }
+  // SR-23: the reactive marks, the same format and size.
+  if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+          vulkan_device, image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+          reactive_image_, reactive_image_memory_)) {
+    REXGPU_ERROR("Failed to create the reactive image");
+    DestroyObjectSlotImage();
+    return false;
+  }
+  image_view_create_info.image = reactive_image_;
+  if (dfn.vkCreateImageView(device, &image_view_create_info, nullptr, &reactive_image_view_) !=
+      VK_SUCCESS) {
+    REXGPU_ERROR("Failed to create the reactive image view");
+    DestroyObjectSlotImage();
+    return false;
+  }
   object_slot_image_width_ = width;
   object_slot_image_height_ = height;
   object_slot_image_initialized_ = false;
@@ -9823,6 +9948,9 @@ void VulkanCommandProcessor::DestroyObjectSlotImage() {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, object_slot_image_view_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, object_slot_image_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, object_slot_image_memory_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, reactive_image_view_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, reactive_image_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, reactive_image_memory_);
   object_slot_image_width_ = 0;
   object_slot_image_height_ = 0;
   object_slot_image_initialized_ = false;

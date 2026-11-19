@@ -156,6 +156,10 @@ class VulkanPresenter final : public Presenter {
     VkImageView depth_image_view() const;
     VkImage motion_image() const;
     VkImageView motion_image_view() const;
+    // SR-23: the reactive mask (kGuestOutputReactiveFormat, 0 to 1 in red),
+    // made, barriered and released with the depth and motion.
+    VkImage reactive_image() const;
+    VkImageView reactive_image_view() const;
     bool camera_ever_written_previously() const;
     void SetCameraWritten(const UpscalerCamera& camera);
 
@@ -236,6 +240,7 @@ class VulkanPresenter final : public Presenter {
   // The formats of the guest output's camera images.
   static constexpr VkFormat kGuestOutputDepthFormat = VK_FORMAT_R32_SFLOAT;
   static constexpr VkFormat kGuestOutputMotionFormat = VK_FORMAT_R16G16_SFLOAT;
+  static constexpr VkFormat kGuestOutputReactiveFormat = VK_FORMAT_R32_SFLOAT;
 
   void AwaitUISubmissionCompletionFromUIThread(uint64_t submission_index) {
     ui_submission_tracker_.AwaitSubmissionCompletion(submission_index);
@@ -293,6 +298,8 @@ class VulkanPresenter final : public Presenter {
     VkImageView depth_view() const { return depth_view_; }
     VkImage motion_image() const { return motion_image_; }
     VkImageView motion_view() const { return motion_view_; }
+    VkImage reactive_image() const { return reactive_image_; }
+    VkImageView reactive_view() const { return reactive_view_; }
     bool camera_ever_written = false;
     // The HDR scene luminance (VulkanGuestOutputRefreshContext::
     // EnsureHdrSceneImage), with its own descriptor set in the guest output
@@ -333,6 +340,9 @@ class VulkanPresenter final : public Presenter {
     VkImage motion_image_ = VK_NULL_HANDLE;
     VkDeviceMemory motion_memory_ = VK_NULL_HANDLE;
     VkImageView motion_view_ = VK_NULL_HANDLE;
+    VkImage reactive_image_ = VK_NULL_HANDLE;
+    VkDeviceMemory reactive_memory_ = VK_NULL_HANDLE;
+    VkImageView reactive_view_ = VK_NULL_HANDLE;
     VkImage hdr_scene_image_ = VK_NULL_HANDLE;
     VkDeviceMemory hdr_scene_memory_ = VK_NULL_HANDLE;
     VkImageView hdr_scene_view_ = VK_NULL_HANDLE;

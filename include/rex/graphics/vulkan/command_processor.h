@@ -1252,6 +1252,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint32_t object_slot_wanted_height_ = 0;
   bool object_slot_image_initialized_ = false;
   bool object_slot_set_binding_ = false;
+  // Issue #5 SR-23: the reactive marks ((depth << 8) | 1, the nearest
+  // marked fragment's), written by the pixel shaders in
+  // present_upscaler_reactive_shaders through kReactiveImageBinding, the
+  // object slot image's size, made, read and cleared with it.
+  VkImage reactive_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory reactive_image_memory_ = VK_NULL_HANDLE;
+  VkImageView reactive_image_view_ = VK_NULL_HANDLE;
+  uint32_t reactive_draws_ = 0;
   // SR-10 (shader_host_inputs.cpp): blue noise and the draw resolution scale
   // at set 0 bindings 5 and 6 for replacement pixel shaders, only with
   // vulkan_shader_override_host_inputs (read once, at start).

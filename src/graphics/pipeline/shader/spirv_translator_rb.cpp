@@ -895,7 +895,10 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
   }
 
   if (!edram_fragment_shader_interlock_ && GetSpirvShaderModification().pixel.object_slot_output) {
-    WriteObjectSlot();
+    WriteObjectSlot(false);
+  }
+  if (!edram_fragment_shader_interlock_ && GetSpirvShaderModification().pixel.reactive_output) {
+    WriteObjectSlot(true);
   }
 
   if (color_targets_written) {
@@ -3413,22 +3416,26 @@ spv::Id SpirvShaderTranslator::FSI_BlendColorOrAlphaWithUnclampedResult(
   return builder_->createOp(spv::OpPhi, value_type, id_vector_temp_);
 }
 
-
-void SpirvShaderTranslator::WriteObjectSlot() {
+void SpirvShaderTranslator::WriteObjectSlot(bool reactive) {
   // UP-1.7: (depth << 8) | slot, the largest winning. FH1's viewport stores
   // depth reversed (1 near), so the nearest fragment of the pixel wins
   // whatever order the draws come in and whether its depth test passed.
   // Killed and demoted invocations reach here not at all or as helpers,
-  // whose atomics have no effect.
+  // whose atomics have no effect. SR-23's reactive marks are the same with
+  // 1 for the slot, in their own image, so a car behind glass keeps its
+  // slot; the swap pass compares the depth with the scene's, as a failed
+  // depth test leaves the mark too.
   assert_true(input_fragment_coordinates_ != spv::NoResult);
   builder_->addCapability(spv::CapabilityImageQuery);
   spv::Id type_image = builder_->makeImageType(type_uint_, spv::Dim2D, false, false, false, 2,
                                                spv::ImageFormatR32ui);
-  spv::Id image = builder_->createVariable(spv::NoPrecision, spv::StorageClassUniformConstant,
-                                           type_image, "xe_object_slots");
+  spv::Id image =
+      builder_->createVariable(spv::NoPrecision, spv::StorageClassUniformConstant, type_image,
+                               reactive ? "xe_reactive_marks" : "xe_object_slots");
   builder_->addDecoration(image, spv::DecorationDescriptorSet,
                           int(kDescriptorSetSharedMemoryAndEdram));
-  builder_->addDecoration(image, spv::DecorationBinding, int(kObjectSlotImageBinding));
+  builder_->addDecoration(image, spv::DecorationBinding,
+                          int(reactive ? kReactiveImageBinding : kObjectSlotImageBinding));
   if (features_.spirv_version >= spv::Spv_1_4) {
     main_interface_.push_back(image);
   }
@@ -3439,12 +3446,15 @@ void SpirvShaderTranslator::WriteObjectSlot() {
       builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
                                   id_vector_temp_),
       spv::NoPrecision);
-  id_vector_temp_.clear();
-  id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantObjectSlot));
-  spv::Id slot = builder_->createLoad(
-      builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                  id_vector_temp_),
-      spv::NoPrecision);
+  spv::Id slot = builder_->makeUintConstant(1);
+  if (!reactive) {
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantObjectSlot));
+    slot = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                    id_vector_temp_),
+        spv::NoPrecision);
+  }
   spv::Id x = builder_->createUnaryOp(spv::OpConvertFToS, type_int_,
                                       builder_->createCompositeExtract(frag_coord, type_float_, 0));
   spv::Id y = builder_->createBinOp(

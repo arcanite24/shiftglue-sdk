@@ -509,6 +509,14 @@ VkImageView VulkanPresenter::VulkanGuestOutputRefreshContext::motion_image_view(
   return guest_output_image_ ? guest_output_image_->motion_view() : VK_NULL_HANDLE;
 }
 
+VkImage VulkanPresenter::VulkanGuestOutputRefreshContext::reactive_image() const {
+  return guest_output_image_ ? guest_output_image_->reactive_image() : VK_NULL_HANDLE;
+}
+
+VkImageView VulkanPresenter::VulkanGuestOutputRefreshContext::reactive_image_view() const {
+  return guest_output_image_ ? guest_output_image_->reactive_view() : VK_NULL_HANDLE;
+}
+
 bool VulkanPresenter::VulkanGuestOutputRefreshContext::camera_ever_written_previously() const {
   return guest_output_image_ && guest_output_image_->camera_ever_written;
 }
@@ -805,6 +813,15 @@ bool VulkanPresenter::DispatchTemporalUpscaler(
     inputs.motion_vectors = {camera_source->motion_image(), camera_source->motion_view(),
                              kGuestOutputMotionFormat, source_width, source_height,
                              kCameraUsage};
+    // SR-23: only when the refresher wrote it for this frame.
+    if (camera && camera->reactive && camera_source->reactive_image() != VK_NULL_HANDLE) {
+      inputs.reactive_mask = {camera_source->reactive_image(),
+                              camera_source->reactive_view(),
+                              kGuestOutputReactiveFormat,
+                              source_width,
+                              source_height,
+                              kCameraUsage};
+    }
   }
   inputs.frame = frame;
   const uint32_t query_slot = BeginTemporalUpscaleTiming(command_buffer, upscaler, frame);
@@ -3549,6 +3566,9 @@ VulkanPresenter::GuestOutputImage::~GuestOutputImage() {
   util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, motion_view_);
   util::DestroyAndNullHandle(dfn.vkDestroyImage, device, motion_image_);
   util::DestroyAndNullHandle(dfn.vkFreeMemory, device, motion_memory_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, reactive_view_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, reactive_image_);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, reactive_memory_);
   util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device, hdr_scene_pool_);
   util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, hdr_scene_view_);
   util::DestroyAndNullHandle(dfn.vkDestroyImage, device, hdr_scene_image_);
@@ -3596,7 +3616,9 @@ bool VulkanPresenter::GuestOutputImage::EnsureCamera() {
       vulkan_device_->physical_device(), kGuestOutputMotionFormat, &motion_properties);
   if ((motion_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) &&
       CreateImage(depth_image_, depth_memory_, depth_view_, kGuestOutputDepthFormat, kUsage) &&
-      CreateImage(motion_image_, motion_memory_, motion_view_, kGuestOutputMotionFormat, kUsage)) {
+      CreateImage(motion_image_, motion_memory_, motion_view_, kGuestOutputMotionFormat, kUsage) &&
+      CreateImage(reactive_image_, reactive_memory_, reactive_view_, kGuestOutputReactiveFormat,
+                  kUsage)) {
     return true;
   }
   util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, depth_view_);
@@ -3605,6 +3627,9 @@ bool VulkanPresenter::GuestOutputImage::EnsureCamera() {
   util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, motion_view_);
   util::DestroyAndNullHandle(dfn.vkDestroyImage, device, motion_image_);
   util::DestroyAndNullHandle(dfn.vkFreeMemory, device, motion_memory_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, reactive_view_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, reactive_image_);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, reactive_memory_);
   return false;
 }
 

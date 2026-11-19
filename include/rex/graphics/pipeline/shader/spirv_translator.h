@@ -93,6 +93,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // winning, for a temporal upscaler's per-object motion. Host render
       // targets only.
       uint32_t object_slot_output : 1;
+      // Issue #5 SR-23: mark the fragment's pixel with its depth in the
+      // reactive image (kReactiveImageBinding), nearest fragment winning, for
+      // a temporal upscaler's reactive mask (glass and other surfaces whose
+      // history does not follow the motion). Host render targets only.
+      uint32_t reactive_output : 1;
     } pixel;
     uint64_t value = 0;
 
@@ -451,6 +456,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   static constexpr uint32_t kSharedMemoryTexelBufferBinding = 2;
   // UP-1.7: the R32_UINT object slot image in the shared memory set.
   static constexpr uint32_t kObjectSlotImageBinding = 3;
+  // SR-23: the R32_UINT reactive image in the shared memory set.
+  static constexpr uint32_t kReactiveImageBinding = 4;
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,
                         bool native_2x_msaa_no_attachments, bool edram_fragment_shader_interlock,
@@ -628,8 +635,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
   void StartFragmentShaderBeforeMain();
   void StartFragmentShaderInMain();
   void CompleteFragmentShaderInMain();
-  // UP-1.7, at the end of a pixel shader with object_slot_output.
-  void WriteObjectSlot();
+  // UP-1.7, at the end of a pixel shader with object_slot_output: the
+  // draw's slot with the depth in the object slot image. SR-23, with
+  // reactive_output: 1 with the depth in the reactive image.
+  void WriteObjectSlot(bool reactive);
 
   // Updates the current flow control condition (to be called in the beginning
   // of exec and in jumps), closing the previous conditionals if needed.

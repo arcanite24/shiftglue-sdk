@@ -81,6 +81,9 @@ struct UpscalerCamera {
   // The frame's sub-pixel jitter in render pixels, as UpscalerFrame.
   float jitter_x = 0.0f;
   float jitter_y = 0.0f;
+  // Issue #5 SR-23: the reactive mask beside the depth and motion was
+  // written for this frame and is for the upscaler.
+  bool reactive = false;
 };
 
 struct UpscalerFrame {
