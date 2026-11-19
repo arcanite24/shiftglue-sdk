@@ -1,0 +1,57 @@
+// Shader Model 5.0 bindings for the XeSL UI shaders (Direct3D 11).
+//
+// The upstream XeSL sources (xesl.xesli and the *.xesl files including it)
+// declare every HLSL resource as `register(xN, spaceM)`, which needs Shader
+// Model 5.1. Direct3D 11 has no register spaces, so this file includes
+// xesl.xesli first (it has an include guard, so the shader's own include of it
+// is then a no-op) and redefines the binding macros to drop the space. Every
+// UI shader uses space0 only, so nothing else changes: the registers, the
+// cbuffer layout and the variable names stay those of the d3d12_5_1 bytecode.
+//
+// compile-d3d11.sh compiles each shader through a stub that includes this file
+// and then the upstream .xesl source.
+
+#ifndef REX_UI_SHADERS_D3D11_SM50_XESLI_
+#define REX_UI_SHADERS_D3D11_SM50_XESLI_
+
+#include "xesl.xesli"
+
+#if !SHADING_LANGUAGE_HLSL_XE
+  #error d3d11_sm50.xesli is for HLSL only.
+#endif
+
+#undef const_buffer_begin_xe
+#define const_buffer_begin_xe(name, glsl_set, glsl_binding, hlsl_b, \
+                              hlsl_b_space)                         \
+    cbuffer name : register(hlsl_b) {
+
+#undef push_const_begin_xe
+#define push_const_begin_xe(hlsl_b, hlsl_b_space) \
+    cbuffer push_consts_xe : register(hlsl_b) {
+
+#undef byte_buffer_declare_xe_impl
+#define byte_buffer_declare_xe_impl(value_type, name, glsl_set, glsl_binding, \
+                                    hlsl_t, hlsl_t_space)                     \
+    ByteAddressBuffer name : register(hlsl_t);
+
+#undef byte_buffer_wo_declare_xe_impl
+#define byte_buffer_wo_declare_xe_impl(value_type, name, glsl_set,          \
+                                       glsl_binding, hlsl_t, hlsl_t_space)  \
+    RWByteAddressBuffer name : register(hlsl_t);
+
+#undef texture_xe
+#define texture_xe(texture_type, name, glsl_set, glsl_binding, hlsl_t, \
+                   hlsl_t_space, msl_texture)                          \
+    texture_type name : register(hlsl_t);
+
+#undef sampler_state_xe
+#define sampler_state_xe(name, glsl_set, glsl_binding, hlsl_s, hlsl_s_space, \
+                         msl_sampler)                                        \
+    SamplerState name : register(hlsl_s);
+
+#undef image_wo_xe
+#define image_wo_xe(type, format, name, glsl_set, glsl_binding, hlsl_u, \
+                    hlsl_u_space, msl_texture)                          \
+    type<format> name : register(hlsl_u);
+
+#endif  // REX_UI_SHADERS_D3D11_SM50_XESLI_

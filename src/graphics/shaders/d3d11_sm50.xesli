@@ -1,0 +1,17 @@
+// Shader Model 5.0 bindings for the XeSL graphics shaders (Direct3D 11).
+//
+// The XeSL binding macros declare resources as `register(xN, spaceM)`, which
+// needs Shader Model 5.1. The UI shaders already have a header that redefines
+// them without the space; the graphics shaders use the same one. Every
+// graphics shader in bytecode/d3d12_5_1 uses space0 only, so dropping the space
+// changes no register number and no cbuffer layout.
+//
+// compile-d3d11.sh compiles each XeSL shader through a stub that includes this
+// file first and then the upstream .xesl source.
+
+#ifndef REX_GRAPHICS_SHADERS_D3D11_SM50_XESLI_
+#define REX_GRAPHICS_SHADERS_D3D11_SM50_XESLI_
+
+#include "../../ui/shaders/d3d11_sm50.xesli"
+
+#endif  // REX_GRAPHICS_SHADERS_D3D11_SM50_XESLI_

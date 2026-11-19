@@ -41,8 +41,12 @@ endif()
 if(WIN32)
     option(REXGLUE_USE_D3D12  "Enable D3D12 graphics backend" ON)
     option(REXGLUE_USE_VULKAN "Enable Vulkan graphics backend" OFF)
+    # Direct3D 11 at feature level 11_0, for GPUs without Vulkan 1.3 or a
+    # usable Direct3D 12 driver. Translates shaders at runtime to SM 5.0.
+    option(REXGLUE_USE_D3D11  "Enable D3D11 graphics backend" ON)
 else()
     set(REXGLUE_USE_D3D12 OFF)
+    set(REXGLUE_USE_D3D11 OFF)
     option(REXGLUE_USE_VULKAN "Enable Vulkan graphics backend" ON)
 endif()
 

@@ -47,6 +47,12 @@ REXCVAR_DECLARE(int32_t, d3d12_queue_priority);
 REXCVAR_DECLARE(bool, d3d12_allow_variable_refresh_rate_and_tearing);
 #endif  // REX_HAS_D3D12
 
+#if REX_HAS_D3D11
+REXCVAR_DECLARE(bool, d3d11_debug);
+REXCVAR_DECLARE(int32_t, d3d11_adapter);
+REXCVAR_DECLARE(bool, d3d11_allow_variable_refresh_rate_and_tearing);
+#endif  // REX_HAS_D3D11
+
 #if REX_HAS_VULKAN
 REXCVAR_DECLARE(bool, vulkan_log_debug_messages);
 REXCVAR_DECLARE(bool, vulkan_allow_present_mode_immediate);

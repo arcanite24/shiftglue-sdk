@@ -21,6 +21,9 @@
 #if REX_HAS_VULKAN
 #include <rex/graphics/vulkan/graphics_system.h>
 #endif
+#if REX_HAS_D3D11
+#include <rex/graphics/d3d11/graphics_system.h>
+#endif
 
 extern "C" REX_GPU_PLUGIN_EXPORT uint32_t rex_gpu_abi_version(void) {
   return rex::system::kGpuPluginAbiVersion;
@@ -51,6 +54,13 @@ extern "C" REX_GPU_PLUGIN_EXPORT rex::system::IGraphicsSystem* rex_gpu_create(
 #if REX_HAS_VULKAN
   if (backend == "any" || backend == "vulkan") {
     return new rex::graphics::vulkan::VulkanGraphicsSystem();
+  }
+#endif
+#if REX_HAS_D3D11
+  // Feature level 11_0, for GPUs without Direct3D 12 or Vulkan 1.3. Only on
+  // request: "any" picks the backends above.
+  if (backend == "d3d11") {
+    return new rex::graphics::d3d11::D3D11GraphicsSystem();
   }
 #endif
   REXLOG_ERROR("rexgpu-fh1: requested backend '{}' is not compiled into this plugin", backend);

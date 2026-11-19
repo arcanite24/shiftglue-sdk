@@ -80,8 +80,8 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/texture_cache.cpp
 )
 
-# D3D12 backend
-if(REXGLUE_USE_D3D12)
+# DXBC sources (D3D12 loads translated packs; D3D11 translates at runtime)
+if(REXGLUE_USE_D3D12 OR REXGLUE_USE_D3D11)
     # DXBC checksum: the translator and the geometry shader generator, both
     # offline only (runtimes take geometry shaders from the pack).
     set(REXGPU_XENOS_DXBC_THIRDPARTY_SOURCES
@@ -101,7 +101,9 @@ if(REXGLUE_USE_D3D12)
         pipeline/shader/dxbc_translator_fetch.cpp
         pipeline/shader/dxbc_translator_memexport.cpp
     )
+endif()
 
+if(REXGLUE_USE_D3D12)
     # D3D12 GPU backend
     set(REXGPU_XENOS_D3D12_SOURCES
         d3d12/graphics_system.cpp
@@ -127,10 +129,30 @@ if(REXGLUE_USE_VULKAN)
         ${REXGPU_FH1_SHADER_ANALYSIS_SOURCES})
 endif()
 
+if(REXGLUE_USE_D3D12 OR REXGLUE_USE_D3D11)
+    list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_DXBC_SOURCES})
+endif()
 if(REXGLUE_USE_D3D12)
-    list(APPEND REXGPU_XENOS_SOURCES
-        ${REXGPU_XENOS_DXBC_SOURCES}
-        ${REXGPU_XENOS_D3D12_SOURCES})
+    list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_D3D12_SOURCES})
+endif()
+
+# D3D11 backend: runtime DXBC (SM 5.0) translation, checksummed for the
+# runtime's shader validation.
+set(REXGPU_XENOS_D3D11_SOURCES
+    d3d11/graphics_system.cpp
+    d3d11/command_processor.cpp
+    d3d11/pipeline_cache.cpp
+    d3d11/primitive_processor.cpp
+    d3d11/shared_memory.cpp
+    d3d11/texture_cache.cpp
+    d3d11/dxbc_shader_model_5_0.cpp
+    d3d11/fh1_native_executor.cpp
+)
+if(REXGLUE_USE_D3D11)
+    list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_D3D11_SOURCES}
+        ${REXGPU_FH1_SHADER_ANALYSIS_SOURCES} ${REXGPU_FH1_SHADER_PRODUCER_SOURCES}
+        ${REXGPU_XENOS_DXBC_THIRDPARTY_SOURCES})
+    list(REMOVE_DUPLICATES REXGPU_XENOS_SOURCES)
 endif()
 
 option(REXGPU_FH1_ORDERED_CENSUS "Compile the experimental ordered draw census" OFF)
@@ -187,6 +209,9 @@ foreach(rexgpu_fh1_target IN ITEMS rexgpu-fh1 rexgpu-fh1-producer)
     if(REXGLUE_USE_D3D12)
         target_link_libraries(${rexgpu_fh1_target} PRIVATE d3d12 dxgi dxguid)
     endif()
+    if(REXGLUE_USE_D3D11)
+        target_link_libraries(${rexgpu_fh1_target} PRIVATE d3d11 dxgi dxguid)
+    endif()
 endforeach()
 set_target_properties(rexgpu-fh1 PROPERTIES EXPORT_NAME gpu-fh1)
 
@@ -220,6 +245,12 @@ endif()
 # Everything PRIVATE: the plugin has no consumers. Never link the OBJECT
 # libraries (rexcore/rexui) here; rexruntime already contains those objects
 # and relinking them would duplicate global state.
+if(REXGLUE_USE_VULKAN OR REXGLUE_USE_D3D11)
+    target_compile_definitions(rexgpu-fh1 PRIVATE REXGPU_SHADER_TRANSLATOR=1)
+endif()
+if(REXGLUE_USE_D3D11)
+    target_compile_definitions(rexgpu-fh1 PRIVATE REXGPU_DXBC_TRANSLATOR=1)
+endif()
 if(REXGLUE_USE_VULKAN)
     # Runtime shader translation (translator.cpp keeps it out of D3D12-only
     # runtimes, which load prebuilt packs).
