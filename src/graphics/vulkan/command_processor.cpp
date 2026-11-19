@@ -4909,6 +4909,20 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
           // this frame's composite hook (scene_bloom.cpp), for the HDR
           // output's highlights, where it is the guest output's size.
           const SceneBloomImage& scene_hdr = scene_bloom_images_[kSceneHdrImage];
+          if (hdr_active && scene_hdr_pending_) {
+            // Once, so a game log says whether the HDR output has the scene.
+            static bool logged = false;
+            if (!logged) {
+              logged = true;
+              if (scene_hdr.width == guest_output_width && scene_hdr.height == guest_output_height)
+                REXGPU_INFO("present_hdr_scene: engaged at {}x{}", scene_hdr.width,
+                            scene_hdr.height);
+              else
+                REXGPU_INFO("present_hdr_scene: skipped, scene {}x{} vs guest output {}x{}",
+                            scene_hdr.width, scene_hdr.height, guest_output_width,
+                            guest_output_height);
+            }
+          }
           if (hdr_active && scene_hdr_pending_ && scene_hdr.image != VK_NULL_HANDLE &&
               scene_hdr.width == guest_output_width && scene_hdr.height == guest_output_height &&
               vulkan_context.EnsureHdrSceneImage()) {
@@ -10752,6 +10766,15 @@ void LogPixelConstants(const RegisterFile& regs, const VulkanShader& shader) {
     text += fmt::format(" c{}=({:g},{:g},{:g},{:g})", r, c[0], c[1], c[2], c[3]);
   }
   REXGPU_INFO("Pixel constants {} (draw {}):{}", hash, logged, text);
+  std::string bools;
+  for (uint32_t r = 0; r < 256; ++r) {
+    if (!(map.bool_bitmap[r >> 5] & (uint32_t(1) << (r & 31))))
+      continue;
+    const uint32_t word = regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + (r >> 5)];
+    bools += fmt::format(" b{}={}", r, (word >> (r & 31)) & 1);
+  }
+  if (!bools.empty())
+    REXGPU_INFO("  bools:{}", bools);
   for (uint32_t slot = 0; slot < 16; ++slot) {
     const uint32_t* w = &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6];
     if (!(w[0] | w[1] | w[2] | w[3] | w[4] | w[5]))

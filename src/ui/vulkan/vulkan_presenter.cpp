@@ -188,7 +188,7 @@ REXCVAR_DEFINE_DOUBLE(present_hdr_gamma, 2.2, "UI/Presenter",
     .range(0.0, 3.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(present_hdr_scene, true, "UI/Presenter",
+REXCVAR_DEFINE_BOOL(present_hdr_scene, false, "UI/Presenter",
                     "On an HDR swapchain, expand highlights by the scene's own luminance where "
                     "the swap provides it (scene_bloom with scene_host_copy: issue #5 SR-21), "
                     "so the sun is brighter than a white wall; otherwise by how near white "
