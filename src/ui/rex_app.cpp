@@ -61,8 +61,9 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU",
                       "Graphics API the GPU plugin uses: any (its first compiled backend), "
-                      "d3d12, vulkan, or null (guest GPU packets only, nothing drawn)")
-    .allowed({"any", "d3d12", "vulkan", "null"})
+                      "d3d12, vulkan, d3d11 (feature level 11_0, for older GPUs), or null "
+                      "(guest GPU packets only, nothing drawn)")
+    .allowed({"any", "d3d12", "vulkan", "d3d11", "null"})
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex {

@@ -1,0 +1,46 @@
+// Typed-buffer bindings for the XeSL texture_load shaders (Direct3D 11).
+//
+// The bytecode/d3d12_5_1 texture_load headers bind their source as
+// Buffer<uint4> (Buffer<uint2> for the 8-byte-aligned sources) and their
+// destination as RWBuffer<uint4>, which is what the texture cache creates views
+// for. Current upstream XeSL uses (RW)ByteAddressBuffer instead. This header
+// maps the byte buffer macros the texture_load shaders use back to typed
+// buffers, so the SM 5.0 build has the same resource types and registers as
+// the d3d12_5_1 one.
+//
+// The upstream revision our d3d12_5_1 texture_load bytecode was built from is
+// not available: with this header the reflection (RDEF) of current upstream
+// matches ours exactly, but the tiled address code does not. compile-d3d11.sh
+// therefore builds texture_load only when asked (D3D11_UNVERIFIED_TEXTURE_LOAD=1).
+//
+// Include after d3d11_sm50.xesli.
+
+#ifndef REX_GRAPHICS_SHADERS_D3D11_TEXTURE_LOAD_TYPED_XESLI_
+#define REX_GRAPHICS_SHADERS_D3D11_TEXTURE_LOAD_TYPED_XESLI_
+
+#include "d3d11_sm50.xesli"
+
+#undef byte_buffer_align8_declare_xe
+#define byte_buffer_align8_declare_xe(name, glsl_set, glsl_binding, hlsl_t, \
+                                      hlsl_t_space)                         \
+    Buffer<uint2> name : register(hlsl_t);
+#undef byte_buffer_align16_declare_xe
+#define byte_buffer_align16_declare_xe(name, glsl_set, glsl_binding, hlsl_t, \
+                                       hlsl_t_space)                         \
+    Buffer<uint4> name : register(hlsl_t);
+#undef byte_buffer_align16_wo_declare_xe
+#define byte_buffer_align16_wo_declare_xe(name, glsl_set, glsl_binding, \
+                                          hlsl_t, hlsl_t_space)         \
+    RWBuffer<uint4> name : register(hlsl_t);
+
+#undef byte_buffer_align8_load8_xe
+#define byte_buffer_align8_load8_xe(name, byte_address) \
+    ((name)[uint(byte_address) >> 3u])
+#undef byte_buffer_align16_load16_xe
+#define byte_buffer_align16_load16_xe(name, byte_address) \
+    ((name)[uint(byte_address) >> 4u])
+#undef byte_buffer_align16_store16_xe
+#define byte_buffer_align16_store16_xe(name, byte_address, value) \
+    ((name)[uint(byte_address) >> 4u] = (value))
+
+#endif  // REX_GRAPHICS_SHADERS_D3D11_TEXTURE_LOAD_TYPED_XESLI_

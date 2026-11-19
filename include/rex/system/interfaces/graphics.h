@@ -44,6 +44,8 @@ enum class NativeGuestOutputBackend : uint32_t {
   kVulkan = 2,
   // No device: the null backend's swaps (no image, device or context).
   kNull = 3,
+  // Direct3D 11 (feature level 11_0).
+  kD3D11 = 4,
 };
 
 enum class NativeGuestOutputPhase : uint32_t {
