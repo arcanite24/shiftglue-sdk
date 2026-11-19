@@ -193,26 +193,12 @@ State& GetState() {
 void ScanIfNeeded(State& state) {
   if (state.scanned) return;
   state.scanned = true;
-  const std::string dirs = REXCVAR_GET(texture_replacement_dirs);
-  size_t start = 0;
-  while (start <= dirs.size()) {
-    const size_t end = std::min(dirs.find(';', start), dirs.size());
-    const std::filesystem::path dir = rex::to_path(dirs.substr(start, end - start));
-    std::error_code error;
-    if (end > start && std::filesystem::is_directory(dir, error)) {
-      for (const auto& entry : std::filesystem::directory_iterator(dir, error)) {
-        const auto stem = rex::path_to_utf8(entry.path().stem());
-        if (entry.path().extension() != ".dds" || stem.size() != 16) continue;
-        unsigned long long hash = 0;
-        if (std::sscanf(stem.c_str(), "%16llx", &hash) == 1) {
-          state.files.emplace(uint64_t(hash), entry.path());  // earlier folders win
-        }
-      }
-    }
-    start = end + 1;
-  }
+  auto scanned = ScanReplacementFolders(REXCVAR_GET(texture_replacement_dirs));
+  for (const auto& problem : scanned.problems) REXGPU_WARN("Texture replacements: {}", problem);
+  state.files = std::move(scanned.files);
   if (!state.files.empty()) {
-    REXGPU_INFO("Texture replacements: {} files", state.files.size());
+    REXGPU_INFO("Texture replacements: {} files ({} aliases)", state.files.size(),
+                scanned.aliases);
   }
 }
 

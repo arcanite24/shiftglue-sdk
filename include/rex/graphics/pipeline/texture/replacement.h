@@ -13,6 +13,9 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include <rex/graphics/pipeline/texture/util.h>
@@ -49,6 +52,17 @@ struct Image {
 
 uint32_t Blocks(const Format& format, uint32_t size, uint32_t level);
 size_t LevelBytes(const Format& format, uint32_t width, uint32_t height, uint32_t level);
+
+// The <hash>.dds files of texture_replacement_dirs (';'-separated, earlier
+// folders winning), plus each folder's aliases.txt: one "<hash> <target>"
+// per line, the target another hash or a file name in that folder, so
+// several guest textures share one image.
+struct ReplacementFiles {
+  std::unordered_map<uint64_t, std::filesystem::path> files;
+  size_t aliases = 0;
+  std::vector<std::string> problems;
+};
+ReplacementFiles ScanReplacementFolders(std::string_view dirs);
 
 // Rescans the folders and forgets loaded files at the next lookup
 // (texture_replacement_reload).
