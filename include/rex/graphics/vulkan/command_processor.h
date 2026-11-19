@@ -297,6 +297,18 @@ class VulkanCommandProcessor : public CommandProcessor {
   // the submission if one was open (FH1 resolve read-backs).
   void Fh1AwaitAllQueueOperations();
   const VulkanTextureCache& texture_cache() const { return *texture_cache_; }
+  // SR-11 (midframe_hooks.cpp): host passes in the middle of a frame. Each
+  // hook runs once a frame, before the first draw with one of the guest
+  // pixel shaders vulkan_midframe_hook_pixel_shaders lists, outside any
+  // render pass, so it may record compute and barriers; the draw then binds
+  // its own state again.
+  struct MidframeHookContext {
+    uint64_t pixel_shader_hash;
+    uint64_t frame;
+    uint32_t draw_in_frame;
+  };
+  using MidframeHook = std::function<void(const MidframeHookContext&)>;
+  void AddMidframeHook(std::string name, MidframeHook hook);
   // fh1_frame_replay: replays a frame dump (recorded on D3D12) on Vulkan and
   // ends the process.
   void RunRequestedFrameReplay() override;
@@ -1250,6 +1262,15 @@ class VulkanCommandProcessor : public CommandProcessor {
   void UploadShaderHostInputNoise();
   void DestroyShaderHostInputs();
   bool host_inputs_set_binding_ = false;
+  // SR-11 triggers (midframe_hooks.cpp).
+  void MaybeRunMidframeHooks(const VulkanShader* pixel_shader);
+  std::vector<std::pair<std::string, MidframeHook>> midframe_hooks_;
+  std::string midframe_hook_list_;
+  std::vector<uint64_t> midframe_hook_hashes_;
+  std::vector<uint64_t> midframe_hook_fired_;
+  uint64_t midframe_hook_frame_ = UINT64_MAX;
+  uint32_t midframe_hook_draws_ = 0;
+  uint32_t midframe_hook_logged_ = 0;
   bool host_input_noise_upload_pending_ = false;
   VkImage host_input_noise_image_ = VK_NULL_HANDLE;
   VkDeviceMemory host_input_noise_memory_ = VK_NULL_HANDLE;

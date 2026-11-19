@@ -6940,6 +6940,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     fh1_draw.pixel_shader = pixel_shader;
     fh1_draw.state_epoch = unchanged_inputs ? memo_state : state_epoch_;
     fh1_draw.state_is_hash = unchanged_inputs;
+    MaybeRunMidframeHooks(pixel_shader);
     fh1_native_executor_->MaybeSnapshotBeforeHud(fh1_draw);
     fh1_native_executor_->PrepareTargets(fh1_draw);
     if (!fh1_native_executor_->BindTargets(fh1_render_pass_key)) {
