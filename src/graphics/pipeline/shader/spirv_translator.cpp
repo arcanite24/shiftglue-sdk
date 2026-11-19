@@ -477,7 +477,8 @@ void SpirvShaderTranslator::StartTranslation() {
   const size_t system_constant_count =
       rex::countof(system_constants) -
       (is_pixel_shader() && !edram_fragment_shader_interlock_ &&
-               GetSpirvShaderModification().pixel.object_slot_output
+               (GetSpirvShaderModification().pixel.object_slot_output ||
+                GetSpirvShaderModification().pixel.reactive_output)
            ? 0
            : 2);
   id_vector_temp_.clear();
@@ -3169,7 +3170,8 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   bool memexport_resolution_scaled = current_shader().memexport_eM_written() &&
                                      (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1);
   const bool object_slot_output =
-      !edram_fragment_shader_interlock_ && GetSpirvShaderModification().pixel.object_slot_output;
+      !edram_fragment_shader_interlock_ && (GetSpirvShaderModification().pixel.object_slot_output ||
+                                            GetSpirvShaderModification().pixel.reactive_output);
   if (edram_fragment_shader_interlock_ || param_gen_needed || memexport_resolution_scaled ||
       float24_depth_from_fragment_coordinates || alpha_to_coverage_possible ||
       object_slot_output) {

@@ -353,8 +353,17 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
         inputs.output.view, inputs.output.image, range, inputs.output.format, inputs.output.width,
         inputs.output.height, true);
 
+    // SR-23: the reactive mask as DLSS's bias towards the current colour.
+    NVSDK_NGX_Resource_VK bias_mask = {};
+    if (inputs.reactive_mask.image) {
+      bias_mask = NVSDK_NGX_Create_ImageView_Resource_VK(
+          inputs.reactive_mask.view, inputs.reactive_mask.image, range, inputs.reactive_mask.format,
+          inputs.reactive_mask.width, inputs.reactive_mask.height, false);
+    }
     const int32_t jitter_sign = REXCVAR_GET(present_dlss_jitter_sign);
     NVSDK_NGX_VK_DLSS_Eval_Params eval = {};
+    if (inputs.reactive_mask.image)
+      eval.pInBiasCurrentColorMask = &bias_mask;
     eval.Feature.pInColor = &color;
     eval.Feature.pInOutput = &output;
     eval.pInDepth = &depth;

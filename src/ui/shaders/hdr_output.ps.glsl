@@ -8,6 +8,12 @@
 // stand-in's alpha is how much of the pixel is UI: the HUD of the guest output
 // and the host UI stay at the paper white, and only the scene's highlights
 // are expanded towards the highlight peak.
+//
+// present_hdr_scene (issue #5 SR-21): where the swap gave the scene's own
+// luminance at its exposure (set 1, over the guest output's rectangle), the
+// expansion follows that, from scene_knee_log2 over 1 / scene_range_inv
+// stops, instead of how near white the 8-bit image is: highlights the SDR
+// image clips to the same white keep their order.
 
 layout(push_constant) uniform HdrOutputConstants {
   // After the rectangle constants of the vertex shader.
@@ -32,6 +38,11 @@ layout(push_constant) uniform HdrOutputConstants {
   // to rotated stand-in pixels.
   uint output_flags;
   vec2 size;  // The stand-in's (unrotated) size.  // The swapchain's size, for the patterns.
+  vec4 scene_rect;  // The guest output in the stand-in: x, y, width, height.
+  uint scene;       // 1 where set 1 has the scene's luminance.
+  float scene_knee_log2;
+  float scene_range_inv;
+  float scene_padding;
 } constants;
 
 const uint kOutputPq = 1u;
@@ -46,6 +57,8 @@ const uint kPatternPaperWhite = 2u;
 const uint kPatternPeak = 3u;
 
 layout(set = 0, binding = 0) uniform texture2D stand_in;
+layout(set = 1, binding = 0) uniform texture2D scene_luminance;
+layout(set = 1, binding = 1) uniform sampler scene_sampler;
 
 layout(location = 0) out vec4 output_color;
 
@@ -169,9 +182,22 @@ void main() {
   float luminance = dot(linear, vec3(0.2126, 0.7152, 0.0722));
   float brightness = mix(luminance, max3(linear), constants.max_channel_weight);
   float t = clamp((brightness - constants.knee) * constants.knee_range_inv, 0.0, 1.0);
-  // Smooth from the knee, reaching the peak at SDR white. Scaling all three
-  // channels together keeps the hue.
-  float boost = 1.0 + constants.highlight_scale * t * t * (1.0 - ui);
+  // Smooth from the knee, reaching the peak at SDR white.
+  float expansion = t * t;
+  if (constants.scene != 0u) {
+    vec2 scene_uv = (frag - constants.scene_rect.xy) / constants.scene_rect.zw;
+    if (all(greaterThanEqual(scene_uv, vec2(0.0))) && all(lessThan(scene_uv, vec2(1.0)))) {
+      float exposed =
+          textureLod(sampler2D(scene_luminance, scene_sampler), scene_uv, 0.0).r;
+      float s = clamp((log2(max(exposed, 1.0e-6)) - constants.scene_knee_log2) *
+                          constants.scene_range_inv,
+                      0.0, 1.0);
+      // Eased into from the knee, as the SDR expansion is.
+      expansion = s * s * (3.0 - 2.0 * s);
+    }
+  }
+  // Scaling all three channels together keeps the hue.
+  float boost = 1.0 + constants.highlight_scale * expansion * (1.0 - ui);
   vec3 color = linear * (constants.paper_white_scale * boost);
   if (constants.pattern != kPatternNone) {
     // The pattern replaces the image; the menu stays on top of it.

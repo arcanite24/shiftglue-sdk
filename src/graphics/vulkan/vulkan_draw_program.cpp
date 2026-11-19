@@ -90,9 +90,11 @@ void VulkanCommandProcessor::DrawProgramResolve() {
           : REXCVAR_GET(fh1_hud_scale) * (1.0 - 2.0 * REXCVAR_GET(fh1_hud_safe_zone));
   const bool object_motion = fh1_native_executor_ && fh1_native_executor_->ObjectMotionEnabled();
   const bool glow_depth_test = REXCVAR_GET(fh1_glow_depth_test);
+  // SR-23: the recorded pixel shader modifications carry the reactive mark.
+  const bool reactive_marks = reactive_marks_enabled_;
   if (program->resolution_scale != resolution_scale || program->hud_squeeze != hud_squeeze ||
       program->hud_scale != hud_scale || program->object_motion != object_motion ||
-      program->glow_depth_test != glow_depth_test) {
+      program->reactive_marks != reactive_marks || program->glow_depth_test != glow_depth_test) {
     if (!program->draws.empty()) {
       for (const ProgramDraw& draw : program->draws) {
         if (draw.valid && draw.index_version != UINT32_MAX) RetireIndexVersion(draw.index_version);
@@ -104,6 +106,7 @@ void VulkanCommandProcessor::DrawProgramResolve() {
     program->hud_squeeze = hud_squeeze;
     program->hud_scale = hud_scale;
     program->object_motion = object_motion;
+    program->reactive_marks = reactive_marks;
     program->glow_depth_test = glow_depth_test;
   }
   draw_program_object_motion_ = object_motion;

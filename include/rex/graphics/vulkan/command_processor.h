@@ -1252,6 +1252,18 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint32_t object_slot_wanted_height_ = 0;
   bool object_slot_image_initialized_ = false;
   bool object_slot_set_binding_ = false;
+  // Issue #5 SR-23: the reactive marks ((depth << 8) | 1, the nearest
+  // marked fragment's), written by the pixel shaders in
+  // present_upscaler_reactive_shaders through kReactiveImageBinding, the
+  // object slot image's size, made, read and cleared with it.
+  VkImage reactive_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory reactive_image_memory_ = VK_NULL_HANDLE;
+  VkImageView reactive_image_view_ = VK_NULL_HANDLE;
+  uint32_t reactive_draws_ = 0;
+  // Whether listed draws write the marks: as object motion, once the image
+  // is the guest output's size and initialised by a camera pass (set at the
+  // swap; translations and programs follow it).
+  bool reactive_marks_enabled_ = false;
   // SR-10 (shader_host_inputs.cpp): blue noise and the draw resolution scale
   // at set 0 bindings 5 and 6 for replacement pixel shaders, only with
   // vulkan_shader_override_host_inputs (read once, at start).
@@ -1326,7 +1338,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   // SR-21's first step (scene_bloom.cpp): our bloom from the bands' copy,
   // host input binding 10.
   static constexpr uint32_t kSceneBloomLevels = 6;
-  static constexpr uint32_t kSceneBloomImages = kSceneBloomLevels * 2 - 1;
+  // 0-5 the reductions, 6-10 the additions, 11 the 1x1 exposure meter, 12
+  // the scene's exposed luminance at full size for present_hdr.
+  static constexpr uint32_t kSceneBloomImages = kSceneBloomLevels * 2 + 1;
+  static constexpr uint32_t kSceneMeterImage = kSceneBloomLevels * 2 - 1;
+  static constexpr uint32_t kSceneHdrImage = kSceneBloomLevels * 2;
   struct SceneBloomImage {
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -1342,6 +1358,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   void DestroySceneBloomInput();
   std::array<SceneBloomImage, kSceneBloomImages> scene_bloom_images_{};
   bool scene_bloom_failed_ = false;
+  uint64_t scene_meter_last_ticks_ = 0;
+  // The HDR luminance image was written at this frame's composite hook.
+  bool scene_hdr_pending_ = false;
   VkDescriptorSetLayout scene_bloom_set_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout scene_bloom_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline scene_bloom_pipeline_ = VK_NULL_HANDLE;
@@ -1696,6 +1715,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Shader modifications and translations by memo state.
   struct TranslationMemo {
     uint64_t state_epoch = 0;
+    bool reactive = false;
     const void* vertex_shader = nullptr;
     const void* pixel_shader = nullptr;
     uint32_t host_vertex_shader_type = 0;
@@ -1798,6 +1818,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     double hud_squeeze = 0.0;
     double hud_scale = 0.0;
     bool object_motion = false;
+    bool reactive_marks = false;
     bool glow_depth_test = false;
   };
   // Key: the buffer (address << 32 | dwords) mixed with the state hash and

@@ -20,9 +20,26 @@
 // tent. The result is in the scene's linear light before exposure, the sum
 // of the six levels; a replacement composite scales it. The image is cleared
 // to 0 until a frame has it.
+//
+// Our exposure meter (SR-21): between the reductions and the additions, one
+// invocation reads the smallest reduction and takes the log2 average of its
+// luminance, weighted towards the centre of the screen (a Gaussian falloff,
+// sigma a third of each axis), into a 1x1 image; from the second frame on it
+// moves towards that by 1 - 2^(-dt * scene_exposure_speed) of the way. The
+// last addition writes the exposure, scene_exposure_key less the adapted
+// value, plus 16, into the alpha of binding 10, so a replacement composite
+// has it without another binding (alpha 0 until a frame is metered; the
+// offset keeps 1/64 EV of precision in 16-bit float).
+//
+// With present_hdr on an HDR swapchain, a last pass writes the scene's
+// luminance at that exposure at full size (image 12, red), which the swap
+// copies to the presenter (VulkanGuestOutputRefreshContext::
+// EnsureHdrSceneImage), whose HDR output expands highlights by how bright
+// the scene really is rather than by how near white its 8-bit image is.
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -33,12 +50,23 @@
 #include <rex/graphics/vulkan/fh1_native_executor.h>
 #include <rex/graphics/vulkan/shader_override_files.h>
 #include <rex/logging.h>
+#include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
 REXCVAR_DEFINE_BOOL(scene_bloom, false, "GPU",
                     "With scene_host_copy: build our own bloom from the scene's float bands at "
                     "the composite's mid-frame hook into host input binding 10, for a "
                     "replacement composite (issue #5 SR-21)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(scene_exposure_speed, 3.0, "GPU",
+                      "How fast scene_bloom's exposure meter adapts: the share of a change "
+                      "still to go after t seconds is 2^(-t * speed)")
+    .range(0.0, 100.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(scene_exposure_key, -7.91, "GPU",
+                      "scene_bloom's exposure: this less the metered log2 luminance (the "
+                      "composite's EXPOSURE=1 and present_hdr's scene luminance)")
+    .range(-16.0, 16.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
@@ -49,7 +77,9 @@ constexpr uint32_t kDefaultWidth = 1280;
 constexpr uint32_t kDefaultHeight = 720;
 
 // Modes: 0 the first reduction (to linear light, Karis' average), 1 a
-// reduction, 2 an addition (the coarser level through a tent, plus `add`).
+// reduction, 2 an addition (the coarser level through a tent, plus `add`;
+// alpha the exposure from the meter, binding 3, when `write_meter`), 3 the
+// meter, 4 the scene's exposed luminance at full size.
 const char* const kSceneBloomSource = R"(#version 450
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(push_constant) uniform SceneBloomConstants {
@@ -57,10 +87,14 @@ layout(push_constant) uniform SceneBloomConstants {
   vec2 source_texel;
   uint mode;
   float prescale;
+  float adapt;  // mode 3: the share of the way to the new value
+  uint write_meter;
+  float key;
 } c;
 layout(set = 0, binding = 0) uniform sampler2D source;
 layout(set = 0, binding = 1) uniform sampler2D add;
-layout(set = 0, binding = 2, rgba16f) writeonly uniform image2D dest;
+layout(set = 0, binding = 2, rgba16f) uniform image2D dest;
+layout(set = 0, binding = 3) uniform sampler2D meter;
 
 vec3 Tap(vec2 uv) {
   vec3 v = textureLod(source, uv, 0.0).rgb;
@@ -75,9 +109,45 @@ float Weight(vec3 group) {
   return c.mode == 0u ? 1.0 / (1.0 + dot(group, vec3(0.2126, 0.7152, 0.0722))) : 1.0;
 }
 
+void Meter() {
+  const ivec2 size = textureSize(source, 0);
+  float sum = 0.0, total = 0.0;
+  for (int y = 0; y < size.y; ++y) {
+    for (int x = 0; x < size.x; ++x) {
+      // Gaussian centre weight, sigma a third of the half extent.
+      const vec2 offset = ((vec2(x, y) + 0.5) / vec2(size) - 0.5) * 6.0;
+      const float w = exp(-0.5 * dot(offset, offset));
+      const vec3 texel = texelFetch(source, ivec2(x, y), 0).rgb;
+      const float luma = dot(texel, vec3(0.2126, 0.7152, 0.0722));
+      sum += w * log2(clamp(luma, 1.0 / 4096.0, 4096.0));
+      total += w;
+    }
+  }
+  const float metered = sum / total;
+  const vec4 previous = imageLoad(dest, ivec2(0));
+  const float adapted = previous.y > 0.5 ? mix(previous.x, metered, c.adapt) : metered;
+  imageStore(dest, ivec2(0), vec4(adapted, 1.0, metered, 1.0));
+}
+
+float Exposure() {
+  const vec4 metered = textureLod(meter, vec2(0.5), 0.0);
+  return metered.y > 0.5 ? c.key - metered.x : 0.0;
+}
+
 void main() {
+  if (c.mode == 3u) {
+    if (gl_GlobalInvocationID.xy == uvec2(0)) Meter();
+    return;
+  }
   const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
   if (any(greaterThanEqual(uvec2(pixel), c.dest_size))) return;
+  if (c.mode == 4u) {
+    vec3 v = max(texelFetch(source, pixel, 0).rgb * c.prescale, vec3(0.0));
+    v *= v;
+    const float luma = dot(v, vec3(0.2126, 0.7152, 0.0722));
+    imageStore(dest, pixel, vec4(luma * exp2(Exposure()), 0.0, 0.0, 1.0));
+    return;
+  }
   const vec2 uv = (vec2(pixel) + 0.5) / vec2(c.dest_size);
   const vec2 t = c.source_texel;
   vec3 result;
@@ -108,7 +178,9 @@ void main() {
               Tap(uv + t * vec2(1.0, 0.0)) + Tap(uv + t * vec2(0.0, 1.0))) * (2.0 / 16.0) +
              Tap(uv) * (4.0 / 16.0) + textureLod(add, uv, 0.0).rgb;
   }
-  imageStore(dest, pixel, vec4(result, 1.0));
+  const bool metered = textureLod(meter, vec2(0.5), 0.0).y > 0.5;
+  imageStore(dest, pixel,
+             vec4(result, c.write_meter != 0u && metered ? Exposure() + 16.0 : 0.0));
 }
 )";
 
@@ -126,6 +198,12 @@ bool VulkanCommandProcessor::CreateSceneBloomInput() {
     SceneBloomImage& image = scene_bloom_images_[i];
     image.width = std::max(1u, (width + (2u << level) - 1) >> (level + 1));
     image.height = std::max(1u, (height + (2u << level) - 1) >> (level + 1));
+    if (i == kSceneMeterImage)
+      image.width = image.height = 1;
+    if (i == kSceneHdrImage) {
+      image.width = width;
+      image.height = height;
+    }
     VkImageCreateInfo image_info = {};
     image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     image_info.imageType = VK_IMAGE_TYPE_2D;
@@ -135,8 +213,9 @@ bool VulkanCommandProcessor::CreateSceneBloomInput() {
     image_info.arrayLayers = 1;
     image_info.samples = VK_SAMPLE_COUNT_1_BIT;
     image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-    image_info.usage =
-        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    // The HDR luminance is copied to the presenter at the swap.
+    image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                       VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (!ui::vulkan::util::CreateDedicatedAllocationImage(
@@ -191,8 +270,8 @@ bool VulkanCommandProcessor::EnsureSceneBloomPipeline() {
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
-  VkDescriptorSetLayoutBinding bindings[3] = {};
-  for (uint32_t i = 0; i < 3; ++i) {
+  VkDescriptorSetLayoutBinding bindings[4] = {};
+  for (uint32_t i = 0; i < 4; ++i) {
     bindings[i].binding = i;
     bindings[i].descriptorType =
         i == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -201,16 +280,17 @@ bool VulkanCommandProcessor::EnsureSceneBloomPipeline() {
   }
   VkDescriptorSetLayoutCreateInfo set_layout_info = {};
   set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  set_layout_info.bindingCount = 3;
+  set_layout_info.bindingCount = 4;
   set_layout_info.pBindings = bindings;
   if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
                                       &scene_bloom_set_layout_) != VK_SUCCESS) {
     REXGPU_WARN("Scene bloom: failed to create the descriptor set layout");
     return false;
   }
-  VkPushConstantRange push_constant_range = {
-      VK_SHADER_STAGE_COMPUTE_BIT, 0,
-      sizeof(uint32_t) * 2 + sizeof(float) * 2 + sizeof(uint32_t) + sizeof(float)};
+  VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                             sizeof(uint32_t) * 2 + sizeof(float) * 2 +
+                                                 sizeof(uint32_t) + sizeof(float) * 2 +
+                                                 sizeof(uint32_t) + sizeof(float)};
   VkPipelineLayoutCreateInfo pipeline_layout_info = {};
   pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
   pipeline_layout_info.setLayoutCount = 1;
@@ -225,7 +305,7 @@ bool VulkanCommandProcessor::EnsureSceneBloomPipeline() {
   // One set per pass; the images never change, so they are written once.
   constexpr uint32_t kPasses = kSceneBloomImages;
   VkDescriptorPoolSize pool_sizes[2] = {
-      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * kPasses},
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * kPasses},
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kPasses},
   };
   VkDescriptorPoolCreateInfo pool_info = {};
@@ -249,13 +329,20 @@ bool VulkanCommandProcessor::EnsureSceneBloomPipeline() {
     REXGPU_WARN("Scene bloom: failed to allocate the descriptor sets");
     return false;
   }
-  // Pass p writes image p in the order the passes run: the reductions
-  // 0-5 read the bands, then the reduction before; the additions 6-10 (level
-  // 4 down to 0) read the next coarser level (the last reduction for level 4)
-  // and add their own level's reduction.
+  // Pass p writes image p: the reductions 0-5 read the bands, then the
+  // reduction before; the additions 6-10 (level 4 down to 0) read the next
+  // coarser level (the last reduction for level 4) and add their own level's
+  // reduction; the meter, 11, reads the last reduction; the HDR luminance,
+  // 12, reads the bands.
   for (uint32_t p = 0; p < kPasses; ++p) {
     VkImageView source, add, dest;
-    if (p < kSceneBloomLevels) {
+    if (p == kSceneHdrImage) {
+      source = add = scene_band_view_;
+      dest = scene_bloom_images_[p].view;
+    } else if (p == kSceneMeterImage) {
+      source = add = scene_bloom_images_[kSceneBloomLevels - 1].view;
+      dest = scene_bloom_images_[p].view;
+    } else if (p < kSceneBloomLevels) {
       source = p ? scene_bloom_images_[p - 1].view : scene_band_view_;
       add = source;
       dest = scene_bloom_images_[p].view;
@@ -267,13 +354,17 @@ bool VulkanCommandProcessor::EnsureSceneBloomPipeline() {
       add = scene_bloom_images_[level].view;
       dest = scene_bloom_images_[kSceneBloomLevels + level].view;
     }
-    VkDescriptorImageInfo infos[3] = {
+    // The meter pass does not read binding 3, so another image stands in.
+    const VkImageView meter = p == kSceneMeterImage ? scene_bloom_images_[0].view
+                                                    : scene_bloom_images_[kSceneMeterImage].view;
+    VkDescriptorImageInfo infos[4] = {
         {scene_ao_sampler_, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
         {scene_ao_sampler_, add, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
         {VK_NULL_HANDLE, dest, VK_IMAGE_LAYOUT_GENERAL},
+        {scene_ao_sampler_, meter, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
     };
-    VkWriteDescriptorSet writes[3] = {};
-    for (uint32_t i = 0; i < 3; ++i) {
+    VkWriteDescriptorSet writes[4] = {};
+    for (uint32_t i = 0; i < 4; ++i) {
       writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
       writes[i].dstSet = scene_bloom_sets_[p];
       writes[i].dstBinding = i;
@@ -282,7 +373,7 @@ bool VulkanCommandProcessor::EnsureSceneBloomPipeline() {
           i == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
       writes[i].pImageInfo = &infos[i];
     }
-    dfn.vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
+    dfn.vkUpdateDescriptorSets(device, 4, writes, 0, nullptr);
   }
   std::vector<uint32_t> spirv;
   std::string compile_error;
@@ -312,10 +403,41 @@ void VulkanCommandProcessor::RunSceneBloom(const MidframeHookContext& context) {
   // exponent scale: the square root of the scene's linear colour.
   const float prescale =
       scene_band_scale_ * std::ldexp(1.0f, register_file_->GetTextureFetch(0).exp_adjust);
+  // The meter adapts by the time since it last ran.
+  const auto now = std::chrono::steady_clock::now().time_since_epoch();
+  const uint64_t ticks =
+      uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(now).count());
+  const double seconds = scene_meter_last_ticks_
+                             ? std::clamp(double(ticks - scene_meter_last_ticks_) * 1e-6, 0.0, 0.25)
+                             : 0.0;
+  scene_meter_last_ticks_ = ticks;
+  const float adapt = float(1.0 - std::exp2(-seconds * double(REXCVAR_GET(scene_exposure_speed))));
   BindExternalComputePipeline(scene_bloom_pipeline_);
-  for (uint32_t p = 0; p < kSceneBloomImages; ++p) {
+  // The reductions, the meter, the additions, then (for present_hdr) the
+  // luminance at full size.
+  const bool hdr = ui::vulkan::GetHdrOutputState().active;
+  std::vector<uint32_t> order;
+  for (uint32_t i = 0; i < kSceneBloomLevels; ++i)
+    order.push_back(i);
+  order.push_back(kSceneMeterImage);
+  for (uint32_t i = kSceneBloomLevels; i < kSceneMeterImage; ++i)
+    order.push_back(i);
+  if (hdr) {
+    order.push_back(kSceneHdrImage);
+    scene_hdr_pending_ = true;
+  }
+  const float key = float(REXCVAR_GET(scene_exposure_key));
+  for (const uint32_t p : order) {
     uint32_t dest_index, source_width, source_height;
-    if (p < kSceneBloomLevels) {
+    if (p == kSceneHdrImage) {
+      dest_index = p;
+      source_width = scene_copy_width_;
+      source_height = scene_copy_height_;
+    } else if (p == kSceneMeterImage) {
+      dest_index = p;
+      source_width = scene_bloom_images_[kSceneBloomLevels - 1].width;
+      source_height = scene_bloom_images_[kSceneBloomLevels - 1].height;
+    } else if (p < kSceneBloomLevels) {
       dest_index = p;
       source_width = p ? scene_bloom_images_[p - 1].width : scene_copy_width_;
       source_height = p ? scene_bloom_images_[p - 1].height : scene_copy_height_;
@@ -343,12 +465,21 @@ void VulkanCommandProcessor::RunSceneBloom(const MidframeHookContext& context) {
       float source_texel[2];
       uint32_t mode;
       float prescale;
+      float adapt;
+      uint32_t write_meter;
+      float key;
     } constants = {{dest.width, dest.height},
                    {1.0f / float(source_width), 1.0f / float(source_height)},
-                   p == 0                  ? 0u
+                   p == kSceneHdrImage     ? 4u
+                   : p == kSceneMeterImage ? 3u
+                   : p == 0                ? 0u
                    : p < kSceneBloomLevels ? 1u
                                            : 2u,
-                   prescale};
+                   prescale,
+                   adapt,
+                   // The level-0 addition (image 6), which the composite binds.
+                   dest_index == kSceneBloomLevels ? 1u : 0u,
+                   key};
     deferred_command_buffer_.CmdVkPushConstants(scene_bloom_pipeline_layout_,
                                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants),
                                                 &constants);
