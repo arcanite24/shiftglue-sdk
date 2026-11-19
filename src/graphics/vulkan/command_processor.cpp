@@ -52,6 +52,7 @@
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/vulkan/shader.h>
+#include <rex/graphics/vulkan/shader_override_files.h>
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/graphics/xenos.h>
 #include <rex/kernel/xboxkrnl/video.h>
@@ -1649,7 +1650,7 @@ bool VulkanCommandProcessor::SetupContext() {
     }
     REXGPU_INFO("Shared memory reads use one texel buffer");
   }
-  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[4];
+  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[6];
   shared_memory_and_edram_descriptor_set_layout_bindings[0].binding = 0;
   shared_memory_and_edram_descriptor_set_layout_bindings[0].descriptorType =
       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1700,6 +1701,27 @@ bool VulkanCommandProcessor::SetupContext() {
     object_slot_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     object_slot_binding.pImmutableSamplers = nullptr;
   }
+  // SR-10: replacement pixel shaders' host inputs. Without the cvar the
+  // layout is the same as before.
+  host_inputs_set_binding_ = ShaderHostInputsWanted();
+  if (host_inputs_set_binding_) {
+    VkDescriptorSetLayoutBinding& noise_binding =
+        shared_memory_and_edram_descriptor_set_layout_bindings
+            [shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount++];
+    noise_binding.binding = kHostInputBlueNoiseBinding;
+    noise_binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    noise_binding.descriptorCount = 1;
+    noise_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    noise_binding.pImmutableSamplers = nullptr;
+    VkDescriptorSetLayoutBinding& constants_binding =
+        shared_memory_and_edram_descriptor_set_layout_bindings
+            [shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount++];
+    constants_binding.binding = kHostInputConstantsBinding;
+    constants_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    constants_binding.descriptorCount = 1;
+    constants_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    constants_binding.pImmutableSamplers = nullptr;
+  }
   if (dfn.vkCreateDescriptorSetLayout(
           device, &shared_memory_and_edram_descriptor_set_layout_create_info, nullptr,
           &descriptor_set_layout_shared_memory_and_edram_) != VK_SUCCESS) {
@@ -1710,7 +1732,7 @@ bool VulkanCommandProcessor::SetupContext() {
   }
 
   // Shared memory and EDRAM common bindings.
-  VkDescriptorPoolSize descriptor_pool_sizes[3];
+  VkDescriptorPoolSize descriptor_pool_sizes[5];
   uint32_t descriptor_pool_size_count = 1;
   descriptor_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   descriptor_pool_sizes[0].descriptorCount =
@@ -1722,6 +1744,13 @@ bool VulkanCommandProcessor::SetupContext() {
   }
   if (object_slot_set_binding_) {
     descriptor_pool_sizes[descriptor_pool_size_count].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    descriptor_pool_sizes[descriptor_pool_size_count++].descriptorCount = 1;
+  }
+  if (host_inputs_set_binding_) {
+    descriptor_pool_sizes[descriptor_pool_size_count].type =
+        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    descriptor_pool_sizes[descriptor_pool_size_count++].descriptorCount = 1;
+    descriptor_pool_sizes[descriptor_pool_size_count].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     descriptor_pool_sizes[descriptor_pool_size_count++].descriptorCount = 1;
   }
   VkDescriptorPoolCreateInfo descriptor_pool_create_info;
@@ -1753,6 +1782,9 @@ bool VulkanCommandProcessor::SetupContext() {
   }
   // A placeholder until the swap knows the guest output size.
   if (!CreateObjectSlotImage(1, 1)) {
+    return false;
+  }
+  if (host_inputs_set_binding_ && !CreateShaderHostInputs()) {
     return false;
   }
   WriteSharedMemoryAndEdramDescriptorSet();
@@ -2668,7 +2700,7 @@ void VulkanCommandProcessor::WriteSharedMemoryAndEdramDescriptorSet() {
     shared_memory_descriptor_buffer_info.offset = shared_memory_binding_range * i;
     shared_memory_descriptor_buffer_info.range = shared_memory_binding_range;
   }
-  VkWriteDescriptorSet write_descriptor_sets[4];
+  VkWriteDescriptorSet write_descriptor_sets[6];
   uint32_t write_descriptor_set_count = 1;
   VkWriteDescriptorSet& write_descriptor_set_shared_memory = write_descriptor_sets[0];
   write_descriptor_set_shared_memory.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -2726,6 +2758,32 @@ void VulkanCommandProcessor::WriteSharedMemoryAndEdramDescriptorSet() {
     write_descriptor_set_object_slots.descriptorCount = 1;
     write_descriptor_set_object_slots.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     write_descriptor_set_object_slots.pImageInfo = &object_slot_image_info;
+  }
+  // SR-10 host inputs; every caller has nothing using set 0, so the
+  // constants (the draw resolution scale) are rewritten here too.
+  VkDescriptorImageInfo host_input_noise_info = {
+      host_input_noise_sampler_, host_input_noise_view_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  VkDescriptorBufferInfo host_input_constants_info = {host_input_constants_buffer_, 0,
+                                                      sizeof(HostInputConstants)};
+  if (host_inputs_set_binding_ && host_input_noise_view_ != VK_NULL_HANDLE &&
+      host_input_constants_buffer_ != VK_NULL_HANDLE) {
+    WriteShaderHostInputConstants();
+    VkWriteDescriptorSet& write_noise = write_descriptor_sets[write_descriptor_set_count++];
+    write_noise = {};
+    write_noise.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write_noise.dstSet = shared_memory_and_edram_descriptor_set_;
+    write_noise.dstBinding = kHostInputBlueNoiseBinding;
+    write_noise.descriptorCount = 1;
+    write_noise.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write_noise.pImageInfo = &host_input_noise_info;
+    VkWriteDescriptorSet& write_constants = write_descriptor_sets[write_descriptor_set_count++];
+    write_constants = {};
+    write_constants.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write_constants.dstSet = shared_memory_and_edram_descriptor_set_;
+    write_constants.dstBinding = kHostInputConstantsBinding;
+    write_constants.descriptorCount = 1;
+    write_constants.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    write_constants.pBufferInfo = &host_input_constants_info;
   }
   vulkan_device->functions().vkUpdateDescriptorSets(
       vulkan_device->device(), write_descriptor_set_count, write_descriptor_sets, 0, nullptr);
@@ -3178,6 +3236,7 @@ void VulkanCommandProcessor::ShutdownContext() {
                                          shared_memory_and_edram_descriptor_pool_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBufferView, device,
                                          shared_memory_texel_buffer_view_);
+  DestroyShaderHostInputs();
 
   frame_dump_.reset();
   fh1_native_executor_.reset();
@@ -8606,6 +8665,8 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     primitive_processor_->BeginSubmission();
 
     texture_cache_->BeginSubmission(GetCurrentSubmission());
+
+    if (host_inputs_set_binding_) UploadShaderHostInputNoise();
   }
 
   if (is_opening_frame) {

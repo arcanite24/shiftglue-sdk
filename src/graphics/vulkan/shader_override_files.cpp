@@ -1,6 +1,7 @@
 #include <rex/graphics/vulkan/shader_override_files.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <fstream>
 #include <optional>
@@ -434,6 +435,29 @@ bool ReflectSpirvInterface(std::span<const uint32_t> words, SpirvInterface& out,
   return true;
 }
 
+namespace {
+std::atomic<bool> g_host_inputs{false};
+
+// A host input the replacement may declare beyond the translation's layout.
+bool IsHostInput(const SpirvInterface& replacement, const SpirvInterface::Resource& resource) {
+  constexpr uint32_t kExecutionModelFragment = 4;
+  if (!g_host_inputs.load(std::memory_order_relaxed) ||
+      replacement.execution_model != kExecutionModelFragment || resource.set != 0 ||
+      resource.count > 1) {
+    return false;
+  }
+  if (resource.binding == kHostInputBlueNoiseBinding) {
+    return resource.kind.rfind("sampled image", 0) == 0 &&
+           resource.kind.find("dim1 arr0 ms0") != std::string::npos;
+  }
+  return resource.binding == kHostInputConstantsBinding && resource.kind == "ubo" &&
+         resource.bytes <= sizeof(HostInputConstants);
+}
+}  // namespace
+
+void SetVulkanShaderOverrideHostInputs(bool enabled) { g_host_inputs = enabled; }
+bool VulkanShaderOverrideHostInputs() { return g_host_inputs; }
+
 bool SpirvInterfaceFits(const SpirvInterface& replacement, const SpirvInterface& translation,
                         std::string& why) {
   if (replacement.execution_model != translation.execution_model) {
@@ -446,6 +470,9 @@ bool SpirvInterfaceFits(const SpirvInterface& replacement, const SpirvInterface&
         translation.resources.begin(), translation.resources.end(), [&](const auto& other) {
           return other.set == resource.set && other.binding == resource.binding;
         });
+    if (match == translation.resources.end() && IsHostInput(replacement, resource)) {
+      continue;
+    }
     if (match == translation.resources.end()) {
       why = fmt::format("set {} binding {} ({}) is not in the translation's layout", resource.set,
                         resource.binding, resource.kind);

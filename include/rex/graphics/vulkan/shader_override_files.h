@@ -63,8 +63,37 @@ bool ReflectSpirvInterface(std::span<const uint32_t> words, SpirvInterface& out,
 // more push constants; only inputs the translation has; exactly the
 // translation's outputs (and, before the fragment stage, at least its
 // built-in outputs). On false, `why` says what differs.
+// With host inputs on, a fragment replacement may also declare them.
 bool SpirvInterfaceFits(const SpirvInterface& replacement, const SpirvInterface& translation,
                         std::string& why);
+
+// Host inputs for replacements (issue #5 SR-10,
+// vulkan_shader_override_host_inputs): with them on, descriptor set 0 of
+// every guest pipeline also holds these, which only replacement pixel shaders
+// read (translations never do), and the interface check lets a replacement
+// declare them.
+//   layout(set = 0, binding = 5) uniform sampler2D host_blue_noise;
+//     64 x 64 RGBA8 tileable blue noise, four independent channels, sampled
+//     with nearest filtering and repeat addressing.
+//   layout(set = 0, binding = 6) uniform HostInputs { ... } host;
+//     HostInputConstants below (std140).
+constexpr uint32_t kHostInputBlueNoiseBinding = 5;
+constexpr uint32_t kHostInputConstantsBinding = 6;
+constexpr uint32_t kHostInputBlueNoiseSize = 64;
+struct HostInputConstants {
+  // The draw resolution scale, the factor translations bake into their
+  // texel offsets.
+  float draw_resolution_scale[2];
+  // 1 / kHostInputBlueNoiseSize.
+  float blue_noise_texel;
+  // Bumped when the constants change.
+  uint32_t version;
+};
+static_assert(sizeof(HostInputConstants) == 16);
+void SetVulkanShaderOverrideHostInputs(bool enabled);
+bool VulkanShaderOverrideHostInputs();
+// `size` x `size` RGBA8 blue noise (void and cluster, one run per channel).
+std::vector<uint8_t> GenerateBlueNoiseRgba8(uint32_t size);
 
 // The first valid file among every root's exact name, then the guest names
 // (VulkanShaderOverrideGuestFilenames) root by root. A file is valid when it

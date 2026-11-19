@@ -1240,6 +1240,26 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint32_t object_slot_wanted_height_ = 0;
   bool object_slot_image_initialized_ = false;
   bool object_slot_set_binding_ = false;
+  // SR-10 (shader_host_inputs.cpp): blue noise and the draw resolution scale
+  // at set 0 bindings 5 and 6 for replacement pixel shaders, only with
+  // vulkan_shader_override_host_inputs (read once, at start).
+  static bool ShaderHostInputsWanted();
+  bool CreateShaderHostInputs();
+  void WriteShaderHostInputConstants();
+  // Records the noise upload at the first submission.
+  void UploadShaderHostInputNoise();
+  void DestroyShaderHostInputs();
+  bool host_inputs_set_binding_ = false;
+  bool host_input_noise_upload_pending_ = false;
+  VkImage host_input_noise_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory host_input_noise_memory_ = VK_NULL_HANDLE;
+  VkImageView host_input_noise_view_ = VK_NULL_HANDLE;
+  VkSampler host_input_noise_sampler_ = VK_NULL_HANDLE;
+  VkBuffer host_input_constants_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory host_input_constants_memory_ = VK_NULL_HANDLE;
+  uint32_t host_input_constants_memory_type_ = 0;
+  VkDeviceSize host_input_constants_memory_size_ = 0;
+  void* host_input_constants_mapping_ = nullptr;
   uint32_t object_slot_draws_ = 0;
   uint32_t object_slot_fallback_draws_ = 0;
   // Draws of the current frame recorded with a pipeline still being built
