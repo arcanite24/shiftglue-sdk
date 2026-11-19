@@ -188,14 +188,19 @@ class Fh1NativeExecutor {
   // TakeCameraFrame it leaves the frame's copy for the swap.
   VkImageView PeekCameraFrame(uint32_t width, uint32_t height, Camera& camera_out);
   // SR-12: a colour resolve to `base` from a 16-bit unorm surface is also
-  // copied as it is into `image` (RGBA16 unorm, kept in shader-read layout,
-  // its layout in *layout). base 0 or no image stops it.
-  void SetSceneCopyTarget(VkImage image, VkImageLayout* layout, uint32_t width, uint32_t height,
+  // copied as it is into `image` (RGBA16 unorm), and the resolves of
+  // RGBA16 float surfaces into rows of the same texture (the scene's bands)
+  // into `band_image` (RGBA16 float) at those rows. Both stay in
+  // shader-read layout, their layouts in *layout and *band_layout. base 0
+  // or no images stops it.
+  void SetSceneCopyTarget(VkImage image, VkImageLayout* layout, VkImage band_image,
+                          VkImageLayout* band_layout, uint32_t width, uint32_t height,
                           uint32_t base) {
-    scene_copy_ = {image, layout, width, height, base};
+    scene_copy_ = {image, layout, band_image, band_layout, width, height, base};
   }
-  // The exponent bias of the last resolve copied there.
+  // The exponent biases of the last resolves copied there.
   int32_t scene_copy_exp_bias() const { return scene_copy_exp_bias_; }
+  int32_t scene_band_exp_bias() const { return scene_band_exp_bias_; }
   // UP-1.5: jitter the scene with a Halton(2, 3) sequence of this length
   // from the next frame (0: none).
   void SetJitterPhases(uint32_t phases) { jitter_phases_ = phases; }
@@ -557,13 +562,17 @@ class Fh1NativeExecutor {
   struct SceneCopyTarget {
     VkImage image = VK_NULL_HANDLE;
     VkImageLayout* layout = nullptr;
+    VkImage band_image = VK_NULL_HANDLE;
+    VkImageLayout* band_layout = nullptr;
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t base = 0;
   };
   SceneCopyTarget scene_copy_;
   int32_t scene_copy_exp_bias_ = 0;
-  void CopySceneForHost(Surface& surface, const Rect& rect, int32_t exp_bias);
+  int32_t scene_band_exp_bias_ = 0;
+  void CopySceneForHost(Surface& surface, const Rect& rect, VkImage dest, VkImageLayout& layout,
+                        uint32_t dest_row);
   void DestroyHudSnapshot();
 
   // UP-1.3 camera tracking (fh1_camera.cpp).

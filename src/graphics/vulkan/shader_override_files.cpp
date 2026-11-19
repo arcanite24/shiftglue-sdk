@@ -447,7 +447,8 @@ bool IsHostInput(const SpirvInterface& replacement, const SpirvInterface::Resour
     return false;
   }
   if (resource.binding == kHostInputBlueNoiseBinding || resource.binding == kHostInputSceneAoBinding ||
-      resource.binding == kHostInputSceneCopyBinding) {
+      resource.binding == kHostInputSceneCopyBinding ||
+      resource.binding == kHostInputSceneBandBinding) {
     return resource.kind.rfind("sampled image", 0) == 0 &&
            resource.kind.find("dim1 arr0 ms0") != std::string::npos;
   }

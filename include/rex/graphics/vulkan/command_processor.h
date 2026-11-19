@@ -1314,7 +1314,15 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool CreateSceneCopyInput();
   void RecordSceneCopyClear();
   void RunSceneCopyHook(const MidframeHookContext& context);
+  bool IsSceneCopyPassHook(const MidframeHookContext& context) const;
   void DestroySceneCopyInput();
+  VkImage scene_band_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory scene_band_memory_ = VK_NULL_HANDLE;
+  VkImageView scene_band_view_ = VK_NULL_HANDLE;
+  VkImageLayout scene_band_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+  float scene_band_scale_ = 1.0f;
+  // What the full-size pass multiplies its texel by, from its hook.
+  float scene_pass_scale_ = 1.0f;
   VkImage scene_copy_image_ = VK_NULL_HANDLE;
   VkDeviceMemory scene_copy_memory_ = VK_NULL_HANDLE;
   VkImageView scene_copy_view_ = VK_NULL_HANDLE;

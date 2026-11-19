@@ -3575,12 +3575,29 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
         complete = false;
       }
     }
-    if (scene_copy_.image != VK_NULL_HANDLE && scene_copy_.layout && scene_copy_.base &&
-        !plan.copying_depth && resolve_info.copy_dest_base == scene_copy_.base && x0 == 0 &&
-        y0 == 0 && plan.sources.size() == 1 && plan.sources[0].surface &&
+    if (scene_copy_.base && !plan.copying_depth && x0 == 0 && y0 == 0 &&
+        plan.sources.size() == 1 && plan.sources[0].surface &&
         plan.sources[0].surface->key.Pack() == plan.resolve_key.Pack()) {
-      CopySceneForHost(*plan.sources[0].surface, plan.sources[0].rect,
-                       int32_t(int8_t((plan.dest_info >> 8) & 0xFF)));
+      Surface& surface = *plan.sources[0].surface;
+      const int32_t exp_bias = int32_t(int8_t((plan.dest_info >> 8) & 0xFF));
+      const uint32_t row_bytes = plan.dest_pitch * 4;
+      const uint32_t offset = resolve_info.copy_dest_base - scene_copy_.base;
+      if (surface.format == VK_FORMAT_R16G16B16A16_UNORM && scene_copy_.image &&
+          scene_copy_.layout && !offset) {
+        CopySceneForHost(surface, plan.sources[0].rect, scene_copy_.image, *scene_copy_.layout,
+                         0);
+        scene_copy_exp_bias_ = exp_bias;
+      } else if (surface.format == VK_FORMAT_R16G16B16A16_SFLOAT && scene_copy_.band_image &&
+                 scene_copy_.band_layout && (plan.dest_info & 7u) == 1u && row_bytes &&
+                 resolve_info.copy_dest_base >= scene_copy_.base && offset % row_bytes == 0 &&
+                 (offset / row_bytes) % 32 == 0 &&
+                 offset / row_bytes * scale_ < scene_copy_.height) {
+        // A band: its rows of the texture are 32-row aligned, so its offset
+        // is whole rows in the tiled layout too.
+        CopySceneForHost(surface, plan.sources[0].rect, scene_copy_.band_image,
+                         *scene_copy_.band_layout, offset / row_bytes * scale_);
+        scene_band_exp_bias_ = exp_bias;
+      }
     }
     // One-off captures the CPU reads also need the guest layout at scale:
     // resolved again unscaled into the guest memory copy, from each guest
@@ -3881,41 +3898,40 @@ void Fh1NativeExecutor::MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw) {
   Count("hud_snapshot");
 }
 
-void Fh1NativeExecutor::CopySceneForHost(Surface& surface, const Rect& rect, int32_t exp_bias) {
-  if (surface.format != VK_FORMAT_R16G16B16A16_UNORM || surface.samples != 1) {
-    Count("scene_copy_format");
+void Fh1NativeExecutor::CopySceneForHost(Surface& surface, const Rect& rect, VkImage dest,
+                                          VkImageLayout& layout, uint32_t dest_row) {
+  if (surface.samples != 1) {
+    Count("scene_copy_samples");
     return;
   }
-  const uint32_t width =
-      std::min(uint32_t(rect.right - rect.left) * scale_, scene_copy_.width);
+  const uint32_t width = std::min(uint32_t(rect.right - rect.left) * scale_, scene_copy_.width);
   const uint32_t height =
-      std::min(uint32_t(rect.bottom - rect.top) * scale_, scene_copy_.height);
+      std::min(uint32_t(rect.bottom - rect.top) * scale_, scene_copy_.height - dest_row);
   if (!width || !height) return;
   Transition(surface, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
              VK_ACCESS_TRANSFER_READ_BIT);
   const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
   command_processor_.PushImageMemoryBarrier(
-      scene_copy_.image, range, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-      *scene_copy_.layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+      dest, range, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, layout,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
   command_processor_.SubmitBarriers(true);
   VkImageCopy region = {};
   region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
   region.dstSubresource = region.srcSubresource;
   region.srcOffset = {int32_t(uint32_t(rect.left) * scale_), int32_t(uint32_t(rect.top) * scale_),
                       0};
+  region.dstOffset = {0, int32_t(dest_row), 0};
   region.extent = {width, height, 1};
   command_processor_.deferred_command_buffer().CmdVkCopyImage(
-      surface.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, scene_copy_.image,
+      surface.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dest,
       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
   command_processor_.PushImageMemoryBarrier(
-      scene_copy_.image, range, VK_PIPELINE_STAGE_TRANSFER_BIT,
-      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-      VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      dest, range, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+      VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-  *scene_copy_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  scene_copy_exp_bias_ = exp_bias;
-  Count("scene_copy");
+  layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  Count(dest == scene_copy_.band_image ? "scene_band_copy" : "scene_copy");
 }
 
 VkImageView Fh1NativeExecutor::TakeHudSnapshot(uint32_t width, uint32_t height) {

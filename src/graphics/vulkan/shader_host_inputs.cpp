@@ -111,6 +111,7 @@ void VulkanCommandProcessor::WriteShaderHostInputConstants() {
   constants.blue_noise_texel = 1.0f / float(kHostInputBlueNoiseSize);
   constants.version = 1;
   constants.scene_copy_scale = scene_copy_scale_;
+  constants.scene_band_scale = scene_band_scale_;
   std::memcpy(host_input_constants_mapping_, &constants, sizeof(constants));
   ui::vulkan::util::FlushMappedMemoryRange(GetVulkanDevice(), host_input_constants_memory_,
                                            host_input_constants_memory_type_, 0,

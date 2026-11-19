@@ -1668,7 +1668,7 @@ bool VulkanCommandProcessor::SetupContext() {
     }
     REXGPU_INFO("Shared memory reads use one texel buffer");
   }
-  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[8];
+  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[9];
   shared_memory_and_edram_descriptor_set_layout_bindings[0].binding = 0;
   shared_memory_and_edram_descriptor_set_layout_bindings[0].descriptorType =
       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1752,6 +1752,11 @@ bool VulkanCommandProcessor::SetupContext() {
             [shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount++];
     scene_copy_binding = scene_ao_binding;
     scene_copy_binding.binding = kHostInputSceneCopyBinding;
+    VkDescriptorSetLayoutBinding& scene_band_binding =
+        shared_memory_and_edram_descriptor_set_layout_bindings
+            [shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount++];
+    scene_band_binding = scene_ao_binding;
+    scene_band_binding.binding = kHostInputSceneBandBinding;
   }
   if (dfn.vkCreateDescriptorSetLayout(
           device, &shared_memory_and_edram_descriptor_set_layout_create_info, nullptr,
@@ -1780,7 +1785,7 @@ bool VulkanCommandProcessor::SetupContext() {
   if (host_inputs_set_binding_) {
     descriptor_pool_sizes[descriptor_pool_size_count].type =
         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    descriptor_pool_sizes[descriptor_pool_size_count++].descriptorCount = 3;
+    descriptor_pool_sizes[descriptor_pool_size_count++].descriptorCount = 4;
     descriptor_pool_sizes[descriptor_pool_size_count].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     descriptor_pool_sizes[descriptor_pool_size_count++].descriptorCount = 1;
   }
@@ -2738,7 +2743,7 @@ void VulkanCommandProcessor::WriteSharedMemoryAndEdramDescriptorSet() {
     shared_memory_descriptor_buffer_info.offset = shared_memory_binding_range * i;
     shared_memory_descriptor_buffer_info.range = shared_memory_binding_range;
   }
-  VkWriteDescriptorSet write_descriptor_sets[8];
+  VkWriteDescriptorSet write_descriptor_sets[9];
   uint32_t write_descriptor_set_count = 1;
   VkWriteDescriptorSet& write_descriptor_set_shared_memory = write_descriptor_sets[0];
   write_descriptor_set_shared_memory.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -2847,6 +2852,19 @@ void VulkanCommandProcessor::WriteSharedMemoryAndEdramDescriptorSet() {
     write_scene_copy.descriptorCount = 1;
     write_scene_copy.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     write_scene_copy.pImageInfo = &scene_copy_info;
+  }
+  VkDescriptorImageInfo scene_band_info = {scene_ao_sampler_, scene_band_view_,
+                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  if (host_inputs_set_binding_ && scene_band_view_ != VK_NULL_HANDLE &&
+      scene_ao_sampler_ != VK_NULL_HANDLE) {
+    VkWriteDescriptorSet& write_scene_band = write_descriptor_sets[write_descriptor_set_count++];
+    write_scene_band = {};
+    write_scene_band.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write_scene_band.dstSet = shared_memory_and_edram_descriptor_set_;
+    write_scene_band.dstBinding = kHostInputSceneBandBinding;
+    write_scene_band.descriptorCount = 1;
+    write_scene_band.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write_scene_band.pImageInfo = &scene_band_info;
   }
   vulkan_device->functions().vkUpdateDescriptorSets(
       vulkan_device->device(), write_descriptor_set_count, write_descriptor_sets, 0, nullptr);

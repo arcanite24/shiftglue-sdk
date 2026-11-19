@@ -194,7 +194,8 @@ void VulkanCommandProcessor::RecordSceneAoClear() {
 }
 
 void VulkanCommandProcessor::RunSceneAmbientOcclusion(const MidframeHookContext& context) {
-  (void)context;
+  // The scene copy's own hook (scene_host_copy_pass) is not the composite's.
+  if (IsSceneCopyPassHook(context)) return;
   const bool wanted = REXCVAR_GET(swap_ambient_occlusion_in_scene) &&
                       REXCVAR_GET(swap_ambient_occlusion) &&
                       REXCVAR_GET(swap_ambient_occlusion_strength) > 0;
