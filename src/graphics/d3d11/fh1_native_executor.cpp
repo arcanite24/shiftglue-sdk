@@ -1826,6 +1826,16 @@ bool Fh1NativeExecutor::Impl::ResolveToMemory(const SourceRect& source,
   const uint32_t host_sample_mode =
       owner.msaa == uint32_t(xenos::MsaaSamples::k2X) ? (surface.samples == 4 ? 2u : 1u) : 0u;
   const D3D11_RECT& rect = source.rect;
+#if REX_D3D11_FH1_RESOLVE_DUMP
+  if (!REXCVAR_GET(fh1_resolve_dump_dir).empty()) {
+    REXGPU_INFO(
+        "FH1 resolve dump: source {} format {} samples {} kind {} rect {},{} {}x{} -> dest "
+        "{:08X} info {:08X} pitch {}",
+        depth ? "depth" : "color", owner.format, surface.samples, source_kind, rect.left,
+        rect.top, rect.right - rect.left, rect.bottom - rect.top, dest_base, dest_info,
+        dest_pitch);
+  }
+#endif
   uint32_t constants[kComputeConstantCount];
   constants[0] = uint32_t(rect.left) | (uint32_t(rect.top) << 16);
   constants[1] = uint32_t(rect.right - rect.left) | (uint32_t(rect.bottom - rect.top) << 16);
