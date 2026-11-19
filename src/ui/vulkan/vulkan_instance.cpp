@@ -21,6 +21,7 @@
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/ui/vulkan/instance.h>
+#include <rex/ui/vulkan/openxr.h>
 #include <rex/ui/vulkan/upscaler.h>
 #include <rex/ui/vulkan/presenter.h>
 
@@ -195,6 +196,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   // Upscaler providers' extensions (DLSS's NGX), enabled when supported.
   std::deque<bool> upscaler_extensions_enabled;
   for (const char* name : GetVulkanUpscalerInstanceExtensions()) {
+    upscaler_extensions_enabled.push_back(false);
+    requested_extensions.emplace(name, &upscaler_extensions_enabled.back());
+  }
+  // The OpenXR runtime's (xr_enabled).
+  for (const char* name : openxr::InstanceExtensions()) {
     upscaler_extensions_enabled.push_back(false);
     requested_extensions.emplace(name, &upscaler_extensions_enabled.back());
   }
@@ -402,8 +408,16 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     instance_create_info.pNext = &validation_features;
     REXLOG_INFO("Vulkan validation: synchronization validation enabled");
   }
-  VkResult instance_create_result =
-      ifn.vkCreateInstance(&instance_create_info, nullptr, &vulkan_instance->instance_);
+  // In VR the runtime may create it (openxr::CreateInstance).
+  auto create_instance = [&]() {
+    VkResult result;
+    if (!openxr::CreateInstance(ifn.vkGetInstanceProcAddr, instance_create_info,
+                                vulkan_instance->instance_, result)) {
+      result = ifn.vkCreateInstance(&instance_create_info, nullptr, &vulkan_instance->instance_);
+    }
+    return result;
+  };
+  VkResult instance_create_result = create_instance();
 
   if (instance_create_result == VK_ERROR_LAYER_NOT_PRESENT ||
       instance_create_result == VK_ERROR_EXTENSION_NOT_PRESENT) {
@@ -416,8 +430,7 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     }
     instance_create_info.enabledLayerCount = 0;
     instance_create_info.enabledExtensionCount = uint32_t(enabled_implementation_extension_count);
-    instance_create_result =
-        ifn.vkCreateInstance(&instance_create_info, nullptr, &vulkan_instance->instance_);
+    instance_create_result = create_instance();
   }
 
   if (instance_create_result != VK_SUCCESS) {

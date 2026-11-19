@@ -627,6 +627,37 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
                 builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
                                             id_vector_temp_),
                 spv::NoPrecision));
+        // LS-4.5: a 4x draw rendered as single-sampled at twice the scale
+        // takes the dither of the pixel the 4x surface has at the draw
+        // resolution scale, and keeps the bit of the sample this pixel holds
+        // (the quadrant of its guest pixel: TL, TR, BL, BR as host samples 0
+        // to 3, the EDRAM sample order).
+        spv::Id alpha_to_coverage_doubled_sample = spv::NoResult;
+        if (!edram_fragment_shader_interlock_ && PixelScaleShift()) {
+          spv::Id quadrant[2];
+          spv::Id* positions[2] = {&alpha_to_coverage_position_x, &alpha_to_coverage_position_y};
+          for (uint32_t i = 0; i < 2; ++i) {
+            const uint32_t scale = i ? draw_resolution_scale_y_ : draw_resolution_scale_x_;
+            spv::Id position = *positions[i];
+            spv::Id const_scale = builder_->makeUintConstant(scale);
+            quadrant[i] = builder_->createBinOp(
+                spv::OpBitwiseAnd, type_uint_,
+                builder_->createBinOp(spv::OpUDiv, type_uint_, position, const_scale),
+                const_uint_1);
+            *positions[i] = builder_->createBinOp(
+                spv::OpIAdd, type_uint_,
+                builder_->createBinOp(
+                    spv::OpIMul, type_uint_,
+                    builder_->createBinOp(spv::OpUDiv, type_uint_, position,
+                                          builder_->makeUintConstant(scale * 2)),
+                    const_scale),
+                builder_->createBinOp(spv::OpUMod, type_uint_, position, const_scale));
+          }
+          alpha_to_coverage_doubled_sample = builder_->createBinOp(
+              spv::OpBitwiseOr, type_uint_, quadrant[0],
+              builder_->createBinOp(spv::OpShiftLeftLogical, type_uint_, quadrant[1],
+                                    const_uint_1));
+        }
         spv::Id alpha_to_coverage_offset = builder_->createTriOp(
             spv::OpBitFieldUExtract, type_uint_, alpha_to_mask,
             builder_->createBinOp(
@@ -752,6 +783,14 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
         id_vector_temp_.push_back(alpha_to_coverage_mask_4x);
         id_vector_temp_.push_back(block_alpha_to_coverage_msaa_4x.getId());
         alpha_to_coverage_mask = builder_->createOp(spv::OpPhi, type_uint_, id_vector_temp_);
+        if (alpha_to_coverage_doubled_sample != spv::NoResult) {
+          // The one host sample is the guest sample of the quadrant.
+          alpha_to_coverage_mask = builder_->createBinOp(
+              spv::OpBitwiseAnd, type_uint_,
+              builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, alpha_to_coverage_mask,
+                                    alpha_to_coverage_doubled_sample),
+              const_uint_1);
+        }
         if (edram_fragment_shader_interlock_) {
           fsi_sample_mask_in_rt_0_alpha_tests = alpha_to_coverage_mask;
         } else {

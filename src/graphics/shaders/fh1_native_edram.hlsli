@@ -80,17 +80,20 @@ Texture2D<float4> fh1_source_color : register(t0);
 // -1...1 (the resolve's exponent bias then restores the range). Set by main.
 static float fh1_fixed16_scale = 32.0f;
 
-// Resolution scale: every guest pixel is fh1_scale x fh1_scale host pixels.
+// Resolution scale: every guest pixel is fh1_scale.x x fh1_scale.y host pixels.
 // Callers convert a host pixel with SetScaledPixel, which keeps its position
 // inside the guest pixel for the source lookup (the same subpixel of the
 // source's guest pixel, as both surfaces are at the same scale).
-#define FH1_FLAG_SCALE_SHIFT 12u  // transfer flags: resolution scale - 1, 12:13
-static uint fh1_scale = 1u;
+#define FH1_FLAG_SCALE_SHIFT 12u  // transfer flags: resolution scale - 1, x 12:13, y 14:15
+static uint2 fh1_scale = uint2(1u, 1u);
+uint2 FlagScale(uint flags) {
+  return uint2((flags >> FH1_FLAG_SCALE_SHIFT) & 3u, (flags >> (FH1_FLAG_SCALE_SHIFT + 2u)) & 3u) + 1u;
+}
 // Untiled predicated tiling: a later tile's band is this many guest rows below
 // the EDRAM rows of the source surface.
 static uint fh1_source_row_offset = 0u;
 static uint2 fh1_subpixel = uint2(0u, 0u);
-void SetScaledPixel(inout uint2 pixel, uint scale) {
+void SetScaledPixel(inout uint2 pixel, uint2 scale) {
   fh1_scale = scale;
   fh1_subpixel = pixel % scale;
   pixel /= scale;
@@ -330,7 +333,7 @@ uint LoadSourceWord(uint reader_layout, uint2 pixel, uint sample, uint half,
   uint source_half;
   [branch] if (LayoutSamePlace(source_layout) != 0u) {
     // The reader's samples are the source's own: no EDRAM relocation.
-    source_pixel = int2(pixel.x, pixel.y + fh1_source_row_offset) * int(fh1_scale) +
+    source_pixel = int2(pixel.x, pixel.y + fh1_source_row_offset) * int2(fh1_scale) +
                    int2(fh1_subpixel);
     uint source_msaa = LayoutMsaa(source_layout);
     host_sample = HostSample(source_msaa >= 2u ? sample : (source_msaa == 1u ? sample & 1u : 0u),
@@ -372,7 +375,7 @@ uint LoadSourceWord(uint reader_layout, uint2 pixel, uint sample, uint half,
   uint sy = source_row * 16u + tile_y;
   uint smx = source_msaa >= 2u ? 1u : 0u;
   uint smy = source_msaa >= 1u ? 1u : 0u;
-  source_pixel = int2(sx >> smx, (sy >> smy) + fh1_source_row_offset) * int(fh1_scale) +
+  source_pixel = int2(sx >> smx, (sy >> smy) + fh1_source_row_offset) * int2(fh1_scale) +
                  int2(fh1_subpixel);
   uint guest_sample = (sx & smx) | ((sy & smy) << smx);
   host_sample = HostSample(guest_sample, source_msaa, LayoutHostSampleMode(source_layout));

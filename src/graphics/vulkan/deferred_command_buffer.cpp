@@ -171,6 +171,12 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                 rex::align(sizeof(ArgsVkCopyBufferToImage), alignof(VkBufferImageCopy))));
       } break;
 
+      case Command::kVkBlitImage: {
+        auto& args = *reinterpret_cast<const ArgsVkBlitImage*>(stream);
+        dfn.vkCmdBlitImage(command_buffer, args.src_image, args.src_image_layout, args.dst_image,
+                           args.dst_image_layout, 1, &args.region, args.filter);
+      } break;
+
       case Command::kVkCopyImage: {
         auto& args = *reinterpret_cast<const ArgsVkCopyImage*>(stream);
         dfn.vkCmdCopyImage(command_buffer, args.src_image, args.src_image_layout, args.dst_image,
@@ -188,6 +194,13 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
         dfn.vkCmdCopyQueryPoolResults(command_buffer, args.query_pool, args.first_query,
                                       args.query_count, args.dst_buffer, args.dst_offset,
                                       args.stride, args.flags);
+      } break;
+
+      case Command::kCallback: {
+        auto& args = *reinterpret_cast<const ArgsCallback*>(stream);
+        args.callback(reinterpret_cast<const uint8_t*>(stream) +
+                          rex::align(sizeof(ArgsCallback), alignof(uintmax_t)),
+                      command_buffer);
       } break;
 
       case Command::kVkDispatch: {

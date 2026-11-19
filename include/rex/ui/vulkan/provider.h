@@ -24,6 +24,7 @@ namespace vulkan {
 class VulkanProvider : public GraphicsProvider {
  public:
   static std::unique_ptr<VulkanProvider> Create(bool with_gpu_emulation, bool with_presentation);
+  ~VulkanProvider() override;
 
   VulkanInstance* vulkan_instance() const { return vulkan_instance_.get(); }
 

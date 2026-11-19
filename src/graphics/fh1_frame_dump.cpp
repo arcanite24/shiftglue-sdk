@@ -22,6 +22,12 @@ REXCVAR_DEFINE_INT32(fh1_frame_dump_frame, 0, "GPU",
 REXCVAR_DEFINE_STRING(fh1_frame_dump_path, "", "GPU",
                       "File the recorded FH1 frame dump is written to")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(fh1_frame_dump_count, 1, "GPU",
+                     "Record this many consecutive frames from fh1_frame_dump_frame on, each "
+                     "in its own file: the path for the first, with -1, -2... before the "
+                     "extension for the next")
+    .range(1, 16)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics {
 
@@ -69,7 +75,8 @@ Fh1FrameDump::Fh1FrameDump(CommandProcessor& command_processor,
       memory_(memory),
       mirror_(std::move(mirror)),
       frame_(frame),
-      path_(std::move(path)) {}
+      path_(std::move(path)),
+      first_path_(path_) {}
 
 Fh1FrameDump::~Fh1FrameDump() {
   if (recording_) command_processor_.SetPacketRecorder(nullptr);
@@ -106,6 +113,7 @@ void Fh1FrameDump::OnSwap(uint64_t frame, uint32_t frontbuffer_address) {
 void Fh1FrameDump::Begin() {
   recording_ = true;
   registers_.assign(register_file_.values, register_file_.values + RegisterFile::kRegisterCount);
+  shaders_.clear();
   for (Shader* shader : {command_processor_.active_vertex_shader(),
                          command_processor_.active_pixel_shader()}) {
     if (!shader) continue;
@@ -288,6 +296,15 @@ void Fh1FrameDump::End(uint32_t frontbuffer_address) {
       front.address, front.length);
   packets_.clear();
   blocks_.clear();
+  // The next frame starts at this swap.
+  if (++written_ < uint32_t(std::max(REXCVAR_GET(fh1_frame_dump_count), 1))) {
+    ++frame_;
+    path_ = first_path_;
+    path_.replace_filename(rex::path_to_utf8(first_path_.stem()) + "-" + std::to_string(written_) +
+                           rex::path_to_utf8(first_path_.extension()));
+    done_ = false;
+    Begin();
+  }
 }
 
 void Fh1FrameDump::RecordDrawInputs(uint32_t used_texture_mask, const Shader& vertex_shader,
