@@ -742,7 +742,12 @@ std::vector<const char*> GetVulkanUpscalerInstanceExtensions() { return {}; }
 
 std::vector<const char*> GetVulkanUpscalerDeviceExtensions(VkInstance, VkPhysicalDevice,
                                                            uint32_t) {
+#if defined(__APPLE__)
+  // MetalFX takes the frame's images and events as Metal objects (vulkan_metalfx_upscaler.cpp).
+  return {"VK_EXT_metal_objects"};
+#else
   return {};
+#endif
 }
 
 std::unique_ptr<VulkanUpscaler> CreateVulkanDlssUpscaler(const VulkanDevice*) { return nullptr; }

@@ -53,6 +53,19 @@ set(REXUI_VULKAN_SOURCES
     vulkan/vulkan_upload_buffer_pool.cpp
     vulkan/vulkan_util.cpp
 )
+if(APPLE)
+    # The MetalFX provider: its Vulkan half in C++, its Metal half the one
+    # Objective-C++ source, built with ARC and without the C++ precompiled
+    # header (it includes no rex header).
+    list(APPEND REXUI_VULKAN_SOURCES
+        vulkan/vulkan_metalfx_upscaler.cpp
+        vulkan/metalfx_bridge.mm
+    )
+    set_source_files_properties(vulkan/metalfx_bridge.mm PROPERTIES
+        COMPILE_OPTIONS "-fobjc-arc"
+        SKIP_PRECOMPILE_HEADERS ON
+    )
+endif()
 
 # D3D12 UI backend
 if(REXGLUE_USE_D3D12)
@@ -175,6 +188,13 @@ if(REXGLUE_USE_VULKAN)
         GPUOpen::VulkanMemoryAllocator
         spirv-tools-headers
     )
+    if(APPLE)
+        target_link_libraries(rexui PRIVATE
+            "-framework Foundation"
+            "-framework Metal"
+            "-framework MetalFX"
+        )
+    endif()
 endif()
 
 # Platform-specific dependencies

@@ -756,12 +756,24 @@ class VulkanFfxFrameGenerator final : public VulkanFrameGenerator {
 }  // namespace
 #endif  // defined(REX_HAS_FFX_API) && REX_HAS_FFX_API
 
+#if !defined(__APPLE__)
+// vulkan_metalfx_upscaler.cpp on Apple platforms.
+std::unique_ptr<VulkanUpscaler> CreateVulkanMetalFxUpscaler(const VulkanDevice*) {
+  return nullptr;
+}
+#endif
+
 std::vector<std::unique_ptr<VulkanUpscaler>> CreateVulkanUpscalers(
     [[maybe_unused]] const VulkanDevice* device) {
   std::vector<std::unique_ptr<VulkanUpscaler>> upscalers;
   if (std::unique_ptr<VulkanUpscaler> dlss = CreateVulkanDlssUpscaler(device)) {
     upscalers.push_back(std::move(dlss));
   }
+#if defined(__APPLE__)
+  if (std::unique_ptr<VulkanUpscaler> metalfx = CreateVulkanMetalFxUpscaler(device)) {
+    upscalers.push_back(std::move(metalfx));
+  }
+#endif
 #if defined(REX_HAS_FFX_API) && REX_HAS_FFX_API
   upscalers.push_back(std::make_unique<VulkanFfxUpscaler>(device, 3));
   upscalers.push_back(std::make_unique<VulkanFfxUpscaler>(device, 2));

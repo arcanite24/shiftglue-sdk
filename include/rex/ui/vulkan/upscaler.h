@@ -63,6 +63,9 @@ std::vector<std::unique_ptr<VulkanUpscaler>> CreateVulkanUpscalers(const VulkanD
 // DLSS through NGX, or null when the build has no DLSS (REX_HAS_DLSS).
 std::unique_ptr<VulkanUpscaler> CreateVulkanDlssUpscaler(const VulkanDevice* device);
 
+// Apple MetalFX on MoltenVK (VK_EXT_metal_objects), or null on other platforms.
+std::unique_ptr<VulkanUpscaler> CreateVulkanMetalFxUpscaler(const VulkanDevice* device);
+
 // Extensions the providers need on the instance, and on a device of this
 // vendor (NGX for DLSS). Instance and device creation enable those that are
 // supported. The names stay valid for the life of the process.

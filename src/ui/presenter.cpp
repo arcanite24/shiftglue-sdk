@@ -59,9 +59,10 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
                       "Guest output effect: bilinear, cas (sharpen, and resample when "
                       "downscaling), fsr (FSR 1 upscale with RCAS sharpening), fsr2 and fsr3 "
-                      "(temporal FSR through the FidelityFX runtime), dlss (DLSS through NGX); "
-                      "FSR 1 when the temporal upscaler is unavailable")
-    .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3", "dlss"});
+                      "(temporal FSR through the FidelityFX runtime), dlss (DLSS through NGX), "
+                      "metalfx (Apple MetalFX on macOS); FSR 1 when the temporal upscaler is "
+                      "unavailable")
+    .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3", "dlss", "metalfx"});
 
 REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
                       rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessDefault,
@@ -117,6 +118,9 @@ GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name
   }
   if (lowered == "dlss") {
     return GuestOutputPaintConfig::Effect::kDlss;
+  }
+  if (lowered == "metalfx") {
+    return GuestOutputPaintConfig::Effect::kMetalFx;
   }
 #endif
   return GuestOutputPaintConfig::Effect::kBilinear;
