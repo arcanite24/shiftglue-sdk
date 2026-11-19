@@ -21,23 +21,25 @@ namespace rex::graphics::texture_replacement {
 namespace {
 
 bool ParseHash(std::string_view text, uint64_t& hash) {
-  if (text.size() != 16) return false;
+  if (text.size() != 16)
+    return false;
   hash = 0;
   for (const char c : text) {
     const int digit = c >= '0' && c <= '9'   ? c - '0'
                       : c >= 'a' && c <= 'f' ? c - 'a' + 10
                       : c >= 'A' && c <= 'F' ? c - 'A' + 10
                                              : -1;
-    if (digit < 0) return false;
+    if (digit < 0)
+      return false;
     hash = (hash << 4) | uint64_t(digit);
   }
   return true;
 }
 
 std::string_view Trim(std::string_view text) {
-  while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) text.remove_prefix(1);
-  while (!text.empty() &&
-         (text.back() == ' ' || text.back() == '\t' || text.back() == '\r')) {
+  while (!text.empty() && (text.front() == ' ' || text.front() == '\t'))
+    text.remove_prefix(1);
+  while (!text.empty() && (text.back() == ' ' || text.back() == '\t' || text.back() == '\r')) {
     text.remove_suffix(1);
   }
   return text;
@@ -58,7 +60,8 @@ ReplacementFiles ScanReplacementFolders(std::string_view dirs) {
   std::vector<HashAlias> hash_aliases;
   const auto offer = [&](uint64_t hash, size_t rank, const std::filesystem::path& path) {
     auto [it, inserted] = found.try_emplace(hash, rank, path);
-    if (!inserted && rank < it->second.first) it->second = {rank, path};
+    if (!inserted && rank < it->second.first)
+      it->second = {rank, path};
   };
 
   size_t start = 0, rank = 0;
@@ -67,7 +70,8 @@ ReplacementFiles ScanReplacementFolders(std::string_view dirs) {
     const std::filesystem::path dir = rex::to_path(dirs.substr(start, end - start));
     start = end + 1;
     std::error_code error;
-    if (dir.empty() || !std::filesystem::is_directory(dir, error)) continue;
+    if (dir.empty() || !std::filesystem::is_directory(dir, error))
+      continue;
     ++rank;
     for (const auto& entry : std::filesystem::directory_iterator(dir, error)) {
       uint64_t hash = 0;
@@ -87,9 +91,10 @@ ReplacementFiles ScanReplacementFolders(std::string_view dirs) {
         text = text.substr(0, hash_mark);
       }
       text = Trim(text);
-      if (text.empty()) continue;
-      const std::string where = rex::path_to_utf8(dir / "aliases.txt") + ":" +
-                                std::to_string(number);
+      if (text.empty())
+        continue;
+      const std::string where =
+          rex::path_to_utf8(dir / "aliases.txt") + ":" + std::to_string(number);
       const size_t space = text.find_first_of(" \t");
       uint64_t hash = 0, target = 0;
       if (space == std::string_view::npos || !ParseHash(text.substr(0, space), hash)) {
@@ -122,7 +127,8 @@ ReplacementFiles ScanReplacementFolders(std::string_view dirs) {
     offer(alias.hash, alias.rank, path);
     ++result.aliases;
   }
-  for (auto& [hash, ranked] : found) result.files.emplace(hash, std::move(ranked.second));
+  for (auto& [hash, ranked] : found)
+    result.files.emplace(hash, std::move(ranked.second));
   return result;
 }
 
