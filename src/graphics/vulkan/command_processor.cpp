@@ -4905,6 +4905,47 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             vulkan_context.SetHudlessWritten();
           }
 
+          // present_hdr_scene (SR-21): the scene's exposed luminance from
+          // this frame's composite hook (scene_bloom.cpp), for the HDR
+          // output's highlights, where it is the guest output's size.
+          const SceneBloomImage& scene_hdr = scene_bloom_images_[kSceneHdrImage];
+          if (hdr_active && scene_hdr_pending_ && scene_hdr.image != VK_NULL_HANDLE &&
+              scene_hdr.width == guest_output_width && scene_hdr.height == guest_output_height &&
+              vulkan_context.EnsureHdrSceneImage()) {
+            const VkImage dest = vulkan_context.hdr_scene_image();
+            const VkImageSubresourceRange range = ui::vulkan::util::InitializeSubresourceRange();
+            PushImageMemoryBarrier(scene_hdr.image, range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                                   VK_ACCESS_TRANSFER_READ_BIT,
+                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            // Earlier paints may still read the previous contents.
+            PushImageMemoryBarrier(dest, range, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                                   VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            SubmitBarriers(true);
+            VkImageCopy region = {};
+            region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.dstSubresource = region.srcSubresource;
+            region.extent = {scene_hdr.width, scene_hdr.height, 1};
+            deferred_command_buffer_.CmdVkCopyImage(scene_hdr.image,
+                                                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dest,
+                                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+            PushImageMemoryBarrier(scene_hdr.image, range, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            PushImageMemoryBarrier(
+                dest, range, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            SubmitBarriers(true);
+            vulkan_context.SetHdrSceneWritten();
+          }
+          scene_hdr_pending_ = false;
+
           // UP-1.3 and UP-1.4: the depth and camera motion beside it.
           if (camera_depth_view != VK_NULL_HANDLE && EnsureSwapCamera() &&
               vulkan_context.EnsureCameraImages()) {

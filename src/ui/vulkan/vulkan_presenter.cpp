@@ -188,6 +188,22 @@ REXCVAR_DEFINE_DOUBLE(present_hdr_gamma, 2.2, "UI/Presenter",
     .range(0.0, 3.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(present_hdr_scene, true, "UI/Presenter",
+                    "On an HDR swapchain, expand highlights by the scene's own luminance where "
+                    "the swap provides it (scene_bloom with scene_host_copy: issue #5 SR-21), "
+                    "so the sun is brighter than a white wall; otherwise by how near white "
+                    "the SDR image is")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(present_hdr_scene_knee, 0.0, "UI/Presenter",
+                      "present_hdr_scene: the scene's exposed luminance, log2, where the "
+                      "expansion starts")
+    .range(-8.0, 8.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(present_hdr_scene_range, 4.0, "UI/Presenter",
+                      "present_hdr_scene: stops above the knee to the full expansion")
+    .range(0.25, 16.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(present_hdr_compare, false, "UI/Presenter",
                     "On an HDR swapchain, show the left half as SDR (piecewise sRGB at the paper "
                     "white, as Windows shows SDR content) beside the HDR right half")
@@ -234,8 +250,15 @@ struct HdrOutputConstants {
   float pattern_value;
   uint32_t output_flags;
   float size[2];
+  // present_hdr_scene: the guest output's rectangle in the stand-in, and the
+  // expansion by the scene's luminance (scene 0 where there is none).
+  float scene_rect[4];
+  uint32_t scene;
+  float scene_knee_log2;
+  float scene_range_inv;
+  float scene_padding;
 };
-static_assert(sizeof(HdrOutputConstants) == 48);
+static_assert(sizeof(HdrOutputConstants) == 80);
 
 // The active HDR swapchain is HDR10 (BT.2020 PQ), not scRGB.
 std::atomic<bool> hdr_output_pq = false;
@@ -499,6 +522,28 @@ void VulkanPresenter::VulkanGuestOutputRefreshContext::SetCameraWritten(
   guest_output_image_->camera_ever_written = true;
   *camera_out_ = camera;
   *camera_written_out_ = true;
+}
+
+bool VulkanPresenter::VulkanGuestOutputRefreshContext::EnsureHdrSceneImage() {
+  return guest_output_image_ && hdr_scene_set_layout_ != VK_NULL_HANDLE &&
+         guest_output_image_->EnsureHdrScene(hdr_scene_set_layout_);
+}
+
+VkImage VulkanPresenter::VulkanGuestOutputRefreshContext::hdr_scene_image() const {
+  return guest_output_image_ ? guest_output_image_->hdr_scene_image() : VK_NULL_HANDLE;
+}
+
+bool VulkanPresenter::VulkanGuestOutputRefreshContext::hdr_scene_ever_written_previously() const {
+  return guest_output_image_ && guest_output_image_->hdr_scene_ever_written;
+}
+
+void VulkanPresenter::VulkanGuestOutputRefreshContext::SetHdrSceneWritten() {
+  if (!guest_output_image_ || !hdr_scene_written_out_ ||
+      guest_output_image_->hdr_scene_image() == VK_NULL_HANDLE) {
+    return;
+  }
+  guest_output_image_->hdr_scene_ever_written = true;
+  *hdr_scene_written_out_ = true;
 }
 
 bool VulkanPresenter::EnsureUpscaleHudComposite() {
@@ -2824,17 +2869,20 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
 
   bool hudless_written = false;
   bool camera_written = false;
+  bool hdr_scene_written = false;
   UpscalerCamera camera;
   VulkanGuestOutputRefreshContext context(
       is_8bpc_out_ref, image_instance.image->image(), image_instance.image->view(),
       image_instance.version, image_instance.ever_successfully_refreshed,
-      image_instance.image.get(), &hudless_written, &camera, &camera_written);
+      image_instance.image.get(), &hudless_written, &camera, &camera_written, &hdr_scene_written,
+      guest_output_paint_image_descriptor_set_layout_);
   bool refresher_succeeded = refresher(context);
   if (refresher_succeeded) {
     image_instance.ever_successfully_refreshed = true;
   }
   image_instance.hudless_valid = refresher_succeeded && hudless_written;
   image_instance.camera_valid = refresher_succeeded && camera_written;
+  image_instance.hdr_scene_valid = refresher_succeeded && hdr_scene_written;
   image_instance.camera = camera;
   // Deferred: the refresher's work reaches the queue later, and the step
   // signals after it.
@@ -3501,6 +3549,10 @@ VulkanPresenter::GuestOutputImage::~GuestOutputImage() {
   util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, motion_view_);
   util::DestroyAndNullHandle(dfn.vkDestroyImage, device, motion_image_);
   util::DestroyAndNullHandle(dfn.vkFreeMemory, device, motion_memory_);
+  util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device, hdr_scene_pool_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, hdr_scene_view_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, hdr_scene_image_);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, hdr_scene_memory_);
   if (view_ != VK_NULL_HANDLE) {
     dfn.vkDestroyImageView(device, view_, nullptr);
   }
@@ -3554,6 +3606,53 @@ bool VulkanPresenter::GuestOutputImage::EnsureCamera() {
   util::DestroyAndNullHandle(dfn.vkDestroyImage, device, motion_image_);
   util::DestroyAndNullHandle(dfn.vkFreeMemory, device, motion_memory_);
   return false;
+}
+
+bool VulkanPresenter::GuestOutputImage::EnsureHdrScene(VkDescriptorSetLayout set_layout) {
+  if (hdr_scene_set_ != VK_NULL_HANDLE) {
+    return true;
+  }
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  if (hdr_scene_image_ == VK_NULL_HANDLE &&
+      !CreateImage(hdr_scene_image_, hdr_scene_memory_, hdr_scene_view_, kGuestOutputHdrSceneFormat,
+                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+    return false;
+  }
+  if (hdr_scene_pool_ == VK_NULL_HANDLE) {
+    // The sampler is immutable in the layout but still counts.
+    const VkDescriptorPoolSize pool_sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1},
+                                                {VK_DESCRIPTOR_TYPE_SAMPLER, 1}};
+    VkDescriptorPoolCreateInfo pool_info = {};
+    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_info.maxSets = 1;
+    pool_info.poolSizeCount = 2;
+    pool_info.pPoolSizes = pool_sizes;
+    if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &hdr_scene_pool_) != VK_SUCCESS) {
+      hdr_scene_pool_ = VK_NULL_HANDLE;
+      return false;
+    }
+  }
+  VkDescriptorSetAllocateInfo set_info = {};
+  set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  set_info.descriptorPool = hdr_scene_pool_;
+  set_info.descriptorSetCount = 1;
+  set_info.pSetLayouts = &set_layout;
+  VkDescriptorSet set;
+  if (dfn.vkAllocateDescriptorSets(device, &set_info, &set) != VK_SUCCESS) {
+    return false;
+  }
+  const VkDescriptorImageInfo image_info = {VK_NULL_HANDLE, hdr_scene_view_,
+                                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  VkWriteDescriptorSet write = {};
+  write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  write.dstSet = set;
+  write.descriptorCount = 1;
+  write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  write.pImageInfo = &image_info;
+  dfn.vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+  hdr_scene_set_ = set;
+  return true;
 }
 
 bool VulkanPresenter::GuestOutputImage::CreateImage(VkImage& image, VkDeviceMemory& memory,
@@ -3711,8 +3810,13 @@ void VulkanPresenter::RecordHdrOutput(VkCommandBuffer command_buffer,
                         paint_context_.hdr_pipeline);
   VkPipelineLayout hdr_pipeline_layout =
       guest_output_paint_pipeline_layouts_[kGuestOutputPaintPipelineLayoutIndexHdr];
-  dfn.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                              hdr_pipeline_layout, 0, 1, &hdr_image.descriptor_set, 0, nullptr);
+  // Set 1, the scene's luminance; without one the stand-in stands in, unread.
+  const bool hdr_scene = hdr_scene_paint_set_ != VK_NULL_HANDLE && REXCVAR_GET(present_hdr_scene) &&
+                         GetPaintedGuestOutputRectFromUIThread().has_value();
+  const VkDescriptorSet hdr_sets[2] = {hdr_image.descriptor_set,
+                                       hdr_scene ? hdr_scene_paint_set_ : hdr_image.descriptor_set};
+  dfn.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, hdr_pipeline_layout,
+                              0, 2, hdr_sets, 0, nullptr);
   GuestOutputPaintRectangleConstants hdr_rect_constants;
   hdr_rect_constants.x = -1.0f;
   hdr_rect_constants.y = -1.0f;
@@ -3757,6 +3861,16 @@ void VulkanPresenter::RecordHdrOutput(VkCommandBuffer command_buffer,
                                (hdr_output_rotation.load(std::memory_order_relaxed) << 1);
   hdr_constants.size[0] = float(paint_context_.swapchain_extent.width);
   hdr_constants.size[1] = float(paint_context_.swapchain_extent.height);
+  if (hdr_scene) {
+    const GuestOutputRect rect = *GetPaintedGuestOutputRectFromUIThread();
+    hdr_constants.scene_rect[0] = float(rect.x);
+    hdr_constants.scene_rect[1] = float(rect.y);
+    hdr_constants.scene_rect[2] = float(std::max(rect.width, 1u));
+    hdr_constants.scene_rect[3] = float(std::max(rect.height, 1u));
+    hdr_constants.scene = 1;
+    hdr_constants.scene_knee_log2 = float(REXCVAR_GET(present_hdr_scene_knee));
+    hdr_constants.scene_range_inv = float(1.0 / REXCVAR_GET(present_hdr_scene_range));
+  }
   dfn.vkCmdPushConstants(command_buffer, hdr_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
                          sizeof(hdr_rect_constants), sizeof(hdr_constants), &hdr_constants);
   dfn.vkCmdDraw(command_buffer, 4, 1, 0, 0);
@@ -3895,6 +4009,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   uint64_t guest_output_reflex_frame = 0;
   bool guest_output_hudless = false;
   bool guest_output_camera_valid = false;
+  bool guest_output_hdr_scene_valid = false;
   UpscalerCamera guest_output_camera;
   {
     uint32_t guest_output_mailbox_index;
@@ -3909,6 +4024,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       guest_output_reflex_frame = guest_output_images_[guest_output_mailbox_index].reflex_frame;
       guest_output_hudless = guest_output_images_[guest_output_mailbox_index].hudless_valid;
       guest_output_camera_valid = guest_output_images_[guest_output_mailbox_index].camera_valid;
+      guest_output_hdr_scene_valid =
+          guest_output_images_[guest_output_mailbox_index].hdr_scene_valid;
       guest_output_camera = guest_output_images_[guest_output_mailbox_index].camera;
     }
     // Incremented the reference count of the guest output image - safe to leave
@@ -3966,6 +4083,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   FrameGenerationHud frame_generation_hud;
   bool frame_generation_hud_deferred = false;
   SetPaintedGuestOutputRect(nullptr);
+  hdr_scene_paint_set_ = VK_NULL_HANDLE;
   if (guest_output_image) {
     VkExtent2D max_framebuffer_extent =
         util::GetMax2DFramebufferExtent(vulkan_device_->properties());
@@ -3974,6 +4092,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         paint_context_.swapchain_extent.height, max_framebuffer_extent.width,
         max_framebuffer_extent.height, guest_output_paint_config);
     SetPaintedGuestOutputRect(&guest_output_flow);
+    // The painting holds a reference to the image, so its set outlives the
+    // HDR output that reads it.
+    if (guest_output_hdr_scene_valid && guest_output_flow.effect_count) {
+      hdr_scene_paint_set_ = guest_output_image->hdr_scene_set();
+    }
     if (guest_output_flow.effect_count) {
       // Store the main target reference to the guest output image so it's not
       // destroyed while it's still potentially in use by main target painting
@@ -5173,6 +5296,16 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
     }
     guest_output_paint_pipeline_layout_create_info.pushConstantRangeCount =
         1 + uint32_t(guest_output_paint_push_constant_range_ffx.size != 0);
+    // The HDR output also reads the scene's luminance (set 1, the same
+    // layout: present_hdr_scene).
+    const VkDescriptorSetLayout hdr_set_layouts[2] = {
+        guest_output_paint_image_descriptor_set_layout_,
+        guest_output_paint_image_descriptor_set_layout_};
+    const bool hdr_layout =
+        GuestOutputPaintPipelineLayoutIndex(i) == kGuestOutputPaintPipelineLayoutIndexHdr;
+    guest_output_paint_pipeline_layout_create_info.setLayoutCount = hdr_layout ? 2 : 1;
+    guest_output_paint_pipeline_layout_create_info.pSetLayouts =
+        hdr_layout ? hdr_set_layouts : &guest_output_paint_image_descriptor_set_layout_;
     if (dfn.vkCreatePipelineLayout(device, &guest_output_paint_pipeline_layout_create_info, nullptr,
                                    &guest_output_paint_pipeline_layouts_[i]) != VK_SUCCESS) {
       REXLOG_ERROR(

@@ -1326,7 +1326,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   // SR-21's first step (scene_bloom.cpp): our bloom from the bands' copy,
   // host input binding 10.
   static constexpr uint32_t kSceneBloomLevels = 6;
-  static constexpr uint32_t kSceneBloomImages = kSceneBloomLevels * 2 - 1;
+  // 0-5 the reductions, 6-10 the additions, 11 the 1x1 exposure meter, 12
+  // the scene's exposed luminance at full size for present_hdr.
+  static constexpr uint32_t kSceneBloomImages = kSceneBloomLevels * 2 + 1;
+  static constexpr uint32_t kSceneMeterImage = kSceneBloomLevels * 2 - 1;
+  static constexpr uint32_t kSceneHdrImage = kSceneBloomLevels * 2;
   struct SceneBloomImage {
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -1342,6 +1346,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   void DestroySceneBloomInput();
   std::array<SceneBloomImage, kSceneBloomImages> scene_bloom_images_{};
   bool scene_bloom_failed_ = false;
+  uint64_t scene_meter_last_ticks_ = 0;
+  // The HDR luminance image was written at this frame's composite hook.
+  bool scene_hdr_pending_ = false;
   VkDescriptorSetLayout scene_bloom_set_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout scene_bloom_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline scene_bloom_pipeline_ = VK_NULL_HANDLE;

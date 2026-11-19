@@ -111,7 +111,9 @@ class VulkanPresenter final : public Presenter {
                                     GuestOutputImage* guest_output_image = nullptr,
                                     bool* hudless_written_out = nullptr,
                                     UpscalerCamera* camera_out = nullptr,
-                                    bool* camera_written_out = nullptr)
+                                    bool* camera_written_out = nullptr,
+                                    bool* hdr_scene_written_out = nullptr,
+                                    VkDescriptorSetLayout hdr_scene_set_layout = VK_NULL_HANDLE)
         : GuestOutputRefreshContext(is_8bpc_out_ref),
           image_(image),
           image_view_(image_view),
@@ -120,7 +122,9 @@ class VulkanPresenter final : public Presenter {
           guest_output_image_(guest_output_image),
           hudless_written_out_(hudless_written_out),
           camera_out_(camera_out),
-          camera_written_out_(camera_written_out) {}
+          camera_written_out_(camera_written_out),
+          hdr_scene_written_out_(hdr_scene_written_out),
+          hdr_scene_set_layout_(hdr_scene_set_layout) {}
 
     // The format is kGuestOutputFormat.
     // Supports usage as a color attachment and as a sampled image, as well as
@@ -155,6 +159,17 @@ class VulkanPresenter final : public Presenter {
     bool camera_ever_written_previously() const;
     void SetCameraWritten(const UpscalerCamera& camera);
 
+    // present_hdr (issue #5 SR-21): the scene's luminance at its exposure, in
+    // red (kGuestOutputHdrSceneFormat, the guest output's size), so the HDR
+    // output expands highlights by how bright the scene is. A transfer
+    // destination, left in VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL for the
+    // fragment shader. Created on first use; after writing it the refresher
+    // calls SetHdrSceneWritten, or painting ignores it for this frame.
+    bool EnsureHdrSceneImage();
+    VkImage hdr_scene_image() const;
+    bool hdr_scene_ever_written_previously() const;
+    void SetHdrSceneWritten();
+
    private:
     VkImage image_;
     VkImageView image_view_;
@@ -164,7 +179,11 @@ class VulkanPresenter final : public Presenter {
     bool* hudless_written_out_;
     UpscalerCamera* camera_out_;
     bool* camera_written_out_;
+    bool* hdr_scene_written_out_;
+    VkDescriptorSetLayout hdr_scene_set_layout_;
   };
+
+  static constexpr VkFormat kGuestOutputHdrSceneFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 
   static std::unique_ptr<VulkanPresenter> Create(HostGpuLossCallback host_gpu_loss_callback,
                                                  const VulkanDevice* vulkan_device,
@@ -275,6 +294,13 @@ class VulkanPresenter final : public Presenter {
     VkImage motion_image() const { return motion_image_; }
     VkImageView motion_view() const { return motion_view_; }
     bool camera_ever_written = false;
+    // The HDR scene luminance (VulkanGuestOutputRefreshContext::
+    // EnsureHdrSceneImage), with its own descriptor set in the guest output
+    // paint image layout, written once.
+    bool EnsureHdrScene(VkDescriptorSetLayout set_layout);
+    VkImage hdr_scene_image() const { return hdr_scene_image_; }
+    VkDescriptorSet hdr_scene_set() const { return hdr_scene_set_; }
+    bool hdr_scene_ever_written = false;
 
    private:
     GuestOutputImage(const VulkanDevice* const vulkan_device, const uint32_t width,
@@ -307,6 +333,11 @@ class VulkanPresenter final : public Presenter {
     VkImage motion_image_ = VK_NULL_HANDLE;
     VkDeviceMemory motion_memory_ = VK_NULL_HANDLE;
     VkImageView motion_view_ = VK_NULL_HANDLE;
+    VkImage hdr_scene_image_ = VK_NULL_HANDLE;
+    VkDeviceMemory hdr_scene_memory_ = VK_NULL_HANDLE;
+    VkImageView hdr_scene_view_ = VK_NULL_HANDLE;
+    VkDescriptorPool hdr_scene_pool_ = VK_NULL_HANDLE;
+    VkDescriptorSet hdr_scene_set_ = VK_NULL_HANDLE;
   };
 
   struct GuestOutputImageInstance {
@@ -327,6 +358,7 @@ class VulkanPresenter final : public Presenter {
     // images with this camera.
     bool hudless_valid = false;
     bool camera_valid = false;
+    bool hdr_scene_valid = false;
     UpscalerCamera camera;
     uint64_t last_refresher_submission = 0;
     // For choosing the barrier stage and access mask and layout depending on
@@ -341,6 +373,7 @@ class VulkanPresenter final : public Presenter {
       ever_successfully_refreshed = false;
       hudless_valid = false;
       camera_valid = false;
+      hdr_scene_valid = false;
     }
   };
 
@@ -744,6 +777,9 @@ class VulkanPresenter final : public Presenter {
   // main target (can be destroyed only after awaiting main target usage
   // completion).
   VkDescriptorSetLayout guest_output_paint_image_descriptor_set_layout_ = VK_NULL_HANDLE;
+  // The painted guest output's HDR scene luminance set for RecordHdrOutput,
+  // or null where this paint has none.
+  VkDescriptorSet hdr_scene_paint_set_ = VK_NULL_HANDLE;
   std::array<VkPipelineLayout, kGuestOutputPaintPipelineLayoutCount>
       guest_output_paint_pipeline_layouts_ = {};
   VkShaderModule guest_output_paint_vs_ = VK_NULL_HANDLE;
