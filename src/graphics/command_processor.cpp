@@ -274,6 +274,11 @@ REXCVAR_DEFINE_STRING(fh1_debug_skip_draws, "", "GPU",
                       "<first>-<last>[,<first>-<last>...] counted from each frame's first draw "
                       "(bisecting a rendering fault in a frame replay)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(gpu_skip_pixel_shaders, "", "GPU",
+                      "Comma-separated guest pixel shader hashes (16 hex digits) whose draws are "
+                      "dropped, for a replacement that does their work itself (issue #5 SR-21: "
+                      "the game's bloom when the composite's POST builds its own)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_STRING(fh1_debug_null_fetch, "", "GPU",
                       "Diagnostics: <draw>:<fetch constant> - that draw of every frame sees "
                       "the texture fetch constant as invalid (a null texture)")
@@ -3701,7 +3706,28 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
         }
         return std::make_pair(draw, fetch);
       }();
-      if (std::any_of(skip_ranges.begin(), skip_ranges.end(), [draw_index](const auto& range) {
+      // gpu_skip_pixel_shaders, parsed again when it changes.
+      static std::string skip_shader_list;
+      static std::vector<uint64_t> skip_shaders;
+      {
+        const std::string list = REXCVAR_GET(gpu_skip_pixel_shaders);
+        if (list != skip_shader_list) {
+          skip_shader_list = list;
+          skip_shaders.clear();
+          for (size_t start = 0; start < list.size();) {
+            const size_t end = std::min(list.find(',', start), list.size());
+            const std::string item = list.substr(start, end - start);
+            if (!item.empty()) skip_shaders.push_back(std::strtoull(item.c_str(), nullptr, 16));
+            start = end + 1;
+          }
+        }
+      }
+      const bool skip_shader =
+          !skip_shaders.empty() && active_pixel_shader_ &&
+          std::find(skip_shaders.begin(), skip_shaders.end(),
+                    active_pixel_shader_->ucode_data_hash()) != skip_shaders.end();
+      if (skip_shader ||
+          std::any_of(skip_ranges.begin(), skip_ranges.end(), [draw_index](const auto& range) {
             return draw_index >= range.first && draw_index <= range.second;
           })) {
         draw_succeeded = true;
