@@ -1281,6 +1281,34 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint32_t host_input_constants_memory_type_ = 0;
   VkDeviceSize host_input_constants_memory_size_ = 0;
   void* host_input_constants_mapping_ = nullptr;
+  // SR-11's first user (scene_ambient_occlusion.cpp): the swap's ambient
+  // occlusion computed at a mid-frame hook and upsampled into host input
+  // binding 7, for a replacement composite to apply before tone mapping.
+  bool CreateSceneAoInput();
+  void RecordSceneAoClear();
+  void RunSceneAmbientOcclusion(const MidframeHookContext& context);
+  void DestroySceneAoInput();
+  VkImage scene_ao_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory scene_ao_memory_ = VK_NULL_HANDLE;
+  VkImageView scene_ao_view_ = VK_NULL_HANDLE;
+  VkSampler scene_ao_sampler_ = VK_NULL_HANDLE;
+  VkImageLayout scene_ao_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+  uint32_t scene_ao_width_ = 0;
+  uint32_t scene_ao_height_ = 0;
+  // 1 everywhere (cleared), or holding a frame's occlusion.
+  bool scene_ao_clear_ = false;
+  // The frame whose occlusion the image holds; the swap skips its own AO
+  // for that frame.
+  uint64_t scene_ao_frame_ = UINT64_MAX;
+  // The guest output size of the last swap, the size the AO is computed at.
+  uint32_t scene_ao_output_width_ = 0;
+  uint32_t scene_ao_output_height_ = 0;
+  bool scene_ao_failed_ = false;
+  VkDescriptorSetLayout scene_ao_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout scene_ao_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline scene_ao_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool scene_ao_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> scene_ao_descriptor_sets_{};
   uint32_t object_slot_draws_ = 0;
   uint32_t object_slot_fallback_draws_ = 0;
   // Draws of the current frame recorded with a pipeline still being built

@@ -77,8 +77,17 @@ bool SpirvInterfaceFits(const SpirvInterface& replacement, const SpirvInterface&
 //     with nearest filtering and repeat addressing.
 //   layout(set = 0, binding = 6) uniform HostInputs { ... } host;
 //     HostInputConstants below (std140).
+//   layout(set = 0, binding = 7) uniform sampler2D host_scene_ao;
+//     Ambient occlusion of the frame's scene, laid out like the scene
+//     texture the composite samples (FH2: turned 180 degrees against the
+//     output), 1
+//     unoccluded, the strength already applied, in .r; sample by the
+//     scene's UV (linear, clamp). 1 everywhere unless
+//     swap_ambient_occlusion_in_scene computed it before the hooked draw
+//     this frame (scene_ambient_occlusion.cpp).
 constexpr uint32_t kHostInputBlueNoiseBinding = 5;
 constexpr uint32_t kHostInputConstantsBinding = 6;
+constexpr uint32_t kHostInputSceneAoBinding = 7;
 constexpr uint32_t kHostInputBlueNoiseSize = 64;
 struct HostInputConstants {
   // The draw resolution scale, the factor translations bake into their

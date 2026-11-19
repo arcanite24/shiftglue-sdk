@@ -183,6 +183,10 @@ class Fh1NativeExecutor {
   // readable from compute shaders) and camera, if the depth covers width x
   // height; null otherwise.
   VkImageView TakeCameraFrame(uint32_t width, uint32_t height, Camera& camera_out);
+  // SR-11, from a mid-frame hook before the swap: this frame's depth if every
+  // band is copied (untiled, copied now) and the last swap's camera. Unlike
+  // TakeCameraFrame it leaves the frame's copy for the swap.
+  VkImageView PeekCameraFrame(uint32_t width, uint32_t height, Camera& camera_out);
   // UP-1.5: jitter the scene with a Halton(2, 3) sequence of this length
   // from the next frame (0: none).
   void SetJitterPhases(uint32_t phases) { jitter_phases_ = phases; }

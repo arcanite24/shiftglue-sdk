@@ -1668,7 +1668,7 @@ bool VulkanCommandProcessor::SetupContext() {
     }
     REXGPU_INFO("Shared memory reads use one texel buffer");
   }
-  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[6];
+  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[7];
   shared_memory_and_edram_descriptor_set_layout_bindings[0].binding = 0;
   shared_memory_and_edram_descriptor_set_layout_bindings[0].descriptorType =
       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1739,6 +1739,14 @@ bool VulkanCommandProcessor::SetupContext() {
     constants_binding.descriptorCount = 1;
     constants_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     constants_binding.pImmutableSamplers = nullptr;
+    VkDescriptorSetLayoutBinding& scene_ao_binding =
+        shared_memory_and_edram_descriptor_set_layout_bindings
+            [shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount++];
+    scene_ao_binding.binding = kHostInputSceneAoBinding;
+    scene_ao_binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    scene_ao_binding.descriptorCount = 1;
+    scene_ao_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    scene_ao_binding.pImmutableSamplers = nullptr;
   }
   if (dfn.vkCreateDescriptorSetLayout(
           device, &shared_memory_and_edram_descriptor_set_layout_create_info, nullptr,
@@ -1767,7 +1775,7 @@ bool VulkanCommandProcessor::SetupContext() {
   if (host_inputs_set_binding_) {
     descriptor_pool_sizes[descriptor_pool_size_count].type =
         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    descriptor_pool_sizes[descriptor_pool_size_count++].descriptorCount = 1;
+    descriptor_pool_sizes[descriptor_pool_size_count++].descriptorCount = 2;
     descriptor_pool_sizes[descriptor_pool_size_count].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     descriptor_pool_sizes[descriptor_pool_size_count++].descriptorCount = 1;
   }
@@ -1802,8 +1810,12 @@ bool VulkanCommandProcessor::SetupContext() {
   if (!CreateObjectSlotImage(1, 1)) {
     return false;
   }
-  if (host_inputs_set_binding_ && !CreateShaderHostInputs()) {
+  if (host_inputs_set_binding_ && (!CreateShaderHostInputs() || !CreateSceneAoInput())) {
     return false;
+  }
+  if (host_inputs_set_binding_) {
+    AddMidframeHook("scene ambient occlusion",
+                    [this](const MidframeHookContext& context) { RunSceneAmbientOcclusion(context); });
   }
   WriteSharedMemoryAndEdramDescriptorSet();
 
@@ -2718,7 +2730,7 @@ void VulkanCommandProcessor::WriteSharedMemoryAndEdramDescriptorSet() {
     shared_memory_descriptor_buffer_info.offset = shared_memory_binding_range * i;
     shared_memory_descriptor_buffer_info.range = shared_memory_binding_range;
   }
-  VkWriteDescriptorSet write_descriptor_sets[6];
+  VkWriteDescriptorSet write_descriptor_sets[7];
   uint32_t write_descriptor_set_count = 1;
   VkWriteDescriptorSet& write_descriptor_set_shared_memory = write_descriptor_sets[0];
   write_descriptor_set_shared_memory.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -2802,6 +2814,18 @@ void VulkanCommandProcessor::WriteSharedMemoryAndEdramDescriptorSet() {
     write_constants.descriptorCount = 1;
     write_constants.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     write_constants.pBufferInfo = &host_input_constants_info;
+  }
+  VkDescriptorImageInfo scene_ao_info = {scene_ao_sampler_, scene_ao_view_,
+                                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  if (host_inputs_set_binding_ && scene_ao_view_ != VK_NULL_HANDLE) {
+    VkWriteDescriptorSet& write_scene_ao = write_descriptor_sets[write_descriptor_set_count++];
+    write_scene_ao = {};
+    write_scene_ao.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write_scene_ao.dstSet = shared_memory_and_edram_descriptor_set_;
+    write_scene_ao.dstBinding = kHostInputSceneAoBinding;
+    write_scene_ao.descriptorCount = 1;
+    write_scene_ao.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write_scene_ao.pImageInfo = &scene_ao_info;
   }
   vulkan_device->functions().vkUpdateDescriptorSets(
       vulkan_device->device(), write_descriptor_set_count, write_descriptor_sets, 0, nullptr);
@@ -3254,6 +3278,7 @@ void VulkanCommandProcessor::ShutdownContext() {
                                          shared_memory_and_edram_descriptor_pool_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBufferView, device,
                                          shared_memory_texel_buffer_view_);
+  DestroySceneAoInput();
   DestroyShaderHostInputs();
 
   frame_dump_.reset();
@@ -4218,11 +4243,15 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
         object_slot_image_height_ == guest_output_height);
     fh1_native_executor_->SetJitterPhases(camera_wanted ? presenter->GuestOutputJitterPhases()
                                                         : 0u);
+    scene_ao_output_width_ = guest_output_width;
+    scene_ao_output_height_ = guest_output_height;
     if (camera_wanted || ambient_occlusion) {
       VkImageView depth_view =
           fh1_native_executor_->TakeCameraFrame(guest_output_width, guest_output_height, camera);
       if (camera_wanted) camera_depth_view = depth_view;
-      if (ambient_occlusion && camera.depth_b != 0.0f) {
+      // With swap_ambient_occlusion_in_scene the hook computed it for this
+      // frame already (scene_ambient_occlusion.cpp).
+      if (ambient_occlusion && camera.depth_b != 0.0f && scene_ao_frame_ != frame_current_) {
         ao_depth_view = depth_view;
       }
     }
@@ -8686,7 +8715,10 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
 
     texture_cache_->BeginSubmission(GetCurrentSubmission());
 
-    if (host_inputs_set_binding_) UploadShaderHostInputNoise();
+    if (host_inputs_set_binding_) {
+      UploadShaderHostInputNoise();
+      if (!scene_ao_clear_ && scene_ao_frame_ + 1 < frame_current_) RecordSceneAoClear();
+    }
   }
 
   if (is_opening_frame) {

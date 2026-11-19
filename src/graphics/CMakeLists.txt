@@ -75,6 +75,7 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/blue_noise.cpp
     vulkan/shader_host_inputs.cpp
     vulkan/midframe_hooks.cpp
+    vulkan/scene_ambient_occlusion.cpp
     vulkan/pipeline_cache.cpp
     vulkan/primitive_processor.cpp
     vulkan/render_target_cache.cpp
