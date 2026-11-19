@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -275,6 +276,16 @@ REXCVAR_DEFINE_BOOL(gpu_draw_unchanged_inputs, true, "GPU/Vulkan",
 REXCVAR_DEFINE_BOOL(gpu_draw_unchanged_inputs_verify, false, "GPU/Vulkan",
                     "With gpu_draw_unchanged_inputs, derive every stage in full anyway and "
                     "count the draws whose skipped stage would have differed")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(gpu_log_pixel_constants, "", "GPU/Vulkan",
+                      "Diagnostics for shader replacements: comma-separated guest pixel shader "
+                      "hashes (16 hex digits) whose draws log the float constants the shader "
+                      "uses (by register) and fetch constant slots 0-15, up to "
+                      "gpu_log_pixel_constants_count draws in all")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(gpu_log_pixel_constants_count, 8, "GPU/Vulkan",
+                     "How many draws gpu_log_pixel_constants logs")
+    .range(1, 1000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(gpu_constant_census, false, "GPU/Vulkan",
                     "Count constant buffer uploads by buffer, their bytes and repeats, logged "
@@ -10567,6 +10578,43 @@ void GatherFloatConstants(uint8_t* out, const uint64_t (&bitmap)[4], const uint3
 
 }  // namespace
 
+namespace {
+// gpu_log_pixel_constants: one draw's constants, for writing a replacement
+// against the values the game sets.
+void LogPixelConstants(const RegisterFile& regs, const VulkanShader& shader) {
+  const std::string list = REXCVAR_GET(gpu_log_pixel_constants);
+  if (list.empty())
+    return;
+  static uint32_t logged = 0;
+  if (logged >= uint32_t(REXCVAR_GET(gpu_log_pixel_constants_count)))
+    return;
+  const std::string hash = fmt::format("{:016X}", shader.ucode_data_hash());
+  std::string upper = list;
+  for (char& c : upper)
+    c = char(std::toupper(static_cast<unsigned char>(c)));
+  if (upper.find(hash) == std::string::npos)
+    return;
+  ++logged;
+  const Shader::ConstantRegisterMap& map = shader.constant_register_map();
+  std::string text;
+  for (uint32_t r = 0; r < 256; ++r) {
+    if (!(map.float_bitmap[r >> 6] & (uint64_t(1) << (r & 63))))
+      continue;
+    float c[4];
+    std::memcpy(c, &regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X + r * 4], sizeof(c));
+    text += fmt::format(" c{}=({:g},{:g},{:g},{:g})", r, c[0], c[1], c[2], c[3]);
+  }
+  REXGPU_INFO("Pixel constants {} (draw {}):{}", hash, logged, text);
+  for (uint32_t slot = 0; slot < 16; ++slot) {
+    const uint32_t* w = &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6];
+    if (!(w[0] | w[1] | w[2] | w[3] | w[4] | w[5]))
+      continue;
+    REXGPU_INFO("  fetch {}: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}", slot, w[0], w[1], w[2],
+                w[3], w[4], w[5]);
+  }
+}
+}  // namespace
+
 void VulkanCommandProcessor::CountConstantUpload(uint32_t buffer, const void* data, size_t size) {
   ConstantCensus& c = constant_census_;
   ++c.uploads[buffer];
@@ -10617,6 +10665,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   }
   uint32_t float_constant_count_pixel = 0;
   if (pixel_shader != nullptr) {
+    LogPixelConstants(regs, *pixel_shader);
     const Shader::ConstantRegisterMap& float_constant_map_pixel =
         pixel_shader->constant_register_map();
     float_constant_count_pixel = float_constant_map_pixel.float_count;
