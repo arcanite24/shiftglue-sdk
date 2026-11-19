@@ -2668,6 +2668,12 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     }
     paint_context_.swapchain_render_pass = new_render_pass;
     paint_context_.swapchain_render_pass_format = render_pass_format;
+    // Before the loading pass below reuses the description: a clearing pass
+    // must begin with its clear value. Without one, beginning it read a null
+    // pClearValues, which crashed the system Adreno and Mali drivers on the
+    // first paint (pinyon-shift #1101, #1107).
+    paint_context_.swapchain_render_pass_clear_load_op =
+        render_pass_attachment.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
     // UP-4: the same pass over an image already painted and copied from:
     // compatible with it, so its framebuffers and pipelines serve both.
     render_pass_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -2685,8 +2691,6 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
                   "the HUD and UI in generated frames");
     }
     paint_context_.swapchain_render_pass_hdr = hdr;
-    paint_context_.swapchain_render_pass_clear_load_op =
-        render_pass_attachment.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
   }
 
   // Get the swapchain images.
