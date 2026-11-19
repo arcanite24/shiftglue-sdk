@@ -63,7 +63,7 @@ REXCVAR_DEFINE_DOUBLE(scene_exposure_speed, 3.0, "GPU",
                       "still to go after t seconds is 2^(-t * speed)")
     .range(0.0, 100.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_DOUBLE(scene_exposure_key, 0.0, "GPU",
+REXCVAR_DEFINE_DOUBLE(scene_exposure_key, -7.91, "GPU",
                       "scene_bloom's exposure: this less the metered log2 luminance (the "
                       "composite's EXPOSURE=1 and present_hdr's scene luminance)")
     .range(-16.0, 16.0)
@@ -477,7 +477,8 @@ void VulkanCommandProcessor::RunSceneBloom(const MidframeHookContext& context) {
                                            : 2u,
                    prescale,
                    adapt,
-                   p == kSceneBloomLevels ? 1u : 0u,
+                   // The level-0 addition (image 6), which the composite binds.
+                   dest_index == kSceneBloomLevels ? 1u : 0u,
                    key};
     deferred_command_buffer_.CmdVkPushConstants(scene_bloom_pipeline_layout_,
                                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants),
