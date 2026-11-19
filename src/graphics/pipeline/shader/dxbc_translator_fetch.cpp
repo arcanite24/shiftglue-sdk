@@ -155,16 +155,20 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
   // memexport is used), fetch from the appropriate binding. Extract whether
   // shared memory is a UAV to system_temp_result_.x and check. In the `if`, put
   // the more likely case (SRV), in the `else`, the less likely one (UAV).
-  a_.OpAnd(dxbc::Dest::R(system_temp_result_, 0b0001), LoadFlagsSystemConstant(),
-           dxbc::Src::LU(kSysFlag_SharedMemoryIsUAV));
-  a_.OpIf(false, dxbc::Src::R(system_temp_result_, dxbc::Src::kXXXX));
+  // Shader model 5_0 drops memory export, so shared memory is never a UAV.
+  bool shared_memory_uav_possible = !target_sm_5_0_;
+  if (shared_memory_uav_possible) {
+    a_.OpAnd(dxbc::Dest::R(system_temp_result_, 0b0001), LoadFlagsSystemConstant(),
+             dxbc::Src::LU(kSysFlag_SharedMemoryIsUAV));
+    a_.OpIf(false, dxbc::Src::R(system_temp_result_, dxbc::Src::kXXXX));
+  }
   if (srv_index_shared_memory_ == kBindingIndexUnallocated) {
     srv_index_shared_memory_ = srv_count_++;
   }
-  if (uav_index_shared_memory_ == kBindingIndexUnallocated) {
+  if (shared_memory_uav_possible && uav_index_shared_memory_ == kBindingIndexUnallocated) {
     uav_index_shared_memory_ = uav_count_++;
   }
-  for (uint32_t i = 0; i < 2; ++i) {
+  for (uint32_t i = 0; i < (shared_memory_uav_possible ? 2u : 1u); ++i) {
     if (i) {
       a_.OpElse();
     }
@@ -206,7 +210,9 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
       }
     }
   }
-  a_.OpEndIf();
+  if (shared_memory_uav_possible) {
+    a_.OpEndIf();
+  }
 
   dxbc::Src result_src(dxbc::Src::R(system_temp_result_));
 
@@ -1798,6 +1804,66 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
               texture_binding_signed.bindful_srv_index,
               uint32_t(SRVMainRegister::kBindfulTexturesStart) + texture_binding_index_signed);
         }
+        // Samples the SRV into the used result components of dest_temp. Shader
+        // model 5.0 (Direct3D 11) has no SRV component mapping, so there, all
+        // components are sampled into a temporary, and the host swizzle of the
+        // fetch constant from the system constants is applied to them.
+        auto sample_srv = [&](uint32_t dest_temp, const dxbc::Src& srv) {
+          uint32_t sample_temp = dest_temp;
+          uint32_t sample_mask = used_result_nonzero_components;
+          if (target_sm_5_0_) {
+            sample_temp = PushSystemTemp();
+            sample_mask = 0b1111;
+          }
+          if (grad_v_temp != UINT32_MAX) {
+            assert_not_zero(grad_component_count);
+            a_.OpSampleD(dxbc::Dest::R(sample_temp, sample_mask),
+                         dxbc::Src::R(coord_and_sampler_temp), 3, srv, sampler,
+                         dxbc::Src::R(grad_h_lod_temp), dxbc::Src::R(grad_v_temp),
+                         srv_grad_component_count);
+          } else {
+            a_.OpSampleL(dxbc::Dest::R(sample_temp, sample_mask),
+                         dxbc::Src::R(coord_and_sampler_temp), 3, srv, sampler, lod_src);
+          }
+          if (!target_sm_5_0_) {
+            return;
+          }
+          MarkSystemConstantUsed(SystemConstants::Index::kTextureSwizzles);
+          dxbc::Src swizzle_src(GetSystemConstantSrc(
+              offsetof(SystemConstants, texture_swizzles) + sizeof(uint32_t) * tfetch_index,
+              dxbc::Src::kXXXX));
+          uint32_t bits_temp = PushSystemTemp();
+          uint32_t remaining_components = used_result_nonzero_components;
+          uint32_t component;
+          while (rex::bit_scan_forward(remaining_components, &component)) {
+            remaining_components &= ~(uint32_t(1) << component);
+            dxbc::Dest dest_component(dxbc::Dest::R(dest_temp, uint32_t(1) << component));
+            dxbc::Src dest_component_src(dxbc::Src::R(dest_temp).Select(component));
+            // bits_temp.x - the swizzle of the component, then .y/.z/.w - its
+            // bits 0, 1 and 2.
+            a_.OpUBFE(dxbc::Dest::R(bits_temp, 0b0001), dxbc::Src::LU(3),
+                      dxbc::Src::LU(component * 3), swizzle_src);
+            a_.OpAnd(dxbc::Dest::R(bits_temp, 0b1110), dxbc::Src::R(bits_temp, dxbc::Src::kXXXX),
+                     dxbc::Src::LU(0, 1, 2, 4));
+            // X or Y, and Z or W, by bit 0.
+            a_.OpMovC(dxbc::Dest::R(bits_temp, 0b0001), dxbc::Src::R(bits_temp, dxbc::Src::kYYYY),
+                      dxbc::Src::R(sample_temp, dxbc::Src::kYYYY),
+                      dxbc::Src::R(sample_temp, dxbc::Src::kXXXX));
+            a_.OpMovC(dest_component, dxbc::Src::R(bits_temp, dxbc::Src::kYYYY),
+                      dxbc::Src::R(sample_temp, dxbc::Src::kWWWW),
+                      dxbc::Src::R(sample_temp, dxbc::Src::kZZZZ));
+            // XY or ZW by bit 1.
+            a_.OpMovC(dest_component, dxbc::Src::R(bits_temp, dxbc::Src::kZZZZ),
+                      dest_component_src, dxbc::Src::R(bits_temp, dxbc::Src::kXXXX));
+            // A constant 1 or 0 (by bit 0) if bit 2 is set.
+            a_.OpMovC(dxbc::Dest::R(bits_temp, 0b0001), dxbc::Src::R(bits_temp, dxbc::Src::kYYYY),
+                      dxbc::Src::LF(1.0f), dxbc::Src::LF(0.0f));
+            a_.OpMovC(dest_component, dxbc::Src::R(bits_temp, dxbc::Src::kWWWW),
+                      dxbc::Src::R(bits_temp, dxbc::Src::kXXXX), dest_component_src);
+          }
+          // Release bits_temp and sample_temp.
+          PopSystemTemp(2);
+        };
         for (uint32_t layer = 0; layer < (layer_lerp_needed ? 2u : 1u); ++layer) {
           uint32_t layer_value_temp = system_temp_result_;
           if (layer) {
@@ -1830,16 +1896,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
                                      texture_bindless_descriptor_index >> 2)
                            .Select(texture_bindless_descriptor_index & 3));
             }
-            if (grad_v_temp != UINT32_MAX) {
-              assert_not_zero(grad_component_count);
-              a_.OpSampleD(dxbc::Dest::R(layer_value_temp, used_result_nonzero_components),
-                           dxbc::Src::R(coord_and_sampler_temp), 3, srv_unsigned, sampler,
-                           dxbc::Src::R(grad_h_lod_temp), dxbc::Src::R(grad_v_temp),
-                           srv_grad_component_count);
-            } else {
-              a_.OpSampleL(dxbc::Dest::R(layer_value_temp, used_result_nonzero_components),
-                           dxbc::Src::R(coord_and_sampler_temp), 3, srv_unsigned, sampler, lod_src);
-            }
+            sample_srv(layer_value_temp, srv_unsigned);
           }
           a_.OpEndIf();
           a_.OpIf(true, is_any_signed_src);
@@ -1860,16 +1917,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
                                      texture_bindless_descriptor_index >> 2)
                            .Select(texture_bindless_descriptor_index & 3));
             }
-            if (grad_v_temp != UINT32_MAX) {
-              assert_not_zero(grad_component_count);
-              a_.OpSampleD(dxbc::Dest::R(signed_temp, used_result_nonzero_components),
-                           dxbc::Src::R(coord_and_sampler_temp), 3, srv_signed, sampler,
-                           dxbc::Src::R(grad_h_lod_temp), dxbc::Src::R(grad_v_temp),
-                           srv_grad_component_count);
-            } else {
-              a_.OpSampleL(dxbc::Dest::R(signed_temp, used_result_nonzero_components),
-                           dxbc::Src::R(coord_and_sampler_temp), 3, srv_signed, sampler, lod_src);
-            }
+            sample_srv(signed_temp, srv_signed);
             a_.OpMovC(dxbc::Dest::R(layer_value_temp, used_result_nonzero_components),
                       dxbc::Src::R(is_signed_temp), dxbc::Src::R(signed_temp),
                       dxbc::Src::R(layer_value_temp));

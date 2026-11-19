@@ -56,17 +56,18 @@ using namespace ucode;
 //   S#/T#/U# binding index, and the second is the s#/t#/u# register index
 //   within its space.
 
-#if defined(REXGPU_FH1_SHADER_PRODUCER)
+#if defined(REXGPU_FH1_SHADER_PRODUCER) || defined(REXGPU_DXBC_TRANSLATOR)
 DxbcShaderTranslator::DxbcShaderTranslator(ui::GraphicsProvider::GpuVendorID vendor_id,
                                            bool bindless_resources_used, bool edram_rov_used,
                                            bool gamma_render_target_as_unorm8,
                                            bool msaa_2x_supported, uint32_t draw_resolution_scale_x,
                                            uint32_t draw_resolution_scale_y,
-                                           bool force_emit_source_map)
+                                           bool force_emit_source_map, bool target_sm_5_0)
     : a_(shader_code_, statistics_),
       ao_(shader_object_, statistics_),
       vendor_id_(vendor_id),
       bindless_resources_used_(bindless_resources_used),
+      target_sm_5_0_(target_sm_5_0),
       edram_rov_used_(edram_rov_used),
       gamma_render_target_as_unorm8_(gamma_render_target_as_unorm8),
       msaa_2x_supported_(msaa_2x_supported),
@@ -314,7 +315,7 @@ void DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(
   a.OpMAd(target_dest, target_src, dxbc::Src::LF(1.0f / 255.0f), temp_non_target_src);
 }
 
-#if defined(REXGPU_FH1_SHADER_PRODUCER)
+#if defined(REXGPU_FH1_SHADER_PRODUCER) || defined(REXGPU_DXBC_TRANSLATOR)
 void DxbcShaderTranslator::RemapAndConvertVertexIndices(uint32_t dest_temp,
                                                         uint32_t dest_temp_components,
                                                         const dxbc::Src& src) {
@@ -774,6 +775,9 @@ void DxbcShaderTranslator::StartPixelShader() {
 }
 
 void DxbcShaderTranslator::StartTranslation() {
+  // The operand factories are static, so the target is per thread.
+  dxbc::SetTargetShaderModel(target_sm_5_0_ ? dxbc::TargetShaderModel::k5_0
+                                            : dxbc::TargetShaderModel::k5_1);
   // Set up the input and output registers.
   Modification shader_modification = GetDxbcShaderModification();
   uint32_t interpolator_register_mask = GetModificationInterpolatorMask();
@@ -1992,6 +1996,8 @@ const DxbcShaderTranslator::SystemConstantRdef DxbcShaderTranslator::system_cons
     {"xe_edram_rt_blend_factors_ops", ShaderRdefTypeIndex::kUint4, sizeof(uint32_t) * 4},
 
     {"xe_edram_blend_constant", ShaderRdefTypeIndex::kFloat4, sizeof(float) * 4},
+
+    {"xe_texture_swizzles", ShaderRdefTypeIndex::kUint4Array8, sizeof(uint32_t) * 4 * 8},
 };
 
 void DxbcShaderTranslator::WriteResourceDefinition() {
@@ -2067,7 +2073,7 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
   name_ptr = (uint32_t(shader_object_.size()) - blob_position_dwords) * sizeof(uint32_t);
   uint32_t constant_name_ptrs_system[size_t(SystemConstants::Index::kCount)];
   if (cbuffer_index_system_constants_ != kBindingIndexUnallocated) {
-    for (size_t i = 0; i < size_t(SystemConstants::Index::kCount); ++i) {
+    for (size_t i = 0; i < SystemConstantRdefCount(); ++i) {
       constant_name_ptrs_system[i] = name_ptr;
       name_ptr += dxbc::AppendAlignedString(shader_object_, system_constant_rdef_[i].name);
     }
@@ -2097,11 +2103,11 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
   if (cbuffer_index_system_constants_ != kBindingIndexUnallocated) {
     shader_object_.resize(constant_position_dwords_system +
                           sizeof(dxbc::RdefVariable) / sizeof(uint32_t) *
-                              size_t(SystemConstants::Index::kCount));
+                              SystemConstantRdefCount());
     auto constants_system = reinterpret_cast<dxbc::RdefVariable*>(shader_object_.data() +
                                                                   constant_position_dwords_system);
     uint32_t constant_offset_system = 0;
-    for (size_t i = 0; i < size_t(SystemConstants::Index::kCount); ++i) {
+    for (size_t i = 0; i < SystemConstantRdefCount(); ++i) {
       dxbc::RdefVariable& constant_system = constants_system[i];
       const SystemConstantRdef& translator_constant_system = system_constant_rdef_[i];
       constant_system.name_ptr = constant_name_ptrs_system[i];
@@ -2241,11 +2247,11 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
       cbuffer.type = dxbc::RdefCbufferType::kCbuffer;
       if (i == cbuffer_index_system_constants_) {
         cbuffer.name_ptr = cbuffer_name_ptr_system;
-        cbuffer.variable_count = uint32_t(SystemConstants::Index::kCount);
+        cbuffer.variable_count = uint32_t(SystemConstantRdefCount());
         cbuffer.variables_ptr =
             (constant_position_dwords_system - blob_position_dwords) * sizeof(uint32_t);
         cbuffer.size_vector_aligned_bytes =
-            uint32_t(rex::align(sizeof(SystemConstants), sizeof(uint32_t) * 4));
+            uint32_t(rex::align(SystemConstantsSize(), sizeof(uint32_t) * 4));
       } else if (i == cbuffer_index_float_constants_) {
         assert_not_zero(constant_register_map.float_count);
         cbuffer.name_ptr = cbuffer_name_ptr_float;
@@ -2497,6 +2503,22 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
 
   uint32_t bindings_end_position_dwords = uint32_t(shader_object_.size());
 
+  uint32_t input_bind_size = sizeof(dxbc::RdefInputBind);
+  if (target_sm_5_0_) {
+    // Shader model 5_0 input binds have no bind point space and ID: compact
+    // the shader model 5_1 records written above.
+    input_bind_size = dxbc::kRdefInputBind5_0Size;
+    constexpr uint32_t kDwords51 = sizeof(dxbc::RdefInputBind) / sizeof(uint32_t);
+    constexpr uint32_t kDwords50 = dxbc::kRdefInputBind5_0Size / sizeof(uint32_t);
+    uint32_t* binds = shader_object_.data() + bindings_position_dwords;
+    uint32_t bind_count = (bindings_end_position_dwords - bindings_position_dwords) / kDwords51;
+    for (uint32_t i = 0; i < bind_count; ++i) {
+      std::memmove(binds + i * kDwords50, binds + i * kDwords51, kDwords50 * sizeof(uint32_t));
+    }
+    bindings_end_position_dwords = bindings_position_dwords + bind_count * kDwords50;
+    shader_object_.resize(bindings_end_position_dwords);
+  }
+
   // ***************************************************************************
   // Header
   // ***************************************************************************
@@ -2507,15 +2529,18 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
     header.cbuffer_count = cbuffer_count_;
     header.cbuffers_ptr = (cbuffers_position_dwords - blob_position_dwords) * sizeof(uint32_t);
     header.input_bind_count = (bindings_end_position_dwords - bindings_position_dwords) *
-                              sizeof(uint32_t) / sizeof(dxbc::RdefInputBind);
+                              sizeof(uint32_t) / input_bind_size;
     header.input_binds_ptr = (bindings_position_dwords - blob_position_dwords) * sizeof(uint32_t);
     if (IsDxbcVertexShader()) {
-      header.shader_model = dxbc::RdefShaderModel::kVertexShader5_1;
+      header.shader_model = target_sm_5_0_ ? dxbc::RdefShaderModel::kVertexShader5_0
+                                           : dxbc::RdefShaderModel::kVertexShader5_1;
     } else if (IsDxbcDomainShader()) {
-      header.shader_model = dxbc::RdefShaderModel::kDomainShader5_1;
+      header.shader_model = target_sm_5_0_ ? dxbc::RdefShaderModel::kDomainShader5_0
+                                           : dxbc::RdefShaderModel::kDomainShader5_1;
     } else {
       assert_true(is_pixel_shader());
-      header.shader_model = dxbc::RdefShaderModel::kPixelShader5_1;
+      header.shader_model = target_sm_5_0_ ? dxbc::RdefShaderModel::kPixelShader5_0
+                                           : dxbc::RdefShaderModel::kPixelShader5_1;
     }
     header.compile_flags = dxbc::kCompileFlagNoPreshader | dxbc::kCompileFlagPreferFlowControl |
                            dxbc::kCompileFlagIeeeStrictness;
@@ -2524,8 +2549,9 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
     }
     // Generator name placed directly after the header.
     header.generator_name_ptr = sizeof(dxbc::RdefHeader);
-    header.fourcc = dxbc::RdefHeader::FourCC::k5_1;
-    header.InitializeSizes();
+    header.fourcc = target_sm_5_0_ ? dxbc::RdefHeader::FourCC::k5_0
+                                   : dxbc::RdefHeader::FourCC::k5_1;
+    header.InitializeSizes(input_bind_size);
   }
 }
 
@@ -3079,6 +3105,26 @@ void DxbcShaderTranslator::WriteOutputSignature() {
 void DxbcShaderTranslator::WriteShaderCode() {
   uint32_t blob_position_dwords = uint32_t(shader_object_.size());
 
+  if (target_sm_5_0_) {
+    // Feature level 11_0 stage limits.
+    if (bindless_resources_used_) {
+      EmitTranslationError("Shader model 5_0 cannot use bindless resources");
+    }
+    if (cbuffer_count_ > 14) {
+      EmitTranslationError("Shader model 5_0: too many constant buffers");
+    }
+    if (sampler_bindings_.size() > 16) {
+      EmitTranslationError("Shader model 5_0: too many samplers");
+    }
+    if (uint32_t(SRVMainRegister::kBindfulTexturesStart) + texture_bindings_.size() >
+        128) {
+      EmitTranslationError("Shader model 5_0: too many textures");
+    }
+    if (uav_count_ && !is_pixel_shader()) {
+      EmitTranslationError("Shader model 5_0: UAVs outside the pixel shader");
+    }
+  }
+
   dxbc::ProgramType program_type;
   if (IsDxbcVertexShader()) {
     program_type = dxbc::ProgramType::kVertexShader;
@@ -3088,7 +3134,7 @@ void DxbcShaderTranslator::WriteShaderCode() {
     assert_true(is_pixel_shader());
     program_type = dxbc::ProgramType::kPixelShader;
   }
-  shader_object_.push_back(dxbc::VersionToken(program_type, 5, 1));
+  shader_object_.push_back(dxbc::VersionToken(program_type, 5, target_sm_5_0_ ? 0 : 1));
   // Reserve space for the length token.
   shader_object_.push_back(0);
 
@@ -3147,7 +3193,7 @@ void DxbcShaderTranslator::WriteShaderCode() {
     ao_.OpDclConstantBuffer(dxbc::Src::CB(dxbc::Src::Dcl, cbuffer_index_system_constants_,
                                           uint32_t(CbufferRegister::kSystemConstants),
                                           uint32_t(CbufferRegister::kSystemConstants)),
-                            (sizeof(SystemConstants) + 15) >> 4);
+                            uint32_t((SystemConstantsSize() + 15) >> 4));
   }
   if (cbuffer_index_fetch_constants_ != kBindingIndexUnallocated) {
     ao_.OpDclConstantBuffer(dxbc::Src::CB(dxbc::Src::Dcl, cbuffer_index_fetch_constants_,

@@ -24,6 +24,13 @@ void DxbcShaderTranslator::ExportToMemory(uint8_t export_eM) {
   if (!export_eM) {
     return;
   }
+  // Feature level 11_0 has no UAVs in vertex shaders, and in pixel shaders
+  // u0 would take render target 0's slot, so shader model 5_0 drops memory
+  // export (the shaders keep their other outputs). FH1 issues no memory export
+  // draws on any measured route.
+  if (target_sm_5_0_) {
+    return;
+  }
 
   assert_zero(export_eM & ~current_shader().memexport_eM_written());
 
