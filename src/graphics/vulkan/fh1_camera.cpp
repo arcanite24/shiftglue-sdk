@@ -309,15 +309,16 @@ uint32_t Fh1NativeExecutor::CurrentDepthKey() const {
   const auto depth_info = register_file_.Get<reg::RB_DEPTH_INFO>();
   const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
   const uint32_t msaa = uint32_t(surface_info.msaa_samples);
-  return MakeDepthKey(depth_info.depth_base, Fh1PitchTiles(surface_info.surface_pitch, msaa), msaa,
-                      depth_info.depth_format)
+  return StorageKey(MakeDepthKey(depth_info.depth_base,
+                                 Fh1PitchTiles(surface_info.surface_pitch, msaa), msaa,
+                                 depth_info.depth_format))
       .Pack();
 }
 
 int32_t Fh1NativeExecutor::ObjectRowOffset() const {
   if (untile_height_) return 0;
   return std::max(0, -int32_t(register_file_.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset)) *
-         int32_t(scale_);
+         int32_t(scale_y_);
 }
 
 uint64_t Fh1NativeExecutor::CurrentColorKey() const {
@@ -356,13 +357,7 @@ bool Fh1NativeExecutor::GetSceneJitter(float& x, float& y) const {
     return true;
   }
   if (!draw_uses_camera_matrix_) return false;
-  const auto depth_info = register_file_.Get<reg::RB_DEPTH_INFO>();
-  const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
-  const uint32_t msaa = uint32_t(surface_info.msaa_samples);
-  if (MakeDepthKey(depth_info.depth_base, Fh1PitchTiles(surface_info.surface_pitch, msaa), msaa,
-                   depth_info.depth_format)
-              .Pack() != camera_scene_depth_ ||
-      CurrentColorKey() != camera_scene_color_) {
+  if (CurrentDepthKey() != camera_scene_depth_ || CurrentColorKey() != camera_scene_color_) {
     return false;
   }
   x = jitter_x_;
@@ -648,12 +643,12 @@ void Fh1NativeExecutor::SnapshotCameraDepth(uint32_t band_row) {
   // A band holds the surface's rows. The copy is resized only before a
   // frame's first band, to the bottom of the lowest band seen, so frames
   // with a taller band than it has are dropped until the next.
-  const uint32_t width = surface->width * scale_;
+  const uint32_t width = surface->width * scale_x_;
   // Untiled (single-pass scene), the surface holds the whole frame, taller
   // than the tile its key was made for.
   const uint32_t rows = untile_height_ ? std::max(surface->height, untile_height_) : surface->height;
-  const uint32_t height = std::min(rows, surface->image_height) * scale_;
-  const uint32_t dest_row = band_row * scale_;
+  const uint32_t height = std::min(rows, surface->image_height) * scale_y_;
+  const uint32_t dest_row = band_row * scale_y_;
   camera_depth_wanted_height_ = std::max(camera_depth_wanted_height_, dest_row + height);
   if (camera_depth_rows_ &&
       (camera_depth_.width != width || camera_depth_.height < dest_row + height)) {
