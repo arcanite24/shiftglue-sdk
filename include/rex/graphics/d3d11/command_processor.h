@@ -296,6 +296,8 @@ class D3D11CommandProcessor : public CommandProcessor {
   uint32_t fxaa_source_height_ = 0;
   // Host draws since the last swap, for the performance counters.
   uint64_t pending_draw_calls_ = 0;
+  // Host viewports bounded by the bound render targets (d3d11_viewport_fit_targets).
+  bool viewport_fit_targets_ = false;
   // The front buffer with its host swizzle applied (no SRV component mapping
   // on Direct3D 11), in the front buffer's format.
   Microsoft::WRL::ComPtr<ID3D11ComputeShader> swap_swizzle_cs_;

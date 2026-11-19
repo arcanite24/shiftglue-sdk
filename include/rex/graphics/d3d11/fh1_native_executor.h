@@ -83,8 +83,10 @@ class Fh1NativeExecutor {
   // (bit 0 depth, bits 1-4 color) and their formats (index 0 depth as
   // xenos::DepthRenderTargetFormat, 1-4 color as
   // xenos::ColorRenderTargetFormat). False skips the draw (the reason is
-  // counted).
-  bool BindTargets(uint32_t& bound_bits, uint32_t* formats);
+  // counted). bound_width and bound_height are the smallest size, in host
+  // pixels, of the bound surfaces (0 when none is bound).
+  bool BindTargets(uint32_t& bound_bits, uint32_t* formats, uint32_t& bound_width,
+                   uint32_t& bound_height);
   // After the command processor recorded the draw.
   void NativeDrawIssued(const Fh1NativeDrawInfo& draw);
   // In place of the render target cache's resolve. Returns whether the copy

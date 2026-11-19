@@ -35,6 +35,12 @@
 // Windows).
 REXCVAR_DECLARE(double, fh1_hud_squeeze);
 
+REXCVAR_DEFINE_INT32(d3d11_viewport_fit_targets, -1, "GPU/D3D11",
+                     "Bound the host viewport by the bound render targets' size (-1: on "
+                     "Intel GPUs only, whose driver shrinks what a larger viewport draws; 0: "
+                     "off; 1: on)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace rex::graphics::d3d11 {
 
 namespace shaders {
@@ -314,6 +320,23 @@ bool D3D11CommandProcessor::SetupContext() {
         draw_resolution_scale_x, draw_resolution_scale_y);
   }
 
+  // Draws without clipping use a host viewport much larger than the render
+  // target (8192 pixels, see draw_util::GetHostViewportInfo). The UHD 620
+  // driver rasterizes them as if that viewport were squeezed into the
+  // target: scaled by the target-to-viewport size ratio towards the top left
+  // (a full-screen depth clear into a 640x1024 surface covered 640/8192 of
+  // its width and 1024/8192 of its height). The vertex shader rescales to
+  // whatever viewport is used, so bounding it by the targets draws the same
+  // pixels (on the RTX 4080 two frame replays stay bit-exact with it and a
+  // third changes in 3 words), but it stays limited to Intel by default.
+  const int32_t viewport_fit_targets = REXCVAR_GET(d3d11_viewport_fit_targets);
+  viewport_fit_targets_ =
+      viewport_fit_targets < 0
+          ? provider.GetAdapterVendorID() == ui::GraphicsProvider::GpuVendorID::kIntel
+          : viewport_fit_targets != 0;
+  if (viewport_fit_targets_) {
+    REXGPU_INFO("Direct3D 11: host viewports bounded by the render target size");
+  }
   gamma_render_target_as_unorm16_ = REXCVAR_GET(gamma_render_target_as_unorm16);
   depth_float24_round_ = REXCVAR_GET(depth_float24_round);
   depth_float24_convert_in_pixel_shader_ = REXCVAR_GET(depth_float24_convert_in_pixel_shader);
@@ -1707,8 +1730,10 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   fh1_native_executor_->PrepareTargets(native_targets);
   uint32_t bound_depth_and_color_render_target_bits = 0;
   uint32_t bound_depth_and_color_render_target_formats[1 + xenos::kMaxColorRenderTargets] = {};
+  uint32_t bound_width = 0, bound_height = 0;
   if (!fh1_native_executor_->BindTargets(bound_depth_and_color_render_target_bits,
-                                         bound_depth_and_color_render_target_formats)) {
+                                         bound_depth_and_color_render_target_formats, bound_width,
+                                         bound_height)) {
     return false;
   }
 
@@ -1728,8 +1753,14 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   bool ps_writes_depth = pixel_shader && pixel_shader->writes_depth();
   draw_util::ViewportInfo viewport_info;
-  draw_util::GetHostViewportInfo(regs, 1, 1, true, D3D11_VIEWPORT_BOUNDS_MAX,
-                                 D3D11_VIEWPORT_BOUNDS_MAX, false, normalized_depth_control,
+  const uint32_t viewport_x_max = viewport_fit_targets_ && bound_width
+                                      ? bound_width
+                                      : uint32_t(D3D11_VIEWPORT_BOUNDS_MAX);
+  const uint32_t viewport_y_max = viewport_fit_targets_ && bound_height
+                                      ? bound_height
+                                      : uint32_t(D3D11_VIEWPORT_BOUNDS_MAX);
+  draw_util::GetHostViewportInfo(regs, 1, 1, true, viewport_x_max, viewport_y_max, false,
+                                 normalized_depth_control,
                                  depth_float24_convert_in_pixel_shader_,
                                  /* full_float24_in_0_to_1 */ true, ps_writes_depth,
                                  viewport_info);

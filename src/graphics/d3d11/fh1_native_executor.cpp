@@ -490,7 +490,8 @@ struct Fh1NativeExecutor::Impl {
   void Shutdown();
   void PrepareTargets(const Fh1NativeDrawInfo& draw);
   void LogStats(uint64_t frame);
-  bool BindTargets(uint32_t& bound_bits, uint32_t* formats);
+  bool BindTargets(uint32_t& bound_bits, uint32_t* formats, uint32_t& bound_width,
+                   uint32_t& bound_height);
   void NativeDrawIssued(const Fh1NativeDrawInfo& draw);
   bool NativeResolve(uint32_t& written_address, uint32_t& written_length);
   void FlushResolveReadbacks();
@@ -1641,8 +1642,11 @@ void Fh1NativeExecutor::Impl::PrepareTargets(const Fh1NativeDrawInfo& draw) {
   }
 }
 
-bool Fh1NativeExecutor::Impl::BindTargets(uint32_t& bound_bits, uint32_t* formats) {
+bool Fh1NativeExecutor::Impl::BindTargets(uint32_t& bound_bits, uint32_t* formats,
+                                          uint32_t& bound_width, uint32_t& bound_height) {
   bound_bits = 0;
+  bound_width = 0;
+  bound_height = 0;
   if (!initialized_) return false;
   CpuTimer timer(*this, kCpuBindTargets);
   if (!pending_targets_valid_) {
@@ -1672,6 +1676,8 @@ bool Fh1NativeExecutor::Impl::BindTargets(uint32_t& bound_bits, uint32_t* format
     }
     formats[i] = keys[i].format;
     bound_bits |= 1u << i;
+    bound_width = bound_width ? std::min(bound_width, surface->width) : surface->width;
+    bound_height = bound_height ? std::min(bound_height, surface->height) : surface->height;
   }
   context()->OMSetRenderTargets(rtv_count, rtv_count ? rtvs : nullptr, dsv);
   if (!used_bits) Count("draw_writes_nothing");
@@ -2362,8 +2368,9 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1NativeDrawInfo& draw) {
 
 void Fh1NativeExecutor::LogStats(uint64_t frame) { impl_->LogStats(frame); }
 
-bool Fh1NativeExecutor::BindTargets(uint32_t& bound_bits, uint32_t* formats) {
-  return impl_->BindTargets(bound_bits, formats);
+bool Fh1NativeExecutor::BindTargets(uint32_t& bound_bits, uint32_t* formats,
+                                    uint32_t& bound_width, uint32_t& bound_height) {
+  return impl_->BindTargets(bound_bits, formats, bound_width, bound_height);
 }
 
 void Fh1NativeExecutor::NativeDrawIssued(const Fh1NativeDrawInfo& draw) {
