@@ -1280,6 +1280,27 @@ class VulkanCommandProcessor : public CommandProcessor {
   void DestroySwapAmbientOcclusion();
   void DestroySwapAmbientOcclusionImages();
   bool swap_ao_failed_ = false;
+  // Morphological antialiasing of the guest output (morphological_aa.cpp,
+  // swap_morphological_aa): edges, blend weights and the blend, in place.
+  bool EnsureSwapMorphologicalAa(uint32_t width, uint32_t height);
+  // frame and scene: the swap source and the pre-HUD snapshot, or
+  // VK_NULL_HANDLE for scene (then the HUD is not told apart).
+  void DispatchSwapMorphologicalAa(VkImage target, VkImageView target_view, VkImageView frame,
+                                   VkImageView scene, uint32_t width, uint32_t height,
+                                   uint32_t frame_index);
+  void DestroySwapMorphologicalAa();
+  void DestroySwapMorphologicalAaImages();
+  bool swap_mlaa_failed_ = false;
+  VkDescriptorSetLayout swap_mlaa_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout swap_mlaa_pipeline_layout_ = VK_NULL_HANDLE;
+  std::array<VkPipeline, 3> swap_mlaa_pipelines_{};
+  VkDescriptorPool swap_mlaa_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_mlaa_descriptor_sets_{};
+  std::array<VkImage, 3> swap_mlaa_images_{};
+  std::array<VkDeviceMemory, 3> swap_mlaa_memory_{};
+  std::array<VkImageView, 3> swap_mlaa_views_{};
+  uint32_t swap_mlaa_width_ = 0;
+  uint32_t swap_mlaa_height_ = 0;
   VkDescriptorSetLayout swap_ao_set_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout swap_ao_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline swap_ao_pipeline_ = VK_NULL_HANDLE;

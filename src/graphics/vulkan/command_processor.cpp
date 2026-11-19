@@ -204,6 +204,8 @@ REXCVAR_DECLARE(bool, fh1_msaa_single_sample);
 REXCVAR_DECLARE(bool, fh1_msaa_2x);
 REXCVAR_DECLARE(uint32_t, vulkan_texture_max_size);
 REXCVAR_DECLARE(bool, spirv_specialize_texture_signs);
+// morphological_aa.cpp.
+REXCVAR_DECLARE(bool, swap_morphological_aa);
 #if REX_HAS_D3D12
 REXCVAR_DECLARE(double, fh1_hud_squeeze);
 #else
@@ -3105,6 +3107,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   // Into the destroy queues, emptied below.
   DestroySceneLut();
   DestroySwapAmbientOcclusion();
+  DestroySwapMorphologicalAa();
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_scene_post_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
                                          swap_scene_post_pipeline_layout_);
@@ -4587,6 +4590,16 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                                               : swap_fxaa_pipeline_);
               deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
             }
+          }
+
+          // Off by default; after FXAA or the scene-only post, before the
+          // HUD mask reads the image.
+          if (REXCVAR_GET(swap_morphological_aa) &&
+              EnsureSwapMorphologicalAa(guest_output_width, guest_output_height)) {
+            DispatchSwapMorphologicalAa(
+                vulkan_context.image(), vulkan_context.image_view(), swap_texture_view,
+                REXCVAR_GET(swap_post_effect_scene_only) ? hud_snapshot_view : VK_NULL_HANDLE,
+                guest_output_width, guest_output_height, swap_frame_index);
           }
 
           if ((hdr_active || hud_mask_wanted) && hud_snapshot_view != VK_NULL_HANDLE &&

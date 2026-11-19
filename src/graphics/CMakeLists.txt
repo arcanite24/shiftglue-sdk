@@ -71,6 +71,7 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/vulkan_draw_program.cpp
     vulkan/scene_post.cpp
     vulkan/ambient_occlusion.cpp
+    vulkan/morphological_aa.cpp
     vulkan/pipeline_cache.cpp
     vulkan/primitive_processor.cpp
     vulkan/render_target_cache.cpp
