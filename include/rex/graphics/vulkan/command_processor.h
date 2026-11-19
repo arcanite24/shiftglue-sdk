@@ -1260,6 +1260,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkDeviceMemory reactive_image_memory_ = VK_NULL_HANDLE;
   VkImageView reactive_image_view_ = VK_NULL_HANDLE;
   uint32_t reactive_draws_ = 0;
+  // Whether listed draws write the marks: as object motion, once the image
+  // is the guest output's size and initialised by a camera pass (set at the
+  // swap; translations and programs follow it).
+  bool reactive_marks_enabled_ = false;
   // SR-10 (shader_host_inputs.cpp): blue noise and the draw resolution scale
   // at set 0 bindings 5 and 6 for replacement pixel shaders, only with
   // vulkan_shader_override_host_inputs (read once, at start).
@@ -1711,6 +1715,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Shader modifications and translations by memo state.
   struct TranslationMemo {
     uint64_t state_epoch = 0;
+    bool reactive = false;
     const void* vertex_shader = nullptr;
     const void* pixel_shader = nullptr;
     uint32_t host_vertex_shader_type = 0;
@@ -1813,6 +1818,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     double hud_squeeze = 0.0;
     double hud_scale = 0.0;
     bool object_motion = false;
+    bool reactive_marks = false;
     bool glow_depth_test = false;
   };
   // Key: the buffer (address << 32 | dwords) mixed with the state hash and

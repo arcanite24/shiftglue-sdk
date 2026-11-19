@@ -4383,10 +4383,11 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
         camera_wanted && object_slot_set_binding_ && ReactiveShadersListed();
     object_slot_wanted_width_ = object_motion_wanted || reactive_wanted ? guest_output_width : 0;
     object_slot_wanted_height_ = object_motion_wanted || reactive_wanted ? guest_output_height : 0;
-    fh1_native_executor_->SetObjectMotionEnabled(
-        object_motion_wanted && object_slot_image_initialized_ &&
-        object_slot_image_width_ == guest_output_width &&
-        object_slot_image_height_ == guest_output_height);
+    const bool object_slot_image_ready = object_slot_image_initialized_ &&
+                                         object_slot_image_width_ == guest_output_width &&
+                                         object_slot_image_height_ == guest_output_height;
+    fh1_native_executor_->SetObjectMotionEnabled(object_motion_wanted && object_slot_image_ready);
+    reactive_marks_enabled_ = reactive_wanted && object_slot_image_ready;
     fh1_native_executor_->SetJitterPhases(camera_wanted ? presenter->GuestOutputJitterPhases()
                                                         : 0u);
     scene_ao_output_width_ = guest_output_width;
@@ -6813,9 +6814,10 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
                                          : pixel_shader && fh1_native_executor_ &&
                                                fh1_native_executor_->IsSceneObjectDraw(*vertex_shader);
     object_slot_draws_ += uint32_t(object_slot && !i);
-    reactive_draws_ +=
-        uint32_t(!i && pixel_shader && object_slot_set_binding_ && ReactiveShadersListed() &&
-                 IsReactivePixelShader(pixel_shader->ucode_data_hash()));
+    // SR-23: listed shaders mark their pixels reactive.
+    const bool reactive = reactive_marks_enabled_ && pixel_shader &&
+                          IsReactivePixelShader(pixel_shader->ucode_data_hash());
+    reactive_draws_ += uint32_t(reactive && !i);
     if (program_hit) {
       // NA-2.4: the recorded modifications and translations (ready when
       // recorded, and translations are never dropped).
@@ -6837,7 +6839,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
           translation_memo.interpolator_mask == interpolator_mask &&
           translation_memo.ps_param_gen_pos == ps_param_gen_pos &&
           translation_memo.depth_control == normalized_depth_control.value &&
-          translation_memo.object_slot == object_slot) {
+          translation_memo.object_slot == object_slot && translation_memo.reactive == reactive) {
         vertex_shader_modification = translation_memo.vertex_modification;
         pixel_shader_modification = translation_memo.pixel_modification;
         vertex_shader_translation = translation_memo.vertex_translation;
@@ -6854,9 +6856,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         if (object_slot) {
           pixel_shader_modification.pixel.object_slot_output = 1;
         }
-        // SR-23: listed shaders mark their pixels reactive.
-        if (pixel_shader && object_slot_set_binding_ &&
-            IsReactivePixelShader(pixel_shader->ucode_data_hash())) {
+        if (reactive) {
           pixel_shader_modification.pixel.reactive_output = 1;
         }
 
@@ -6896,6 +6896,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         }
         translation_memo.state_epoch = memo_translation ? memo_state : 0;
         translation_memo.object_slot = object_slot;
+        translation_memo.reactive = reactive;
         translation_memo.vertex_shader = vertex_shader;
         translation_memo.pixel_shader = pixel_shader;
         translation_memo.host_vertex_shader_type =
