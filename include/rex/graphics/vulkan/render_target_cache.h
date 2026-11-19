@@ -132,6 +132,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
            !REXCVAR_GET(snorm16_render_target_full_range);
   }
   bool gamma_render_target_as_unorm16() const { return gamma_render_target_as_unorm16_; }
+  bool unorm10_render_target_as_unorm16() const { return unorm10_render_target_as_unorm16_; }
 
   bool depth_unorm24_vulkan_format_supported() const {
     return depth_unorm24_vulkan_format_supported_;
@@ -782,6 +783,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                          uint32_t dump_pitch);
 
   bool gamma_render_target_as_unorm16_ = false;
+  bool unorm10_render_target_as_unorm16_ = false;
 
   bool depth_unorm24_vulkan_format_supported_ = false;
   bool depth_float24_round_ = false;

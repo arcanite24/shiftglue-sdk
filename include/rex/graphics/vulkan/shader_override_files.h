@@ -88,6 +88,7 @@ bool SpirvInterfaceFits(const SpirvInterface& replacement, const SpirvInterface&
 constexpr uint32_t kHostInputBlueNoiseBinding = 5;
 constexpr uint32_t kHostInputConstantsBinding = 6;
 constexpr uint32_t kHostInputSceneAoBinding = 7;
+constexpr uint32_t kHostInputSceneCopyBinding = 8;
 constexpr uint32_t kHostInputBlueNoiseSize = 64;
 struct HostInputConstants {
   // The draw resolution scale, the factor translations bake into their
@@ -97,8 +98,12 @@ struct HostInputConstants {
   float blue_noise_texel;
   // Bumped when the constants change.
   uint32_t version;
+  // SR-12: what binding 8 is multiplied by to be in the scene texture's
+  // units (2^ the resolve's exponent bias), 1 until a copy is made.
+  float scene_copy_scale;
+  float reserved[3];
 };
-static_assert(sizeof(HostInputConstants) == 16);
+static_assert(sizeof(HostInputConstants) == 32);
 void SetVulkanShaderOverrideHostInputs(bool enabled);
 bool VulkanShaderOverrideHostInputs();
 // `size` x `size` RGBA8 blue noise (void and cluster, one run per channel).

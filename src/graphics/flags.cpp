@@ -24,6 +24,10 @@ REXCVAR_DEFINE_BOOL(snorm16_render_target_full_range, true, "GPU",
 REXCVAR_DEFINE_BOOL(gamma_render_target_as_unorm16, true, "GPU",
                     "Use R16G16B16A16_UNORM for gamma render targets (more accurate than sRGB)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(unorm10_render_target_as_unorm16, false, "GPU",
+                    "Store k_2_10_10_10 render targets as R16G16B16A16_UNORM on the host (Vulkan "
+                    "host render targets): what is drawn into them keeps 16 bits a channel until "
+                    "it is resolved, and a host copy of the resolve can keep it longer (SR-12)");
 REXCVAR_DEFINE_STRING(dump_shaders, "", "GPU", "Path to dump shaders to");
 REXCVAR_DEFINE_BOOL(fh1_native_gpu_profile, false, "GPU",
                     "Measure the FH1 native executor's GPU time per phase (transfers, resolves, "

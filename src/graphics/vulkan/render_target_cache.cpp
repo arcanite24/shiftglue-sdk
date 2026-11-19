@@ -614,6 +614,8 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
     // Host render targets.
 
     gamma_render_target_as_unorm16_ = gamma_render_target_as_unorm16_requested;
+    unorm10_render_target_as_unorm16_ =
+        REXCVAR_GET(unorm10_render_target_as_unorm16) && color_rgba16_unorm_supported;
 
     depth_float24_round_ = REXCVAR_GET(depth_float24_round);
     depth_float24_convert_in_pixel_shader_ = REXCVAR_GET(depth_float24_convert_in_pixel_shader);
@@ -1671,6 +1673,9 @@ VkFormat VulkanRenderTargetCache::GetColorVulkanFormat(
       return gamma_render_target_as_unorm16_ ? VK_FORMAT_R16G16B16A16_UNORM
                                              : VK_FORMAT_R8G8B8A8_UNORM;
     case xenos::ColorRenderTargetFormat::k_2_10_10_10:
+      // More than the console keeps, on request; resolves still pack 10 bits.
+      if (unorm10_render_target_as_unorm16_) return VK_FORMAT_R16G16B16A16_UNORM;
+      [[fallthrough]];
     case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
       // 10 bits per color channel, as on the console (8 bits lost precision).
       return VK_FORMAT_A2B10G10R10_UNORM_PACK32;

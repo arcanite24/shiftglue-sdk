@@ -3575,6 +3575,13 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
         complete = false;
       }
     }
+    if (scene_copy_.image != VK_NULL_HANDLE && scene_copy_.layout && scene_copy_.base &&
+        !plan.copying_depth && resolve_info.copy_dest_base == scene_copy_.base && x0 == 0 &&
+        y0 == 0 && plan.sources.size() == 1 && plan.sources[0].surface &&
+        plan.sources[0].surface->key.Pack() == plan.resolve_key.Pack()) {
+      CopySceneForHost(*plan.sources[0].surface, plan.sources[0].rect,
+                       int32_t(int8_t((plan.dest_info >> 8) & 0xFF)));
+    }
     // One-off captures the CPU reads also need the guest layout at scale:
     // resolved again unscaled into the guest memory copy, from each guest
     // pixel's first host pixel, and read back. Small resolves also need an
@@ -3872,6 +3879,43 @@ void Fh1NativeExecutor::MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw) {
       surface->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hud_snapshot_.image,
       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
   Count("hud_snapshot");
+}
+
+void Fh1NativeExecutor::CopySceneForHost(Surface& surface, const Rect& rect, int32_t exp_bias) {
+  if (surface.format != VK_FORMAT_R16G16B16A16_UNORM || surface.samples != 1) {
+    Count("scene_copy_format");
+    return;
+  }
+  const uint32_t width =
+      std::min(uint32_t(rect.right - rect.left) * scale_, scene_copy_.width);
+  const uint32_t height =
+      std::min(uint32_t(rect.bottom - rect.top) * scale_, scene_copy_.height);
+  if (!width || !height) return;
+  Transition(surface, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+             VK_ACCESS_TRANSFER_READ_BIT);
+  const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  command_processor_.PushImageMemoryBarrier(
+      scene_copy_.image, range, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      *scene_copy_.layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  command_processor_.SubmitBarriers(true);
+  VkImageCopy region = {};
+  region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.dstSubresource = region.srcSubresource;
+  region.srcOffset = {int32_t(uint32_t(rect.left) * scale_), int32_t(uint32_t(rect.top) * scale_),
+                      0};
+  region.extent = {width, height, 1};
+  command_processor_.deferred_command_buffer().CmdVkCopyImage(
+      surface.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, scene_copy_.image,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+  command_processor_.PushImageMemoryBarrier(
+      scene_copy_.image, range, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  *scene_copy_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  scene_copy_exp_bias_ = exp_bias;
+  Count("scene_copy");
 }
 
 VkImageView Fh1NativeExecutor::TakeHudSnapshot(uint32_t width, uint32_t height) {

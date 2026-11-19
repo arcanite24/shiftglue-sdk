@@ -1309,6 +1309,21 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipeline scene_ao_pipeline_ = VK_NULL_HANDLE;
   VkDescriptorPool scene_ao_descriptor_pool_ = VK_NULL_HANDLE;
   std::array<VkDescriptorSet, kMaxFramesInFlight> scene_ao_descriptor_sets_{};
+  // SR-12 (scene_host_copy.cpp): a 16-bit copy of the composite's scene at
+  // its resolve, host input binding 8.
+  bool CreateSceneCopyInput();
+  void RecordSceneCopyClear();
+  void RunSceneCopyHook(const MidframeHookContext& context);
+  void DestroySceneCopyInput();
+  VkImage scene_copy_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory scene_copy_memory_ = VK_NULL_HANDLE;
+  VkImageView scene_copy_view_ = VK_NULL_HANDLE;
+  VkImageLayout scene_copy_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+  uint32_t scene_copy_width_ = 0;
+  uint32_t scene_copy_height_ = 0;
+  // The address the composite's fetch 0 read at the last hook; 0 for none.
+  uint32_t scene_copy_base_ = 0;
+  float scene_copy_scale_ = 1.0f;
   uint32_t object_slot_draws_ = 0;
   uint32_t object_slot_fallback_draws_ = 0;
   // Draws of the current frame recorded with a pipeline still being built

@@ -187,6 +187,15 @@ class Fh1NativeExecutor {
   // band is copied (untiled, copied now) and the last swap's camera. Unlike
   // TakeCameraFrame it leaves the frame's copy for the swap.
   VkImageView PeekCameraFrame(uint32_t width, uint32_t height, Camera& camera_out);
+  // SR-12: a colour resolve to `base` from a 16-bit unorm surface is also
+  // copied as it is into `image` (RGBA16 unorm, kept in shader-read layout,
+  // its layout in *layout). base 0 or no image stops it.
+  void SetSceneCopyTarget(VkImage image, VkImageLayout* layout, uint32_t width, uint32_t height,
+                          uint32_t base) {
+    scene_copy_ = {image, layout, width, height, base};
+  }
+  // The exponent bias of the last resolve copied there.
+  int32_t scene_copy_exp_bias() const { return scene_copy_exp_bias_; }
   // UP-1.5: jitter the scene with a Halton(2, 3) sequence of this length
   // from the next frame (0: none).
   void SetJitterPhases(uint32_t phases) { jitter_phases_ = phases; }
@@ -545,6 +554,16 @@ class Fh1NativeExecutor {
   bool hud_snapshot_taken_ = false;
   bool hud_snapshot_ready_ = false;
   Surface hud_snapshot_;
+  struct SceneCopyTarget {
+    VkImage image = VK_NULL_HANDLE;
+    VkImageLayout* layout = nullptr;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t base = 0;
+  };
+  SceneCopyTarget scene_copy_;
+  int32_t scene_copy_exp_bias_ = 0;
+  void CopySceneForHost(Surface& surface, const Rect& rect, int32_t exp_bias);
   void DestroyHudSnapshot();
 
   // UP-1.3 camera tracking (fh1_camera.cpp).

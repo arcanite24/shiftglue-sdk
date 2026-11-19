@@ -76,6 +76,7 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/shader_host_inputs.cpp
     vulkan/midframe_hooks.cpp
     vulkan/scene_ambient_occlusion.cpp
+    vulkan/scene_host_copy.cpp
     vulkan/pipeline_cache.cpp
     vulkan/primitive_processor.cpp
     vulkan/render_target_cache.cpp
