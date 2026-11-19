@@ -3706,13 +3706,18 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
         }
         return std::make_pair(draw, fetch);
       }();
-      // gpu_skip_pixel_shaders, parsed again when it changes.
-      static std::string skip_shader_list;
+      // gpu_skip_pixel_shaders, parsed again only when it changes.
+      static std::atomic<bool> skip_shaders_changed = [] {
+        rex::cvar::RegisterChangeCallback("gpu_skip_pixel_shaders",
+                                          [](std::string_view, std::string_view) {
+                                            skip_shaders_changed.store(true);
+                                          });
+        return true;
+      }();
       static std::vector<uint64_t> skip_shaders;
       {
-        const std::string list = REXCVAR_GET(gpu_skip_pixel_shaders);
-        if (list != skip_shader_list) {
-          skip_shader_list = list;
+        if (skip_shaders_changed.exchange(false)) {
+          const std::string list = REXCVAR_GET(gpu_skip_pixel_shaders);
           skip_shaders.clear();
           for (size_t start = 0; start < list.size();) {
             const size_t end = std::min(list.find(',', start), list.size());
