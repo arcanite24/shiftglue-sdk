@@ -22,7 +22,9 @@
 
 namespace rex::graphics::dxbc {
 
-// Utilities for generating shader model 5_1 byte code (for Direct3D 12).
+// Utilities for generating shader model 5_1 byte code (for Direct3D 12), and
+// shader model 5_0 byte code (for Direct3D 11 at feature level 11_0) when the
+// target is switched with SetTargetShaderModel on the generating thread.
 //
 // This file contains only parts of DXBC used by Xenia currently or previously,
 // not all of DXBC. If an operation, operand, blob or something else is needed
@@ -317,7 +319,22 @@ enum RdefInputFlags : uint32_t {
   kRdefInputFlagUnused = 1 << 4,
 };
 
+// Shader model 5_0 has no register spaces: resource, sampler and UAV operands
+// are indexed by the register alone, constant buffer operands by the register
+// and the location, declarations carry no space (and constant buffer
+// declarations no separate size), and reflection input binds have no space or
+// ID. The target is per thread because the operand factories are static.
+enum class TargetShaderModel : uint32_t { k5_1, k5_0 };
+inline thread_local TargetShaderModel target_shader_model_ = TargetShaderModel::k5_1;
+inline void SetTargetShaderModel(TargetShaderModel model) { target_shader_model_ = model; }
+inline bool IsTargetShaderModel5_0() { return target_shader_model_ == TargetShaderModel::k5_0; }
+
 enum class RdefShaderModel : uint32_t {
+  kPixelShader5_0 = 0xFFFF0500u,
+  kVertexShader5_0 = 0xFFFE0500u,
+  kGeometryShader5_0 = 0x47530500u,
+  kDomainShader5_0 = 0x44530500u,
+  kComputeShader5_0 = 0x43530500u,
   kPixelShader5_1 = 0xFFFF0501u,
   kVertexShader5_1 = 0xFFFE0501u,
   kGeometryShader5_1 = 0x47530501u,
@@ -408,6 +425,8 @@ struct alignas(uint32_t) RdefInputBind {
   uint32_t id;
 };
 static_assert_size(RdefInputBind, sizeof(uint32_t) * 10);
+// Shader model 5_0 input binds end before bind_point_space.
+constexpr uint32_t kRdefInputBind5_0Size = sizeof(uint32_t) * 8;
 
 struct alignas(uint32_t) RdefHeader {
   enum class FourCC : uint32_t {
@@ -433,10 +452,10 @@ struct alignas(uint32_t) RdefHeader {
   uint32_t sizeof_structure_member_bytes;
   // Zero.
   uint32_t unknown_0;
-  void InitializeSizes() {
+  void InitializeSizes(uint32_t input_bind_size = sizeof(RdefInputBind)) {
     sizeof_header_bytes = sizeof(*this);
     sizeof_cbuffer_bytes = sizeof(RdefCbuffer);
-    sizeof_input_bind_bytes = sizeof(RdefInputBind);
+    sizeof_input_bind_bytes = input_bind_size;
     sizeof_variable_bytes = sizeof(RdefVariable);
     sizeof_type_bytes = sizeof(RdefType);
     sizeof_structure_member_bytes = sizeof(RdefStructureMember);
@@ -942,6 +961,9 @@ struct Dest : OperandAddress {
     return Dest(OperandType::kInputDomainPoint, read_mask);
   }
   static Dest U(uint32_t index_1d, Index index_2d, uint32_t write_mask = 0b1111) {
+    if (IsTargetShaderModel5_0()) {
+      return Dest(OperandType::kUnorderedAccessView, write_mask, index_2d);
+    }
     return Dest(OperandType::kUnorderedAccessView, write_mask, index_1d, index_2d);
   }
   static Dest VThreadID(uint32_t read_mask) { return Dest(OperandType::kInputThreadID, read_mask); }
@@ -1072,21 +1094,41 @@ struct Src : OperandAddress {
   static Src LP(const int32_t* xyzw) { return LI(xyzw[0], xyzw[1], xyzw[2], xyzw[3]); }
   static Src LP(const float* xyzw) { return LF(xyzw[0], xyzw[1], xyzw[2], xyzw[3]); }
   static Src S(uint32_t index_1d, Index index_2d) {
+    if (IsTargetShaderModel5_0()) {
+      return Src(OperandType::kSampler, kXXXX, index_2d);
+    }
     return Src(OperandType::kSampler, kXXXX, index_1d, index_2d);
   }
   static Src S(DclT, uint32_t id, uint32_t lower_bound, uint32_t upper_bound) {
+    if (IsTargetShaderModel5_0()) {
+      return Src(OperandType::kSampler, kXYZW, lower_bound);
+    }
     return Src(OperandType::kSampler, kXYZW, id, lower_bound, upper_bound);
   }
   static Src T(uint32_t index_1d, Index index_2d, uint32_t swizzle = kXYZW) {
+    if (IsTargetShaderModel5_0()) {
+      return Src(OperandType::kResource, swizzle, index_2d);
+    }
     return Src(OperandType::kResource, swizzle, index_1d, index_2d);
   }
   static Src T(DclT, uint32_t id, uint32_t lower_bound, uint32_t upper_bound) {
+    if (IsTargetShaderModel5_0()) {
+      return Src(OperandType::kResource, kXYZW, lower_bound);
+    }
     return Src(OperandType::kResource, kXYZW, id, lower_bound, upper_bound);
   }
   static Src CB(uint32_t id, Index index, Index location, uint32_t swizzle = kXYZW) {
+    if (IsTargetShaderModel5_0()) {
+      return Src(OperandType::kConstantBuffer, swizzle, index, location);
+    }
     return Src(OperandType::kConstantBuffer, swizzle, id, index, location);
   }
+  // In shader model 5_0, OpDclConstantBuffer makes the cb#[size] operand from
+  // the lower bound.
   static Src CB(DclT, uint32_t id, uint32_t lower_bound, uint32_t upper_bound) {
+    if (IsTargetShaderModel5_0()) {
+      return Src(OperandType::kConstantBuffer, kXYZW, lower_bound);
+    }
     return Src(OperandType::kConstantBuffer, kXYZW, id, lower_bound, upper_bound);
   }
   static Src Label(uint32_t index) { return Src(OperandType::kLabel, kXXXX, index); }
@@ -1098,9 +1140,15 @@ struct Src : OperandAddress {
     return Src(OperandType::kInputDomainPoint, swizzle);
   }
   static Src U(uint32_t index_1d, Index index_2d, uint32_t swizzle = kXYZW) {
+    if (IsTargetShaderModel5_0()) {
+      return Src(OperandType::kUnorderedAccessView, swizzle, index_2d);
+    }
     return Src(OperandType::kUnorderedAccessView, swizzle, index_1d, index_2d);
   }
   static Src U(DclT, uint32_t id, uint32_t lower_bound, uint32_t upper_bound) {
+    if (IsTargetShaderModel5_0()) {
+      return Src(OperandType::kUnorderedAccessView, kXYZW, lower_bound);
+    }
     return Src(OperandType::kUnorderedAccessView, kXYZW, id, lower_bound, upper_bound);
   }
   static Src VThreadID(uint32_t swizzle = kXYZW) {
@@ -1909,11 +1957,14 @@ class Assembler {
                      uint32_t space = 0) {
     uint32_t operands_length = operand.GetLength(0b1111, false);
     code_.reserve(code_.size() + 3 + operands_length);
-    code_.push_back(OpcodeToken(Opcode::kDclResource, 2 + operands_length) |
+    bool sm_5_0 = IsTargetShaderModel5_0();
+    code_.push_back(OpcodeToken(Opcode::kDclResource, (sm_5_0 ? 1 : 2) + operands_length) |
                     (uint32_t(dimension) << 11));
     operand.Write(code_, false, 0b1111, false, true);
     code_.push_back(return_type_token);
-    code_.push_back(space);
+    if (!sm_5_0) {
+      code_.push_back(space);
+    }
   }
   // The order of constant buffer declarations in a shader indicates their
   // relative priority from highest to lowest (hint to driver).
@@ -1921,6 +1972,17 @@ class Assembler {
       const Src& operand, uint32_t size_vectors,
       ConstantBufferAccessPattern access_pattern = ConstantBufferAccessPattern::kImmediateIndexed,
       uint32_t space = 0) {
+    if (IsTargetShaderModel5_0()) {
+      // cb#[size]: the operand's second index is the size in vectors.
+      Src cb_operand(OperandType::kConstantBuffer, Src::kXYZW, operand.index_1d_,
+                     Index(size_vectors));
+      uint32_t cb_operands_length = cb_operand.GetLength(0b1111, false);
+      code_.reserve(code_.size() + 1 + cb_operands_length);
+      code_.push_back(OpcodeToken(Opcode::kDclConstantBuffer, cb_operands_length) |
+                      (uint32_t(access_pattern) << 11));
+      cb_operand.Write(code_, false, 0b1111, false, true);
+      return;
+    }
     uint32_t operands_length = operand.GetLength(0b1111, false);
     code_.reserve(code_.size() + 3 + operands_length);
     code_.push_back(OpcodeToken(Opcode::kDclConstantBuffer, 2 + operands_length) |
@@ -1933,9 +1995,13 @@ class Assembler {
                     uint32_t space = 0) {
     uint32_t operands_length = operand.GetLength(0b1111, false);
     code_.reserve(code_.size() + 2 + operands_length);
-    code_.push_back(OpcodeToken(Opcode::kDclSampler, 1 + operands_length) | (uint32_t(mode) << 11));
+    bool sm_5_0 = IsTargetShaderModel5_0();
+    code_.push_back(OpcodeToken(Opcode::kDclSampler, (sm_5_0 ? 0 : 1) + operands_length) |
+                    (uint32_t(mode) << 11));
     operand.Write(code_, false, 0b1111, false, true);
-    code_.push_back(space);
+    if (!sm_5_0) {
+      code_.push_back(space);
+    }
   }
   // In geometry shaders, only kPointList, kLineStrip and kTriangleStrip are
   // allowed.
@@ -2170,27 +2236,39 @@ class Assembler {
                                      uint32_t space = 0) {
     uint32_t operands_length = operand.GetLength(0b1111, false);
     code_.reserve(code_.size() + 3 + operands_length);
-    code_.push_back(OpcodeToken(Opcode::kDclUnorderedAccessViewTyped, 2 + operands_length) |
+    bool sm_5_0 = IsTargetShaderModel5_0();
+    code_.push_back(OpcodeToken(Opcode::kDclUnorderedAccessViewTyped,
+                                (sm_5_0 ? 1 : 2) + operands_length) |
                     (uint32_t(dimension) << 11) | flags);
     operand.Write(code_, false, 0b1111, false, true);
     code_.push_back(return_type_token);
-    code_.push_back(space);
+    if (!sm_5_0) {
+      code_.push_back(space);
+    }
   }
   // Possible flags are kUAVFlagGloballyCoherentAccess and
   // kUAVFlagRasterizerOrderedAccess.
   void OpDclUnorderedAccessViewRaw(uint32_t flags, const Src& operand, uint32_t space = 0) {
     uint32_t operands_length = operand.GetLength(0b1111, false);
     code_.reserve(code_.size() + 2 + operands_length);
-    code_.push_back(OpcodeToken(Opcode::kDclUnorderedAccessViewRaw, 1 + operands_length) | flags);
+    bool sm_5_0 = IsTargetShaderModel5_0();
+    code_.push_back(OpcodeToken(Opcode::kDclUnorderedAccessViewRaw,
+                                (sm_5_0 ? 0 : 1) + operands_length) |
+                    flags);
     operand.Write(code_, true, 0b1111, false, true);
-    code_.push_back(space);
+    if (!sm_5_0) {
+      code_.push_back(space);
+    }
   }
   void OpDclResourceRaw(const Src& operand, uint32_t space = 0) {
     uint32_t operands_length = operand.GetLength(0b1111, false);
     code_.reserve(code_.size() + 2 + operands_length);
-    code_.push_back(OpcodeToken(Opcode::kDclResourceRaw, 1 + operands_length));
+    bool sm_5_0 = IsTargetShaderModel5_0();
+    code_.push_back(OpcodeToken(Opcode::kDclResourceRaw, (sm_5_0 ? 0 : 1) + operands_length));
     operand.Write(code_, true, 0b1111, false, true);
-    code_.push_back(space);
+    if (!sm_5_0) {
+      code_.push_back(space);
+    }
   }
   void OpLdUAVTyped(const Dest& dest, const Src& address, uint32_t address_components,
                     const Src& uav) {

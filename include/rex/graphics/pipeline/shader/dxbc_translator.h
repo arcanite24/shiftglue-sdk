@@ -50,8 +50,24 @@ class DxbcShaderTranslator : public ShaderTranslator {
   DxbcShaderTranslator(ui::GraphicsProvider::GpuVendorID vendor_id, bool bindless_resources_used,
                        bool edram_rov_used, bool gamma_render_target_as_unorm8 = false,
                        bool msaa_2x_supported = true, uint32_t draw_resolution_scale_x = 1,
-                       uint32_t draw_resolution_scale_y = 1, bool force_emit_source_map = false);
+                       uint32_t draw_resolution_scale_y = 1, bool force_emit_source_map = false,
+                       bool target_sm_5_0 = false);
   ~DxbcShaderTranslator() override;
+
+  // Shader model 5_0 output for Direct3D 11 at feature level 11_0: bindful
+  // only, no register spaces, no UAVs outside pixel shaders (memory export
+  // from vertex shaders is dropped), and the stage slot limits of 11_0.
+  bool target_sm_5_0() const { return target_sm_5_0_; }
+  // The system constants that exist in the target shader model: texture
+  // swizzles are only for shader model 5.0, so shader model 5.1 (the Direct3D
+  // 12 pack) keeps its layout and RDEF unchanged.
+  size_t SystemConstantRdefCount() const {
+    return size_t(SystemConstants::Index::kCount) - (target_sm_5_0_ ? 0 : 1);
+  }
+  size_t SystemConstantsSize() const {
+    return target_sm_5_0_ ? sizeof(SystemConstants)
+                          : offsetof(SystemConstants, texture_swizzles);
+  }
 
   // Stage linkage ordering and rules (must be respected not only within the
   // DxbcShaderTranslator, but also by everything else between the VS and the
@@ -391,6 +407,14 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // The constant blend factor for the respective modes.
     float edram_blend_constant[4];
 
+    // Shader model 5.0 (Direct3D 11) only, which has no SRV component mapping:
+    // the host swizzle of each texture fetch constant, 3 bits per result
+    // component in bits 0:11 (bit 2 - constant, bit 0 selects 1 for a
+    // constant, otherwise bit 1 selects ZW over XY and bit 0 the second of
+    // the pair), applied in the shader after sampling. Kept last so the
+    // Direct3D 12 offsets do not change.
+    uint32_t texture_swizzles[32];
+
    private:
     friend class DxbcShaderTranslator;
 
@@ -443,6 +467,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
       kEdramRTBlendFactorsOps,
 
       kEdramBlendConstant,
+
+      kTextureSwizzles,
 
       kCount,
     };
@@ -925,6 +951,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
 
   // Whether textures and samplers should be bindless.
   bool bindless_resources_used_;
+  bool target_sm_5_0_;
 
   // Whether the output merger should be emulated in pixel shaders.
   bool edram_rov_used_;
