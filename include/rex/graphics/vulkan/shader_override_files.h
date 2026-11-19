@@ -90,6 +90,7 @@ constexpr uint32_t kHostInputConstantsBinding = 6;
 constexpr uint32_t kHostInputSceneAoBinding = 7;
 constexpr uint32_t kHostInputSceneCopyBinding = 8;
 constexpr uint32_t kHostInputSceneBandBinding = 9;
+constexpr uint32_t kHostInputSceneBloomBinding = 10;
 constexpr uint32_t kHostInputBlueNoiseSize = 64;
 struct HostInputConstants {
   // The draw resolution scale, the factor translations bake into their

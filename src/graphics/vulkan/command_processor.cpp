@@ -1668,7 +1668,7 @@ bool VulkanCommandProcessor::SetupContext() {
     }
     REXGPU_INFO("Shared memory reads use one texel buffer");
   }
-  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[9];
+  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[10];
   shared_memory_and_edram_descriptor_set_layout_bindings[0].binding = 0;
   shared_memory_and_edram_descriptor_set_layout_bindings[0].descriptorType =
       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1757,6 +1757,11 @@ bool VulkanCommandProcessor::SetupContext() {
             [shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount++];
     scene_band_binding = scene_ao_binding;
     scene_band_binding.binding = kHostInputSceneBandBinding;
+    VkDescriptorSetLayoutBinding& scene_bloom_binding =
+        shared_memory_and_edram_descriptor_set_layout_bindings
+            [shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount++];
+    scene_bloom_binding = scene_ao_binding;
+    scene_bloom_binding.binding = kHostInputSceneBloomBinding;
   }
   if (dfn.vkCreateDescriptorSetLayout(
           device, &shared_memory_and_edram_descriptor_set_layout_create_info, nullptr,
@@ -1785,7 +1790,7 @@ bool VulkanCommandProcessor::SetupContext() {
   if (host_inputs_set_binding_) {
     descriptor_pool_sizes[descriptor_pool_size_count].type =
         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    descriptor_pool_sizes[descriptor_pool_size_count++].descriptorCount = 4;
+    descriptor_pool_sizes[descriptor_pool_size_count++].descriptorCount = 5;
     descriptor_pool_sizes[descriptor_pool_size_count].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     descriptor_pool_sizes[descriptor_pool_size_count++].descriptorCount = 1;
   }
@@ -1821,7 +1826,8 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
   if (host_inputs_set_binding_ &&
-      (!CreateShaderHostInputs() || !CreateSceneAoInput() || !CreateSceneCopyInput())) {
+      (!CreateShaderHostInputs() || !CreateSceneAoInput() || !CreateSceneCopyInput() ||
+       !CreateSceneBloomInput())) {
     return false;
   }
   if (host_inputs_set_binding_) {
@@ -1829,6 +1835,8 @@ bool VulkanCommandProcessor::SetupContext() {
                     [this](const MidframeHookContext& context) { RunSceneAmbientOcclusion(context); });
     AddMidframeHook("scene host copy",
                     [this](const MidframeHookContext& context) { RunSceneCopyHook(context); });
+    AddMidframeHook("scene bloom",
+                    [this](const MidframeHookContext& context) { RunSceneBloom(context); });
   }
   WriteSharedMemoryAndEdramDescriptorSet();
 
@@ -2743,7 +2751,7 @@ void VulkanCommandProcessor::WriteSharedMemoryAndEdramDescriptorSet() {
     shared_memory_descriptor_buffer_info.offset = shared_memory_binding_range * i;
     shared_memory_descriptor_buffer_info.range = shared_memory_binding_range;
   }
-  VkWriteDescriptorSet write_descriptor_sets[9];
+  VkWriteDescriptorSet write_descriptor_sets[10];
   uint32_t write_descriptor_set_count = 1;
   VkWriteDescriptorSet& write_descriptor_set_shared_memory = write_descriptor_sets[0];
   write_descriptor_set_shared_memory.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -2865,6 +2873,20 @@ void VulkanCommandProcessor::WriteSharedMemoryAndEdramDescriptorSet() {
     write_scene_band.descriptorCount = 1;
     write_scene_band.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     write_scene_band.pImageInfo = &scene_band_info;
+  }
+  const VkImageView scene_bloom_view = scene_bloom_images_[kSceneBloomLevels].view;
+  VkDescriptorImageInfo scene_bloom_info = {scene_ao_sampler_, scene_bloom_view,
+                                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  if (host_inputs_set_binding_ && scene_bloom_view != VK_NULL_HANDLE &&
+      scene_ao_sampler_ != VK_NULL_HANDLE) {
+    VkWriteDescriptorSet& write_scene_bloom = write_descriptor_sets[write_descriptor_set_count++];
+    write_scene_bloom = {};
+    write_scene_bloom.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write_scene_bloom.dstSet = shared_memory_and_edram_descriptor_set_;
+    write_scene_bloom.dstBinding = kHostInputSceneBloomBinding;
+    write_scene_bloom.descriptorCount = 1;
+    write_scene_bloom.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write_scene_bloom.pImageInfo = &scene_bloom_info;
   }
   vulkan_device->functions().vkUpdateDescriptorSets(
       vulkan_device->device(), write_descriptor_set_count, write_descriptor_sets, 0, nullptr);
@@ -3317,6 +3339,7 @@ void VulkanCommandProcessor::ShutdownContext() {
                                          shared_memory_and_edram_descriptor_pool_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBufferView, device,
                                          shared_memory_texel_buffer_view_);
+  DestroySceneBloomInput();
   DestroySceneCopyInput();
   DestroySceneAoInput();
   DestroyShaderHostInputs();
@@ -8759,6 +8782,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
       UploadShaderHostInputNoise();
       if (!scene_ao_clear_ && scene_ao_frame_ + 1 < frame_current_) RecordSceneAoClear();
       RecordSceneCopyClear();
+      RecordSceneBloomClear();
     }
   }
 

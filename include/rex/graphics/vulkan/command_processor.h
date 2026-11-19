@@ -1323,6 +1323,30 @@ class VulkanCommandProcessor : public CommandProcessor {
   float scene_band_scale_ = 1.0f;
   // What the full-size pass multiplies its texel by, from its hook.
   float scene_pass_scale_ = 1.0f;
+  // SR-21's first step (scene_bloom.cpp): our bloom from the bands' copy,
+  // host input binding 10.
+  static constexpr uint32_t kSceneBloomLevels = 6;
+  static constexpr uint32_t kSceneBloomImages = kSceneBloomLevels * 2 - 1;
+  struct SceneBloomImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    uint32_t width = 0;
+    uint32_t height = 0;
+  };
+  bool CreateSceneBloomInput();
+  void RecordSceneBloomClear();
+  bool EnsureSceneBloomPipeline();
+  void RunSceneBloom(const MidframeHookContext& context);
+  void DestroySceneBloomInput();
+  std::array<SceneBloomImage, kSceneBloomImages> scene_bloom_images_{};
+  bool scene_bloom_failed_ = false;
+  VkDescriptorSetLayout scene_bloom_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout scene_bloom_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline scene_bloom_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool scene_bloom_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kSceneBloomImages> scene_bloom_sets_{};
   VkImage scene_copy_image_ = VK_NULL_HANDLE;
   VkDeviceMemory scene_copy_memory_ = VK_NULL_HANDLE;
   VkImageView scene_copy_view_ = VK_NULL_HANDLE;
