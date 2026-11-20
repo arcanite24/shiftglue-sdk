@@ -162,12 +162,29 @@ bool Fh1PlanResolve(const RegisterFile& regs, const memory::Memory& memory,
   }
   if (plan.skip) return true;
   const int32_t exp_bias = plan.copying_depth ? 0 : int32_t(dest_info.copy_dest_exp_bias);
+  // Pack 7 (16_16 target into a 16_16 texture) encodes the value as the
+  // destination's number format says (bits 23-24: 0 signed fraction, 1
+  // unsigned fraction, 2 signed integer, 3 unsigned integer). FM3's car
+  // shadow resolves its variance map as signed integers with exp bias +10,
+  // and its blur twice as unsigned fractions; copying the target's snorm
+  // words (the value / 32) gave the blur and the ground shadow mask values
+  // 1/64 of the console's or saturated, and the shadow came out a square
+  // block (FM3-ReGPU FM3-QUIRKS.md Q19).
+  uint32_t number_code = 0;
+  switch (dest_info.copy_dest_number) {
+    case xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction: number_code = 1; break;
+    case xenos::SurfaceNumberFormat::kSignedInteger: number_code = 2; break;
+    case xenos::SurfaceNumberFormat::kUnsignedInteger: number_code = 3; break;
+    default: break;
+  }
+  if (pack != 7) number_code = 0;
   plan.dest_info = pack | (uint32_t(dest_info.copy_dest_endian) << 3) |
                    (uint32_t(!plan.copying_depth && dest_info.copy_dest_swap) << 6) |
                    (uint32_t(flags.depth_float24_round) << 7) |
                    ((uint32_t(exp_bias) & 0xFF) << 8) | (bpb_log2 << 16) |
                    (uint32_t(flags.gamma_as_unorm16) << 18) |
-                   (uint32_t(!flags.fixed16_truncated) << 19);
+                   (uint32_t(!flags.fixed16_truncated) << 19) |
+                   (number_code << 23);
   plan.dest_base = regs[XE_GPU_REG_RB_COPY_DEST_BASE];
   plan.dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>().copy_dest_pitch;
   plan.sample_select = uint32_t(plan.info.copy_dest_coordinate_info.copy_sample_select);

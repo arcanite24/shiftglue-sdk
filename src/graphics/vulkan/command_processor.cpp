@@ -322,6 +322,55 @@ REXCVAR_DEFINE_INT32(vulkan_memory_budget_log_seconds, 30, "GPU/Vulkan",
                      "the resident size, with their peaks, this often (0: never)")
     .range(0, 3600)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(texture_integer_fetch_rescale, true, "GPU/Vulkan",
+                    "Return integer number format texture fetches (fetch constant num_format) "
+                    "as the integer, not the normalized value, for 16-bit formats, by raising "
+                    "the fetch's exp_adjust by 15 (signed) or 16 (unsigned) in the uploaded "
+                    "fetch constants. FM3's ground shadow samples its variance map so; without "
+                    "it the car shadow is a square block (FM3-ReGPU Q19)");
+
+namespace {
+// Xenos returns a texture fetch with num_format = integer as the raw integer
+// (then exp_adjust), the normalized fetch's value times 2^w - 1 (unsigned) or
+// 2^(w - 1) - 1 (signed). The SPIR-V translator always normalizes, so fold
+// the scale into exp_adjust, which it reads from the uploaded fetch constant:
+// 2^15 for 32767 and 2^16 for 65535 are off by 1/32767 and 1/65535. 8-bit
+// formats (2^8 for 255 is 0.4% off) keep the normalized value.
+void RescaleIntegerTextureFetches(uint32_t* fetch_constants) {
+  for (uint32_t i = 0; i < 32; ++i) {
+    uint32_t* fetch = fetch_constants + i * 6;
+    if ((fetch[0] & 3) != uint32_t(rex::graphics::xenos::FetchConstantType::kTexture) ||
+        !(fetch[3] & 1)) {
+      continue;
+    }
+    uint32_t components;
+    switch (fetch[1] & 63) {
+      case 24:  // k_16
+        components = 1;
+        break;
+      case 25:  // k_16_16
+        components = 2;
+        break;
+      case 26:  // k_16_16_16_16
+        components = 4;
+        break;
+      default:
+        continue;
+    }
+    const uint32_t sign = (fetch[0] >> 2) & 3;
+    if (sign > 1) continue;  // Biased or gamma.
+    bool same_sign = true;
+    for (uint32_t c = 1; c < components; ++c) {
+      same_sign &= ((fetch[0] >> (2 + 2 * c)) & 3) == sign;
+    }
+    if (!same_sign) continue;
+    int32_t exp_adjust = int32_t(fetch[3] << 13) >> 26;
+    exp_adjust = std::min(exp_adjust + (sign ? 15 : 16), 31);
+    fetch[3] = (fetch[3] & ~(UINT32_C(63) << 13)) | ((uint32_t(exp_adjust) & 63) << 13);
+  }
+}
+}  // namespace
+
 REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                     "device (falls back to render passes otherwise)")
@@ -10822,6 +10871,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       }
       buffer_info.range = VkDeviceSize(fetch_buffer_size);
       std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], kFetchConstantsSize);
+      if (REXCVAR_GET(texture_integer_fetch_rescale)) {
+        RescaleIntegerTextureFetches(reinterpret_cast<uint32_t*>(mapping));
+      }
       if (bindless) {
         std::memcpy(mapping + kFetchConstantsSize, bindless_indices_,
                     SpirvShaderTranslator::kBindlessIndicesBytes);

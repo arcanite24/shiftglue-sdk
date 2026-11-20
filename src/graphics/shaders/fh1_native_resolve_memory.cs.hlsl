@@ -266,7 +266,7 @@ void main(uint3 thread : SV_DispatchThreadID) {
       ((pack == 0u && (format == FORMAT_8_8_8_8 || format == FORMAT_8_8_8_8_GAMMA)) ||
        (pack == 1u && (format == FORMAT_2_10_10_10 ||
                        format == FORMAT_2_10_10_10_AS_10_10_10_10)) ||
-       (pack == 7u && format == FORMAT_16_16))) {
+       (pack == 7u && format == FORMAT_16_16 && ((FH1_DEST_INFO >> 23u) & 3u) == 0u))) {
     StoreWord(address, host_pixel, EndianSwap32(LoadOwnerWord(pixel, first_sample, 0u), endian));
     return;
   }
@@ -288,6 +288,21 @@ void main(uint3 thread : SV_DispatchThreadID) {
     StoreWord(address, host_pixel, EndianSwap32(EncodeColor(color, FORMAT_2_10_10_10), endian));
   } else if (pack == 2u) {
     StoreWord(address, host_pixel, EndianSwap32(asuint(color.r), endian));
+  } else if (pack == 7u && ((FH1_DEST_INFO >> 23u) & 3u) != 0u) {
+    // The destination's number format (bits 23-24: 1 unsigned fraction, 2
+    // signed integer, 3 unsigned integer) encodes the biased guest value, as
+    // the console's resolve does.
+    uint number = (FH1_DEST_INFO >> 23u) & 3u;
+    int2 q;
+    if (number == 1u) {
+      q = int2(saturate(color.rg) * 65535.0f + 0.5f);
+    } else if (number == 3u) {
+      q = int2(clamp(round(color.rg), 0.0f, 65535.0f));
+    } else {
+      q = int2(clamp(round(color.rg), -32768.0f, 32767.0f));
+    }
+    StoreWord(address, host_pixel,
+              EndianSwap32((uint(q.x) & 0xFFFFu) | (uint(q.y) << 16u), endian));
   } else if (pack == 7u) {
     // The samples' average back in the target's snorm encoding (the texture's
     // fetch constant says how it reads them).
